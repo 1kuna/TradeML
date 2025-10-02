@@ -1,0 +1,248 @@
+"""
+Finnhub connector for options chains and market data.
+
+Free tier: 60 API calls/minute
+API Docs: https://finnhub.io/docs/api
+
+Supports:
+- Options chains (calls/puts)
+- Quote data
+- Company fundamentals
+"""
+
+import os
+from datetime import datetime, date
+from typing import List, Optional, Dict, Any
+import pandas as pd
+from loguru import logger
+
+from .base import BaseConnector, ConnectorError
+from ..schemas import DataType, get_schema
+
+
+class FinnhubConnector(BaseConnector):
+    """
+    Connector for Finnhub market data.
+
+    Free tier provides:
+    - Options chains with strikes and expiries
+    - Real-time quotes
+    - Company profiles
+    """
+
+    API_URL = "https://finnhub.io/api/v1"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        rate_limit_per_sec: float = 0.9,  # ~54 per minute (conservative for 60/min limit)
+    ):
+        """
+        Initialize Finnhub connector.
+
+        Args:
+            api_key: Finnhub API key (or from environment)
+            rate_limit_per_sec: Max requests per second
+        """
+        api_key = api_key or os.getenv("FINNHUB_API_KEY")
+
+        if not api_key:
+            raise ConnectorError(
+                "Finnhub API key not found. Set FINNHUB_API_KEY in .env"
+            )
+
+        super().__init__(
+            source_name="finnhub",
+            api_key=api_key,
+            base_url=self.API_URL,
+            rate_limit_per_sec=rate_limit_per_sec,
+        )
+
+        logger.info("Finnhub connector initialized")
+
+    def _fetch_raw(self, endpoint: str, **params) -> Dict:
+        """
+        Fetch raw data from Finnhub API.
+
+        Args:
+            endpoint: API endpoint path
+            **params: Query parameters
+
+        Returns:
+            Raw JSON response
+        """
+        url = f"{self.API_URL}/{endpoint}"
+
+        api_params = {
+            "token": self.api_key,
+            **params
+        }
+
+        try:
+            response = self._get(url, params=api_params)
+            data = response.json()
+
+            # Check for API errors
+            if "error" in data:
+                raise ConnectorError(f"Finnhub error: {data['error']}")
+
+            return data
+
+        except Exception as e:
+            logger.error(f"Finnhub API error: {e}")
+            raise ConnectorError(f"Failed to fetch from Finnhub: {e}")
+
+    def _transform(self, raw_data: Dict, **kwargs) -> pd.DataFrame:
+        """
+        Transform Finnhub response to our schema.
+
+        Implemented by specific fetch methods.
+        """
+        raise NotImplementedError("Use specific fetch methods")
+
+    def fetch_options_chain(
+        self,
+        symbol: str,
+        date: Optional[str] = None
+    ) -> pd.DataFrame:
+        """
+        Fetch options chain for a symbol.
+
+        Args:
+            symbol: Underlying symbol
+            date: Expiry date (YYYY-MM-DD) or None for all
+
+        Returns:
+            DataFrame with options chain
+        """
+        logger.info(f"Fetching options chain for {symbol}")
+
+        params = {"symbol": symbol}
+        if date:
+            params["date"] = date
+
+        raw_data = self._fetch_raw("stock/option-chain", **params)
+
+        # Parse options data
+        rows = []
+        options_data = raw_data.get("data", [])
+
+        for opt in options_data:
+            row = {
+                "underlier": symbol,
+                "expiry": datetime.fromtimestamp(opt["expirationDate"]).date() if opt.get("expirationDate") else None,
+                "strike": float(opt["strike"]),
+                "cp_flag": "C" if opt["type"] == "Call" else "P",
+                "bid": float(opt.get("bid", 0)) if opt.get("bid") else None,
+                "ask": float(opt.get("ask", 0)) if opt.get("ask") else None,
+                "bid_size": int(opt.get("bidSize", 0)) if opt.get("bidSize") else None,
+                "ask_size": int(opt.get("askSize", 0)) if opt.get("askSize") else None,
+                "nbbo_mid": None,  # Will compute
+                "ts_ns": int(datetime.now().timestamp() * 1e9),
+            }
+
+            # Compute mid if bid/ask available
+            if row["bid"] is not None and row["ask"] is not None:
+                row["nbbo_mid"] = (row["bid"] + row["ask"]) / 2
+
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+
+        if not df.empty:
+            source_uri = f"finnhub://option-chain/{symbol}"
+            df = self._add_metadata(df, source_uri=source_uri)
+            df = df.sort_values(["expiry", "strike", "cp_flag"]).reset_index(drop=True)
+
+        return df
+
+    def fetch_quote(self, symbol: str) -> Dict:
+        """
+        Fetch real-time quote for a symbol.
+
+        Args:
+            symbol: Ticker symbol
+
+        Returns:
+            Dict with quote data
+        """
+        logger.info(f"Fetching quote for {symbol}")
+
+        raw_data = self._fetch_raw("quote", symbol=symbol)
+        return raw_data
+
+    def fetch_company_profile(self, symbol: str) -> Dict:
+        """
+        Fetch company profile/fundamentals.
+
+        Args:
+            symbol: Ticker symbol
+
+        Returns:
+            Dict with company info
+        """
+        logger.info(f"Fetching company profile for {symbol}")
+
+        raw_data = self._fetch_raw("stock/profile2", symbol=symbol)
+        return raw_data
+
+    def fetch_options_expiries(self, symbol: str) -> List[date]:
+        """
+        Get available expiry dates for options.
+
+        Args:
+            symbol: Underlying symbol
+
+        Returns:
+            List of expiry dates
+        """
+        logger.info(f"Fetching options expiries for {symbol}")
+
+        # Fetch chain without date filter to get all expiries
+        df = self.fetch_options_chain(symbol)
+
+        if df.empty:
+            return []
+
+        expiries = df["expiry"].dropna().unique().tolist()
+        expiries.sort()
+
+        return expiries
+
+
+# CLI for testing
+if __name__ == "__main__":
+    import argparse
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="Fetch Finnhub options data")
+    parser.add_argument("--symbol", type=str, required=True, help="Symbol to fetch")
+    parser.add_argument("--expiry", type=str, help="Expiry date (YYYY-MM-DD)")
+    parser.add_argument("--output", type=str, default="data_layer/raw/options_nbbo")
+
+    args = parser.parse_args()
+
+    connector = FinnhubConnector()
+
+    # Fetch options chain
+    df = connector.fetch_options_chain(args.symbol, date=args.expiry)
+
+    if not df.empty:
+        output_path = f"{args.output}/{args.symbol}_options.parquet"
+        connector.write_parquet(
+            df,
+            path=output_path,
+            schema=get_schema(DataType.OPTIONS_NBBO),
+        )
+        print(f"[OK] Fetched {len(df)} options contracts for {args.symbol} to {output_path}")
+
+        # Print summary
+        expiries = df["expiry"].unique()
+        print(f"\nExpiries found: {len(expiries)}")
+        for exp in sorted(expiries)[:5]:  # Show first 5
+            count = len(df[df["expiry"] == exp])
+            print(f"  {exp}: {count} contracts")
+    else:
+        print(f"[WARN] No options data found for {args.symbol}")

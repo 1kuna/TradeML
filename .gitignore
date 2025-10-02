@@ -1,0 +1,134 @@
+# TradeML .gitignore
+
+# ===== Secrets & Environment =====
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets/
+credentials/
+
+# ===== Data Files =====
+data_layer/raw/
+data_layer/curated/
+data_layer/reference/
+*.parquet
+*.csv
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.feather
+*.db
+*.sqlite
+*.duckdb
+
+# ===== Model Artifacts =====
+models/**/*.pkl
+models/**/*.joblib
+models/**/*.h5
+models/**/*.pt
+models/**/*.pth
+models/**/*.onnx
+models/**/*.pb
+mlruns/
+mlartifacts/
+
+# ===== Logs =====
+logs/
+*.log
+*.log.*
+
+# ===== Cache & Temporary Files =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+*.cover
+*.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ===== DVC =====
+.dvc/tmp
+.dvc/cache
+
+# ===== Jupyter =====
+.ipynb_checkpoints
+notebooks/.ipynb_checkpoints/
+*.ipynb_backup
+
+# ===== IDE & Editors =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== Build & Distribution =====
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+*.whl
+
+# ===== Virtual Environments =====
+venv/
+env/
+ENV/
+.venv/
+.conda/
+
+# ===== Docker =====
+docker-compose.override.yml
+.docker/
+
+# ===== Reports & Outputs =====
+ops/reports/*.json
+ops/reports/*.md
+ops/reports/*.html
+!ops/reports/.gitkeep
+
+# ===== Backtest Results =====
+backtest/results/
+backtest/cache/
+
+# ===== MinIO / S3 Local =====
+minio_data/
+
+# ===== Database =====
+*.sql.backup
+postgres_data/
+
+# ===== OS Generated =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# ===== Profiling =====
+*.prof
+*.lprof
+*.pstats
+
+# ===== Misc =====
+.dvcignore
+.envrc
+*.bak
+*.tmp
+*.swp

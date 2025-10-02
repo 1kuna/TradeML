@@ -1,0 +1,298 @@
+"""
+Base connector class with retry logic, checksums, and lineage tracking.
+
+All data connectors must inherit from BaseConnector and implement:
+- _fetch_raw(): fetch data from vendor API
+- _transform(): transform raw payload to our schema
+"""
+
+import hashlib
+import time
+from abc import ABC, abstractmethod
+from datetime import datetime
+from typing import Any, Dict, Optional
+from pathlib import Path
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from loguru import logger
+
+
+class BaseConnector(ABC):
+    """
+    Base class for all data connectors.
+
+    Provides:
+    - HTTP retry with exponential backoff
+    - Response checksum generation
+    - Metadata tracking (ingested_at, source_uri, source_name)
+    - Parquet writing with schema validation
+    """
+
+    def __init__(
+        self,
+        source_name: str,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        rate_limit_per_sec: float = 2.0,
+        max_retries: int = 5,
+    ):
+        """
+        Initialize connector.
+
+        Args:
+            source_name: Name of data source (e.g., 'alpaca', 'iex')
+            api_key: API key for authentication
+            base_url: Base URL for API
+            rate_limit_per_sec: Max requests per second
+            max_retries: Max retry attempts on failure
+        """
+        self.source_name = source_name
+        self.api_key = api_key
+        self.base_url = base_url
+        self.rate_limit_per_sec = rate_limit_per_sec
+        self.max_retries = max_retries
+
+        # Rate limiting
+        self._last_request_time = 0.0
+        self._min_request_interval = 1.0 / rate_limit_per_sec
+
+        # Setup HTTP session with retry
+        self.session = self._create_session()
+
+        logger.info(f"Initialized {source_name} connector")
+
+    def _create_session(self) -> requests.Session:
+        """Create requests session with retry strategy."""
+        session = requests.Session()
+
+        # Retry strategy: retry on 429, 500, 502, 503, 504
+        retry_strategy = Retry(
+            total=self.max_retries,
+            backoff_factor=1,  # 1s, 2s, 4s, 8s, 16s
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+        )
+
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        return session
+
+    def _rate_limit(self):
+        """Enforce rate limiting between requests."""
+        now = time.time()
+        elapsed = now - self._last_request_time
+        if elapsed < self._min_request_interval:
+            time.sleep(self._min_request_interval - elapsed)
+        self._last_request_time = time.time()
+
+    def _get(self, url: str, params: Optional[Dict] = None, headers: Optional[Dict] = None) -> requests.Response:
+        """
+        Make GET request with rate limiting and retry.
+
+        Args:
+            url: Request URL
+            params: Query parameters
+            headers: Request headers
+
+        Returns:
+            Response object
+
+        Raises:
+            requests.exceptions.RequestException: on failure after retries
+        """
+        self._rate_limit()
+
+        try:
+            response = self.session.get(url, params=params, headers=headers, timeout=30)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed for {url}: {e}")
+            raise
+
+    def _post(self, url: str, data: Optional[Dict] = None, headers: Optional[Dict] = None) -> requests.Response:
+        """Make POST request with rate limiting and retry."""
+        self._rate_limit()
+
+        try:
+            response = self.session.post(url, json=data, headers=headers, timeout=30)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            logger.error(f"POST request failed for {url}: {e}")
+            raise
+
+    @staticmethod
+    def _compute_checksum(data: bytes) -> str:
+        """
+        Compute SHA256 checksum of raw data.
+
+        Args:
+            data: Raw bytes
+
+        Returns:
+            Hex digest string
+        """
+        return hashlib.sha256(data).hexdigest()
+
+    @abstractmethod
+    def _fetch_raw(self, **kwargs) -> Any:
+        """
+        Fetch raw data from vendor API.
+
+        Must be implemented by subclasses.
+
+        Returns:
+            Raw response data (dict, list, bytes, etc.)
+        """
+        pass
+
+    @abstractmethod
+    def _transform(self, raw_data: Any, **kwargs) -> pd.DataFrame:
+        """
+        Transform raw vendor data to our schema.
+
+        Must be implemented by subclasses.
+
+        Args:
+            raw_data: Output from _fetch_raw()
+            **kwargs: Additional context (e.g., symbol, date range)
+
+        Returns:
+            pandas DataFrame conforming to schema
+        """
+        pass
+
+    def _add_metadata(
+        self,
+        df: pd.DataFrame,
+        source_uri: str,
+        transform_id: Optional[str] = None
+    ) -> pd.DataFrame:
+        """
+        Add metadata columns for lineage tracking.
+
+        Args:
+            df: DataFrame to augment
+            source_uri: API endpoint or file path
+            transform_id: Hash of transformation logic (optional)
+
+        Returns:
+            DataFrame with metadata columns
+        """
+        df = df.copy()
+        df["ingested_at"] = pd.Timestamp.now(tz="UTC")
+        df["source_name"] = self.source_name
+        df["source_uri"] = source_uri
+
+        if transform_id:
+            df["transform_id"] = transform_id
+
+        return df
+
+    def fetch_and_transform(self, **kwargs) -> pd.DataFrame:
+        """
+        Fetch raw data and transform to schema (template method).
+
+        Args:
+            **kwargs: Parameters for _fetch_raw and _transform
+
+        Returns:
+            Transformed DataFrame with metadata
+        """
+        logger.info(f"Fetching data from {self.source_name}...")
+
+        # Fetch raw data
+        raw_data = self._fetch_raw(**kwargs)
+
+        # Transform to schema
+        source_uri = kwargs.get("source_uri", self.base_url or self.source_name)
+        df = self._transform(raw_data, **kwargs)
+
+        # Add metadata
+        df = self._add_metadata(df, source_uri=source_uri)
+
+        logger.info(f"Fetched and transformed {len(df)} rows from {self.source_name}")
+        return df
+
+    def write_parquet(
+        self,
+        df: pd.DataFrame,
+        path: Path,
+        schema: Optional[pa.Schema] = None,
+        partition_cols: Optional[list] = None,
+    ):
+        """
+        Write DataFrame to Parquet with optional schema validation.
+
+        Args:
+            df: DataFrame to write
+            path: Output path (file or directory if partitioned)
+            schema: PyArrow schema for validation (optional)
+            partition_cols: Columns to partition by (e.g., ['date', 'symbol'])
+        """
+        path = Path(path)
+
+        # Create directory if needed
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Convert to PyArrow table
+        table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+
+        if partition_cols:
+            # Write partitioned dataset
+            pq.write_to_dataset(
+                table,
+                root_path=str(path),
+                partition_cols=partition_cols,
+                existing_data_behavior="overwrite_or_ignore",
+            )
+            logger.info(f"Wrote partitioned Parquet to {path}")
+        else:
+            # Write single file
+            pq.write_table(table, str(path), compression="snappy")
+            logger.info(f"Wrote Parquet to {path}")
+
+    def validate_response(self, response: requests.Response, expected_keys: Optional[list] = None):
+        """
+        Validate JSON response contains expected keys.
+
+        Args:
+            response: Response object
+            expected_keys: List of required keys in JSON
+
+        Raises:
+            ValueError: if validation fails
+        """
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise ValueError(f"Invalid JSON response: {e}")
+
+        if expected_keys:
+            missing = set(expected_keys) - set(data.keys())
+            if missing:
+                raise ValueError(f"Response missing required keys: {missing}")
+
+        return data
+
+
+class ConnectorError(Exception):
+    """Base exception for connector errors."""
+    pass
+
+
+class RateLimitError(ConnectorError):
+    """Raised when rate limit is exceeded."""
+    pass
+
+
+class DataQualityError(ConnectorError):
+    """Raised when fetched data fails QC checks."""
+    pass
