@@ -167,4 +167,4 @@ quickstart: env-setup docker-up install validate
 	@echo "1. Edit .env with your API keys"
 	@echo "2. Run: make validate"
 	@echo "3. Run: make fetch-sample"
-	@echo "4. Review: QUICKSTART.md"
+	@echo "4. Review: README.md (Quick Start) and QUICK_REFERENCE.md"

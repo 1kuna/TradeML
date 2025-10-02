@@ -262,13 +262,13 @@ def main():
     if passed == total:
         print("\n🎉 All checks passed! System is ready.")
         print("\nNext steps:")
-        print("1. Review QUICKSTART.md for usage examples")
+        print("1. Review README.md (Quick Start) and QUICK_REFERENCE.md (commands)")
         print("2. Fetch historical data: python -m data_layer.connectors.alpaca_connector")
         print("3. Continue with Phase 1 implementation")
         return 0
     else:
         print("\n⚠️  Some checks failed. Review errors above.")
-        print("See QUICKSTART.md for troubleshooting.")
+        print("See README.md (Troubleshooting) and QUICK_REFERENCE.md.")
         return 1
 
 
