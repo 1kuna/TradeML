@@ -7,6 +7,7 @@ All data connectors must inherit from BaseConnector and implement:
 """
 
 import hashlib
+import os
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -237,6 +238,20 @@ class BaseConnector(ABC):
             schema: PyArrow schema for validation (optional)
             partition_cols: Columns to partition by (e.g., ['date', 'symbol'])
         """
+        # If configured, write to S3 instead of local filesystem
+        storage_backend = os.getenv("STORAGE_BACKEND", "local").lower()
+        if storage_backend == "s3":
+            try:
+                from data_layer.storage.s3_client import get_s3_client
+            except Exception as e:
+                logger.error(f"S3 backend requested but unavailable: {e}")
+                storage_backend = "local"
+
+        if storage_backend == "s3":
+            self._write_parquet_s3(df, path, schema=schema, partition_cols=partition_cols)
+            return
+
+        # Local filesystem write
         path = Path(path)
 
         # Create directory if needed
@@ -258,6 +273,79 @@ class BaseConnector(ABC):
             # Write single file
             pq.write_table(table, str(path), compression="snappy")
             logger.info(f"Wrote Parquet to {path}")
+
+    def _write_parquet_s3(
+        self,
+        df: pd.DataFrame,
+        path: Path | str,
+        schema: Optional[pa.Schema] = None,
+        partition_cols: Optional[list] = None,
+    ):
+        """
+        Write DataFrame to S3 using the repo's S3Client.
+
+        Notes:
+            - Maps local-style roots under data_layer/ to S3 prefixes:
+              data_layer/raw -> raw, data_layer/curated -> curated, otherwise reference
+            - When partition_cols are provided, writes one object per partition
+              at <root>/<col1>=<v1>/.../data.parquet
+        """
+        from data_layer.storage.s3_client import get_s3_client
+
+        s3 = get_s3_client()
+        path_str = str(path)
+
+        # Normalize root mapping
+        if path_str.startswith("data_layer/raw"):
+            root = path_str.replace("data_layer/raw", "raw", 1)
+        elif path_str.startswith("data_layer/curated"):
+            root = path_str.replace("data_layer/curated", "curated", 1)
+        elif path_str.startswith("s3://"):
+            # Allow explicit s3://bucket/prefix (ignore client bucket)
+            # Strip scheme and bucket if it matches current to get key prefix
+            # Expected form: s3://<bucket>/<prefix>
+            parts = path_str[5:].split("/", 1)
+            root = parts[1] if len(parts) > 1 else ""
+        else:
+            root = path_str
+
+        # Convert to bytes once per partition
+        if partition_cols:
+            # Partition and write per unique combination
+            part_cols = [c for c in partition_cols if c in df.columns]
+            if not part_cols:
+                logger.warning("Partition columns not found in DataFrame; writing unpartitioned")
+                partition_cols = None
+            else:
+                grouped = df.groupby(part_cols, dropna=False, as_index=False)
+                for _, sub in grouped:
+                    # Build key like root/col1=v1/col2=v2/data.parquet
+                    sub_key = root.rstrip("/")
+                    for c in part_cols:
+                        v = sub.iloc[0][c]
+                        # Format dates
+                        if hasattr(v, 'isoformat'):
+                            v = v.isoformat()
+                        sub_key += f"/{c}={v}"
+
+                    buf = pa.BufferOutputStream()
+                    table = pa.Table.from_pandas(sub, schema=schema, preserve_index=False)
+                    pq.write_table(table, buf, compression="snappy")
+                    s3.put_object(key=f"{sub_key}/data.parquet", data=buf.getvalue().to_pybytes())
+                logger.info(f"Wrote partitioned dataset to s3://{s3.bucket}/{root}")
+                return
+
+        # Fallback: single object
+        table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+        buf = pa.BufferOutputStream()
+        pq.write_table(table, buf, compression="snappy")
+
+        # If path ends with .parquet, keep it; else use data.parquet
+        key = root
+        if not key.endswith(".parquet"):
+            key = key.rstrip("/") + "/data.parquet"
+        s3.put_object(key=key, data=buf.getvalue().to_pybytes())
+        logger.info(f"Wrote Parquet to s3://{s3.bucket}/{key}")
 
     def validate_response(self, response: requests.Response, expected_keys: Optional[list] = None):
         """
