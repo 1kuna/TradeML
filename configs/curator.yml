@@ -1,0 +1,16 @@
+# Watermark-based curation jobs
+
+watermark:
+  # S3 key used by BookmarkManager to track watermark per job
+  bookmark_key: manifests/curator_watermarks.json
+
+jobs:
+  - name: equities_bars_ohlcv
+    source: alpaca
+    table: equities_bars
+    input_prefix: raw/alpaca/equities_bars
+    output_prefix: curated/equities_ohlcv_adj
+    partition: date
+    # Idempotency: curator skips dates already produced
+    idempotent: true
+
