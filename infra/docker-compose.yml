@@ -36,6 +36,7 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
+    profiles: ["dev-s3"]
 
   # Create MinIO buckets on startup
   minio-init:
@@ -55,6 +56,41 @@ services:
       echo 'MinIO buckets created successfully';
       exit 0;
       "
+    profiles: ["dev-s3"]
+
+  # Edge data collector (runs with S3 storage)
+  edge-collector:
+    image: python:3.11-slim
+    container_name: trademl_edge
+    working_dir: /app
+    volumes:
+      - ../:/app
+    env_file:
+      - ../.env
+    depends_on:
+      minio:
+        condition: service_healthy
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements.txt && \
+             python scripts/edge_collector.py --config configs/edge.yml"
+    profiles: ["edge"]
+
+  # Curator processor (watermark-based)
+  curator:
+    image: python:3.11-slim
+    container_name: trademl_curator
+    working_dir: /app
+    volumes:
+      - ../:/app
+    env_file:
+      - ../.env
+    depends_on:
+      minio:
+        condition: service_healthy
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements.txt && \
+             python scripts/curator.py --config configs/curator.yml"
+    profiles: ["curator"]
 
   # Optional: Redis for message queue / caching
   redis:

@@ -1,7 +1,7 @@
 # TradeML Makefile
 # Common commands for development and deployment
 
-.PHONY: help setup docker-up docker-down docker-logs test validate clean data fetch-sample
+.PHONY: help setup docker-up docker-down docker-logs test validate clean data fetch-sample edge-up curator-up dev-s3
 
 help:
 	@echo "TradeML - Autonomous Trading Agent"
@@ -11,6 +11,9 @@ help:
 	@echo "  make docker-up      - Start Docker services (PostgreSQL, MinIO, etc.)"
 	@echo "  make docker-down    - Stop Docker services"
 	@echo "  make docker-logs    - View Docker service logs"
+	@echo "  make edge-up        - Start edge collector (with dev MinIO)"
+	@echo "  make curator-up     - Start curator (with dev MinIO)"
+	@echo "  make dev-s3         - Start only MinIO (dev S3)"
 	@echo "  make validate       - Run setup validation checks"
 	@echo "  make test           - Run unit tests"
 	@echo "  make test-int       - Run integration tests"
@@ -53,6 +56,23 @@ docker-logs:
 
 docker-ps:
 	cd infra && docker-compose ps
+
+# Edge/Curator services via compose profiles
+edge-up:
+	@echo "Starting edge collector with dev MinIO..."
+	cd infra && COMPOSE_PROFILES=dev-s3,edge docker-compose up -d minio minio-init edge-collector
+	@echo "✓ Edge collector running (profile: edge + dev-s3)"
+	@echo "MinIO Console: http://localhost:9001 (minioadmin/minioadmin)"
+
+curator-up:
+	@echo "Starting curator with dev MinIO..."
+	cd infra && COMPOSE_PROFILES=dev-s3,curator docker-compose up -d minio minio-init curator
+	@echo "✓ Curator running (profile: curator + dev-s3)"
+
+dev-s3:
+	@echo "Starting dev MinIO only..."
+	cd infra && COMPOSE_PROFILES=dev-s3 docker-compose up -d minio minio-init
+	@echo "✓ MinIO started at http://localhost:9001 (minioadmin/minioadmin)"
 
 # Validation
 validate:
