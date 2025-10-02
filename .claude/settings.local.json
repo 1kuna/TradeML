@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(./venv/Scripts/pip install --upgrade pip setuptools wheel)",
+      "Bash(./venv/Scripts/python:*)",
+      "Bash(./venv/Scripts/pip install pandas polars pyarrow numpy scipy psycopg2-binary sqlalchemy boto3 s3fs requests aiohttp loguru python-dotenv pyyaml)",
+      "Bash(./venv/Scripts/pip install:*)",
+      "Bash(cat:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
