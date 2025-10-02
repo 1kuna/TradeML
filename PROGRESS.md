@@ -261,8 +261,8 @@ Before starting Phase 2 (Feature Engineering + Models), ensure:
 - [x] PBO calculator ready
 - [x] DSR calculator ready
 - [ ] Universe constructor tested with real data
-- [ ] Baseline feature set defined
-- [ ] Labeling framework YAML config created
+ - [x] Baseline feature set defined
+ - [x] Labeling framework YAML config created
 
 ---
 
@@ -283,9 +283,10 @@ Before starting Phase 2 (Feature Engineering + Models), ensure:
    - YAML-configurable thresholds
 
 3. **Baseline Models**
-   - Ridge regression (regression baseline)
-   - Logistic regression (classification baseline)
-   - LightGBM with monotonicity constraints
+   - Ridge regression (regression baseline) — IMPLEMENTED
+   - Logistic regression (classification baseline) — IMPLEMENTED
+   - LightGBM with monotonicity constraints — TODO (optional in Phase 2.1)
+   - Pipeline integration — IMPLEMENTED (`ops/pipelines/equities_xs.py`)
    - **Target**: Sharpe >= 1.0, Max DD <= 20%, DSR > 0, PBO <= 5%
 
 ### Phase 2 Success Criteria
@@ -329,6 +330,45 @@ Before ANY model goes live:
    - Demotion if 2-week DD > 10%
 
 ---
+
+## Phase 2 Integration (Implementation Status)
+
+### Delivered Components
+
+| Area | Component | File | Status |
+|------|-----------|------|--------|
+| Features | Equity features (PIT) | feature_store/equities/features.py | ✅ |
+| Features | Dataset builder (panel) | feature_store/equities/dataset.py | ✅ |
+| Labels | Horizon returns | labeling/horizon/horizon.py | ✅ |
+| Labels | Triple-barrier | labeling/triple_barrier/triple_barrier.py | ✅ |
+| Labels | YAML config template | labeling/configs/default_labels.yaml | ✅ |
+| Validation | CPCV wrapper | validation/__init__.py | ✅ |
+| Models | Baselines (ridge/logit) | models/equities_xs/baselines.py | ✅ |
+| Portfolio | Target weights builder | portfolio/build.py | ✅ |
+| Backtest | Minimal backtester (daily) | backtest/engine/backtester.py | ✅ |
+| Reporting | Daily emitter (MD/JSON) | ops/reports/emitter.py | ✅ |
+| Pipeline | End-to-end Phase 2 | ops/pipelines/equities_xs.py | ✅ |
+
+### How to Run (Example)
+
+```
+python -m ops.pipelines.equities_xs \
+  --start 2024-01-02 --end 2024-01-31 \
+  --symbols AAPL MSFT \
+  --label horizon --k 5 \
+  --folds 5 --embargo 3 \
+  --capital 1000000 --spread_bps 5 \
+  --gross_cap 1.0 --max_name 0.05 --kelly 1.0
+```
+
+Outputs:
+- Signals/backtest in-memory (equity curve + metrics)
+- Daily report JSON/MD written to `ops/reports/` for the final date
+
+Notes:
+- Set `CURATED_EQUITY_BARS_ADJ_DIR` to the folder with per-symbol curated Parquet (default: `data_layer/curated/equities_ohlcv_adj`).
+- For triple-barrier labels, provide `--label triple_barrier --tp 2.0 --sl 1.0 --max_h 10`.
+
 
 ## Acknowledgments
 

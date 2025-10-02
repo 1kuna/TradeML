@@ -1,0 +1,23 @@
+# Labeling configuration (YAML)
+#
+# This template defines defaults for horizon returns and triple-barrier labels.
+# Adjust per dataset and strategy, ensuring PIT discipline is maintained.
+
+equities:
+  horizon:
+    # Default forward horizons in trading days
+    horizons: [5, 20]
+
+  triple_barrier:
+    # Barriers scale with rolling sigma estimated from past returns
+    vol_window: 20     # trailing window for sigma
+    tp_sigma: 2.0      # take-profit multiple of sigma
+    sl_sigma: 1.0      # stop-loss multiple of sigma
+    max_h: 10          # max holding period in trading days
+
+options:
+  # Placeholder for options labeling (vol sleeve, spread sleeve)
+  vol_sleeve:
+    horizon_days: 5
+    metric: iv_change  # or vrp
+
