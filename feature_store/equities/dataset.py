@@ -29,9 +29,9 @@ def _compute_features_panel(panel: pd.DataFrame, standardize_window: int = 252) 
     df = panel.sort_values(["symbol", "date"]).copy()
     # Returns
     df["ret_1d"] = df.groupby("symbol")["close"].pct_change()
-    # Momentum
+    # Momentum - use transform to preserve index alignment
     for k in (5, 20, 60):
-        df[f"mom_{k}d"] = df.groupby("symbol")["close"].apply(lambda s: s / s.shift(k) - 1.0)
+        df[f"mom_{k}d"] = df.groupby("symbol")["close"].transform(lambda s: s / s.shift(k) - 1.0)
     # Realized volatility
     for k in (20, 60):
         df[f"rv_{k}d"] = df.groupby("symbol")["ret_1d"].rolling(window=k, min_periods=max(5, k // 2)).std(ddof=1).reset_index(level=0, drop=True)
@@ -51,7 +51,7 @@ def _compute_features_panel(panel: pd.DataFrame, standardize_window: int = 252) 
 
     feature_cols = ["mom_5d", "mom_20d", "mom_60d", "rv_20d", "rv_60d", "adv_20d"]
     for c in feature_cols:
-        df[f"feature_{c}"] = df.groupby("symbol")[c].apply(zscore)
+        df[f"feature_{c}"] = df.groupby("symbol")[c].transform(zscore)
 
     out_cols = ["date", "symbol", "feature_dow_sin", "feature_dow_cos"] + [f"feature_{c}" for c in feature_cols]
     features = df[out_cols].dropna(subset=[f for f in out_cols if f.startswith("feature_")])
@@ -183,7 +183,8 @@ def build_training_dataset(
     feature_cols = [c for c in df.columns if c.startswith("feature_")]
     X = df[["entry_date", "symbol"] + feature_cols].rename(columns={"entry_date": "date"})
     y = df[target_col]
-    meta = df[["date", "symbol"]].copy()
+    # meta should use entry_date before renaming
+    meta = df[["entry_date", "symbol"]].rename(columns={"entry_date": "date"}).copy()
     meta["horizon_days"] = df.get("horizon_days", horizon_days)
 
     return Dataset(X=X.reset_index(drop=True), y=y.reset_index(drop=True), meta=meta.reset_index(drop=True))

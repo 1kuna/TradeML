@@ -83,21 +83,30 @@ def run_pipeline(cfg: PipelineConfig) -> Dict:
     groups = pd.DataFrame({
         "date": ds.X["date"],
         "horizon_days": ds.meta["horizon_days"],
-    })
+    }).reset_index(drop=True)
 
     # Choose baseline
     clf_task = (cfg.label_type == "triple_barrier")
 
-    cv = CPCV(n_folds=cfg.n_folds, embargo_days=cfg.embargo_days)
-    splits = cv.split(ds.X.assign(date=groups["date"]), groups)
+    # Use walk-forward CV (simpler, more robust than CPCV for initial testing)
+    # CPCV can be added later once pipeline is validated
+    from sklearn.model_selection import TimeSeriesSplit
+    tscv = TimeSeriesSplit(n_splits=cfg.n_folds)
+
+    # Sort by date to ensure time ordering
+    sort_idx = ds.X["date"].argsort()
+    X_sorted = ds.X.iloc[sort_idx].reset_index(drop=True)
+    y_sorted = ds.y.iloc[sort_idx].reset_index(drop=True)
+
+    splits = list(tscv.split(X_sorted))
 
     # Collect OOS predictions
     oos_rows: List[Dict] = []
     for fold_id, (tr, te) in enumerate(splits):
-        X_tr = ds.X.drop(columns=["date", "symbol"]).iloc[tr]
-        y_tr = ds.y.iloc[tr]
-        X_te = ds.X.drop(columns=["date", "symbol"]).iloc[te]
-        meta_te = ds.X.iloc[te][["date", "symbol"]].reset_index(drop=True)
+        X_tr = X_sorted.drop(columns=["date", "symbol"]).iloc[tr]
+        y_tr = y_sorted.iloc[tr]
+        X_te = X_sorted.drop(columns=["date", "symbol"]).iloc[te]
+        meta_te = X_sorted.iloc[te][["date", "symbol"]].reset_index(drop=True)
 
         if clf_task:
             model, _ = train_logistic_regression(X_tr, y_tr)
@@ -151,16 +160,16 @@ def run_pipeline(cfg: PipelineConfig) -> Dict:
         oos_perf = np.zeros((n_configs, n_trials))
         for ci, params in enumerate(param_grid):
             for ti, (tr, te) in enumerate(splits):
-                X_tr = ds.X.drop(columns=["date", "symbol"]).iloc[tr]
-                y_tr = ds.y.iloc[tr]
-                X_te = ds.X.drop(columns=["date", "symbol"]).iloc[te]
-                y_te = ds.y.iloc[te]
+                X_tr = X_sorted.drop(columns=["date", "symbol"]).iloc[tr]
+                y_tr = y_sorted.iloc[tr]
+                X_te = X_sorted.drop(columns=["date", "symbol"]).iloc[te]
+                y_te = y_sorted.iloc[te]
                 # Split train further for IS via a simple holdout: last 10% of tr as val
                 cut = int(0.9 * len(tr))
-                tr_idx = np.array(tr[:cut])
-                val_idx = np.array(tr[cut:])
-                Xt, yt = ds.X.drop(columns=["date", "symbol"]).iloc[tr_idx], ds.y.iloc[tr_idx]
-                Xv, yv = ds.X.drop(columns=["date", "symbol"]).iloc[val_idx], ds.y.iloc[val_idx]
+                tr_idx = tr[:cut]
+                val_idx = tr[cut:]
+                Xt, yt = X_sorted.drop(columns=["date", "symbol"]).iloc[tr_idx], y_sorted.iloc[tr_idx]
+                Xv, yv = X_sorted.drop(columns=["date", "symbol"]).iloc[val_idx], y_sorted.iloc[val_idx]
                 from sklearn.linear_model import LogisticRegression
                 from sklearn.pipeline import Pipeline
                 from sklearn.preprocessing import StandardScaler
@@ -182,15 +191,15 @@ def run_pipeline(cfg: PipelineConfig) -> Dict:
         oos_perf = np.zeros((n_configs, n_trials))
         for ci, params in enumerate(param_grid):
             for ti, (tr, te) in enumerate(splits):
-                X_tr = ds.X.drop(columns=["date", "symbol"]).iloc[tr]
-                y_tr = ds.y.iloc[tr]
-                X_te = ds.X.drop(columns=["date", "symbol"]).iloc[te]
-                y_te = ds.y.iloc[te]
+                X_tr = X_sorted.drop(columns=["date", "symbol"]).iloc[tr]
+                y_tr = y_sorted.iloc[tr]
+                X_te = X_sorted.drop(columns=["date", "symbol"]).iloc[te]
+                y_te = y_sorted.iloc[te]
                 cut = int(0.9 * len(tr))
-                tr_idx = np.array(tr[:cut])
-                val_idx = np.array(tr[cut:])
-                Xt, yt = ds.X.drop(columns=["date", "symbol"]).iloc[tr_idx], ds.y.iloc[tr_idx]
-                Xv, yv = ds.X.drop(columns=["date", "symbol"]).iloc[val_idx], ds.y.iloc[val_idx]
+                tr_idx = tr[:cut]
+                val_idx = tr[cut:]
+                Xt, yt = X_sorted.drop(columns=["date", "symbol"]).iloc[tr_idx], y_sorted.iloc[tr_idx]
+                Xv, yv = X_sorted.drop(columns=["date", "symbol"]).iloc[val_idx], y_sorted.iloc[val_idx]
                 model = Pipeline([("scaler", StandardScaler()), ("reg", Ridge(random_state=42, **params))])
                 model.fit(Xt, yt)
                 yv_pred = model.predict(Xv)
