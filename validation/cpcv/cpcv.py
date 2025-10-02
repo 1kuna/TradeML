@@ -55,7 +55,8 @@ class CPCV:
         self,
         labels: pd.DataFrame,
         date_col: str = 'date',
-        horizon_col: str = 'horizon_days'
+        horizon_col: str = 'horizon_days',
+        symbol_col: Optional[str] = 'symbol'
     ) -> pd.DataFrame:
         """
         Calculate label end times (when label is determined).
@@ -64,12 +65,22 @@ class CPCV:
             labels: DataFrame with labels
             date_col: Column with label start date
             horizon_col: Column with label horizon in days
+            symbol_col: Optional column with symbol (for multi-symbol panels)
 
         Returns:
-            DataFrame with t0 (start) and t1 (end) columns
+            DataFrame with t0 (start), t1 (end), and optionally symbol columns
         """
-        label_times = labels[[date_col, horizon_col]].copy()
-        label_times.columns = ['t0', 'horizon']
+        cols_to_copy = [date_col, horizon_col]
+        if symbol_col and symbol_col in labels.columns:
+            cols_to_copy.append(symbol_col)
+
+        label_times = labels[cols_to_copy].copy()
+
+        # Rename for consistency
+        rename_dict = {date_col: 't0', horizon_col: 'horizon'}
+        if symbol_col and symbol_col in label_times.columns:
+            rename_dict[symbol_col] = 'symbol'
+        label_times = label_times.rename(columns=rename_dict)
 
         # Calculate label end time
         label_times['t1'] = label_times.apply(
@@ -77,7 +88,11 @@ class CPCV:
             axis=1
         )
 
-        return label_times[['t0', 't1']]
+        result_cols = ['t0', 't1']
+        if 'symbol' in label_times.columns:
+            result_cols.append('symbol')
+
+        return label_times[result_cols]
 
     def purge_train_set(
         self,
@@ -88,25 +103,57 @@ class CPCV:
         """
         Remove training samples that overlap with test labels.
 
+        For multi-symbol panels: only purge samples where BOTH symbol AND time overlap.
+        For single-symbol: purge based on time overlap only.
+
         Args:
-            label_times: DataFrame with t0, t1 for each sample
+            label_times: DataFrame with t0, t1 for each sample (optionally symbol)
             train_indices: Training set indices
             test_indices: Test set indices
 
         Returns:
             Purged training indices
         """
-        test_t0_min = label_times.iloc[test_indices]['t0'].min()
-        test_t1_max = label_times.iloc[test_indices]['t1'].max()
+        has_symbols = 'symbol' in label_times.columns
 
-        # Find training samples that overlap with test period
-        overlap_mask = (
-            (label_times.iloc[train_indices]['t1'] >= test_t0_min) &
-            (label_times.iloc[train_indices]['t0'] <= test_t1_max)
-        )
+        if not has_symbols:
+            # Original logic: purge based on time overlap only
+            test_t0_min = label_times.iloc[test_indices]['t0'].min()
+            test_t1_max = label_times.iloc[test_indices]['t1'].max()
 
-        # Remove overlapping samples
-        purged_train = train_indices[~overlap_mask.values]
+            # Find training samples that overlap with test period
+            overlap_mask = (
+                (label_times.iloc[train_indices]['t1'] >= test_t0_min) &
+                (label_times.iloc[train_indices]['t0'] <= test_t1_max)
+            )
+
+            purged_train = train_indices[~overlap_mask.values]
+
+        else:
+            # Symbol-aware purging: only purge when BOTH symbol AND time overlap
+            test_data = label_times.iloc[test_indices]
+            train_data = label_times.iloc[train_indices]
+
+            # Build set of (symbol, time_range) tuples in test set
+            overlap_mask = np.zeros(len(train_indices), dtype=bool)
+
+            for test_symbol in test_data['symbol'].unique():
+                # Get time range for this symbol in test set
+                test_symbol_data = test_data[test_data['symbol'] == test_symbol]
+                test_t0_min = test_symbol_data['t0'].min()
+                test_t1_max = test_symbol_data['t1'].max()
+
+                # Find training samples for SAME SYMBOL that overlap time
+                same_symbol_mask = train_data['symbol'] == test_symbol
+                time_overlap_mask = (
+                    (train_data['t1'] >= test_t0_min) &
+                    (train_data['t0'] <= test_t1_max)
+                )
+
+                # Mark as overlapping if both conditions met
+                overlap_mask |= (same_symbol_mask & time_overlap_mask).values
+
+            purged_train = train_indices[~overlap_mask]
 
         n_purged = len(train_indices) - len(purged_train)
         if n_purged > 0:
@@ -154,7 +201,8 @@ class CPCV:
         X: pd.DataFrame,
         labels: pd.DataFrame,
         date_col: str = 'date',
-        horizon_col: str = 'horizon_days'
+        horizon_col: str = 'horizon_days',
+        symbol_col: Optional[str] = 'symbol'
     ) -> List[Tuple[np.ndarray, np.ndarray]]:
         """
         Generate train/test splits with purging and embargo.
@@ -164,14 +212,15 @@ class CPCV:
             labels: Labels DataFrame with date and horizon
             date_col: Date column name
             horizon_col: Horizon column name
+            symbol_col: Symbol column name (for multi-symbol panels)
 
         Returns:
             List of (train_indices, test_indices) tuples
         """
         n_samples = len(X)
 
-        # Calculate label times
-        label_times = self.get_label_times(labels, date_col, horizon_col)
+        # Calculate label times (with symbol if present)
+        label_times = self.get_label_times(labels, date_col, horizon_col, symbol_col)
 
         # Create folds based on time
         fold_size = n_samples // self.n_folds
@@ -209,7 +258,8 @@ class CPCV:
         labels: pd.DataFrame,
         n_test_folds: int = 2,
         date_col: str = 'date',
-        horizon_col: str = 'horizon_days'
+        horizon_col: str = 'horizon_days',
+        symbol_col: Optional[str] = 'symbol'
     ) -> List[Tuple[np.ndarray, np.ndarray]]:
         """
         Generate combinatorial train/test splits.
@@ -227,7 +277,7 @@ class CPCV:
             List of (train_indices, test_indices) tuples
         """
         n_samples = len(X)
-        label_times = self.get_label_times(labels, date_col, horizon_col)
+        label_times = self.get_label_times(labels, date_col, horizon_col, symbol_col)
 
         # Create fold indices
         fold_size = n_samples // self.n_folds
