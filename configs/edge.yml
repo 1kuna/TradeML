@@ -1,0 +1,10 @@
+locks:
+  lease_seconds: 120
+  renew_seconds: 45
+
+# Tasks to run on the edge collector
+# Supported: alpaca_bars (default)
+tasks:
+  - alpaca_bars
+
+# Optional: connector-specific settings can be added here later
