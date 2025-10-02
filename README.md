@@ -198,6 +198,42 @@ python -m data_layer.connectors.alpaca_connector \
 1. **No model promotion without CPCV + PBO + DSR** and multi-week shadow trading beating champion net
 2. **Data lineage on every row:** `ingested_at`, `source_uri`, `transform_id`
 3. **Capacity realism:** square-root impact estimates, participation caps (≤10% ADV)
+
+---
+
+## 🧩 Raspberry Pi Sync Setup (MinIO + Tailscale)
+
+This repo supports a drop-in S3 backend so the same code runs on Raspberry Pi, macOS, and Windows by flipping `.env`. The Pi hosts MinIO (S3-compatible) behind Tailscale, accessible at `http://<pi-hostname>:9000` inside your tailnet.
+
+- Storage backend: set `STORAGE_BACKEND=s3` in `.env` and fill `S3_ENDPOINT`, `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
+- Edge collector writes to `raw/<source>/<table>/date=YYYY-MM-DD/data.parquet`.
+- Curator reads watermarks and produces `curated/<table>/date=YYYY-MM-DD/data.parquet` idempotently.
+
+Steps:
+- On the Pi: `TS_AUTHKEY=tskey-auth-XXXX TS_HOSTNAME=minio bash scripts/setup_pi.sh`
+  - Installs Tailscale, Docker, launches MinIO, and prints app credentials.
+- On your workstation: copy creds into `.env` and run edge/curator locally or in Docker.
+
+Single-script on the Pi:
+- `bash scripts/pi_node.sh up` — bootstraps Docker/MinIO, provisions credentials, self-checks, then runs a resilient loop (edge → curator) that resumes on restart.
+- `bash scripts/pi_node.sh selfcheck` — validates configuration and prints actionable fixes.
+
+Direct orchestrator (any OS):
+- `python scripts/node.py` — self-checks and enters the loop (edge → curator → sleep).
+
+Windows Trainer (GPU required):
+- `python scripts/trainer.py --selfcheck` — verifies curated data and GPU.
+- `python scripts/trainer.py` — runs the training scaffold; requires CUDA GPU and fails if not present.
+
+Local dev (MinIO via Docker):
+- `make dev-s3` to start MinIO locally (console at http://localhost:9001).
+- `make edge-up` to run the edge collector against local MinIO.
+- `make curator-up` to run the watermark-based curator.
+
+Configs:
+- `configs/edge.yml` controls locks and collector tasks.
+- `configs/curator.yml` defines watermark file and curation jobs.
+
 4. **Universe realism:** delisted names included; splits/dividends applied by our logic
 5. **Shorting realism:** borrow fees/HTB indicators; haircut short alpha if unknown
 
