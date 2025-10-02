@@ -1,6 +1,6 @@
 # TradeML — Autonomous Equities + Options Trading Agent
 
-![Status](https://img.shields.io/badge/status-Phase%201%20Complete%20(~75%25)-green)
+![Status](https://img.shields.io/badge/status-Phase%205%20In%20Progress%20(50%25)-orange)
 ![Python](https://img.shields.io/badge/python-3.11+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -10,7 +10,8 @@
 
 ## 📌 Current Status
 
-- Phase 1 complete (~75%). See `PROGRESS.md` for the full completion report, validation results (CPCV/PBO/DSR), and next steps for Phase 2.
+- **Phase 5 In Progress (50% Complete)**: Critical CPCV multi-symbol fix complete, universe expanded to 152 symbols. See [STATUS.md](STATUS.md) for current status, test results, and next steps.
+- **Phases 1-4 Complete**: Infrastructure, equities pipeline, options foundations, and monitoring fully operational.
 
 
 ## 🎯 Go/No-Go Criteria (all OOS, net of costs/impact)
@@ -224,10 +225,12 @@ mypy data_layer/ models/ validation/
 
 ## 📚 Documentation
 
+- **[README.md](README.md):** This file - project overview and setup (you are here)
+- **[STATUS.md](STATUS.md):** Current project status, progress, and next steps
+- **[QUICK_REFERENCE.md](QUICK_REFERENCE.md):** Command cheat sheet for common operations
 - **[TradeML_Blueprint.md](TradeML_Blueprint.md):** Full system blueprint with acceptance criteria
 - **[Data_Sourcing_Playbook.md](Data_Sourcing_Playbook.md):** Canonical guide for data sources, PIT discipline, QC checks
-- **API Contracts:** See section 15 of blueprint for minimal API specs
-- **Runbook:** `ops/runbook.md` (coming soon)
+- **Archived Reports:** See [docs/archive/](docs/archive/) for historical phase completion reports
 
 ---
 
