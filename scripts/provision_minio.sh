@@ -14,7 +14,19 @@ echo "Using endpoint: $MINIO_SCHEME://$MINIO_ENDPOINT"
 # Download mc client if not present
 if ! command -v mc >/dev/null 2>&1; then
   echo "Installing MinIO client (mc)..."
-  curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o mc
+  OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    aarch64|arm64) MC_ARCH=arm64 ;;
+    x86_64|amd64) MC_ARCH=amd64 ;;
+    armv7l|armv6l) MC_ARCH=arm ;;
+    *) MC_ARCH=amd64 ;;
+  esac
+  if [ "$OS" = "darwin" ]; then
+    curl -fsSL https://dl.min.io/client/mc/release/darwin-amd64/mc -o mc
+  else
+    curl -fsSL https://dl.min.io/client/mc/release/linux-${MC_ARCH}/mc -o mc
+  fi
   chmod +x mc
   sudo mv mc /usr/local/bin/mc
 fi
