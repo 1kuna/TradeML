@@ -67,6 +67,9 @@ class EdgeCollector:
             self.bookmarks = None
             self.s3_writer = None
 
+        # Cache of vendor->set(symbols) to skip during this run (e.g., invalid tickers)
+        self._vendor_bad_symbols = {"polygon": set(), "alpaca": set(), "finnhub": set(), "fred": set()}
+
         # Connectors
         self.connectors = self._init_connectors()
 
@@ -115,13 +118,45 @@ class EdgeCollector:
             return False
 
     def _renew_lease_loop(self, name: str, interval: int):
-        """Background lease renewal (should run in thread)."""
+        """Background lease renewal (should run in thread).
+
+        More robust behavior: retry on transient failures and attempt re-acquire
+        if the lease vanished or expired, before exiting to avoid split-brain.
+        """
+        failures = 0
         while not self.shutdown_requested:
             time.sleep(interval)
-            if not self.lease_mgr.renew(name):
-                logger.error("Lease renewal failed, exiting")
+            try:
+                if self.lease_mgr.renew(name):
+                    failures = 0
+                    continue
+            except Exception as e:
+                logger.warning(f"Lease renew threw: {e}")
+
+            failures += 1
+            # Try to re-acquire if lease disappeared/expired
+            try:
+                holder = self.lease_mgr.get_holder(name)
+            except Exception:
+                holder = None
+            if holder is None:
+                try:
+                    if self.lease_mgr.acquire(name, force=True):
+                        logger.warning("Lease re-acquired after renewal failure")
+                        failures = 0
+                        continue
+                except Exception as e:
+                    logger.warning(f"Lease re-acquire failed: {e}")
+
+            if failures >= 2:
+                logger.error("Lease renewal failed repeatedly; exiting")
                 self.shutdown_requested = True
                 break
+            # brief backoff before next attempt to avoid tight loop
+            try:
+                time.sleep(max(1, interval // 3))
+            except Exception:
+                pass
 
     def _upload_to_s3(self, df: pd.DataFrame, source: str, table: str, date: str, async_write: bool = False):
         """Upload dataframe to S3 with partitioning."""
@@ -390,6 +425,25 @@ class EdgeCollector:
 
         return connectors
 
+    def _should_fetch_eod_for_day(self, vendor: str, day: date) -> bool:
+        """Gate EOD/day timeframe fetches for 'today' unless past cutoff or explicitly allowed.
+
+        Env:
+          - EOD_FETCH_TODAY=true|false (default false)
+          - EOD_TODAY_CUTOFF_UTC_HOUR=int hour (default 22)
+        """
+        if day != datetime.utcnow().date():
+            return True
+        allow_today = os.getenv("EOD_FETCH_TODAY", "false").lower() == "true"
+        if allow_today:
+            cutoff = 22
+            try:
+                cutoff = int(os.getenv("EOD_TODAY_CUTOFF_UTC_HOUR", "22"))
+            except Exception:
+                cutoff = 22
+            return datetime.utcnow().hour >= cutoff
+        return False
+
     def _symbols_universe(self) -> List[str]:
         universe_file = Path("data_layer/reference/universe_symbols.txt")
         if universe_file.exists():
@@ -474,6 +528,9 @@ class EdgeCollector:
             BATCH = max(1, int(os.getenv("NODE_POLYGON_SYMBOLS_PER_UNIT", "10")))
             d = start_date
             while d <= today and not self.shutdown_requested:
+                if not self._should_fetch_eod_for_day("polygon", d):
+                    d += timedelta(days=1)
+                    continue
                 for i in range(0, len(symbols), BATCH):
                     chunk = symbols[i:i+BATCH]
                     tokens = len(chunk)  # ~1 req per symbol-day
@@ -718,12 +775,20 @@ class EdgeCollector:
             return ("empty", 0, "no connector")
         rows = []
         for sym in symbols:
+            if sym in self._vendor_bad_symbols.get("polygon", set()):
+                continue
             try:
                 df = conn.fetch_aggregates(sym, day, day, timespan="day")
             except Exception as e:
                 emsg = str(e)
                 if "429" in emsg or "rate" in emsg.lower():
                     return ("ratelimited", 0, emsg)
+                # Likely invalid/unsupported ticker: suppress further attempts this run
+                if any(s in emsg.lower() for s in ["invalid", "not found", "ticker"]):
+                    try:
+                        self._vendor_bad_symbols.setdefault("polygon", set()).add(sym)
+                    except Exception:
+                        pass
                 df = pd.DataFrame()
             if not df.empty:
                 rows.append(df)

@@ -407,3 +407,5 @@ For issues, feature requests, or questions:
 ---
 
 **Built with discipline. Governed by statistics. Validated out-of-sample.**
+EOD gating:
+- Daily/EOD fetches skip 'today' by default (`EOD_FETCH_TODAY=false`) to avoid incomplete or unavailable daily bars. Optionally allow 'today' after a UTC cutoff via `EOD_TODAY_CUTOFF_UTC_HOUR`.
