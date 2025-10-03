@@ -28,6 +28,35 @@ ensure_command() {
   fi
 }
 
+get_minio_root_creds() {
+  # Populate MINIO_ROOT_USER and MINIO_ROOT_PASSWORD into env safely
+  # Preference order: existing env -> saved file -> docker inspect -> defaults
+  if [[ -n "${MINIO_ROOT_USER:-}" && -n "${MINIO_ROOT_PASSWORD:-}" ]]; then
+    export MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+    return 0
+  fi
+  if [[ -f .minio_root.env ]]; then
+    # shellcheck disable=SC1091
+    source .minio_root.env
+    if [[ -n "${MINIO_ROOT_USER:-}" && -n "${MINIO_ROOT_PASSWORD:-}" ]]; then
+      export MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+      return 0
+    fi
+  fi
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^minio$'; then
+    local envs
+    envs=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' minio 2>/dev/null || true)
+    local u p
+    u=$(printf "%s" "$envs" | grep '^MINIO_ROOT_USER=' | head -n1 | cut -d= -f2-)
+    p=$(printf "%s" "$envs" | grep '^MINIO_ROOT_PASSWORD=' | head -n1 | cut -d= -f2-)
+    if [[ -n "$u" && -n "$p" ]]; then
+      export MINIO_ROOT_USER="$u" MINIO_ROOT_PASSWORD="$p"
+      return 0
+    fi
+  fi
+  export MINIO_ROOT_USER="rootadmin" MINIO_ROOT_PASSWORD="rootadmin"
+}
+
 is_local_host() {
   # Returns 0 if host looks local
   case "$1" in
@@ -128,6 +157,9 @@ install_prereqs() {
       sudo mkdir -p /srv/minio
       export MINIO_ROOT_USER=${MINIO_ROOT_USER:-rootadmin}
       export MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-$(openssl rand -hex 24)}
+      # Persist root creds for future provisioning
+      printf "MINIO_ROOT_USER=%s\nMINIO_ROOT_PASSWORD=%s\n" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" > .minio_root.env
+      chmod 600 .minio_root.env || true
       sudo docker rm -f minio 2>/dev/null || true
       sudo docker run -d --name minio --restart=always \
         -e MINIO_ROOT_USER="$MINIO_ROOT_USER" \
@@ -142,8 +174,9 @@ install_prereqs() {
       echo "Provisioning MinIO app user..."
       export OUTPUT_ENV=.env.s3
       # Point provisioning to local endpoint explicitly
+      get_minio_root_creds
       MINIO_ENDPOINT=127.0.0.1:9000 MINIO_SCHEME=http \
-      MINIO_ROOT_USER="$MINIO_ROOT_USER" MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
+      MINIO_ROOT_USER="${MINIO_ROOT_USER:-rootadmin}" MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-rootadmin}" \
       bash ./scripts/provision_minio.sh || true
     else
       echo "MinIO did not become healthy in time; skipping provisioning." >&2
