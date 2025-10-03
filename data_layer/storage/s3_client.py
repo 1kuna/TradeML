@@ -10,10 +10,16 @@ from typing import Optional, Dict, List, BinaryIO
 from pathlib import Path
 from datetime import datetime
 
-import boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError
 from loguru import logger
+
+# Lazy imports for boto3/botocore to avoid hard dependency in local mode/tests
+try:  # pragma: no cover - exercised in environments with boto3 installed
+    from botocore.config import Config  # type: ignore
+    from botocore.exceptions import ClientError  # type: ignore
+except Exception:  # pragma: no cover
+    Config = None  # type: ignore
+    class ClientError(Exception):
+        pass
 
 
 class S3Client:
@@ -51,11 +57,16 @@ class S3Client:
         self.bucket = bucket or os.getenv("S3_BUCKET", "ata")
         self.region = region or os.getenv("S3_REGION", "us-east-1")
 
+        # Import boto3 lazily to avoid dependency in local-only environments
+        try:
+            import boto3  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError("boto3 is required for S3 backend. Install boto3 or set STORAGE_BACKEND=local") from e
+
         # Configure boto3 for MinIO compatibility
-        config = Config(
-            signature_version='s3v4',
-            s3={'addressing_style': 'path' if force_path_style else 'virtual'}
-        )
+        cfg = None
+        if Config is not None:
+            cfg = Config(signature_version='s3v4', s3={'addressing_style': 'path' if force_path_style else 'virtual'})
 
         self.s3 = boto3.client(
             's3',
@@ -63,7 +74,7 @@ class S3Client:
             region_name=self.region,
             aws_access_key_id=access_key or os.getenv("AWS_ACCESS_KEY_ID"),
             aws_secret_access_key=secret_key or os.getenv("AWS_SECRET_ACCESS_KEY"),
-            config=config
+            config=cfg
         )
 
         logger.info(f"S3Client initialized: endpoint={self.endpoint_url}, bucket={self.bucket}")

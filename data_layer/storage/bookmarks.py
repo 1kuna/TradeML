@@ -10,7 +10,11 @@ from typing import Optional, Dict
 from datetime import datetime, date
 from dataclasses import dataclass, asdict
 
-from botocore.exceptions import ClientError
+try:  # pragma: no cover
+    from botocore.exceptions import ClientError  # type: ignore
+except Exception:  # pragma: no cover
+    class ClientError(Exception):
+        pass
 from loguru import logger
 
 from .s3_client import S3Client
