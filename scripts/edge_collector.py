@@ -108,8 +108,8 @@ class EdgeCollector:
     def _upload_to_s3(self, df: pd.DataFrame, source: str, table: str, date: str):
         """Upload dataframe to S3 with partitioning."""
         if not self.s3:
-            # Local storage fallback
-            local_dir = Path(f"data_layer/raw/{table}/{source}/date={date}")
+            # Local storage fallback (source-first layout for consistency)
+            local_dir = Path(f"data_layer/raw/{source}/{table}/date={date}")
             local_dir.mkdir(parents=True, exist_ok=True)
             local_file = local_dir / "data.parquet"
             df.to_parquet(local_file, index=False)
@@ -218,10 +218,11 @@ class EdgeCollector:
                 logger.info(f"Fetching data for {current_date}")
 
                 # Fetch bars for all symbols
-                df = connector.fetch_and_transform(
+                df = connector.fetch_bars(
                     symbols=symbols,
-                    start=current_date.isoformat(),
-                    end=(current_date + timedelta(days=1)).isoformat(),
+                    start_date=current_date,
+                    end_date=current_date,
+                    timeframe="1Day",
                 )
 
                 if df.empty:
