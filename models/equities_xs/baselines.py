@@ -33,7 +33,12 @@ def _split_xy(df: pd.DataFrame, target_col: str) -> Tuple[pd.DataFrame, pd.Serie
     return X, y
 
 
-def train_ridge_regression(X: pd.DataFrame, y: pd.Series, alpha: float = 1.0) -> Tuple[Pipeline, Dict[str, float]]:
+def train_ridge_regression(
+    X: pd.DataFrame,
+    y: pd.Series,
+    alpha: float = 1.0,
+    sample_weight: np.ndarray | None = None,
+) -> Tuple[Pipeline, Dict[str, float]]:
     """Train a Ridge regression baseline with standardization.
 
     Returns fitted pipeline and IS metrics on provided data (for quick checks).
@@ -44,7 +49,10 @@ def train_ridge_regression(X: pd.DataFrame, y: pd.Series, alpha: float = 1.0) ->
             ("model", Ridge(alpha=alpha, random_state=42)),
         ]
     )
-    pipe.fit(X, y)
+    if sample_weight is not None:
+        pipe.fit(X, y, **{"model__sample_weight": sample_weight})
+    else:
+        pipe.fit(X, y)
     preds = pipe.predict(X)
     metrics = {
         "r2": float(r2_score(y, preds)) if len(np.unique(y)) > 1 else 0.0,
@@ -59,6 +67,7 @@ def train_logistic_regression(
     y: pd.Series,
     C: float = 1.0,
     class_weight: str | dict | None = "balanced",
+    sample_weight: np.ndarray | None = None,
 ) -> Tuple[Pipeline, Dict[str, float]]:
     """Train a Logistic regression baseline with standardization.
 
@@ -80,7 +89,10 @@ def train_logistic_regression(
             ),
         ]
     )
-    pipe.fit(X, y)
+    if sample_weight is not None:
+        pipe.fit(X, y, **{"model__sample_weight": sample_weight})
+    else:
+        pipe.fit(X, y)
     preds = pipe.predict(X)
     metrics = {
         "accuracy": float(accuracy_score(y, preds)),
@@ -97,4 +109,3 @@ def train_logistic_regression(
         + ", ".join([f"{k}={v:.3f}" for k, v in metrics.items()])
     )
     return pipe, metrics
-
