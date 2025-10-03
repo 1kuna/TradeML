@@ -13,7 +13,10 @@ credentials/
 # ===== Data Files =====
 data_layer/raw/
 data_layer/curated/
+# Reference data directory (allow Python modules)
 data_layer/reference/
+!data_layer/reference/*.py
+!data_layer/reference/**/__init__.py
 *.parquet
 *.csv
 *.h5
