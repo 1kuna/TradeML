@@ -96,6 +96,12 @@ test-all:
 	@echo "Running all tests..."
 	pytest tests/ -v --cov=. --cov-report=html
 
+# Smoke: one-cycle collect -> curate -> audit summary (local storage)
+smoke:
+	@echo "Running one-cycle smoke (local storage)..."
+	STORAGE_BACKEND=local python scripts/smoke.py
+	@echo "✓ Smoke complete"
+
 # Code quality
 lint:
 	@echo "Running linters..."
