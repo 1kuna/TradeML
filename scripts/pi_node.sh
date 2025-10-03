@@ -142,7 +142,9 @@ install_prereqs() {
       echo "Provisioning MinIO app user..."
       export OUTPUT_ENV=.env.s3
       # Point provisioning to local endpoint explicitly
-      MINIO_ENDPOINT=127.0.0.1:9000 MINIO_SCHEME=http bash ./scripts/provision_minio.sh || true
+      MINIO_ENDPOINT=127.0.0.1:9000 MINIO_SCHEME=http \
+      MINIO_ROOT_USER="$MINIO_ROOT_USER" MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
+      bash ./scripts/provision_minio.sh || true
     else
       echo "MinIO did not become healthy in time; skipping provisioning." >&2
     fi
