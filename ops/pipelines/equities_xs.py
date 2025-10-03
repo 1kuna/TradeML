@@ -22,6 +22,7 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 from loguru import logger
+import yaml
 
 from data_layer.curated.loaders import load_price_panel
 from feature_store.equities.dataset import build_training_dataset
@@ -29,6 +30,7 @@ from models.equities_xs.baselines import train_logistic_regression, train_ridge_
 from portfolio.build import build as build_portfolio
 from backtest.engine.backtester import MinimalBacktester
 from validation import CPCV, DSRCalculator, PBOCalculator
+from validation.calibration import binary_calibration
 from ops.reports.emitter import emit_daily
 
 
@@ -40,6 +42,66 @@ def _to_date(d: object) -> date:
     if isinstance(d, str):
         return datetime.strptime(d, "%Y-%m-%d").date()
     raise TypeError(f"Unsupported date type: {type(d)}")
+
+
+def _load_training_cfg(path: str = "configs/training/equities_xs.yml") -> dict:
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f)
+    except Exception:
+        return {}
+
+
+def _months_between(d0: date, d1: date) -> float:
+    return (d1 - d0).days / 30.4375
+
+
+def _time_decay_weights(dates: pd.Series, end: date, half_life_months: float) -> np.ndarray:
+    if half_life_months <= 0:
+        return np.ones(len(dates), dtype=float)
+    ages = dates.apply(lambda d: _months_between(_to_date(d), end)).astype(float)
+    w = 0.5 ** (ages / half_life_months)
+    # Avoid zeros
+    w = np.clip(w, 1e-6, None)
+    return w.values
+
+
+def _parse_regime_name(name: str) -> tuple[Optional[date], Optional[date]]:
+    name = name.strip()
+    if name.lower().startswith("pre-"):
+        yr = int(name.split("-", 1)[-1])
+        return None, date(yr, 1, 1)
+    if name.endswith("+"):
+        yr = int(name[:-1])
+        return date(yr, 1, 1), None
+    # range YYYY-YYYY
+    try:
+        a, b = name.split("-")
+        return date(int(a), 1, 1), date(int(b), 12, 31)
+    except Exception:
+        return None, None
+
+
+def _regime_allow_mask(dates: pd.Series, regime_cfg: list[dict]) -> np.ndarray:
+    allowed_windows = []
+    for r in regime_cfg or []:
+        use_for = str(r.get("use_for", "")).lower()
+        if use_for not in ("fit_and_validate", "fit_only"):
+            continue
+        start, end = _parse_regime_name(str(r.get("name", "")).strip())
+        allowed_windows.append((start, end))
+    if not allowed_windows:
+        return np.ones(len(dates), dtype=bool)
+    ds = dates.apply(_to_date)
+    mask = np.zeros(len(ds), dtype=bool)
+    for start, end in allowed_windows:
+        if start is None and end is not None:
+            mask |= ds <= end
+        elif start is not None and end is None:
+            mask |= ds >= start
+        elif start is not None and end is not None:
+            mask |= (ds >= start) & (ds <= end)
+    return mask
 
 
 @dataclass
@@ -79,40 +141,54 @@ def run_pipeline(cfg: PipelineConfig) -> Dict:
     if ds.X.empty:
         raise RuntimeError("Empty dataset produced — ensure curated data is available for the universe/date range.")
 
-    # Prepare CPCV labels (date + horizon)
+    # Prepare CPCV label metadata (date + horizon + symbol for symbol-aware purging)
     groups = pd.DataFrame({
         "date": ds.X["date"],
         "horizon_days": ds.meta["horizon_days"],
+        "symbol": ds.X["symbol"],
     }).reset_index(drop=True)
 
     # Choose baseline
     clf_task = (cfg.label_type == "triple_barrier")
 
-    # Use walk-forward CV (simpler, more robust than CPCV for initial testing)
-    # CPCV can be added later once pipeline is validated
-    from sklearn.model_selection import TimeSeriesSplit
-    tscv = TimeSeriesSplit(n_splits=cfg.n_folds)
-
-    # Sort by date to ensure time ordering
+    # Sort by date to ensure time ordering and align groups
     sort_idx = ds.X["date"].argsort()
     X_sorted = ds.X.iloc[sort_idx].reset_index(drop=True)
     y_sorted = ds.y.iloc[sort_idx].reset_index(drop=True)
+    groups_sorted = groups.iloc[sort_idx].reset_index(drop=True)
 
-    splits = list(tscv.split(X_sorted))
+    # CPCV with purging and embargo per SSOT/Blueprint
+    cv = CPCV(n_folds=cfg.n_folds, embargo_days=cfg.embargo_days)
+    splits = cv.split(X_sorted, groups_sorted)
 
     # Collect OOS predictions
     oos_rows: List[Dict] = []
+    # Load training config for regime/time-decay
+    tcfg = _load_training_cfg()
+    hl_months = float(((tcfg.get("time_decay") or {}).get("half_life_months", 0)))
+    regime_cfg = (tcfg.get("regime_masks") or [])
+
+    end_date = _to_date(cfg.end_date)
+    all_weights = _time_decay_weights(X_sorted["date"], end=end_date, half_life_months=hl_months) if hl_months > 0 else np.ones(len(X_sorted))
+    allow_mask = _regime_allow_mask(X_sorted["date"], regime_cfg)
+
     for fold_id, (tr, te) in enumerate(splits):
         X_tr = X_sorted.drop(columns=["date", "symbol"]).iloc[tr]
         y_tr = y_sorted.iloc[tr]
         X_te = X_sorted.drop(columns=["date", "symbol"]).iloc[te]
         meta_te = X_sorted.iloc[te][["date", "symbol"]].reset_index(drop=True)
 
+        # Apply regime filter and time-decay weights on train set
+        tr_mask = allow_mask[tr]
+        X_tr_f = X_tr.iloc[tr_mask]
+        y_tr_f = y_tr.iloc[tr_mask]
+        w_tr = all_weights[tr][tr_mask]
+
         if clf_task:
-            model, _ = train_logistic_regression(X_tr, y_tr)
+            model, _ = train_logistic_regression(X_tr_f, y_tr_f, sample_weight=w_tr)
             score = model.predict_proba(X_te)[:, 1]
         else:
-            model, _ = train_ridge_regression(X_tr, y_tr)
+            model, _ = train_ridge_regression(X_tr_f, y_tr_f, sample_weight=w_tr)
             score = model.predict(X_te)
 
         fold_scores = pd.DataFrame({"date": meta_te["date"], "symbol": meta_te["symbol"], "score": score})
@@ -210,6 +286,21 @@ def run_pipeline(cfg: PipelineConfig) -> Dict:
     pbo_calc = PBOCalculator(n_trials=oos_perf.shape[1])
     pbo_res = pbo_calc.calculate_pbo(is_perf, oos_perf)
 
+    # Optional calibration metrics for classifiers
+    calib = None
+    if clf_task:
+        # Merge OOS scores with true labels
+        merged = oos_scores.merge(ds.y.rename("y_true").to_frame().reset_index(drop=True), left_index=True, right_index=True)
+        # Align by date+symbol to avoid index ambiguity
+        merged = merged.join(ds.X[["date", "symbol"]].reset_index(drop=True))
+        # Sort and drop NaNs
+        m = merged.dropna(subset=["score", "y_true"]).copy()
+        try:
+            res = binary_calibration(m["y_true"].values.astype(int), m["score"].values.astype(float), n_bins=10)
+            calib = {"brier": round(res.brier, 6), "logloss": round(res.logloss, 6)}
+        except Exception:
+            calib = None
+
     # Emit daily positions for the last date
     last_date = tw["date"].max()
     last_positions = tw[tw["date"] == last_date][["symbol", "target_w"]]
@@ -221,6 +312,8 @@ def run_pipeline(cfg: PipelineConfig) -> Dict:
         "dsr": round(dsr_res["dsr"], 4),
         "pbo": round(pbo_res["pbo"], 4),
     }
+    if calib is not None:
+        metrics_report.update({"brier": calib.get("brier"), "logloss": calib.get("logloss")})
     emit_daily(last_date, last_positions, metrics_report)
 
     return {
