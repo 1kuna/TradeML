@@ -215,15 +215,16 @@ Steps:
 - On your workstation: copy creds into `.env` and run edge/curator locally or in Docker.
 
 Single-script on the Pi:
-- `bash scripts/pi_node.sh up` — bootstraps Docker/MinIO, provisions credentials, self-checks, then runs a resilient loop (edge → curator) that resumes on restart.
-- `bash scripts/pi_node.sh selfcheck` — validates configuration and prints actionable fixes.
+- `bash scripts/run_node.sh` — shortest one-click launcher; boots Docker/MinIO, provisions credentials, self-checks, then runs the resilient loop (edge → curator) that resumes on restart.
+- Advanced: `bash scripts/pi_node.sh up` (same as above) or `bash scripts/pi_node.sh selfcheck` (diagnostics only).
 
-Direct orchestrator (any OS):
-- `python scripts/node.py` — self-checks and enters the loop (edge → curator → sleep).
+Direct orchestrator (Pi node):
+- `bash scripts/run_node.sh` — one-click bootstrap (Docker/MinIO), provisions credentials, runs self-checks, then enters the continuous loop:
+  edge (forward) → audit → backfill → curate → audit(refresh) → sleep. Hands-off; it logs alerts and retries instead of exiting.
 
 Windows Trainer (GPU required):
-- `python scripts/trainer.py --selfcheck` — verifies curated data and GPU.
-- `python scripts/trainer.py` — runs the training scaffold; requires CUDA GPU and fails if not present.
+- `scripts\windows\training_run.bat` — one-click: creates venv, installs deps, and starts the self-checking training loop.
+- The loop runs GREEN-gated training periodically and logs results.
 
 Local dev (MinIO via Docker):
 - `make dev-s3` to start MinIO locally (console at http://localhost:9001).
