@@ -190,6 +190,10 @@ ensure_env() {
   if [[ ! -f .env ]]; then
     cp .env.template .env
   fi
+  # Sync .env with .env.template (non-destructive; preserves existing values)
+  if command -v python3 >/dev/null 2>&1; then
+    python3 scripts/sync_env.py --no-backup || true
+  fi
   # Merge S3 snippet if present
   if [[ -f .env.s3 ]]; then
     # Replace or append keys

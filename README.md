@@ -248,6 +248,7 @@ Local dev (MinIO via Docker):
 - `make dev-s3` to start MinIO locally (console at http://localhost:9001).
 - `make edge-up` to run the edge collector against local MinIO.
 - `make curator-up` to run the watermark-based curator.
+- `python scripts/sync_env.py` to non-destructively sync `.env` with `.env.template` (preserves your keys, adds new knobs like `REQUEST_PACING_*`).
 
 Configs:
 - `configs/edge.yml` controls locks and collector tasks.
