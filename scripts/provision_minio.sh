@@ -57,8 +57,13 @@ cat > "$POLICY_FILE" <<'JSON'
 JSON
 
 echo "Creating and attaching policy..."
-mc admin policy add local ata-policy "$POLICY_FILE" || true
-mc admin policy set local ata-policy user="$APP_USER"
+# Newer mc uses 'create' and 'attach'; fall back to legacy if needed
+if mc admin policy create local ata-policy "$POLICY_FILE" 2>/dev/null; then
+  mc admin policy attach local ata-policy --user "$APP_USER"
+else
+  mc admin policy add local ata-policy "$POLICY_FILE" || true
+  mc admin policy set local ata-policy user="$APP_USER"
+fi
 rm -f "$POLICY_FILE"
 
 if [[ -n "${OUTPUT_ENV:-}" ]]; then
