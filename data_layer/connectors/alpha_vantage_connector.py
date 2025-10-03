@@ -35,7 +35,7 @@ class AlphaVantageConnector(BaseConnector):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        rate_limit_per_sec: float = 0.2,  # ~12 per minute (conservative for free tier)
+        rate_limit_per_sec: float = 0.2,  # AV: 25/day; rpm governed by 429/backoff
     ):
         """
         Initialize Alpha Vantage connector.

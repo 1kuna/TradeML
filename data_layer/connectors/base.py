@@ -73,9 +73,10 @@ class BaseConnector(ABC):
         # Retry strategy: retry on 429, 500, 502, 503, 504
         retry_strategy = Retry(
             total=self.max_retries,
-            backoff_factor=1,  # 1s, 2s, 4s, 8s, 16s
+            backoff_factor=2,  # 2s, 4s, 8s, 16s, 32s
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "POST"],
+            raise_on_status=False,
         )
 
         adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -109,8 +110,23 @@ class BaseConnector(ABC):
         """
         self._rate_limit()
 
+        import time, random
         try:
             response = self.session.get(url, params=params, headers=headers, timeout=30)
+            if response.status_code == 429:
+                # Respect Retry-After if provided; otherwise exponential backoff with jitter
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        sleep_s = int(retry_after)
+                    except Exception:
+                        sleep_s = self._min_request_interval * (1 + random.random())
+                else:
+                    sleep_s = min(60, (self._min_request_interval or 1.0) * (2 + random.random()))
+                logger.warning(f"429 rate limited for {url}; sleeping {sleep_s:.2f}s")
+                time.sleep(sleep_s)
+                # One more attempt (let session retry strategy handle further if needed)
+                response = self.session.get(url, params=params, headers=headers, timeout=30)
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:

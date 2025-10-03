@@ -45,7 +45,7 @@ class AlpacaConnector(BaseConnector):
         self,
         api_key: Optional[str] = None,
         secret_key: Optional[str] = None,
-        rate_limit_per_sec: float = 10.0,  # Conservative limit
+        rate_limit_per_sec: float = 2.83,  # ~170 rpm (85% of 200)
     ):
         """
         Initialize Alpaca connector.
@@ -110,6 +110,7 @@ class AlpacaConnector(BaseConnector):
             timeframe=self.TIMEFRAME_MAP[timeframe],
             start=datetime.combine(start_date, datetime.min.time()),
             end=datetime.combine(end_date, datetime.max.time()),
+            feed="iex",
         )
 
         try:

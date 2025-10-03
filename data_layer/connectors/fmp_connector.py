@@ -36,7 +36,7 @@ class FMPConnector(BaseConnector):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        rate_limit_per_sec: float = 0.25,  # ~15 per minute (conservative for 250/day)
+        rate_limit_per_sec: float = 0.5,  # push limits but gated by 250/day budget
     ):
         """
         Initialize FMP connector.

@@ -35,7 +35,7 @@ class FinnhubConnector(BaseConnector):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        rate_limit_per_sec: float = 0.9,  # ~54 per minute (conservative for 60/min limit)
+        rate_limit_per_sec: float = 0.85,  # ~51 per minute (85% of 60)
     ):
         """
         Initialize Finnhub connector.
@@ -128,15 +128,29 @@ class FinnhubConnector(BaseConnector):
         options_data = raw_data.get("data", [])
 
         for opt in options_data:
+            # Expiry can be epoch seconds or ISO string depending on plan/version
+            exp_raw = opt.get("expirationDate")
+            expiry = None
+            if exp_raw:
+                try:
+                    # Epoch seconds
+                    expiry = datetime.fromtimestamp(int(exp_raw)).date()
+                except Exception:
+                    try:
+                        # ISO string
+                        expiry = pd.to_datetime(exp_raw).date()
+                    except Exception:
+                        expiry = None
+
             row = {
                 "underlier": symbol,
-                "expiry": datetime.fromtimestamp(opt["expirationDate"]).date() if opt.get("expirationDate") else None,
-                "strike": float(opt["strike"]),
-                "cp_flag": "C" if opt["type"] == "Call" else "P",
-                "bid": float(opt.get("bid", 0)) if opt.get("bid") else None,
-                "ask": float(opt.get("ask", 0)) if opt.get("ask") else None,
-                "bid_size": int(opt.get("bidSize", 0)) if opt.get("bidSize") else None,
-                "ask_size": int(opt.get("askSize", 0)) if opt.get("askSize") else None,
+                "expiry": expiry,
+                "strike": float(opt.get("strike")) if opt.get("strike") is not None else None,
+                "cp_flag": "C" if str(opt.get("type", "")).lower().startswith("c") else "P",
+                "bid": float(opt.get("bid", 0)) if opt.get("bid") is not None else None,
+                "ask": float(opt.get("ask", 0)) if opt.get("ask") is not None else None,
+                "bid_size": int(opt.get("bidSize", 0)) if opt.get("bidSize") is not None else None,
+                "ask_size": int(opt.get("askSize", 0)) if opt.get("askSize") is not None else None,
                 "nbbo_mid": None,  # Will compute
                 "ts_ns": int(datetime.now().timestamp() * 1e9),
             }

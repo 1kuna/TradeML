@@ -6,6 +6,7 @@ from .alpha_vantage_connector import AlphaVantageConnector
 from .fred_connector import FREDConnector
 from .finnhub_connector import FinnhubConnector
 from .fmp_connector import FMPConnector
+from .polygon_connector import PolygonConnector
 
 __all__ = [
     "BaseConnector",
@@ -17,4 +18,5 @@ __all__ = [
     "FREDConnector",
     "FinnhubConnector",
     "FMPConnector",
+    "PolygonConnector",
 ]

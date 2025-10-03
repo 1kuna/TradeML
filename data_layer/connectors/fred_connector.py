@@ -47,7 +47,7 @@ class FREDConnector(BaseConnector):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        rate_limit_per_sec: float = 10.0,  # Conservative for free tier
+        rate_limit_per_sec: float = 1.7,  # ~102 rpm (85% of 120 rpm heuristic)
     ):
         """
         Initialize FRED connector.
