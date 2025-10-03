@@ -30,27 +30,27 @@ ensure_command() {
 
 get_minio_root_creds() {
   # Populate MINIO_ROOT_USER and MINIO_ROOT_PASSWORD into env safely
-  # Preference order: existing env -> saved file -> docker inspect -> defaults
+  # Preference order: existing env -> docker inspect -> saved file -> defaults
   if [[ -n "${MINIO_ROOT_USER:-}" && -n "${MINIO_ROOT_PASSWORD:-}" ]]; then
     export MINIO_ROOT_USER MINIO_ROOT_PASSWORD
     return 0
+  fi
+  if sudo docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^minio$'; then
+    local envs
+    envs=$(sudo docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' minio 2>/dev/null || true)
+    local u p
+    u=$(printf "%s" "$envs" | grep '^MINIO_ROOT_USER=' | head -n1 | cut -d= -f2-)
+    p=$(printf "%s" "$envs" | grep '^MINIO_ROOT_PASSWORD=' | head -n1 | cut -d= -f2-)
+    if [[ -n "$u" && -n "$p" ]]; then
+      export MINIO_ROOT_USER="$u" MINIO_ROOT_PASSWORD="$p"
+      return 0
+    fi
   fi
   if [[ -f .minio_root.env ]]; then
     # shellcheck disable=SC1091
     source .minio_root.env
     if [[ -n "${MINIO_ROOT_USER:-}" && -n "${MINIO_ROOT_PASSWORD:-}" ]]; then
       export MINIO_ROOT_USER MINIO_ROOT_PASSWORD
-      return 0
-    fi
-  fi
-  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^minio$'; then
-    local envs
-    envs=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' minio 2>/dev/null || true)
-    local u p
-    u=$(printf "%s" "$envs" | grep '^MINIO_ROOT_USER=' | head -n1 | cut -d= -f2-)
-    p=$(printf "%s" "$envs" | grep '^MINIO_ROOT_PASSWORD=' | head -n1 | cut -d= -f2-)
-    if [[ -n "$u" && -n "$p" ]]; then
-      export MINIO_ROOT_USER="$u" MINIO_ROOT_PASSWORD="$p"
       return 0
     fi
   fi
@@ -92,7 +92,7 @@ should_start_local_minio() {
   fi
 
   # If compose-managed MinIO is running, skip
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^trademl_minio$'; then
+  if sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^trademl_minio$'; then
     return 1
   fi
 
@@ -155,8 +155,8 @@ install_prereqs() {
   if should_start_local_minio; then
     if ! sudo docker ps --format '{{.Names}}' | grep -q '^minio$'; then
       sudo mkdir -p /srv/minio
-      export MINIO_ROOT_USER=${MINIO_ROOT_USER:-rootadmin}
-      export MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-$(openssl rand -hex 24)}
+      export MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      export MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
       # Persist root creds for future provisioning
       printf "MINIO_ROOT_USER=%s\nMINIO_ROOT_PASSWORD=%s\n" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" > .minio_root.env
       chmod 600 .minio_root.env || true
