@@ -203,6 +203,45 @@ CREATE TABLE IF NOT EXISTS delistings (
 
 CREATE INDEX idx_delist_date ON delistings(delist_date);
 
+-- =====================
+-- SSOT: Data completeness + backfill ledger
+-- =====================
+
+-- Completeness/QC — one row per (source, table, symbol, dt)
+CREATE TABLE IF NOT EXISTS partition_status (
+  source TEXT,
+  table_name TEXT,
+  symbol TEXT,
+  dt DATE,
+  status TEXT CHECK (status IN ('GREEN','AMBER','RED')),
+  rows INT,
+  expected_rows INT,
+  qc_score REAL,
+  last_checked TIMESTAMP,
+  notes TEXT,
+  PRIMARY KEY (source, table_name, symbol, dt)
+);
+
+CREATE INDEX IF NOT EXISTS idx_partition_status_dt ON partition_status(dt);
+CREATE INDEX IF NOT EXISTS idx_partition_status_table ON partition_status(table_name, dt);
+
+-- Backfill queue ledger
+CREATE TABLE IF NOT EXISTS backfill_queue (
+  id SERIAL PRIMARY KEY,
+  source TEXT,
+  table_name TEXT,
+  symbol TEXT,
+  dt DATE,
+  priority INT,
+  attempts INT DEFAULT 0,
+  enqueued_at TIMESTAMP,
+  last_attempt TIMESTAMP,
+  last_err TEXT,
+  UNIQUE (source, table_name, symbol, dt)
+);
+
+CREATE INDEX IF NOT EXISTS idx_backfill_queue_priority ON backfill_queue(priority DESC, enqueued_at);
+
 -- COMMENT statements for documentation
 COMMENT ON TABLE data_ingestion_log IS 'Audit log of all data ingestion jobs with checksums and lineage';
 COMMENT ON TABLE data_quality_log IS 'QC checks results for schema validation, outliers, coverage gaps';
@@ -216,3 +255,5 @@ COMMENT ON TABLE drift_metrics IS 'Feature drift monitoring (PSI, KL) for regime
 COMMENT ON TABLE system_health IS 'Tripwire and health check log for alerting and kill switches';
 COMMENT ON TABLE corporate_actions IS 'Point-in-time corporate actions for survivorship-bias-free backtesting';
 COMMENT ON TABLE delistings IS 'Delisting database to include defunct tickers in historical universes';
+COMMENT ON TABLE partition_status IS 'Canonical GREEN/AMBER/RED completeness ledger per (source, table, symbol, date)';
+COMMENT ON TABLE backfill_queue IS 'Backfill work items prioritized by policy to close data gaps';
