@@ -222,6 +222,17 @@ Direct orchestrator (Pi node):
 - `bash scripts/run_node.sh` — one-click bootstrap (Docker/MinIO), provisions credentials, runs self-checks, then enters the continuous loop:
   edge (forward) → audit → backfill → curate → audit(refresh) → sleep. Hands-off; it logs alerts and retries instead of exiting.
 
+Concurrency on RPi:
+- IO workloads are parallelized with small thread pools tuned for Pi (A76, 4 cores, 8 GB).
+- Env knobs:
+  - `NODE_WORKERS` — global worker cap (default 4)
+  - `NODE_MAX_INFLIGHT_ALPACA` — per-source inflight (default 2–4)
+- Writes to `raw/<source>/<table>/date=*` are idempotent and guarded with S3 ETag retries to avoid races; bookmarks advance only after persist.
+
+Multi-source fan-out:
+- Edge fan-outs one unit per source (Alpaca/Polygon/Finnhub/FRED) and dynamically redistributes idle slots when a source runs out of work or cools down (rate limits).
+- Daily budgets gate scheduling per vendor; short per-minute bursts are smoothed by connector-level backoff. When a source pauses, free workers shift to other sources automatically.
+
 Windows Trainer (GPU required):
 - `scripts\windows\training_run.bat` — one-click: creates venv, installs deps, and starts the self-checking training loop.
 - The loop runs GREEN-gated training periodically and logs results.

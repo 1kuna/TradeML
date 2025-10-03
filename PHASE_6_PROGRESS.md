@@ -24,6 +24,12 @@ This document tracks what’s completed and what remains from the original “mi
 - Promotion policy: optional multi‑week shadow
   - Configurable `promotion_policy.require_shadow_days`, defaults to 20: `configs/training/equities_xs.yml`, `ops/ssot/train_gate.py`
 
+- Parallel ingestion on RPi (workers)
+  - Bounded thread pools for IO-heavy paths with conservative defaults: `utils/concurrency.py`
+  - Edge collector now fans out across sources (Alpaca/Polygon/Finnhub/FRED) with a global scheduler; starts 1 unit per source and reallocates workers when a vendor cools down (rate limits) or runs out of work. Alpaca uses per-day fetch; bookmarks update only after persist: `scripts/edge_collector.py`
+  - Backfill queue items processed in parallel under S3 lease; per-partition ETag retries prevent races: `ops/ssot/backfill.py`
+  - Env knobs: `NODE_WORKERS` (global), `NODE_MAX_INFLIGHT_ALPACA` (per-source)
+
 ## Still Missing / Outstanding
 
 - Options pipeline end‑to‑end (training → CPCV → promotion)

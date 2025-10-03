@@ -3,8 +3,19 @@ locks:
   renew_seconds: 45
 
 # Tasks to run on the edge collector
-# Supported: alpaca_bars (default)
+# Supported: alpaca_bars, polygon_bars, finnhub_options, fred_treasury
 tasks:
   - alpaca_bars
+  - polygon_bars
+  - finnhub_options
+  - fred_treasury
+
+# Policy: daily API budgets (governed by BudgetManager)
+policy:
+  daily_api_budget:
+    alpaca:  { requests: 250000 }
+    polygon: { requests: 7000 }
+    finnhub: { requests: 86400 }
+    fred:    { requests: 10000 }
 
 # Optional: connector-specific settings can be added here later

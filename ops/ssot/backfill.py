@@ -15,6 +15,7 @@ import os
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import threading
 
 import pandas as pd
 import yaml
@@ -27,6 +28,7 @@ from ops.ssot.budget import BudgetManager
 from data_layer.connectors.finnhub_connector import FinnhubConnector
 from data_layer.connectors.polygon_connector import PolygonConnector
 from data_layer.connectors.fred_connector import FREDConnector
+from utils.concurrency import partition_lock, worker_count
 import json
 
 
@@ -58,36 +60,64 @@ def _load_universe(path: str = "data_layer/reference/universe_symbols.txt") -> L
 
 
 def _append_raw_partition(df: pd.DataFrame, source: str, table: str, ds: date):
+    """Append-merge rows into a date partition with basic de-duplication.
+
+    - For S3: use ETag-based conditional writes with retry to avoid races.
+    - For local: serialize within-process via partition lock.
+    """
     backend = os.getenv("STORAGE_BACKEND", "local").lower()
+    part_key = f"raw/{source}/{table}/date={ds.isoformat()}"
+    subset_cols = [c for c in ["date", "symbol", "open", "high", "low", "close", "volume"] if c in df.columns]
     if backend == "s3":
         s3 = get_s3_client()
-        key = f"raw/{source}/{table}/date={ds.isoformat()}/data.parquet"
+        key = f"{part_key}/data.parquet"
         import io
-        # Merge if exists
-        try:
-            data, _ = s3.get_object(key)
-            existing = pd.read_parquet(io.BytesIO(data))
-            merged = pd.concat([existing, df], ignore_index=True)
-            merged = merged.drop_duplicates(subset=[c for c in ["date", "symbol", "open", "high", "low", "close", "volume"] if c in merged.columns])
-        except Exception:
-            merged = df
-        buf = io.BytesIO()
-        merged.to_parquet(buf, index=False)
-        s3.put_object(key, buf.getvalue())
-        logger.info(f"Upserted {len(df)} rows (total {len(merged)}) to s3://{s3.bucket}/{key}")
+        # Conditional upsert loop
+        attempts = 0
+        while attempts < 5:
+            attempts += 1
+            try:
+                try:
+                    data, etag = s3.get_object(key)
+                    existing = pd.read_parquet(io.BytesIO(data))
+                    merged = pd.concat([existing, df], ignore_index=True)
+                    if subset_cols:
+                        merged = merged.drop_duplicates(subset=subset_cols)
+                    buf = io.BytesIO()
+                    merged.to_parquet(buf, index=False)
+                    s3.put_object(key, buf.getvalue(), if_match=etag)
+                    logger.info(f"Upserted {len(df)} rows (total {len(merged)}) to s3://{s3.bucket}/{key}")
+                    return
+                except Exception:
+                    # Assume not found or stale etag; attempt create-if-absent
+                    buf = io.BytesIO()
+                    df if subset_cols else df
+                    df.to_parquet(buf, index=False)
+                    s3.put_object(key, buf.getvalue(), if_none_match="*")
+                    logger.info(f"Created partition with {len(df)} rows at s3://{s3.bucket}/{key}")
+                    return
+            except Exception as e:
+                # Precondition failed or transient, retry
+                if attempts >= 5:
+                    logger.warning(f"S3 upsert failed after retries for {key}: {e}")
+                    raise
+        return
     else:
-        # Local source-first layout
-        path = Path("data_layer/raw") / source / table / f"date={ds.isoformat()}"
-        path.mkdir(parents=True, exist_ok=True)
-        out = path / "data.parquet"
-        if out.exists():
-            existing = pd.read_parquet(out)
-            merged = pd.concat([existing, df], ignore_index=True)
-            merged = merged.drop_duplicates(subset=[c for c in ["date", "symbol", "open", "high", "low", "close", "volume"] if c in merged.columns])
-        else:
-            merged = df
-        merged.to_parquet(out, index=False)
-        logger.info(f"Upserted {len(df)} rows (total {len(merged)}) to {out}")
+        # Local source-first layout with in-process lock
+        lock = partition_lock(part_key)
+        with lock:
+            path = Path("data_layer/raw") / source / table / f"date={ds.isoformat()}"
+            path.mkdir(parents=True, exist_ok=True)
+            out = path / "data.parquet"
+            if out.exists():
+                existing = pd.read_parquet(out)
+                merged = pd.concat([existing, df], ignore_index=True)
+                if subset_cols:
+                    merged = merged.drop_duplicates(subset=subset_cols)
+            else:
+                merged = df
+            merged.to_parquet(out, index=False)
+            logger.info(f"Upserted {len(df)} rows (total {len(merged)}) to {out}")
 
 
 def _lease_manager_if_s3() -> Optional[LeaseManager]:
@@ -170,33 +200,35 @@ def _estimate_requests(num_symbols: int, days: int, batch_size: int = 100) -> in
 
 
 def _process_queue_equities_eod(rows: List[Tuple], connector: AlpacaConnector, budget: Optional[BudgetManager] = None):
+    """Process EOD queue items with bounded concurrency under a single lease."""
     lm = _lease_manager_if_s3()
     lease_name = "backfill.equities_eod"
     if lm and not lm.acquire(lease_name, force=True):
         logger.info("Backfill lease held elsewhere; skipping queue batch")
         return
     try:
-        for (item_id, source, table_name, symbol, dt, priority, attempts) in rows:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _handle_item(item: Tuple):
+            (item_id, source, table_name, symbol, dt, priority, attempts) = item
             if table_name != "equities_eod":
-                continue
+                return
             try:
                 _touch_queue_item(item_id)  # record attempt
-                # Fetch only the target symbol/date
                 ds = pd.to_datetime(dt).date()
                 # Budget: assume one request per symbol-day
                 if budget and not budget.try_consume("alpaca", 1):
                     logger.warning("Budget exhausted for Alpaca (queue item); yielding")
                     _yield_on_budget()
-                    continue
+                    return
                 df = connector.fetch_bars(symbols=[symbol], start_date=ds, end_date=ds, timeframe="1Day")
                 if df.empty:
-                    # Fallback: try Polygon aggregates (one request)
                     poly_ok = budget.try_consume("polygon", 1) if budget else True
                     if poly_ok:
                         try:
                             pconn = PolygonConnector(api_key=os.getenv("POLYGON_API_KEY"))
                             pdf = pconn.fetch_aggregates(symbol, ds, ds, timespan="day")
-                        except Exception as _e:
+                        except Exception:
                             pdf = pd.DataFrame()
                         if not pdf.empty:
                             _append_raw_partition(pdf, source="polygon", table="equities_bars", ds=ds)
@@ -210,37 +242,46 @@ def _process_queue_equities_eod(rows: List[Tuple], connector: AlpacaConnector, b
             except Exception as e:
                 logger.exception(f"Backfill item failed (id={item_id}): {e}")
                 _touch_queue_item(item_id, err=str(e))
+
+        max_workers = worker_count(default=4)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = [ex.submit(_handle_item, r) for r in rows if r[2] == "equities_eod"]
+            for _ in as_completed(futs):
+                pass
     finally:
         if lm:
             lm.release(lease_name)
 
 
 def _process_queue_equities_minute(rows: List[Tuple], connector: AlpacaConnector, budget: Optional[BudgetManager] = None):
+    """Process minute queue items with bounded concurrency under a single lease."""
     lm = _lease_manager_if_s3()
     lease_name = "backfill.equities_minute"
     if lm and not lm.acquire(lease_name, force=True):
         logger.info("Backfill lease held elsewhere; skipping minute queue batch")
         return
     try:
-        for (item_id, source, table_name, symbol, dt, priority, attempts) in rows:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _handle_item(item: Tuple):
+            (item_id, source, table_name, symbol, dt, priority, attempts) = item
             if table_name != "equities_minute":
-                continue
+                return
             try:
                 _touch_queue_item(item_id)
                 ds = pd.to_datetime(dt).date()
                 if budget and not budget.try_consume("alpaca", 1):
                     logger.warning("Budget exhausted for Alpaca (minute); yielding")
                     _yield_on_budget()
-                    continue
+                    return
                 df = connector.fetch_bars(symbols=[symbol], start_date=ds, end_date=ds, timeframe="1Min")
                 if df.empty:
-                    # Fallback: Polygon minute aggregates for that day
                     poly_ok = budget.try_consume("polygon", 1) if budget else True
                     if poly_ok:
                         try:
                             pconn = PolygonConnector(api_key=os.getenv("POLYGON_API_KEY"))
                             pdf = pconn.fetch_aggregates(symbol, ds, ds, timespan="minute")
-                        except Exception as _e:
+                        except Exception:
                             pdf = pd.DataFrame()
                         if not pdf.empty:
                             _append_raw_partition(pdf, source="polygon", table="equities_bars_minute", ds=ds)
@@ -254,6 +295,12 @@ def _process_queue_equities_minute(rows: List[Tuple], connector: AlpacaConnector
             except Exception as e:
                 logger.exception(f"Minute backfill item failed (id={item_id}): {e}")
                 _touch_queue_item(item_id, err=str(e))
+
+        max_workers = worker_count(default=4)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = [ex.submit(_handle_item, r) for r in rows if r[2] == "equities_minute"]
+            for _ in as_completed(futs):
+                pass
     finally:
         if lm:
             lm.release(lease_name)
