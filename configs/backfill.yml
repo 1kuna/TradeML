@@ -1,0 +1,40 @@
+scheduler:
+  timezone: America/New_York
+
+policy:
+  max_concurrency: 3
+  daily_api_budget:
+    alpaca:  { requests: 250000 }  # near-theoretical; rpm limited in connector
+    finnhub: { requests: 86400 }   # 60 rpm * 60 * 24
+    av:      { requests: 25 }      # Alpha Vantage: 25/day
+    fred:    { requests: 10000 }   # lower daily cap; rpm limited in connector
+    fmp:     { requests: 250 }     # FMP free tier: 250/day
+    polygon: { requests: 7000 }    # Polygon free: 5 rpm (~7200/day) → cap at 7000
+
+  priorities:
+    - { table: corp_actions,     weight: 100 }
+    - { table: delistings,       weight: 100 }
+    - { table: equities_eod,     weight: 90 }
+    - { table: equities_minute,  weight: 80 }
+    - { table: options_chains,   weight: 70 }
+    - { table: options_nbbo,     weight: 60 }
+
+targets:
+  equities_eod:    { earliest: '2000-01-01', chunk_days: 30, expect_rows: 1 }
+  equities_minute: { earliest: '2010-01-01', chunk_days: 5,  expect_rows: 390 }
+  options_chains:  { earliest: '2015-01-01', chunk_days: 1,  expect_contracts_min: 50 }
+  macro_treasury:  { earliest: '2000-01-01', chunk_days: 365, expect_rows: 5 }
+  macro_vintages:  { series: ['DGS10','CPIAUCSL'] }
+
+qc_thresholds:
+  green_min_ratio: 0.98
+  rows_low_ratio:  0.90
+  rows_high_ratio: 1.20
+  allow_halfdays:  true
+
+horizons:
+  equities_eod:    { collect_earliest: '1990-01-01', train_window_years: 15 }
+  equities_minute: { collect_earliest: '2010-01-01', train_window_years: 10 }
+  equities_ticks:  { collect_earliest: '2012-06-01', train_window_years: 4 }
+  options_chains:  { collect_earliest: '2012-01-01', train_window_years: 10 }
+  options_nbbo:    { collect_earliest: '2010-01-01', train_window_years: 8 }

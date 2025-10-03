@@ -1,0 +1,10 @@
+dependencies: [options_chains]
+min_surface_qc_rate: 0.95
+green_threshold: { window_years: 10, min_ratio: 0.95 }
+cpcv: { folds: 8, embargo_days: 10 }
+time_decay: { half_life_months: 18 }
+regime_masks:
+  - { name: '2012-2016', use_for: fit_and_validate }
+  - { name: '2016-2024', use_for: fit_and_validate }
+  - { name: '2025+',     use_for: monitor_only }
+

@@ -14,3 +14,10 @@ jobs:
     # Idempotency: curator skips dates already produced
     idempotent: true
 
+  - name: equities_minute_pass
+    source: alpaca
+    table: equities_bars_minute
+    input_prefix: raw/alpaca/equities_bars_minute
+    output_prefix: curated/equities_minute
+    partition: date
+    idempotent: true

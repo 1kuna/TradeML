@@ -1,0 +1,15 @@
+router:
+  fallback: best_available
+  weights:
+    equities_xs: 0.6
+    intraday_xs: 0.3
+    options_vol: 0.1
+  stacker:
+    enabled: false
+    model: lightgbm
+    folds: 8
+    # Optional explicit linear weights to use when enabled=true (acts as a simple stacker)
+    linear_weights:
+      equities_xs: 0.7
+      intraday_xs: 0.2
+      options_vol: 0.1
