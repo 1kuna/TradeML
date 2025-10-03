@@ -12,7 +12,7 @@ import signal
 import time
 import argparse
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional, List
 import threading
 
@@ -31,6 +31,7 @@ from data_layer.connectors.alpaca_connector import AlpacaConnector
 from utils.concurrency import max_inflight_for, worker_count
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ops.ssot.budget import BudgetManager
+from utils.s3_writer import S3Writer
 
 
 class EdgeCollector:
@@ -53,10 +54,18 @@ class EdgeCollector:
                 renew_seconds=self.config.get("locks", {}).get("renew_seconds", 45),
             )
             self.bookmarks = BookmarkManager(self.s3)
+            # Initialize a background S3 writer to serialize heavy writes
+            try:
+                self.s3_writer = S3Writer(self.s3)
+                self.s3_writer.start()
+            except Exception as e:
+                logger.warning(f"Failed to start S3 writer: {e}")
+                self.s3_writer = None
         else:
             self.s3 = None
             self.lease_mgr = None
             self.bookmarks = None
+            self.s3_writer = None
 
         # Connectors
         self.connectors = self._init_connectors()
@@ -114,7 +123,7 @@ class EdgeCollector:
                 self.shutdown_requested = True
                 break
 
-    def _upload_to_s3(self, df: pd.DataFrame, source: str, table: str, date: str):
+    def _upload_to_s3(self, df: pd.DataFrame, source: str, table: str, date: str, async_write: bool = False):
         """Upload dataframe to S3 with partitioning."""
         if not self.s3:
             # Local storage fallback (source-first layout for consistency)
@@ -127,29 +136,28 @@ class EdgeCollector:
 
         # S3 upload
         key = f"raw/{source}/{table}/date={date}/data.parquet"
-
-        # Convert to parquet bytes
-        import io
-        buffer = io.BytesIO()
-        df.to_parquet(buffer, index=False)
-        data = buffer.getvalue()
-
-        # Upload with temp key first, then rename (atomic-ish)
-        temp_key = f"{key}.tmp"
-        self.s3.put_object(temp_key, data)
-
-        # Check if final key exists (idempotency)
-        if self.s3.object_exists(key):
-            logger.debug(f"Object already exists, skipping: {key}")
+        if self.s3_writer and async_write:
+            fut = self.s3_writer.submit_df_parquet(key, df)
+            return fut
+        else:
+            # Synchronous path (fallback)
+            fut = self.s3_writer.submit_df_parquet(key, df) if self.s3_writer else None
+            if fut is not None:
+                fut.result()
+                return
+            import io
+            buffer = io.BytesIO()
+            df.to_parquet(buffer, index=False)
+            data = buffer.getvalue()
+            temp_key = f"{key}.tmp"
+            self.s3.put_object(temp_key, data)
+            if self.s3.object_exists(key):
+                logger.debug(f"Object already exists, skipping: {key}")
+                self.s3.delete_object(temp_key)
+                return
+            self.s3.put_object(key, data)
             self.s3.delete_object(temp_key)
-            return
-
-        # Rename temp to final
-        # Note: S3 doesn't have atomic rename, so we copy+delete
-        self.s3.put_object(key, data)
-        self.s3.delete_object(temp_key)
-
-        logger.info(f"Uploaded to S3: {key} ({len(df)} rows, {len(data)} bytes)")
+            logger.info(f"Uploaded to S3: {key} ({len(df)} rows, {len(data)} bytes)")
 
     def _write_manifest(self, source: str, table: str, date: str, row_count: int):
         """Write manifest log for audit trail."""
@@ -177,6 +185,32 @@ class EdgeCollector:
         new_data = '\n'.join(lines).encode('utf-8')
         self.s3.put_object(manifest_key, new_data)
         logger.debug(f"Updated manifest: {manifest_key}")
+
+    def _upload_parquet_key(self, df: pd.DataFrame, key: str, async_write: bool = False):
+        if not self.s3:
+            # Not used for local; call site should handle local path
+            return None
+        if self.s3_writer and async_write:
+            return self.s3_writer.submit_df_parquet(key, df)
+        else:
+            fut = self.s3_writer.submit_df_parquet(key, df) if self.s3_writer else None
+            if fut is not None:
+                fut.result()
+                return None
+            import io
+            buffer = io.BytesIO()
+            df.to_parquet(buffer, index=False)
+            data = buffer.getvalue()
+            temp_key = f"{key}.tmp"
+            self.s3.put_object(temp_key, data)
+            if self.s3.object_exists(key):
+                logger.debug(f"Object already exists, skipping: {key}")
+                self.s3.delete_object(temp_key)
+                return None
+            self.s3.put_object(key, data)
+            self.s3.delete_object(temp_key)
+            logger.info(f"Uploaded to S3: {key} ({len(df)} rows, {len(data)} bytes)")
+            return None
 
     def _alpaca_fetch_day_parallel(self, connector: AlpacaConnector, symbols: List[str], day_str: str, inflight_override: Optional[int] = None) -> pd.DataFrame:
         """Fetch a single day of bars in parallel by symbol chunks, returning combined DataFrame."""
@@ -437,15 +471,18 @@ class EdgeCollector:
                 return
             last_ts = self.bookmarks.get_last_timestamp("polygon", "equities_bars") if self.bookmarks else None
             start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=7))
+            BATCH = max(1, int(os.getenv("NODE_POLYGON_SYMBOLS_PER_UNIT", "10")))
             d = start_date
             while d <= today and not self.shutdown_requested:
-                tokens = len(symbols)  # ~1 req per symbol-day
-                yield {
-                    "vendor": "polygon",
-                    "desc": f"polygon {d}",
-                    "tokens": tokens,
-                    "run": lambda day=d, syms=symbols: self._run_polygon_day(syms, day, budget),
-                }
+                for i in range(0, len(symbols), BATCH):
+                    chunk = symbols[i:i+BATCH]
+                    tokens = len(chunk)  # ~1 req per symbol-day
+                    yield {
+                        "vendor": "polygon",
+                        "desc": f"polygon {d} [{i}:{i+len(chunk)}]",
+                        "tokens": tokens,
+                        "run": lambda day=d, syms=chunk: self._run_polygon_day(syms, day, budget),
+                    }
                 d += timedelta(days=1)
 
         def finnhub_units():
@@ -503,16 +540,25 @@ class EdgeCollector:
         max_workers = worker_count(default=4)
         logger.info(f"Starting fan-out across tasks: {task_order} with {max_workers} workers")
 
-        vendor_freeze = {}  # vendor -> until_ts
+        vendor_freeze: dict[str, float] = {}  # vendor -> until_ts
+        vendor_inflight: dict[str, int] = {}
         active = {}
         results_ok = 0
         submitted = 0
+
+        def vendor_cap(vendor: str) -> int:
+            # Default per-vendor inflight: conservative (1), Alpaca allows override
+            default_caps = {"alpaca": 1, "polygon": 1, "finnhub": 1, "fred": 1}
+            return max(1, max_inflight_for(vendor, default=default_caps.get(vendor, 1)))
 
         def can_run(vendor: str, tokens: int) -> bool:
             # Check cooldown
             from time import time as _now
             until = vendor_freeze.get(vendor)
             if until and _now() < until:
+                return False
+            # Check inflight cap
+            if vendor_inflight.get(vendor, 0) >= vendor_cap(vendor):
                 return False
             # Check daily budget
             if budget and tokens > 0:
@@ -522,24 +568,39 @@ class EdgeCollector:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             rr = cycle(task_order)
 
-            # Seed one unit per task if possible
-            for t in task_order:
-                it = producers.get(t)
-                if not it:
-                    continue
-                try:
-                    unit = next(it)
-                except StopIteration:
-                    continue
-                if can_run(unit["vendor"], unit.get("tokens", 1)):
-                    fut = ex.submit(unit["run"])
-                    active[fut] = (t, unit)
-                    submitted += 1
+            # Seed up to max_workers with RR across tasks, honoring vendor caps
+            import random, time as _t
+            while len(active) < max_workers and not self.shutdown_requested:
+                progressed = False
+                for _ in range(len(task_order)):
+                    t = next(rr)
+                    it = producers.get(t)
+                    if not it:
+                        continue
+                    try:
+                        unit = next(it)
+                    except StopIteration:
+                        producers[t] = None
+                        continue
+                    v = unit["vendor"]
+                    if can_run(v, unit.get("tokens", 1)):
+                        fut = ex.submit(unit["run"])
+                        active[fut] = (t, unit)
+                        vendor_inflight[v] = vendor_inflight.get(v, 0) + 1
+                        submitted += 1
+                        progressed = True
+                        # Small jitter to de-synchronize vendor calls
+                        _t.sleep(random.uniform(0.05, 0.15))
+                        if len(active) >= max_workers:
+                            break
+                if not progressed:
+                    break
 
             while active and not self.shutdown_requested:
                 # As futures complete, schedule replacements
                 done = next(as_completed(list(active.keys())))
                 t, unit = active.pop(done)
+                v = unit["vendor"]
                 status, rows, msg = ("error", 0, "")
                 try:
                     res = done.result()
@@ -569,9 +630,13 @@ class EdgeCollector:
                     pass
                 elif status == "error":
                     logger.warning(f"Unit error [{unit['desc']}]: {msg}")
+                # Decrement inflight
+                if v:
+                    vendor_inflight[v] = max(0, vendor_inflight.get(v, 0) - 1)
 
                 # Attempt to schedule next unit from any task, prefer same task to preserve order
                 scheduled = False
+                import random, time as _t
                 for _ in range(len(task_order)):
                     tn = next(rr)
                     it = producers.get(tn)
@@ -582,11 +647,14 @@ class EdgeCollector:
                     except StopIteration:
                         producers[tn] = None
                         continue
-                    if can_run(nxt["vendor"], nxt.get("tokens", 1)):
+                    v2 = nxt["vendor"]
+                    if can_run(v2, nxt.get("tokens", 1)):
                         fut = ex.submit(nxt["run"])
                         active[fut] = (tn, nxt)
+                        vendor_inflight[v2] = vendor_inflight.get(v2, 0) + 1
                         submitted += 1
                         scheduled = True
+                        _t.sleep(random.uniform(0.03, 0.12))
                         break
 
                 if not scheduled and not active:
@@ -599,9 +667,11 @@ class EdgeCollector:
                         except StopIteration:
                             producers[tn] = None
                             continue
-                        if can_run(nxt["vendor"], nxt.get("tokens", 1)):
+                        v3 = nxt["vendor"]
+                        if can_run(v3, nxt.get("tokens", 1)):
                             fut = ex.submit(nxt["run"])
                             active[fut] = (tn, nxt)
+                            vendor_inflight[v3] = vendor_inflight.get(v3, 0) + 1
                             submitted += 1
                             break
 
@@ -619,20 +689,26 @@ class EdgeCollector:
 
     # ----- Unit runners for each source -----
 
-    def _run_alpaca_day(self, symbols: List[str], day: datetime.date, budget: Optional[BudgetManager]):
+    def _run_alpaca_day(self, symbols: List[str], day: date, budget: Optional[BudgetManager]):
         connector = self.connectors.get("alpaca")
         if not connector:
             return ("empty", 0, "no connector")
         df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1)
         if df.empty:
             return ("empty", 0, "no data")
-        self._upload_to_s3(df, "alpaca", "equities_bars", day.isoformat())
+        fut = self._upload_to_s3(df, "alpaca", "equities_bars", day.isoformat(), async_write=True)
+        try:
+            # Ensure persisted before manifest/bookmark
+            if fut is not None:
+                fut.result()
+        except Exception as e:
+            return ("error", 0, str(e))
         self._write_manifest("alpaca", "equities_bars", day.isoformat(), len(df))
         if self.bookmarks:
             self.bookmarks.set("alpaca", "equities_bars", day.isoformat(), len(df))
         return ("ok", int(len(df)), "")
 
-    def _run_polygon_day(self, symbols: List[str], day: datetime.date, budget: Optional[BudgetManager]):
+    def _run_polygon_day(self, symbols: List[str], day: date, budget: Optional[BudgetManager]):
         try:
             from data_layer.connectors.polygon_connector import PolygonConnector
         except Exception:
@@ -654,14 +730,19 @@ class EdgeCollector:
         if not rows:
             return ("empty", 0, "no data")
         out = pd.concat(rows, ignore_index=True)
-        self._upload_to_s3(out, "polygon", "equities_bars", day.isoformat())
+        fut = self._upload_to_s3(out, "polygon", "equities_bars", day.isoformat(), async_write=True)
+        try:
+            if fut is not None:
+                fut.result()
+        except Exception as e:
+            return ("error", 0, str(e))
         self._write_manifest("polygon", "equities_bars", day.isoformat(), len(out))
         if self.bookmarks:
             # bookmark advances per day for polygon bars
             self.bookmarks.set("polygon", "equities_bars", day.isoformat(), len(out))
         return ("ok", int(len(out)), "")
 
-    def _run_finnhub_options_underlier(self, symbol: str, day: datetime.date, budget: Optional[BudgetManager]):
+    def _run_finnhub_options_underlier(self, symbol: str, day: date, budget: Optional[BudgetManager]):
         try:
             from data_layer.connectors.finnhub_connector import FinnhubConnector
         except Exception:
@@ -680,10 +761,13 @@ class EdgeCollector:
             return ("empty", 0, "no data")
         # Partition by underlier
         if self.s3:
-            import io
-            buf = io.BytesIO()
-            df.to_parquet(buf, index=False)
-            self.s3.put_object(f"raw/finnhub/options_chains/date={day.isoformat()}/underlier={symbol}/data.parquet", buf.getvalue())
+            key = f"raw/finnhub/options_chains/date={day.isoformat()}/underlier={symbol}/data.parquet"
+            fut = self._upload_parquet_key(df, key, async_write=True)
+            try:
+                if fut is not None:
+                    fut.result()
+            except Exception as e:
+                return ("error", 0, str(e))
         else:
             out = Path("data_layer/raw/finnhub/options_chains") / f"date={day.isoformat()}" / f"underlier={symbol}"
             out.mkdir(parents=True, exist_ok=True)
@@ -692,7 +776,7 @@ class EdgeCollector:
             self.bookmarks.set("finnhub", "options_chains", day.isoformat(), int(len(df)))
         return ("ok", int(len(df)), "")
 
-    def _run_fred_treasury_day(self, day: datetime.date, budget: Optional[BudgetManager]):
+    def _run_fred_treasury_day(self, day: date, budget: Optional[BudgetManager]):
         try:
             from data_layer.connectors.fred_connector import FREDConnector
         except Exception:
@@ -711,10 +795,13 @@ class EdgeCollector:
             return ("empty", 0, "no data")
         # Write per date
         if self.s3:
-            import io
-            buf = io.BytesIO()
-            df.to_parquet(buf, index=False)
-            self.s3.put_object(f"raw/fred/macro_treasury/date={day.isoformat()}/data.parquet", buf.getvalue())
+            key = f"raw/fred/macro_treasury/date={day.isoformat()}/data.parquet"
+            fut = self._upload_parquet_key(df, key, async_write=True)
+            try:
+                if fut is not None:
+                    fut.result()
+            except Exception as e:
+                return ("error", 0, str(e))
         else:
             out = Path("data_layer/raw/macro_treasury/fred") / f"date={day.isoformat()}"
             out.mkdir(parents=True, exist_ok=True)
@@ -729,7 +816,15 @@ class EdgeCollector:
 
         # Run collection tasks with fan-out scheduler
         tasks = self.config.get("tasks", ["alpaca_bars"])
-        self._schedule_fanout(tasks)
+        try:
+            self._schedule_fanout(tasks)
+        finally:
+            # Ensure S3 writer stops cleanly
+            try:
+                if self.s3_writer:
+                    self.s3_writer.stop()
+            except Exception:
+                pass
 
         logger.info("Edge collector stopped")
 

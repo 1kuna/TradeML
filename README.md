@@ -233,6 +233,13 @@ Multi-source fan-out:
 - Edge fan-outs one unit per source (Alpaca/Polygon/Finnhub/FRED) and dynamically redistributes idle slots when a source runs out of work or cools down (rate limits).
 - Daily budgets gate scheduling per vendor; short per-minute bursts are smoothed by connector-level backoff. When a source pauses, free workers shift to other sources automatically.
 
+Request pacing (global):
+- A global request pacer smooths outbound API calls across threads. It enforces per-vendor inter-request intervals with a small jitter so calls form a steady stream rather than bursts.
+- Enabled by default via `REQUEST_PACING_ENABLED=true`. Configure jitter with `REQUEST_PACING_JITTER_MS`.
+
+S3 writer queue:
+- A background S3 writer serializes Parquet writes to reduce visible stalls on the Pi and keep worker threads free for network I/O. Enabled automatically when using S3.
+
 Windows Trainer (GPU required):
 - `scripts\windows\training_run.bat` — one-click: creates venv, installs deps, and starts the self-checking training loop.
 - The loop runs GREEN-gated training periodically and logs results.

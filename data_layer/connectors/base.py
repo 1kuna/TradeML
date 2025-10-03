@@ -20,6 +20,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from loguru import logger
+from utils.pacing import RequestPacer
 
 
 class BaseConnector(ABC):
@@ -57,7 +58,7 @@ class BaseConnector(ABC):
         self.rate_limit_per_sec = rate_limit_per_sec
         self.max_retries = max_retries
 
-        # Rate limiting
+        # Local fallback rate limiting (per instance); global pacer is preferred
         self._last_request_time = 0.0
         self._min_request_interval = 1.0 / rate_limit_per_sec
 
@@ -86,7 +87,15 @@ class BaseConnector(ABC):
         return session
 
     def _rate_limit(self):
-        """Enforce rate limiting between requests."""
+        """Enforce rate limiting between requests (global pacer + local fallback)."""
+        try:
+            RequestPacer.instance().acquire(self.source_name, self.rate_limit_per_sec)
+            # Update local timestamp for completeness
+            self._last_request_time = time.time()
+            return
+        except Exception:
+            pass
+        # Fallback to simple per-instance spacing if pacer unavailable
         now = time.time()
         elapsed = now - self._last_request_time
         if elapsed < self._min_request_interval:

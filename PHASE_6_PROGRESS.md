@@ -28,7 +28,9 @@ This document tracks what’s completed and what remains from the original “mi
   - Bounded thread pools for IO-heavy paths with conservative defaults: `utils/concurrency.py`
   - Edge collector now fans out across sources (Alpaca/Polygon/Finnhub/FRED) with a global scheduler; starts 1 unit per source and reallocates workers when a vendor cools down (rate limits) or runs out of work. Alpaca uses per-day fetch; bookmarks update only after persist: `scripts/edge_collector.py`
   - Backfill queue items processed in parallel under S3 lease; per-partition ETag retries prevent races: `ops/ssot/backfill.py`
-  - Env knobs: `NODE_WORKERS` (global), `NODE_MAX_INFLIGHT_ALPACA` (per-source)
+  - Global request pacer smooths outbound API calls across threads to prevent bursts: `utils/pacing.py` integrated into `data_layer/connectors/base.py`
+  - Background S3 writer queue serializes heavy Parquet writes to reduce stalls: `utils/s3_writer.py` integrated into `scripts/edge_collector.py`
+  - Env knobs: `NODE_WORKERS` (global), `NODE_MAX_INFLIGHT_ALPACA` (per-source), `REQUEST_PACING_ENABLED`, `REQUEST_PACING_JITTER_MS`
 
 ## Still Missing / Outstanding
 
