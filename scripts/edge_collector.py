@@ -59,8 +59,11 @@ class EdgeCollector:
 
         # Shutdown flag
         self.shutdown_requested = False
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        try:
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+        except Exception:
+            pass
 
     def _init_connectors(self):
         """Initialize data connectors from config."""
@@ -82,6 +85,8 @@ class EdgeCollector:
         """Handle shutdown signals gracefully."""
         logger.warning(f"Received signal {signum}, shutting down gracefully...")
         self.shutdown_requested = True
+        # Propagate interrupt so orchestrator can exit promptly
+        raise KeyboardInterrupt
 
     def _acquire_lease(self, name: str) -> bool:
         """Acquire lease or exit if already held."""

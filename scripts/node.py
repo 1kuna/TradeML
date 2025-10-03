@@ -24,6 +24,7 @@ import sys
 import time
 import json
 import argparse
+import signal
 from pathlib import Path
 from datetime import datetime, date
 
@@ -135,16 +136,28 @@ def main():
         ok = selfcheck()
         sys.exit(0 if ok else 2)
 
+    # Install top-level signal handlers so Ctrl+C exits promptly
+    def _handle_sig(signum, _frame):
+        logger.warning(f"Received signal {signum}; exiting...")
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, _handle_sig)
+        signal.signal(signal.SIGTERM, _handle_sig)
+    except Exception:
+        pass
+
     # Default: self-check + loop (never exit on failure; log + retry)
     selfcheck()
     logger.info("Starting node loop: edge -> audit -> backfill -> curate -> audit -> reports -> sleep")
 
-    while True:
-        start = time.time()
-        try:
-            run_edge_once(args.edge_config)
-        except Exception as e:
-            logger.exception(f"Collector failed: {e}")
+    try:
+        while True:
+            start = time.time()
+            try:
+                run_edge_once(args.edge_config)
+            except Exception as e:
+                logger.exception(f"Collector failed: {e}")
 
         # Reference (corp actions, delistings) — fetched when API key exists
         try:
@@ -305,14 +318,16 @@ def main():
         except Exception as e:
             logger.exception(f"Shadow logging failed: {e}")
 
-        elapsed = int(time.time() - start)
-        sleep_for = max(1, args.interval - elapsed)
-        logger.info(f"Cycle complete in {elapsed}s; sleeping {sleep_for}s")
-        try:
-            time.sleep(sleep_for)
-        except KeyboardInterrupt:
-            logger.warning("Interrupted; exiting")
-            break
+            elapsed = int(time.time() - start)
+            sleep_for = max(1, args.interval - elapsed)
+            logger.info(f"Cycle complete in {elapsed}s; sleeping {sleep_for}s")
+            try:
+                time.sleep(sleep_for)
+            except KeyboardInterrupt:
+                raise
+    except KeyboardInterrupt:
+        logger.warning("Interrupted; exiting node")
+        return
 
 
 if __name__ == "__main__":
