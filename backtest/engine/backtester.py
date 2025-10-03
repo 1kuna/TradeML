@@ -72,6 +72,7 @@ class MinimalBacktester:
         initial_capital: float = 1_000_000.0,
         fee_per_share: float = 0.0,  # US equities often $0
         spread_bps: float = 5.0,      # Estimate 5 bps spread
+        borrow_bps: float = 0.0,      # Daily borrow fee (annualized bps) applied to shorts
     ):
         """
         Initialize backtester.
@@ -84,6 +85,7 @@ class MinimalBacktester:
         self.initial_capital = initial_capital
         self.fee_per_share = fee_per_share
         self.spread_bps = spread_bps
+        self.borrow_bps = borrow_bps
 
         # State
         self.cash = initial_capital
@@ -279,6 +281,17 @@ class MinimalBacktester:
 
                 if symbol in price_map:
                     self.execute_trade(trade_date, symbol, target_qty, price_map[symbol])
+
+            # Daily borrow carry for existing short positions
+            if self.borrow_bps and self.borrow_bps > 0:
+                daily_rate = (self.borrow_bps / 10000.0) / 252.0
+                carry_cost = 0.0
+                for symbol, pos_queue in list(self.positions.items()):
+                    qty = sum(p.quantity for p in pos_queue)
+                    if qty < 0 and symbol in price_map:
+                        carry_cost += abs(qty) * price_map[symbol] * daily_rate
+                if carry_cost:
+                    self.cash -= carry_cost
 
             # Calculate portfolio value
             portfolio_value = self.get_portfolio_value(price_map)
