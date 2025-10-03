@@ -41,8 +41,12 @@ def _to_date(d: object) -> Date:
 
 
 def _load_symbol_history(symbol: str, base_dir: str) -> Optional[pd.DataFrame]:
-    """Load per-symbol curated OHLCV (adjusted if available)."""
-    # Preferred: {SYMBOL}_adj.parquet
+    """Load per-symbol curated OHLCV (adjusted if available).
+
+    Preferred: per-symbol file under base_dir. If not found, fall back to
+    scanning date-partitioned curated directories and filtering for the symbol.
+    """
+    # Preferred: {SYMBOL}_adj.parquet or {SYMBOL}.parquet
     candidates = [
         os.path.join(base_dir, f"{symbol}_adj.parquet"),
         os.path.join(base_dir, f"{symbol}.parquet"),
@@ -55,7 +59,42 @@ def _load_symbol_history(symbol: str, base_dir: str) -> Optional[pd.DataFrame]:
             except Exception as e:  # pragma: no cover (environment dependent engines)
                 logger.warning(f"Failed to read {path}: {e}")
                 continue
-    logger.debug(f"No curated file found for {symbol} under {base_dir}")
+
+    # Fallback: scan date-partitioned curated directory
+    root = os.path.join("data_layer", "curated", "equities_ohlcv_adj")
+    if os.path.exists(root):
+        frames = []
+        # Read up to last ~400 calendar days of partitions to keep IO bounded
+        try:
+            dirs = [p for p in os.listdir(root) if p.startswith("date=")]
+            # Sort by date and keep most recent 400
+            def _ds(n: str):
+                try:
+                    return datetime.strptime(n.split("=", 1)[-1], "%Y-%m-%d").date()
+                except Exception:
+                    return None
+            dated = sorted([(d, _ds(d)) for d in dirs], key=lambda x: (x[1] is None, x[1]))
+            dated = [d for d in dated if d[1] is not None]
+            for dname, _ in dated[-400:]:
+                path = os.path.join(root, dname, "data.parquet")
+                if not os.path.exists(path):
+                    continue
+                try:
+                    df = pd.read_parquet(path)
+                except Exception:
+                    continue
+                if df.empty or "symbol" not in df.columns:
+                    continue
+                sub = df[df["symbol"] == symbol]
+                if not sub.empty:
+                    frames.append(sub)
+        except Exception:
+            pass
+        if frames:
+            out = pd.concat(frames, ignore_index=True)
+            return out
+
+    logger.debug(f"No curated history found for {symbol}")
     return None
 
 
@@ -225,4 +264,3 @@ if __name__ == "__main__":  # Simple smoke test (paths must exist)
 
     out = compute_equity_features(args.asof, args.symbols)
     print(out.head().to_string(index=False))
-
