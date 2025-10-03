@@ -4,6 +4,8 @@
 .env
 .env.local
 .env.*.local
+.env.bak
+.env.s3
 *.key
 *.pem
 .minio_root.env
