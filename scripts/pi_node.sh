@@ -23,6 +23,9 @@ cd "$REPO_DIR"
 # Per-repo temp dir for safe, atomic edits (avoids sed* litter)
 TMP_DIR="$REPO_DIR/.tmp"
 mkdir -p "$TMP_DIR" 2>/dev/null || true
+# PID directory for background workers
+PID_DIR="${PID_DIR:-$REPO_DIR/run}"
+mkdir -p "$PID_DIR" 2>/dev/null || true
 # Cleanup temp dir on exit/interrupt
 cleanup_tmp() { rm -rf "$TMP_DIR" 2>/dev/null || true; }
 trap cleanup_tmp EXIT INT TERM
@@ -401,6 +404,65 @@ run_loop() {
   python scripts/node.py --interval "${RUN_INTERVAL_SECONDS:-900}"
 }
 
+# ---------- Worker lifecycle helpers ----------
+
+pid_file_for() {
+  local vendor="$1"
+  echo "$PID_DIR/${vendor}.pid"
+}
+
+is_pid_running() {
+  local pid="$1"
+  if [[ -z "$pid" ]]; then return 1; fi
+  if kill -0 "$pid" >/dev/null 2>&1; then return 0; fi
+  if command -v ps >/dev/null 2>&1 && ps -p "$pid" >/dev/null 2>&1; then return 0; fi
+  return 1
+}
+
+stop_vendor() {
+  local vendor="$1"
+  local pf; pf=$(pid_file_for "$vendor")
+  if [[ ! -f "$pf" ]]; then
+    return 0
+  fi
+  local pid; pid=$(cat "$pf" 2>/dev/null || true)
+  if [[ -z "$pid" ]]; then
+    rm -f "$pf" 2>/dev/null || true
+    return 0
+  fi
+  if is_pid_running "$pid"; then
+    echo "Stopping $vendor (pid $pid)..."
+    kill -TERM "$pid" 2>/dev/null || true
+    # wait up to 20s for graceful shutdown
+    local i
+    for i in $(seq 1 20); do
+      if ! is_pid_running "$pid"; then break; fi
+      sleep 1
+    done
+    if is_pid_running "$pid"; then
+      echo "$vendor did not exit in time; force killing..."
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$pf" 2>/dev/null || true
+}
+
+stop_all_vendors() {
+  # Stop known vendors first
+  local vendors=(polygon alpaca finnhub fred)
+  local v
+  for v in "${vendors[@]}"; do
+    stop_vendor "$v"
+  done
+  # Clean up any stray pid files
+  if compgen -G "$PID_DIR/*.pid" >/dev/null; then
+    for pf in "$PID_DIR"/*.pid; do
+      local base; base=$(basename "$pf" .pid)
+      stop_vendor "$base"
+    done
+  fi
+}
+
 wait_for_minio() {
   local url=${1:-http://127.0.0.1:9000/minio/health/live}
   local attempts=${2:-30}
@@ -444,6 +506,8 @@ case "$cmd" in
     
     start_vendor() {
       vendor="$1"; conc="$2"; rpm="$3"; budget="$4"
+      # Stop existing vendor if running
+      stop_vendor "$vendor" || true
       # Export vendor-specific env for this process only
       echo "Launching $vendor worker (conc=$conc rpm=$rpm budget=$budget)"
       nohup env \
@@ -453,7 +517,9 @@ case "$cmd" in
         BUDGET="$budget" \
         python -m trademl.workers.vendor_worker \
           >> "$log_dir/${vendor}.log" 2>&1 &
-      echo "$vendor started (pid $!)"
+      pid=$!
+      echo "$vendor started (pid $pid)"
+      echo "$pid" > "$(pid_file_for "$vendor")"
     }
 
     # Example defaults; tune via editing below or exporting env before calling
@@ -463,9 +529,28 @@ case "$cmd" in
     start_vendor fred    2 60  0
     echo "✓ Workers launched. Tail logs in $log_dir/*.log"
     ;;
+  down)
+    echo "Stopping vendor workers..."
+    stop_all_vendors
+    echo "✓ All workers stopped"
+    ;;
+  status)
+    echo "Vendor worker status:"
+    for pf in "$PID_DIR"/*.pid; do
+      [[ -e "$pf" ]] || continue
+      v=$(basename "$pf" .pid)
+      pid=$(cat "$pf" 2>/dev/null || true)
+      if is_pid_running "$pid"; then
+        echo "- $v: running (pid $pid)"
+      else
+        echo "- $v: not running (stale pid $pid); cleaning up"
+        rm -f "$pf" 2>/dev/null || true
+      fi
+    done
+    ;;
   *)
     echo "Unknown command: $cmd" >&2
-    echo "Usage: bash scripts/pi_node.sh [install|selfcheck|up]" >&2
+    echo "Usage: bash scripts/pi_node.sh [install|selfcheck|up|down|status]" >&2
     exit 2
     ;;
 esac

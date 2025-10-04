@@ -184,11 +184,15 @@ class VendorRunner:
         active_started: Dict[object, float] = {}
         last_heartbeat = time.time()
 
-        try:
+        def _try_schedule(max_slots: int) -> bool:
+            """Attempt to schedule up to max_slots units; return True if any submitted."""
+            if max_slots <= 0:
+                return False
+            progressed_local = False
             import random
-            while len(active) < cap and not self._shutdown and not self.edge.shutdown_requested:
-                progressed = False
-                for _ in range(len(producers)):
+            for _ in range(max_slots):
+                scheduled = False
+                for __ in range(len(producers)):
                     idx = next(rr)
                     it = producers[idx]
                     try:
@@ -203,21 +207,37 @@ class VendorRunner:
                         active[fut] = unit
                         active_started[fut] = time.time()
                         self._stats.submitted += 1
-                        progressed = True
+                        progressed_local = True
+                        scheduled = True
                         time.sleep(random.uniform(0.03, 0.12))
-                        if len(active) >= cap:
-                            break
-                if not progressed:
+                        break
+                if not scheduled:
                     break
+            return progressed_local
 
-            # If no work was scheduled at all, release lease and exit to avoid holding it idly
-            if not active:
+        try:
+            # Initial seeding
+            progressed = _try_schedule(cap - len(active))
+            if not progressed and not active:
+                # If frozen, wait out the freeze window instead of exiting immediately
+                now = time.time()
+                if self._freeze_until and now < self._freeze_until:
+                    sleep_for = min(5.0, self._freeze_until - now)
+                    time.sleep(max(0.5, sleep_for))
+                    progressed = _try_schedule(cap - len(active))
+            if not progressed and not active:
                 logger.info(f"{self.vendor}: no units scheduled; releasing lease")
                 self._release_lease_now()
                 return
 
-            while active and not self._shutdown and not self.edge.shutdown_requested:
-                done_set, _ = wait(list(active.keys()), timeout=2.0, return_when=FIRST_COMPLETED)
+            # Main loop: stay alive across cooldowns; only exit when no work and not frozen
+            while not self._shutdown and not self.edge.shutdown_requested:
+                # Harvest completions if any inflight
+                if active:
+                    done_set, _ = wait(list(active.keys()), timeout=2.0, return_when=FIRST_COMPLETED)
+                else:
+                    done_set = set()
+
                 if not done_set:
                     now = time.time()
                     if now - last_heartbeat >= 30:
@@ -243,28 +263,20 @@ class VendorRunner:
                                 status, rows, msg = ("ok", 0, "")
                         self._handle_result(unit, status, rows, msg)
 
-                if not (self._shutdown or self.edge.shutdown_requested):
-                    for _ in range(max(0, cap - len(active))):
-                        scheduled = False
-                        for __ in range(len(producers)):
-                            idx = next(rr)
-                            it = producers[idx]
-                            try:
-                                unit2 = next(it)
-                            except StopIteration:
-                                producers[idx] = iter(())
-                                continue
-                            tokens2 = int(unit2.get("tokens", 1))
-                            if self._can_submit(tokens2):
-                                logger.info(f"{self.vendor}: submitting unit desc='{unit2.get('desc')}' tokens={tokens2}")
-                                f2 = self._executor.submit(unit2["run"])
-                                active[f2] = unit2
-                                active_started[f2] = time.time()
-                                self._stats.submitted += 1
-                                scheduled = True
-                                break
-                        if not scheduled:
-                            break
+                # Try to keep the pipeline full
+                progressed = _try_schedule(max(0, cap - len(active)))
+
+                # If nothing to do and nothing inflight, decide to wait vs exit
+                if not progressed and not active:
+                    now = time.time()
+                    if self._freeze_until and now < self._freeze_until:
+                        # Still in cooldown; wait a bit then continue
+                        sleep_for = min(5.0, self._freeze_until - now)
+                        time.sleep(max(0.5, sleep_for))
+                        continue
+                    # No freeze and no progress: likely out of units/budget
+                    logger.info(f"{self.vendor}: idle with no schedulable units; exiting runner")
+                    break
 
             logger.info(f"{self.vendor}: runner complete. submitted={self._stats.submitted} ok={self._stats.completed_ok}")
 
