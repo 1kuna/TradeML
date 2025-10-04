@@ -235,6 +235,11 @@ class AlpacaConnector(BaseConnector):
         for i in range(0, len(symbols), BATCH_SIZE):
             batch = symbols[i:i + BATCH_SIZE]
             logger.debug(f"Fetching batch {i // BATCH_SIZE + 1} ({len(batch)} symbols)")
+            # Respect per-connector pacing for Alpaca SDK calls
+            try:
+                self._rate_limit()
+            except Exception:
+                pass
 
             raw_data = self._fetch_raw(
                 symbols=batch,
@@ -288,6 +293,11 @@ class AlpacaConnector(BaseConnector):
             end=datetime.combine(end_date, datetime.max.time()),
         )
         try:
+            # Respect per-connector pacing for Alpaca SDK calls
+            try:
+                self._rate_limit()
+            except Exception:
+                pass
             bars = self.opt_client.get_option_bars(req)
         except Exception as e:
             raise ConnectorError(f"Alpaca options bars failed: {e}")
@@ -337,6 +347,11 @@ class AlpacaConnector(BaseConnector):
             end=datetime.combine(end_date, datetime.max.time()),
         )
         try:
+            # Respect per-connector pacing for Alpaca SDK calls
+            try:
+                self._rate_limit()
+            except Exception:
+                pass
             trades = self.opt_client.get_option_trades(req)
         except Exception as e:
             raise ConnectorError(f"Alpaca options trades failed: {e}")
@@ -376,6 +391,11 @@ class AlpacaConnector(BaseConnector):
             feed_param = None
         try:
             req = OptionChainRequest(underlying_symbol=underlying_symbol, feed=feed_param)
+            # Respect per-connector pacing for Alpaca SDK calls
+            try:
+                self._rate_limit()
+            except Exception:
+                pass
             snapshots = self.opt_client.get_option_chain(req)
         except Exception as e:
             raise ConnectorError(f"Alpaca option chain failed: {e}")
@@ -402,6 +422,11 @@ class AlpacaConnector(BaseConnector):
             feed_param = None
         try:
             req = OptionChainRequest(underlying_symbol=underlying_symbol, feed=feed_param)
+            # Respect per-connector pacing for Alpaca SDK calls
+            try:
+                self._rate_limit()
+            except Exception:
+                pass
             snapshots = self.opt_client.get_option_chain(req)
         except Exception as e:
             raise ConnectorError(f"Alpaca option chain failed: {e}")
@@ -466,6 +491,11 @@ class AlpacaConnector(BaseConnector):
             # types=None (all)
         )
         try:
+            # Respect per-connector pacing for Alpaca SDK calls
+            try:
+                self._rate_limit()
+            except Exception:
+                pass
             ca = self.ca_client.get_corporate_actions(req)
         except Exception as e:
             raise ConnectorError(f"Alpaca corporate actions failed: {e}")

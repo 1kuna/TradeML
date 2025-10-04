@@ -231,9 +231,35 @@ class EdgeCollector:
         logger.debug(f"Updated manifest: {manifest_key}")
 
     def _upload_parquet_key(self, df: pd.DataFrame, key: str, async_write: bool = False):
+        """Upload a DataFrame to S3 under an explicit key.
+
+        Returns a Future if async_write and an S3Writer is available; otherwise
+        performs a blocking upload and returns None.
+        """
         if not self.s3:
             # Not used for local; call site should handle local path
             return None
+        if self.s3_writer and async_write:
+            return self.s3_writer.submit_df_parquet(key, df)
+        if self.s3_writer and not async_write:
+            fut = self.s3_writer.submit_df_parquet(key, df)
+            fut.result()
+            return None
+        # Fallback: synchronous upload without S3Writer
+        import io
+        buffer = io.BytesIO()
+        df.to_parquet(buffer, index=False)
+        data = buffer.getvalue()
+        temp_key = f"{key}.tmp"
+        self.s3.put_object(temp_key, data)
+        if self.s3.object_exists(key):
+            logger.debug(f"Object already exists, skipping: {key}")
+            self.s3.delete_object(temp_key)
+            return None
+        self.s3.put_object(key, data)
+        self.s3.delete_object(temp_key)
+        logger.info(f"Uploaded to S3: {key} ({len(df)} rows, {len(data)} bytes)")
+        return None
 
     def _wait_future_with_logs(self, fut, desc: str, check_seconds: int = 30):
         """Wait on a Future with periodic progress logs to surface stalls."""
@@ -251,27 +277,6 @@ class EdgeCollector:
         except Exception:
             # Fall back to blocking wait if anything goes wrong with timed waits
             return fut.result()
-        if self.s3_writer and async_write:
-            return self.s3_writer.submit_df_parquet(key, df)
-        else:
-            fut = self.s3_writer.submit_df_parquet(key, df) if self.s3_writer else None
-            if fut is not None:
-                fut.result()
-                return None
-            import io
-            buffer = io.BytesIO()
-            df.to_parquet(buffer, index=False)
-            data = buffer.getvalue()
-            temp_key = f"{key}.tmp"
-            self.s3.put_object(temp_key, data)
-            if self.s3.object_exists(key):
-                logger.debug(f"Object already exists, skipping: {key}")
-                self.s3.delete_object(temp_key)
-                return None
-            self.s3.put_object(key, data)
-            self.s3.delete_object(temp_key)
-            logger.info(f"Uploaded to S3: {key} ({len(df)} rows, {len(data)} bytes)")
-            return None
 
     def _alpaca_fetch_day_parallel(self, connector: AlpacaConnector, symbols: List[str], day_str: str, inflight_override: Optional[int] = None, timeframe: str = "1Day") -> pd.DataFrame:
         """Fetch a single day of bars (timeframe configurable) in parallel by symbol chunks; return combined DataFrame."""

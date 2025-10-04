@@ -133,8 +133,27 @@ def main():
         logger.info(f"No tasks configured for vendor {vendor}; exiting")
         return
 
-    # Budget override if provided (0/None => unlimited/no override)
+    # Budget: use repo-configured budgets by default; allow override via --budget
+    try:
+        default_budget = edge._init_budget()
+    except Exception:
+        default_budget = None
     budget_mgr = _build_budget(vendor, args.budget)
+    if budget_mgr is None:
+        budget_mgr = default_budget
+    else:
+        # If overriding, try to persist vendor-specific cap into the shared budget
+        try:
+            if default_budget and vendor in default_budget.state:
+                vb = default_budget.state[vendor]
+                # Clamp remaining to new limit to avoid bursts beyond override
+                vb.limit = int(args.budget)
+                vb.remaining = min(vb.remaining, vb.limit)
+                default_budget.state[vendor] = vb
+                default_budget._persist()
+                budget_mgr = default_budget
+        except Exception as e:
+            logger.warning(f"Could not persist budget override for {vendor}: {e}")
 
     # Wire up and run a single vendor runner
     from scripts.scheduler.per_vendor import VendorRunner
@@ -176,4 +195,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
