@@ -521,6 +521,17 @@ class EdgeCollector:
             # Resume window
             last_ts = self.bookmarks.get_last_timestamp("alpaca", "equities_bars") if self.bookmarks else None
             start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=30))
+            # If only 'today' is in range and it's gated, optionally fall back to yesterday once
+            try:
+                if start_date == today and not self._should_fetch_eod_for_day("alpaca", today):
+                    prev = today - timedelta(days=1)
+                    # Avoid redundant fallback if we've already processed yesterday
+                    if (not last_ts) or (datetime.fromisoformat(last_ts).date() < prev):
+                        start_date = prev
+                    else:
+                        return  # no units when only gated today remains and yesterday already processed
+            except Exception:
+                pass
             d = start_date
             while d <= today and not self.shutdown_requested:
                 # Gate 'today' until cutoff
@@ -546,6 +557,15 @@ class EdgeCollector:
                 return
             last_ts = self.bookmarks.get_last_timestamp("polygon", "equities_bars") if self.bookmarks else None
             start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=7))
+            try:
+                if start_date == today and not self._should_fetch_eod_for_day("polygon", today):
+                    prev = today - timedelta(days=1)
+                    if (not last_ts) or (datetime.fromisoformat(last_ts).date() < prev):
+                        start_date = prev
+                    else:
+                        return
+            except Exception:
+                pass
             BATCH = max(1, int(os.getenv("NODE_POLYGON_SYMBOLS_PER_UNIT", "10")))
             d = start_date
             while d <= today and not self.shutdown_requested:
@@ -635,8 +655,8 @@ class EdgeCollector:
             submitted = 0
 
             def vendor_cap(vendor: str) -> int:
-                # Default per-vendor inflight: conservative (1), Alpaca allows override
-                default_caps = {"alpaca": 1, "polygon": 1, "finnhub": 1, "fred": 1}
+                # Increase default per-vendor inflight to utilize workers when available
+                default_caps = {"alpaca": 2, "polygon": 2, "finnhub": 2, "fred": 2}
                 return max(1, max_inflight_for(vendor, default=default_caps.get(vendor, 1)))
 
             def can_run(vendor: str, tokens: int) -> bool:

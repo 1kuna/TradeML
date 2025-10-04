@@ -21,7 +21,7 @@ policy:
 
 targets:
   equities_eod:    { earliest: '2000-01-01', chunk_days: 30, expect_rows: 1 }
-  equities_minute: { earliest: '2010-01-01', chunk_days: 5,  expect_rows: 390 }
+  equities_minute: { earliest: '2010-01-01', chunk_days: 1,  expect_rows: 390, top_n: 1000 }
   options_chains:  { earliest: '2015-01-01', chunk_days: 1,  expect_contracts_min: 50 }
   macro_treasury:  { earliest: '2000-01-01', chunk_days: 365, expect_rows: 5 }
   macro_vintages:  { series: ['DGS10','CPIAUCSL'] }

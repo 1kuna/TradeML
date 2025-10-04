@@ -353,6 +353,12 @@ ensure_env() {
 
   # Cleanup pre-merge backup if still present (successful merge)
   rm -f .env.premerge 2>/dev/null || true
+
+  # Concurrency defaults (increase workers and vendor inflight caps)
+  set_env_kv ".env" "NODE_WORKERS" "${NODE_WORKERS:-6}" "always"
+  set_env_kv ".env" "NODE_MAX_INFLIGHT_POLYGON" "${NODE_MAX_INFLIGHT_POLYGON:-2}" "always"
+  set_env_kv ".env" "NODE_MAX_INFLIGHT_FINNHUB" "${NODE_MAX_INFLIGHT_FINNHUB:-2}" "always"
+  set_env_kv ".env" "NODE_MAX_INFLIGHT_FRED" "${NODE_MAX_INFLIGHT_FRED:-2}" "always"
 }
 
 ensure_python() {
