@@ -446,7 +446,7 @@ case "$cmd" in
       vendor="$1"; conc="$2"; rpm="$3"; budget="$4"
       # Export vendor-specific env for this process only
       echo "Launching $vendor worker (conc=$conc rpm=$rpm budget=$budget)"
-      nohup \
+      nohup env \
         VENDOR="$vendor" \
         CONCURRENCY="$conc" \
         RPM_LIMIT="$rpm" \
