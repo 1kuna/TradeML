@@ -65,19 +65,86 @@ def merge_env(template_lines: List[Line], env_lines: List[Line]) -> str:
     tmpl_map = to_map(template_lines)
     out_lines: List[str] = []
 
+    # Keys we never want to alter/relocate if present in current .env
+    protected_re = re.compile(r"(.*(_API_KEY|_SECRET_KEY)$)|^(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY)$")
+
     # Rebuild using template order and comments
     for kind, a, b in template_lines:
         if kind == "comment":
             out_lines.append(a)
         elif kind == "kv":
             key = a
-            if key in env_map:
+            if key in env_map and protected_re.match(key):
+                # Preserve current value for protected keys
+                out_lines.append(f"{key}={env_map[key]}")
+            elif key in env_map:
                 out_lines.append(f"{key}={env_map[key]}")
             else:
                 out_lines.append(f"{key}={b if b is not None else ''}")
 
-    # Append custom-only keys from current .env
-    extra_keys = [k for k in keys_in_order(env_lines) if k not in tmpl_map]
+    # Append custom-only keys from current .env (deduplicated, keep last value)
+    extra_keys_raw = [k for k in keys_in_order(env_lines) if k not in tmpl_map]
+    seen: Dict[str, bool] = {}
+    extra_keys: List[str] = []
+    # Deduplicate preserving the last occurrence
+    for k in reversed(extra_keys_raw):
+        if k not in seen:
+            seen[k] = True
+            extra_keys.insert(0, k)
+
+    # Pin vendor keys into main body even if template doesn't declare them
+    pinned_keys = [
+        "ALPACA_API_KEY",
+        "ALPACA_SECRET_KEY",
+        "POLYGON_API_KEY",
+        "FRED_API_KEY",
+        "FINNHUB_API_KEY",
+        "FMP_API_KEY",
+    ]
+
+    # Determine which keys are already present as KV in out_lines
+    present_kv: Dict[str, int] = {}
+    for idx, line in enumerate(out_lines):
+        if not isinstance(line, str):
+            continue
+        m = ASSIGN_RE.match(line)
+        if m:
+            present_kv[m.group(1)] = idx
+
+    # Insert pinned keys not already present
+    for key in pinned_keys:
+        if key not in env_map:
+            continue
+        if key in present_kv:
+            # Ensure not duplicated in extras
+            if key in extra_keys:
+                extra_keys = [k for k in extra_keys if k != key]
+            continue
+        # Try to insert after a comment mentioning the key
+        inserted = False
+        for i, line in enumerate(out_lines):
+            if isinstance(line, str) and line.strip().startswith('#') and key in line:
+                out_lines.insert(i + 1, f"{key}={env_map[key]}")
+                present_kv[key] = i + 1
+                inserted = True
+                break
+        if not inserted:
+            # Insert after a Data API Keys header if available
+            anchor = None
+            for i, line in enumerate(out_lines):
+                if isinstance(line, str) and 'Data API Keys' in line:
+                    anchor = i
+                    break
+            if anchor is not None:
+                out_lines.insert(anchor + 1, f"{key}={env_map[key]}")
+                present_kv[key] = anchor + 1
+            else:
+                # Fallback to appending near the end (before custom block)
+                out_lines.append(f"{key}={env_map[key]}")
+                present_kv[key] = len(out_lines) - 1
+        # Remove from extras to avoid duplication
+        if key in extra_keys:
+            extra_keys = [k for k in extra_keys if k != key]
     if extra_keys:
         out_lines.append("")
         out_lines.append("# ===== Custom entries preserved from previous .env =====")
