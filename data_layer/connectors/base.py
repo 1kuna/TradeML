@@ -120,8 +120,10 @@ class BaseConnector(ABC):
         self._rate_limit()
 
         import time, random
+        logger.debug(f"HTTP GET begin: {url} params={params}")
         try:
             response = self.session.get(url, params=params, headers=headers, timeout=30)
+            logger.debug(f"HTTP GET status: {response.status_code} for {url}")
             if response.status_code == 429:
                 # Respect Retry-After if provided; otherwise exponential backoff with jitter
                 retry_after = response.headers.get("Retry-After")
@@ -136,6 +138,7 @@ class BaseConnector(ABC):
                 time.sleep(sleep_s)
                 # One more attempt (let session retry strategy handle further if needed)
                 response = self.session.get(url, params=params, headers=headers, timeout=30)
+                logger.debug(f"HTTP GET retry status: {response.status_code} for {url}")
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:

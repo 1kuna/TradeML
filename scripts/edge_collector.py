@@ -234,6 +234,23 @@ class EdgeCollector:
         if not self.s3:
             # Not used for local; call site should handle local path
             return None
+
+    def _wait_future_with_logs(self, fut, desc: str, check_seconds: int = 30):
+        """Wait on a Future with periodic progress logs to surface stalls."""
+        try:
+            import time as _time
+            import concurrent.futures as _fut
+            waited = 0
+            while not self.shutdown_requested:
+                try:
+                    return fut.result(timeout=check_seconds)
+                except _fut.TimeoutError:
+                    waited += check_seconds
+                    logger.warning(f"Waiting on async task: {desc} (waited {waited}s)")
+                    continue
+        except Exception:
+            # Fall back to blocking wait if anything goes wrong with timed waits
+            return fut.result()
         if self.s3_writer and async_write:
             return self.s3_writer.submit_df_parquet(key, df)
         else:
@@ -495,21 +512,27 @@ class EdgeCollector:
 
         # Acquire leases per task upfront; start renew threads
         renew_threads: dict[str, threading.Thread] = {}
-        for t in list(tasks):
+        # Work on a copy to safely mutate the list
+        tasks = list(tasks)
+        acquired: List[str] = []
+        for t in tasks:
             if not self._acquire_task_lease(t):
                 logger.warning(f"Lease held for task {t}; skipping")
-                tasks = [x for x in tasks if x != t]
-        
-            if self.lease_mgr:
-                renew_every = int(self.config.get("locks", {}).get("renew_seconds", 45))
-                for t in tasks:
-                    th = threading.Thread(
-                        target=self._renew_lease_loop,
-                        args=(self._lease_name_for_task(t), renew_every),
-                        daemon=True,
-                    )
-                    th.start()
-                    renew_threads[t] = th
+                continue
+            acquired.append(t)
+        tasks = acquired
+
+        # Start exactly one renew thread per acquired task
+        if self.lease_mgr and tasks:
+            renew_every = int(self.config.get("locks", {}).get("renew_seconds", 45))
+            for t in tasks:
+                th = threading.Thread(
+                    target=self._renew_lease_loop,
+                    args=(self._lease_name_for_task(t), renew_every),
+                    daemon=True,
+                )
+                th.start()
+                renew_threads[t] = th
 
             # Build unit producers
             symbols = self._symbols_universe()
@@ -651,6 +674,7 @@ class EdgeCollector:
             vendor_freeze: dict[str, float] = {}  # vendor -> until_ts
             vendor_inflight: dict[str, int] = {}
             active: dict = {}
+            active_started: dict = {}  # fut -> (start_ts, unit_desc, vendor)
             results_ok = 0
             submitted = 0
 
@@ -693,8 +717,14 @@ class EdgeCollector:
                         continue
                     v = unit["vendor"]
                     if can_run(v, unit.get("tokens", 1)):
+                        logger.debug(f"Submitting unit: vendor={unit.get('vendor')} desc={unit.get('desc')} tokens={unit.get('tokens',1)}")
                         fut = ex.submit(unit["run"])
                         active[fut] = (t, unit)
+                        try:
+                            import time as _time
+                            active_started[fut] = (_time.time(), unit.get('desc'), unit.get('vendor'))
+                        except Exception:
+                            pass
                         vendor_inflight[v] = vendor_inflight.get(v, 0) + 1
                         submitted += 1
                         progressed = True
@@ -727,21 +757,46 @@ class EdgeCollector:
                     break
 
             from concurrent.futures import wait, FIRST_COMPLETED
-            max_wait = int(os.getenv("EDGE_SCHEDULER_WAIT_TIMEOUT_SECONDS", "60"))
+            # If set to <= 0, wait indefinitely for a unit to finish
+            try:
+                max_wait_val = int(os.getenv("EDGE_SCHEDULER_WAIT_TIMEOUT_SECONDS", "60"))
+            except Exception:
+                max_wait_val = 60
+            max_wait = None if max_wait_val <= 0 else max_wait_val
+            break_on_timeout = os.getenv("EDGE_SCHEDULER_BREAK_ON_TIMEOUT", "true").lower() in ("1","true","yes","on")
 
             while active and not self.shutdown_requested:
                     # As futures complete, schedule replacements (with timeout to avoid deadlock)
                     try:
                         done_set, _ = wait(list(active.keys()), timeout=max_wait, return_when=FIRST_COMPLETED)
                         if not done_set:
-                            logger.warning(f"No unit finished within {max_wait}s; breaking scheduler loop (active={len(active)})")
-                            break
+                            # Continue waiting or break (configurable), but always log what is running
+                            if isinstance(max_wait, (int, float)):
+                                try:
+                                    import time as _time
+                                    now_ts = _time.time()
+                                    durations = []
+                                    for fut, (st, desc, vend) in list(active_started.items()):
+                                        durations.append(f"{vend}:{desc}={int(now_ts-st)}s")
+                                    logger.warning(
+                                        f"No unit finished within {max_wait}s; running: {', '.join(durations)} (active={len(active)})"
+                                    )
+                                except Exception:
+                                    logger.warning(f"No unit finished within {max_wait}s; (active={len(active)})")
+                            if break_on_timeout:
+                                break
+                            else:
+                                continue
                         done = next(iter(done_set))
                     except Exception:
                         logger.warning("Scheduler wait failed; breaking loop")
                         break
 
                     t, unit = active.pop(done)
+                    try:
+                        active_started.pop(done, None)
+                    except Exception:
+                        pass
                     v = unit["vendor"]
                     status, rows, msg = ("error", 0, "")
                     try:
@@ -811,8 +866,14 @@ class EdgeCollector:
                                 continue
                             v3 = nxt["vendor"]
                             if can_run(v3, nxt.get("tokens", 1)):
+                                logger.debug(f"Submitting unit: vendor={nxt.get('vendor')} desc={nxt.get('desc')} tokens={nxt.get('tokens',1)}")
                                 fut = ex.submit(nxt["run"])
                                 active[fut] = (tn, nxt)
+                                try:
+                                    import time as _time
+                                    active_started[fut] = (_time.time(), nxt.get('desc'), nxt.get('vendor'))
+                                except Exception:
+                                    pass
                                 vendor_inflight[v3] = vendor_inflight.get(v3, 0) + 1
                                 submitted += 1
                                 break
@@ -844,6 +905,7 @@ class EdgeCollector:
         connector = self.connectors.get("alpaca")
         if not connector:
             return ("empty", 0, "no connector")
+        logger.debug(f"_run_alpaca_day start: {day} symbols={len(symbols)}")
         df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1)
         if df.empty:
             return ("empty", 0, "no data")
@@ -851,7 +913,7 @@ class EdgeCollector:
         try:
             # Ensure persisted before manifest/bookmark
             if fut is not None:
-                fut.result()
+                self._wait_future_with_logs(fut, desc=f"alpaca {day} parquet upload")
         except Exception as e:
             return ("error", 0, str(e))
         self._write_manifest("alpaca", "equities_bars", day.isoformat(), len(df))
@@ -868,6 +930,7 @@ class EdgeCollector:
         if not conn:
             return ("empty", 0, "no connector")
         rows = []
+        logger.debug(f"_run_polygon_day start: {day} symbols={len(symbols)}")
         for sym in symbols:
             if sym in self._vendor_bad_symbols.get("polygon", set()):
                 continue
@@ -937,7 +1000,7 @@ class EdgeCollector:
             fut = self._upload_parquet_key(df, key, async_write=True)
             try:
                 if fut is not None:
-                    fut.result()
+                    self._wait_future_with_logs(fut, desc=f"finnhub options {symbol} {day} parquet upload")
             except Exception as e:
                 return ("error", 0, str(e))
         else:
@@ -971,7 +1034,7 @@ class EdgeCollector:
             fut = self._upload_parquet_key(df, key, async_write=True)
             try:
                 if fut is not None:
-                    fut.result()
+                    self._wait_future_with_logs(fut, desc=f"fred treasury {day} parquet upload")
             except Exception as e:
                 return ("error", 0, str(e))
         else:

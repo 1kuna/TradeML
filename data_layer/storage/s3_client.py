@@ -63,10 +63,29 @@ class S3Client:
         except Exception as e:  # pragma: no cover
             raise RuntimeError("boto3 is required for S3 backend. Install boto3 or set STORAGE_BACKEND=local") from e
 
-        # Configure boto3 for MinIO compatibility
+        # Configure boto3: path-style (MinIO), explicit timeouts, bounded retries
         cfg = None
         if Config is not None:
-            cfg = Config(signature_version='s3v4', s3={'addressing_style': 'path' if force_path_style else 'virtual'})
+            # Environment overrides with safe defaults
+            def _int_env(name: str, default: int) -> int:
+                try:
+                    return int(os.getenv(name, str(default)))
+                except Exception:
+                    return default
+
+            connect_timeout = _int_env("S3_CONNECT_TIMEOUT", 3)
+            read_timeout = _int_env("S3_READ_TIMEOUT", 30)
+            max_attempts = _int_env("S3_MAX_ATTEMPTS", 4)
+            max_pool = _int_env("S3_MAX_POOL_CONNECTIONS", 10)
+
+            cfg = Config(
+                signature_version='s3v4',
+                s3={'addressing_style': 'path' if force_path_style else 'virtual'},
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                retries={'max_attempts': max_attempts, 'mode': 'standard'},
+                max_pool_connections=max_pool,
+            )
 
         self.s3 = boto3.client(
             's3',
@@ -121,6 +140,7 @@ class S3Client:
             kwargs['Metadata'] = metadata
 
         try:
+            logger.debug(f"Begin put_object: s3://{bucket}/{key} (bytes={len(data)})")
             response = self.s3.put_object(**kwargs)
             etag = response['ETag'].strip('"')
             logger.debug(f"Put object: s3://{bucket}/{key} (ETag: {etag})")
@@ -158,6 +178,7 @@ class S3Client:
             kwargs['IfMatch'] = if_match
 
         try:
+            logger.debug(f"Begin get_object: s3://{bucket}/{key}")
             response = self.s3.get_object(**kwargs)
             data = response['Body'].read()
             etag = response['ETag'].strip('"')
@@ -194,6 +215,7 @@ class S3Client:
 
         objects = []
         try:
+            logger.debug(f"Begin list_objects: s3://{bucket}/{prefix}")
             paginator = self.s3.get_paginator('list_objects_v2')
             for page in paginator.paginate(**kwargs):
                 if 'Contents' in page:
@@ -215,6 +237,7 @@ class S3Client:
         """Delete object from S3."""
         bucket = bucket or self.bucket
         try:
+            logger.debug(f"Begin delete_object: s3://{bucket}/{key}")
             self.s3.delete_object(Bucket=bucket, Key=key)
             logger.debug(f"Deleted object: s3://{bucket}/{key}")
         except ClientError as e:
@@ -230,6 +253,7 @@ class S3Client:
         """
         bucket = bucket or self.bucket
         try:
+            logger.debug(f"Begin head_object: s3://{bucket}/{key}")
             response = self.s3.head_object(Bucket=bucket, Key=key)
             return {
                 'ETag': response['ETag'].strip('"'),

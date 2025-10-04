@@ -85,19 +85,26 @@ class S3Writer:
         key = task.key
         df = task.df
         # Convert to parquet bytes
+        try:
+            logger.debug(f"S3Writer: begin serialize parquet {key} rows={len(df)}")
+        except Exception:
+            logger.debug(f"S3Writer: begin serialize parquet {key}")
         buffer = io.BytesIO()
         df.to_parquet(buffer, index=False)
         data = buffer.getvalue()
         # Upload with temp key pattern, idempotent if final exists
         temp_key = f"{key}.tmp"
+        logger.debug(f"S3Writer: begin put tmp {temp_key} ({len(data)} bytes)")
         self.s3.put_object(temp_key, data)
         if self.s3.object_exists(key):
             # Already present; clean up temp and exit
+            logger.debug(f"S3Writer: final exists, begin delete tmp {temp_key}")
             self.s3.delete_object(temp_key)
             logger.debug(f"S3Writer: final exists, skipped write {key}")
             return
         # Promote temp to final (copy+delete simulated by second put)
+        logger.debug(f"S3Writer: begin promote final {key}")
         self.s3.put_object(key, data)
+        logger.debug(f"S3Writer: begin delete tmp {temp_key}")
         self.s3.delete_object(temp_key)
         logger.info(f"S3Writer: wrote {key} ({len(data)} bytes)")
-

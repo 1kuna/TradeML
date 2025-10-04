@@ -114,8 +114,15 @@ class AlpacaConnector(BaseConnector):
         )
 
         try:
-            # Fetch bars
+            # Fetch bars with timing logs to diagnose stalls in Alpaca SDK
+            from time import time as _now
+            t0 = _now()
+            logger.debug(
+                f"Alpaca get_stock_bars begin: tf={timeframe} symbols={len(symbols)} start={start_date} end={end_date}"
+            )
             bars = self.client.get_stock_bars(request)
+            dt = _now() - t0
+            logger.debug(f"Alpaca get_stock_bars done in {dt:.2f}s: tf={timeframe}")
             return bars.dict()  # Convert to dict for processing
         except Exception as e:
             logger.error(f"Alpaca API error: {e}")
