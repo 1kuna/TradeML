@@ -950,7 +950,8 @@ def main():
     )
     args = parser.parse_args()
 
-    load_dotenv()
+    # Ensure .env overrides any ambient AWS_* vars
+    load_dotenv(override=True)
     collector = EdgeCollector(args.config)
     collector.run()
 

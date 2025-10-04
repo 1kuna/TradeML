@@ -125,7 +125,8 @@ def main():
     parser.add_argument("--curator-config", default="configs/curator.yml")
     args = parser.parse_args()
 
-    load_dotenv(dotenv_path=REPO_ROOT / ".env", override=False)
+    # Force .env to override any ambient AWS_* that might be set in the shell
+    load_dotenv(dotenv_path=REPO_ROOT / ".env", override=True)
 
     # File logger
     log_dir = REPO_ROOT / "logs"

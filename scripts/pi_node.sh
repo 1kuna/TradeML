@@ -233,12 +233,14 @@ ensure_env() {
   if [[ ! -f .env ]]; then
     cp .env.template .env
   fi
+  # Keep a pre-merge backup to allow revert if validation fails
+  cp .env .env.premerge 2>/dev/null || true
   # Sync .env with .env.template (non-destructive; preserves existing values)
   if command -v python3 >/dev/null 2>&1; then
     python3 scripts/sync_env.py --no-backup || true
   fi
   # Merge S3 snippet if present
-  if [[ -f .env.s3 ]]; then
+  if [[ -f .env.s3 ]] && [[ "${S3_ENV_MERGE_MODE:-if-empty}" == "legacy" ]]; then
     # Replace or append keys
     while IFS='=' read -r k v; do
       [[ -z "$k" ]] && continue
@@ -251,9 +253,58 @@ ensure_env() {
     echo "✓ Updated .env with S3 credentials"
   fi
 
+  # Controlled S3 creds merge (never|if-empty|always), default if-empty
+  if [[ -f .env.s3 ]] && [[ "${S3_ENV_MERGE_MODE:-if-empty}" != "legacy" ]]; then
+    mode=${S3_ENV_MERGE_MODE:-if-empty}
+    sed -i 's/\r$//' .env.s3 .env 2>/dev/null || true
+    while IFS='=' read -r k v; do
+      [[ -z "$k" ]] && continue
+      if ! printf '%s' "$k" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
+        continue
+      fi
+      case "$mode" in
+        never)
+          ;;
+        if-empty|*)
+          if ! grep -q "^$k=" .env; then
+            echo "$k=$v" >> .env
+          fi
+          ;;
+        always)
+          if grep -q "^$k=" .env; then
+            sed -i.bak "s|^$k=.*|$k=$v|" .env
+          else
+            echo "$k=$v" >> .env
+          fi
+          ;;
+      esac
+    done < .env.s3
+    echo "S3 creds merge ($mode) applied"
+  fi
+
+  # Validate merged S3 creds (optional, default on)
+  if [[ "${S3_ENV_VALIDATE:-true}" == "true" ]]; then
+    # Export current .env so ensure_mc_alias uses the right values
+    set -a; source .env; set +a
+    ensure_mc_alias || true
+    if command -v mc >/dev/null 2>&1; then
+      if ! mc ls "minio/${S3_BUCKET:-}/" >/dev/null 2>&1; then
+        echo "[WARN] S3 creds validation failed; reverting .env to pre-merge"
+        if [[ -f .env.premerge ]]; then
+          mv .env.premerge .env
+        fi
+        # Re-export reverted env
+        set -a; source .env; set +a
+      fi
+    fi
+  fi
+
   # Force required toggles
   sed -i.bak "s|^STORAGE_BACKEND=.*|STORAGE_BACKEND=s3|" .env || true
   if ! grep -q "^ROLE=" .env; then echo "ROLE=edge" >> .env; fi
+
+  # Cleanup pre-merge backup if still present (successful merge)
+  rm -f .env.premerge 2>/dev/null || true
 }
 
 ensure_python() {
@@ -271,6 +322,8 @@ ensure_python() {
 
 run_loop() {
   source venv/bin/activate
+  # Avoid ambient AWS_* overriding .env inside Python
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
   python scripts/node.py --interval "${RUN_INTERVAL_SECONDS:-900}"
 }
 
