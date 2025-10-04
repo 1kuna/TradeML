@@ -653,61 +653,74 @@ class EdgeCollector:
                     return budget.try_consume(vendor, tokens)
                 return True
 
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                rr = cycle(task_order)
+            # Executor (non-blocking shutdown to avoid hangs on stuck futures)
+            ex = ThreadPoolExecutor(max_workers=max_workers)
+            rr = cycle(task_order)
 
-                # Seed up to max_workers with RR across tasks, honoring vendor caps
-                import random, time as _t
-                while len(active) < max_workers and not self.shutdown_requested:
-                    progressed = False
-                    for _ in range(len(task_order)):
-                        t = next(rr)
-                        it = producers.get(t)
-                        if not it:
-                            continue
+            # Seed up to max_workers with RR across tasks, honoring vendor caps
+            import random, time as _t
+            while len(active) < max_workers and not self.shutdown_requested:
+                progressed = False
+                for _ in range(len(task_order)):
+                    t = next(rr)
+                    it = producers.get(t)
+                    if not it:
+                        continue
+                    try:
+                        unit = next(it)
+                    except StopIteration:
+                        producers[t] = None
+                        continue
+                    v = unit["vendor"]
+                    if can_run(v, unit.get("tokens", 1)):
+                        fut = ex.submit(unit["run"])
+                        active[fut] = (t, unit)
+                        vendor_inflight[v] = vendor_inflight.get(v, 0) + 1
+                        submitted += 1
+                        progressed = True
+                        # Small jitter to de-synchronize vendor calls
+                        _t.sleep(random.uniform(0.05, 0.15))
+                        if len(active) >= max_workers:
+                            break
+                if not progressed:
+                    # Log why nothing was scheduled to aid debugging
+                    if not active:
                         try:
-                            unit = next(it)
-                        except StopIteration:
-                            producers[t] = None
-                            continue
-                        v = unit["vendor"]
-                        if can_run(v, unit.get("tokens", 1)):
-                            fut = ex.submit(unit["run"])
-                            active[fut] = (t, unit)
-                            vendor_inflight[v] = vendor_inflight.get(v, 0) + 1
-                            submitted += 1
-                            progressed = True
-                            # Small jitter to de-synchronize vendor calls
-                            _t.sleep(random.uniform(0.05, 0.15))
-                            if len(active) >= max_workers:
-                                break
-                    if not progressed:
-                        # Log why nothing was scheduled to aid debugging
-                        if not active:
-                            try:
-                                from time import time as _now
-                                caps = {
-                                    v: f"{vendor_inflight.get(v,0)}/{vendor_cap(v)}"
-                                    for v in ("alpaca", "polygon", "finnhub", "fred")
-                                }
-                                freezes = {
-                                    v: int(max(0, vendor_freeze.get(v, 0) - _now()))
-                                    for v in ("alpaca", "polygon", "finnhub", "fred")
-                                }
-                                budgets = {
-                                    v: (budget.remaining(v) if budget else None)
-                                    for v in ("alpaca", "polygon", "finnhub", "fred")
-                                }
-                                logger.warning(
-                                    f"No units scheduled: caps={caps}, freeze_s={freezes}, budget_remaining={budgets}"
-                                )
-                            except Exception:
-                                pass
+                            from time import time as _now
+                            caps = {
+                                v: f"{vendor_inflight.get(v,0)}/{vendor_cap(v)}"
+                                for v in ("alpaca", "polygon", "finnhub", "fred")
+                            }
+                            freezes = {
+                                v: int(max(0, vendor_freeze.get(v, 0) - _now()))
+                                for v in ("alpaca", "polygon", "finnhub", "fred")
+                            }
+                            budgets = {
+                                v: (budget.remaining(v) if budget else None)
+                                for v in ("alpaca", "polygon", "finnhub", "fred")
+                            }
+                            logger.warning(
+                                f"No units scheduled: caps={caps}, freeze_s={freezes}, budget_remaining={budgets}"
+                            )
+                        except Exception:
+                            pass
+                    break
+
+            from concurrent.futures import wait, FIRST_COMPLETED
+            max_wait = int(os.getenv("EDGE_SCHEDULER_WAIT_TIMEOUT_SECONDS", "60"))
+
+            while active and not self.shutdown_requested:
+                    # As futures complete, schedule replacements (with timeout to avoid deadlock)
+                    try:
+                        done_set, _ = wait(list(active.keys()), timeout=max_wait, return_when=FIRST_COMPLETED)
+                        if not done_set:
+                            logger.warning(f"No unit finished within {max_wait}s; breaking scheduler loop (active={len(active)})")
+                            break
+                        done = next(iter(done_set))
+                    except Exception:
+                        logger.warning("Scheduler wait failed; breaking loop")
                         break
 
-                while active and not self.shutdown_requested:
-                    # As futures complete, schedule replacements
-                    done = next(as_completed(list(active.keys())))
                     t, unit = active.pop(done)
                     v = unit["vendor"]
                     status, rows, msg = ("error", 0, "")
@@ -787,6 +800,11 @@ class EdgeCollector:
             logger.info(f"Fan-out complete. Submitted units: {submitted}, ok: {results_ok}")
 
         finally:
+            try:
+                # Attempt to stop executor without waiting for potentially stuck futures
+                ex.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
             # Ensure leases/threads are always cleaned up
             for t, th in list(renew_threads.items()):
                 try:
