@@ -350,6 +350,8 @@ ensure_env() {
   # Force required toggles
   set_env_kv ".env" "STORAGE_BACKEND" "s3" "always"
   if ! grep -q "^ROLE=" .env; then echo "ROLE=edge" >> .env; fi
+  # Ensure per-vendor scheduler is enabled out of the box
+  set_env_kv ".env" "EDGE_SCHEDULER_MODE" "per_vendor" "always"
 
   # Cleanup pre-merge backup if still present (successful merge)
   rm -f .env.premerge 2>/dev/null || true
@@ -359,6 +361,11 @@ ensure_env() {
   set_env_kv ".env" "NODE_MAX_INFLIGHT_POLYGON" "${NODE_MAX_INFLIGHT_POLYGON:-2}" "always"
   set_env_kv ".env" "NODE_MAX_INFLIGHT_FINNHUB" "${NODE_MAX_INFLIGHT_FINNHUB:-2}" "always"
   set_env_kv ".env" "NODE_MAX_INFLIGHT_FRED" "${NODE_MAX_INFLIGHT_FRED:-2}" "always"
+  # Sensible default rate-limit cooldowns (if not explicitly set)
+  set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_ALPACA" "${NODE_VENDOR_FREEZE_SECONDS_ALPACA:-60}" "if-empty"
+  set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_POLYGON" "${NODE_VENDOR_FREEZE_SECONDS_POLYGON:-60}" "if-empty"
+  set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_FINNHUB" "${NODE_VENDOR_FREEZE_SECONDS_FINNHUB:-60}" "if-empty"
+  set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_FRED" "${NODE_VENDOR_FREEZE_SECONDS_FRED:-60}" "if-empty"
 }
 
 ensure_python() {

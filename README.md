@@ -233,6 +233,11 @@ Multi-source fan-out:
 - Edge fan-outs one unit per source (Alpaca/Polygon/Finnhub/FRED) and dynamically redistributes idle slots when a source runs out of work or cools down (rate limits).
 - Daily budgets gate scheduling per vendor; short per-minute bursts are smoothed by connector-level backoff. When a source pauses, free workers shift to other sources automatically.
 
+Per-vendor scheduler (default):
+- Enabled by default. To use the old scheduler, set `EDGE_SCHEDULER_MODE=legacy` or pass `--scheduler legacy`.
+- Runs one executor per vendor so slow vendors (e.g., Polygon) never block faster ones.
+- Env knobs: `NODE_MAX_INFLIGHT_<VENDOR>` caps, `NODE_VENDOR_FREEZE_SECONDS_<VENDOR>` cooldowns.
+
 Request pacing (global):
 - A global request pacer smooths outbound API calls across threads. It enforces per-vendor inter-request intervals with a small jitter so calls form a steady stream rather than bursts.
 - Enabled by default via `REQUEST_PACING_ENABLED=true`. Configure jitter with `REQUEST_PACING_JITTER_MS`.

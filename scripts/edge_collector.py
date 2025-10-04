@@ -273,8 +273,8 @@ class EdgeCollector:
             logger.info(f"Uploaded to S3: {key} ({len(df)} rows, {len(data)} bytes)")
             return None
 
-    def _alpaca_fetch_day_parallel(self, connector: AlpacaConnector, symbols: List[str], day_str: str, inflight_override: Optional[int] = None) -> pd.DataFrame:
-        """Fetch a single day of bars in parallel by symbol chunks, returning combined DataFrame."""
+    def _alpaca_fetch_day_parallel(self, connector: AlpacaConnector, symbols: List[str], day_str: str, inflight_override: Optional[int] = None, timeframe: str = "1Day") -> pd.DataFrame:
+        """Fetch a single day of bars (timeframe configurable) in parallel by symbol chunks; return combined DataFrame."""
         # Chunk symbols to match connector's batch size guidance (100)
         BATCH = 100
         chunks = [symbols[i:i + BATCH] for i in range(0, len(symbols), BATCH)]
@@ -282,7 +282,7 @@ class EdgeCollector:
 
         def _fetch_chunk(chunk):
             ds = pd.to_datetime(day_str).date()
-            return connector.fetch_bars(symbols=chunk, start_date=ds, end_date=ds, timeframe="1Day")
+            return connector.fetch_bars(symbols=chunk, start_date=ds, end_date=ds, timeframe=timeframe)
 
         results = []
         with ThreadPoolExecutor(max_workers=inflight) as ex:
@@ -362,7 +362,7 @@ class EdgeCollector:
                 logger.info(f"Fetching data for {current_date}")
 
                 # Parallel fetch bars for all symbols for this day
-                df = self._alpaca_fetch_day_parallel(connector, symbols, current_date.isoformat())
+                df = self._alpaca_fetch_day_parallel(connector, symbols, current_date.isoformat(), timeframe="1Day")
 
                 if df.empty:
                     logger.debug(f"No data for {current_date}")
@@ -480,6 +480,7 @@ class EdgeCollector:
     def _lease_name_for_task(self, task_name: str) -> str:
         mapping = {
             "alpaca_bars": "edge-alpaca-equities_bars",
+            "alpaca_minute": "edge-alpaca-equities_bars_minute",
             "polygon_bars": "edge-polygon-equities_bars",
             "finnhub_options": "edge-finnhub-options_chains",
             "fred_treasury": "edge-fred-macro_treasury",
@@ -612,6 +613,29 @@ class EdgeCollector:
                     }
                 d += timedelta(days=1)
 
+        def alpaca_minute_units():
+            if "alpaca" not in self.connectors:
+                return
+            # Resume from minute bookmark; else start modestly back to keep cycle time bounded
+            last_ts = self.bookmarks.get_last_timestamp("alpaca", "equities_bars_minute") if self.bookmarks else None
+            start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=int(os.getenv("ALPACA_MINUTE_START_DAYS", "7"))))
+            d = start_date
+            while d <= today and not self.shutdown_requested:
+                if not self._should_fetch_eod_for_day("alpaca", d):
+                    d += timedelta(days=1)
+                    continue
+                from math import ceil
+                alp_bad = set([s.upper() for s in self._vendor_bad_symbols.get("alpaca", set())]) | self.bad_symbols.vendor_set("alpaca")
+                syms = [s for s in symbols if s.upper() not in alp_bad]
+                tokens = max(1, ceil(len(syms) / 100))  # ~1 req per 100 symbols per day
+                yield {
+                    "vendor": "alpaca",
+                    "desc": f"alpaca-minute {d}",
+                    "tokens": tokens,
+                    "run": lambda day=d, syms=syms: self._run_alpaca_minute_day(syms, day, budget),
+                }
+                d += timedelta(days=1)
+
         def finnhub_units():
             if "finnhub" not in self.connectors:
                 return
@@ -656,6 +680,8 @@ class EdgeCollector:
             for t in tasks:
                 if t == "alpaca_bars":
                     producers[t] = alpaca_units()
+                elif t == "alpaca_minute":
+                    producers[t] = alpaca_minute_units()
                 elif t == "polygon_bars":
                     producers[t] = polygon_units()
                 elif t == "finnhub_options":
@@ -908,7 +934,7 @@ class EdgeCollector:
         if not connector:
             return ("empty", 0, "no connector")
         logger.debug(f"_run_alpaca_day start: {day} symbols={len(symbols)}")
-        df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1)
+        df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1, timeframe="1Day")
         if df.empty:
             return ("empty", 0, "no data")
         fut = self._upload_to_s3(df, "alpaca", "equities_bars", day.isoformat(), async_write=True)
@@ -921,6 +947,25 @@ class EdgeCollector:
         self._write_manifest("alpaca", "equities_bars", day.isoformat(), len(df))
         if self.bookmarks:
             self.bookmarks.set("alpaca", "equities_bars", day.isoformat(), len(df))
+        return ("ok", int(len(df)), "")
+
+    def _run_alpaca_minute_day(self, symbols: List[str], day: date, budget: Optional[BudgetManager]):
+        connector = self.connectors.get("alpaca")
+        if not connector:
+            return ("empty", 0, "no connector")
+        logger.debug(f"_run_alpaca_minute_day start: {day} symbols={len(symbols)}")
+        df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1, timeframe="1Min")
+        if df.empty:
+            return ("empty", 0, "no data")
+        fut = self._upload_to_s3(df, "alpaca", "equities_bars_minute", day.isoformat(), async_write=True)
+        try:
+            if fut is not None:
+                self._wait_future_with_logs(fut, desc=f"alpaca minute {day} parquet upload")
+        except Exception as e:
+            return ("error", 0, str(e))
+        self._write_manifest("alpaca", "equities_bars_minute", day.isoformat(), len(df))
+        if self.bookmarks:
+            self.bookmarks.set("alpaca", "equities_bars_minute", day.isoformat(), len(df))
         return ("ok", int(len(df)), "")
 
     def _run_polygon_day(self, symbols: List[str], day: date, budget: Optional[BudgetManager]):
@@ -1051,14 +1096,26 @@ class EdgeCollector:
             self.bookmarks.set("fred", "macro_treasury", day.isoformat(), int(len(df)))
         return ("ok", int(len(df)), "")
 
-    def run(self):
+    def run(self, scheduler_mode: Optional[str] = None):
         """Run edge collector."""
         logger.info("Edge collector starting...")
 
-        # Run collection tasks with fan-out scheduler
         tasks = self.config.get("tasks", ["alpaca_bars"])
+        mode = (scheduler_mode or os.getenv("EDGE_SCHEDULER_MODE", "per_vendor")).lower()
+        logger.info(f"Scheduler mode: {mode}")
+
         try:
-            self._schedule_fanout(tasks)
+            if mode == "per_vendor":
+                try:
+                    from scripts.scheduler.per_vendor import VendorSupervisor
+                except Exception as e:
+                    logger.warning(f"Failed to import per-vendor scheduler; falling back to legacy: {e}")
+                    self._schedule_fanout(tasks)
+                else:
+                    sup = VendorSupervisor(self)
+                    sup.run(tasks)
+            else:
+                self._schedule_fanout(tasks)
         finally:
             # Ensure S3 writer stops cleanly
             try:
@@ -1077,12 +1134,18 @@ def main():
         default="configs/edge.yml",
         help="Path to config file",
     )
+    parser.add_argument(
+        "--scheduler",
+        choices=["legacy", "per_vendor"],
+        default=None,
+        help="Scheduler mode (overrides EDGE_SCHEDULER_MODE)",
+    )
     args = parser.parse_args()
 
     # Ensure .env overrides any ambient AWS_* vars
     load_dotenv(override=True)
     collector = EdgeCollector(args.config)
-    collector.run()
+    collector.run(scheduler_mode=args.scheduler)
 
 
 if __name__ == "__main__":

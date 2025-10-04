@@ -9,6 +9,7 @@ tasks:
   - polygon_bars
   - finnhub_options
   - fred_treasury
+  - alpaca_minute
 
 # Policy: daily API budgets (governed by BudgetManager)
 policy:
