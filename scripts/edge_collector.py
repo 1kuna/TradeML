@@ -589,7 +589,9 @@ class EdgeCollector:
                         return
             except Exception:
                 pass
-            BATCH = max(1, int(os.getenv("NODE_POLYGON_SYMBOLS_PER_UNIT", "10")))
+            # Keep polygon units under scheduler timeout given ~5 rpm free-tier
+            # Default to small chunks; override via NODE_POLYGON_SYMBOLS_PER_UNIT
+            BATCH = max(1, int(os.getenv("NODE_POLYGON_SYMBOLS_PER_UNIT", "3")))
             d = start_date
             while d <= today and not self.shutdown_requested:
                 if not self._should_fetch_eod_for_day("polygon", d):
@@ -679,8 +681,8 @@ class EdgeCollector:
             submitted = 0
 
             def vendor_cap(vendor: str) -> int:
-                # Increase default per-vendor inflight to utilize workers when available
-                default_caps = {"alpaca": 2, "polygon": 2, "finnhub": 2, "fred": 2}
+                # Constrain polygon to 1 to avoid parallel long units under strict RPM
+                default_caps = {"alpaca": 2, "polygon": 1, "finnhub": 2, "fred": 2}
                 return max(1, max_inflight_for(vendor, default=default_caps.get(vendor, 1)))
 
             def can_run(vendor: str, tokens: int) -> bool:
@@ -931,11 +933,15 @@ class EdgeCollector:
             return ("empty", 0, "no connector")
         rows = []
         logger.debug(f"_run_polygon_day start: {day} symbols={len(symbols)}")
-        for sym in symbols:
+        total = len(symbols)
+        import time as _time
+        for idx, sym in enumerate(symbols, start=1):
             if sym in self._vendor_bad_symbols.get("polygon", set()):
                 continue
             try:
+                t0 = _time.time()
                 df = conn.fetch_aggregates(sym, day, day, timespan="day")
+                logger.debug(f"polygon fetch {day} [{idx}/{total}] {sym} took {(_time.time()-t0):.2f}s rows={0 if df is None else len(df)}")
             except Exception as e:
                 emsg = str(e)
                 if "429" in emsg or "rate" in emsg.lower():
@@ -960,7 +966,7 @@ class EdgeCollector:
         fut = self._upload_to_s3(out, "polygon", "equities_bars", day.isoformat(), async_write=True)
         try:
             if fut is not None:
-                fut.result()
+                self._wait_future_with_logs(fut, desc=f"polygon {day} parquet upload")
         except Exception as e:
             return ("error", 0, str(e))
         self._write_manifest("polygon", "equities_bars", day.isoformat(), len(out))
