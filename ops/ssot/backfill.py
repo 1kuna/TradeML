@@ -588,7 +588,15 @@ def backfill_run(budget: Dict[str, int] | None = None) -> None:
         tcfg_m = targets["equities_minute"]
         earliest_m = pd.to_datetime(tcfg_m.get("earliest", "2010-01-01")).date()
         chunk_days_m = int(tcfg_m.get("chunk_days", 5))
-        _backfill_window_equities_minute(connector, universe, earliest=earliest_m, chunk_days=chunk_days_m, top_n=100, budget=bm)
+        top_n_m = int(tcfg_m.get("top_n", 100))
+        _backfill_window_equities_minute(
+            connector,
+            universe,
+            earliest=earliest_m,
+            chunk_days=chunk_days_m,
+            top_n=top_n_m,
+            budget=bm,
+        )
 
     # 3) Options chains exploratory (forward only, small budget)
     if "options_chains" in targets:

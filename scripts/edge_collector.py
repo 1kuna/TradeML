@@ -494,21 +494,26 @@ class EdgeCollector:
         budget = self._init_budget()
 
         # Acquire leases per task upfront; start renew threads
-        renew_threads = {}
-        for t in tasks:
+        renew_threads: dict[str, threading.Thread] = {}
+        for t in list(tasks):
             if not self._acquire_task_lease(t):
                 logger.warning(f"Lease held for task {t}; skipping")
                 tasks = [x for x in tasks if x != t]
-        if self.lease_mgr:
-            renew_every = int(self.config.get("locks", {}).get("renew_seconds", 45))
-            for t in tasks:
-                th = threading.Thread(target=self._renew_lease_loop, args=(self._lease_name_for_task(t), renew_every), daemon=True)
-                th.start()
-                renew_threads[t] = th
+        try:
+            if self.lease_mgr:
+                renew_every = int(self.config.get("locks", {}).get("renew_seconds", 45))
+                for t in tasks:
+                    th = threading.Thread(
+                        target=self._renew_lease_loop,
+                        args=(self._lease_name_for_task(t), renew_every),
+                        daemon=True,
+                    )
+                    th.start()
+                    renew_threads[t] = th
 
-        # Build unit producers
-        symbols = self._symbols_universe()
-        today = datetime.now().date()
+            # Build unit producers
+            symbols = self._symbols_universe()
+            today = datetime.now().date()
 
         def alpaca_units():
             if "alpaca" not in self.connectors:
@@ -601,156 +606,148 @@ class EdgeCollector:
                 }
                 d += timedelta(days=1)
 
-        producers = {}
-        for t in tasks:
-            if t == "alpaca_bars":
-                producers[t] = alpaca_units()
-            elif t == "polygon_bars":
-                producers[t] = polygon_units()
-            elif t == "finnhub_options":
-                producers[t] = finnhub_units()
-            elif t == "fred_treasury":
-                producers[t] = fred_units()
-
-        # Runnable loop
-        from itertools import cycle
-        task_order = [t for t in tasks if t in producers]
-        if not task_order:
-            logger.info("No runnable tasks (connectors missing?)")
-            # Release leases
-            for t in renew_threads:
-                try:
-                    self.shutdown_requested = True
-                    renew_threads[t].join(timeout=1)
-                except Exception:
-                    pass
+            producers = {}
             for t in tasks:
-                self._release_task_lease(t)
-            return
+                if t == "alpaca_bars":
+                    producers[t] = alpaca_units()
+                elif t == "polygon_bars":
+                    producers[t] = polygon_units()
+                elif t == "finnhub_options":
+                    producers[t] = finnhub_units()
+                elif t == "fred_treasury":
+                    producers[t] = fred_units()
 
-        max_workers = worker_count(default=4)
-        logger.info(f"Starting fan-out across tasks: {task_order} with {max_workers} workers")
+            # Runnable loop
+            from itertools import cycle
+            task_order = [t for t in tasks if t in producers]
+            if not task_order:
+                logger.info("No runnable tasks (connectors missing?)")
+                return
 
-        vendor_freeze: dict[str, float] = {}  # vendor -> until_ts
-        vendor_inflight: dict[str, int] = {}
-        active = {}
-        results_ok = 0
-        submitted = 0
+            max_workers = worker_count(default=4)
+            logger.info(f"Starting fan-out across tasks: {task_order} with {max_workers} workers")
 
-        def vendor_cap(vendor: str) -> int:
-            # Default per-vendor inflight: conservative (1), Alpaca allows override
-            default_caps = {"alpaca": 1, "polygon": 1, "finnhub": 1, "fred": 1}
-            return max(1, max_inflight_for(vendor, default=default_caps.get(vendor, 1)))
+            vendor_freeze: dict[str, float] = {}  # vendor -> until_ts
+            vendor_inflight: dict[str, int] = {}
+            active: dict = {}
+            results_ok = 0
+            submitted = 0
 
-        def can_run(vendor: str, tokens: int) -> bool:
-            # Check cooldown
-            from time import time as _now
-            until = vendor_freeze.get(vendor)
-            if until and _now() < until:
-                return False
-            # Check inflight cap
-            if vendor_inflight.get(vendor, 0) >= vendor_cap(vendor):
-                return False
-            # Check daily budget
-            if budget and tokens > 0:
-                return budget.try_consume(vendor, tokens)
-            return True
+            def vendor_cap(vendor: str) -> int:
+                # Default per-vendor inflight: conservative (1), Alpaca allows override
+                default_caps = {"alpaca": 1, "polygon": 1, "finnhub": 1, "fred": 1}
+                return max(1, max_inflight_for(vendor, default=default_caps.get(vendor, 1)))
 
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            rr = cycle(task_order)
+            def can_run(vendor: str, tokens: int) -> bool:
+                # Check cooldown
+                from time import time as _now
+                until = vendor_freeze.get(vendor)
+                if until and _now() < until:
+                    return False
+                # Check inflight cap
+                if vendor_inflight.get(vendor, 0) >= vendor_cap(vendor):
+                    return False
+                # Check daily budget
+                if budget and tokens > 0:
+                    return budget.try_consume(vendor, tokens)
+                return True
 
-            # Seed up to max_workers with RR across tasks, honoring vendor caps
-            import random, time as _t
-            while len(active) < max_workers and not self.shutdown_requested:
-                progressed = False
-                for _ in range(len(task_order)):
-                    t = next(rr)
-                    it = producers.get(t)
-                    if not it:
-                        continue
-                    try:
-                        unit = next(it)
-                    except StopIteration:
-                        producers[t] = None
-                        continue
-                    v = unit["vendor"]
-                    if can_run(v, unit.get("tokens", 1)):
-                        fut = ex.submit(unit["run"])
-                        active[fut] = (t, unit)
-                        vendor_inflight[v] = vendor_inflight.get(v, 0) + 1
-                        submitted += 1
-                        progressed = True
-                        # Small jitter to de-synchronize vendor calls
-                        _t.sleep(random.uniform(0.05, 0.15))
-                        if len(active) >= max_workers:
-                            break
-                if not progressed:
-                    break
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                rr = cycle(task_order)
 
-            while active and not self.shutdown_requested:
-                # As futures complete, schedule replacements
-                done = next(as_completed(list(active.keys())))
-                t, unit = active.pop(done)
-                v = unit["vendor"]
-                status, rows, msg = ("error", 0, "")
-                try:
-                    res = done.result()
-                    if isinstance(res, tuple) and len(res) == 3:
-                        status, rows, msg = res
-                    elif isinstance(res, int):
-                        status, rows, msg = ("ok", res, "")
-                    else:
-                        status, rows, msg = ("ok", 0, "")
-                except Exception as e:
-                    emsg = str(e)
-                    # crude 429 detection
-                    if "429" in emsg or "rate" in emsg.lower():
-                        from time import time as _now
-                        vendor_freeze[unit["vendor"]] = _now() + 60
-                        status = "ratelimited"
-                        msg = emsg
-                    else:
-                        status = "error"
-                        msg = emsg
-
-                if status == "ok":
-                    results_ok += 1
-                elif status == "ratelimited":
-                    logger.warning(f"Vendor {unit['vendor']} rate-limited, cooling off")
-                elif status == "empty":
-                    pass
-                elif status == "error":
-                    logger.warning(f"Unit error [{unit['desc']}]: {msg}")
-                # Decrement inflight
-                if v:
-                    vendor_inflight[v] = max(0, vendor_inflight.get(v, 0) - 1)
-
-                # Attempt to schedule next unit from any task, prefer same task to preserve order
-                scheduled = False
+                # Seed up to max_workers with RR across tasks, honoring vendor caps
                 import random, time as _t
-                for _ in range(len(task_order)):
-                    tn = next(rr)
-                    it = producers.get(tn)
-                    if not it:
-                        continue
-                    try:
-                        nxt = next(it)
-                    except StopIteration:
-                        producers[tn] = None
-                        continue
-                    v2 = nxt["vendor"]
-                    if can_run(v2, nxt.get("tokens", 1)):
-                        fut = ex.submit(nxt["run"])
-                        active[fut] = (tn, nxt)
-                        vendor_inflight[v2] = vendor_inflight.get(v2, 0) + 1
-                        submitted += 1
-                        scheduled = True
-                        _t.sleep(random.uniform(0.03, 0.12))
+                while len(active) < max_workers and not self.shutdown_requested:
+                    progressed = False
+                    for _ in range(len(task_order)):
+                        t = next(rr)
+                        it = producers.get(t)
+                        if not it:
+                            continue
+                        try:
+                            unit = next(it)
+                        except StopIteration:
+                            producers[t] = None
+                            continue
+                        v = unit["vendor"]
+                        if can_run(v, unit.get("tokens", 1)):
+                            fut = ex.submit(unit["run"])
+                            active[fut] = (t, unit)
+                            vendor_inflight[v] = vendor_inflight.get(v, 0) + 1
+                            submitted += 1
+                            progressed = True
+                            # Small jitter to de-synchronize vendor calls
+                            _t.sleep(random.uniform(0.05, 0.15))
+                            if len(active) >= max_workers:
+                                break
+                    if not progressed:
+                        # Log why nothing was scheduled to aid debugging
+                        if not active:
+                            try:
+                                from time import time as _now
+                                caps = {
+                                    v: f"{vendor_inflight.get(v,0)}/{vendor_cap(v)}"
+                                    for v in ("alpaca", "polygon", "finnhub", "fred")
+                                }
+                                freezes = {
+                                    v: int(max(0, vendor_freeze.get(v, 0) - _now()))
+                                    for v in ("alpaca", "polygon", "finnhub", "fred")
+                                }
+                                budgets = {
+                                    v: (budget.remaining(v) if budget else None)
+                                    for v in ("alpaca", "polygon", "finnhub", "fred")
+                                }
+                                logger.warning(
+                                    f"No units scheduled: caps={caps}, freeze_s={freezes}, budget_remaining={budgets}"
+                                )
+                            except Exception:
+                                pass
                         break
 
-                if not scheduled and not active:
-                    # Try a final pass to pick any remaining units
-                    for tn, it in list(producers.items()):
+                while active and not self.shutdown_requested:
+                    # As futures complete, schedule replacements
+                    done = next(as_completed(list(active.keys())))
+                    t, unit = active.pop(done)
+                    v = unit["vendor"]
+                    status, rows, msg = ("error", 0, "")
+                    try:
+                        res = done.result()
+                        if isinstance(res, tuple) and len(res) == 3:
+                            status, rows, msg = res
+                        elif isinstance(res, int):
+                            status, rows, msg = ("ok", res, "")
+                        else:
+                            status, rows, msg = ("ok", 0, "")
+                    except Exception as e:
+                        emsg = str(e)
+                        # crude 429 detection
+                        if "429" in emsg or "rate" in emsg.lower():
+                            from time import time as _now
+                            vendor_freeze[unit["vendor"]] = _now() + 60
+                            status = "ratelimited"
+                            msg = emsg
+                        else:
+                            status = "error"
+                            msg = emsg
+
+                    if status == "ok":
+                        results_ok += 1
+                    elif status == "ratelimited":
+                        logger.warning(f"Vendor {unit['vendor']} rate-limited, cooling off")
+                    elif status == "empty":
+                        pass
+                    elif status == "error":
+                        logger.warning(f"Unit error [{unit['desc']}]: {msg}")
+                    # Decrement inflight
+                    if v:
+                        vendor_inflight[v] = max(0, vendor_inflight.get(v, 0) - 1)
+
+                    # Attempt to schedule next unit from any task, prefer same task to preserve order
+                    scheduled = False
+                    import random, time as _t
+                    for _ in range(len(task_order)):
+                        tn = next(rr)
+                        it = producers.get(tn)
                         if not it:
                             continue
                         try:
@@ -758,25 +755,49 @@ class EdgeCollector:
                         except StopIteration:
                             producers[tn] = None
                             continue
-                        v3 = nxt["vendor"]
-                        if can_run(v3, nxt.get("tokens", 1)):
+                        v2 = nxt["vendor"]
+                        if can_run(v2, nxt.get("tokens", 1)):
                             fut = ex.submit(nxt["run"])
                             active[fut] = (tn, nxt)
-                            vendor_inflight[v3] = vendor_inflight.get(v3, 0) + 1
+                            vendor_inflight[v2] = vendor_inflight.get(v2, 0) + 1
                             submitted += 1
+                            scheduled = True
+                            _t.sleep(random.uniform(0.03, 0.12))
                             break
 
-        logger.info(f"Fan-out complete. Submitted units: {submitted}, ok: {results_ok}")
+                    if not scheduled and not active:
+                        # Try a final pass to pick any remaining units
+                        for tn, it in list(producers.items()):
+                            if not it:
+                                continue
+                            try:
+                                nxt = next(it)
+                            except StopIteration:
+                                producers[tn] = None
+                                continue
+                            v3 = nxt["vendor"]
+                            if can_run(v3, nxt.get("tokens", 1)):
+                                fut = ex.submit(nxt["run"])
+                                active[fut] = (tn, nxt)
+                                vendor_inflight[v3] = vendor_inflight.get(v3, 0) + 1
+                                submitted += 1
+                                break
 
-        # Cleanup leases
-        for t in renew_threads:
-            try:
-                self.shutdown_requested = True
-                renew_threads[t].join(timeout=1)
-            except Exception:
-                pass
-        for t in tasks:
-            self._release_task_lease(t)
+            logger.info(f"Fan-out complete. Submitted units: {submitted}, ok: {results_ok}")
+
+        finally:
+            # Ensure leases/threads are always cleaned up
+            for t, th in list(renew_threads.items()):
+                try:
+                    self.shutdown_requested = True
+                    th.join(timeout=1)
+                except Exception:
+                    pass
+            for t in tasks:
+                try:
+                    self._release_task_lease(t)
+                except Exception:
+                    pass
 
     # ----- Unit runners for each source -----
 
