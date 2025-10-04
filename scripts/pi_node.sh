@@ -27,7 +27,7 @@ mkdir -p "$TMP_DIR" 2>/dev/null || true
 cleanup_tmp() { rm -rf "$TMP_DIR" 2>/dev/null || true; }
 trap cleanup_tmp EXIT INT TERM
 
-MIN_PY_DEPS=(boto3 pandas pyarrow pyyaml python-dotenv loguru alpaca-py requests)
+MIN_PY_DEPS=(boto3 pandas pyarrow pyyaml python-dotenv loguru alpaca-py requests exchange-calendars)
 
 ensure_command() {
   if ! command -v "$1" >/dev/null 2>&1; then

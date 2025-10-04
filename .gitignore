@@ -13,12 +13,18 @@ secrets/
 credentials/
 
 # ===== Data Files =====
-data_layer/raw/
-data_layer/curated/
+data_layer/raw/*
+!data_layer/raw/*.py
+!data_layer/raw/**/__init__.py
+data_layer/curated/*
+!data_layer/curated/*.py
+!data_layer/curated/**/__init__.py
 # Reference data directory (allow Python modules)
-data_layer/reference/
+# Reference data directory: ignore contents by default, allow Python modules
+data_layer/reference/*
 !data_layer/reference/*.py
 !data_layer/reference/**/__init__.py
+!data_layer/reference/.gitkeep
 *.parquet
 *.csv
 *.h5
