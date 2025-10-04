@@ -186,6 +186,49 @@ install_prereqs() {
   fi
 }
 
+ensure_mc_alias() {
+  if ! command -v mc >/dev/null 2>&1; then
+    echo "mc not installed; skipping alias setup"
+    return 0
+  fi
+  # Load from env or .env
+  local ep key secret bucket
+  ep=${S3_ENDPOINT:-}
+  key=${AWS_ACCESS_KEY_ID:-}
+  secret=${AWS_SECRET_ACCESS_KEY:-}
+  bucket=${S3_BUCKET:-}
+  if [[ -z "$ep" && -f .env ]]; then ep=$(grep -E '^S3_ENDPOINT=' .env | tail -n1 | cut -d= -f2- || true); fi
+  if [[ -z "$key" && -f .env ]]; then key=$(grep -E '^AWS_ACCESS_KEY_ID=' .env | tail -n1 | cut -d= -f2- || true); fi
+  if [[ -z "$secret" && -f .env ]]; then secret=$(grep -E '^AWS_SECRET_ACCESS_KEY=' .env | tail -n1 | cut -d= -f2- || true); fi
+  if [[ -z "$bucket" && -f .env ]]; then bucket=$(grep -E '^S3_BUCKET=' .env | tail -n1 | cut -d= -f2- || true); fi
+  if [[ -z "$ep" || -z "$key" || -z "$secret" ]]; then
+    echo "Missing S3 env vars; skipping mc alias"
+    return 0
+  fi
+  # Set/refresh alias and verify
+  mc alias set minio "$ep" "$key" "$secret" --api S3v4 >/dev/null 2>&1 || true
+  if ! mc ls minio/ >/dev/null 2>&1; then
+    echo "Resetting mc alias credentials for minio..."
+    mc alias rm minio >/dev/null 2>&1 || true
+    mc alias set minio "$ep" "$key" "$secret" --api S3v4 >/dev/null 2>&1 || true
+  fi
+}
+
+prune_locks() {
+  if ! command -v mc >/dev/null 2>&1; then
+    return 0
+  fi
+  local bucket
+  bucket=${S3_BUCKET:-}
+  if [[ -z "$bucket" && -f .env ]]; then bucket=$(grep -E '^S3_BUCKET=' .env | tail -n1 | cut -d= -f2- || true); fi
+  [[ -z "$bucket" ]] && return 0
+  # Remove locks prefix safely; it is ephemeral
+  if mc ls "minio/$bucket/locks/" >/dev/null 2>&1; then
+    echo "Clearing S3 locks/ prefix before start..."
+    mc rm -r --force "minio/$bucket/locks/" >/dev/null 2>&1 || true
+  fi
+}
+
 ensure_env() {
   if [[ ! -f .env ]]; then
     cp .env.template .env
@@ -255,12 +298,15 @@ case "$cmd" in
     install_prereqs
     ensure_env
     ensure_python
+    ensure_mc_alias
     python scripts/node.py --selfcheck
     ;;
   up)
     install_prereqs
     ensure_env
     ensure_python
+    ensure_mc_alias
+    prune_locks
     python scripts/node.py --selfcheck
     echo "Starting Pi Node loop..."
     run_loop
