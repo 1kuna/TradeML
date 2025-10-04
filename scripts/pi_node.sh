@@ -527,7 +527,7 @@ case "$cmd" in
     start_vendor alpaca  8 200 0
     start_vendor finnhub 4 60  0
     start_vendor fred    2 60  0
-    echo "✓ Workers launched. Tail logs in $log_dir/*.log"
+    echo "✓ Workers launched. Tail logs with: tail -f -n 100 $log_dir/*.log"
     ;;
   down)
     echo "Stopping vendor workers..."
