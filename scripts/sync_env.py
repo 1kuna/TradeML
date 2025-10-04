@@ -26,7 +26,8 @@ from typing import List, Tuple, Dict, Optional
 Line = Tuple[str, str, Optional[str]]  # (kind, text or key, value)
 
 
-ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+# Accept optional whitespace around '=' and ignore leading spaces
+ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
 
 def parse_env_file(path: Path) -> List[Line]:
@@ -117,4 +118,3 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
