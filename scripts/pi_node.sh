@@ -366,6 +366,11 @@ ensure_env() {
   set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_POLYGON" "${NODE_VENDOR_FREEZE_SECONDS_POLYGON:-60}" "if-empty"
   set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_FINNHUB" "${NODE_VENDOR_FREEZE_SECONDS_FINNHUB:-60}" "if-empty"
   set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_FRED" "${NODE_VENDOR_FREEZE_SECONDS_FRED:-60}" "if-empty"
+  # Backfill horizons (defaults guided by SSOT/Playbook)
+  set_env_kv ".env" "ALPACA_DAY_START_DAYS" "${ALPACA_DAY_START_DAYS:-5475}" "if-empty"    # ~15y
+  set_env_kv ".env" "ALPACA_MINUTE_START_DAYS" "${ALPACA_MINUTE_START_DAYS:-730}" "if-empty" # ~2y
+  set_env_kv ".env" "POLYGON_DAY_START_DAYS" "${POLYGON_DAY_START_DAYS:-3650}" "if-empty"   # ~10y
+  set_env_kv ".env" "FRED_TREASURY_START_DAYS" "${FRED_TREASURY_START_DAYS:-18250}" "if-empty" # ~50y
 }
 
 ensure_python() {

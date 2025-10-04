@@ -9,16 +9,37 @@ def _today_date():
     return datetime.now().date()
 
 
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _start_date(edge, vendor: str, table: str, default_days: int):
+    """Resolve start date using bookmark when present, else default_days back."""
+    bm = edge.bookmarks.get_last_timestamp(vendor, table) if edge.bookmarks else None
+    today = _today_date()
+    if bm:
+        try:
+            return (datetime.fromisoformat(bm).date() + timedelta(days=1))
+        except Exception:
+            pass
+    return today - timedelta(days=default_days)
+
+
 def alpaca_bars_units(edge, budget_mgr=None) -> Iterator[dict]:
     if "alpaca" not in edge.connectors:
         return
     symbols = edge._symbols_universe()
     today = _today_date()
-    last_ts = edge.bookmarks.get_last_timestamp("alpaca", "equities_bars") if edge.bookmarks else None
-    start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=30))
+    # Default: 15 years of daily bars (SSOT green threshold ~15y)
+    default_days = _int_env("ALPACA_DAY_START_DAYS", 365 * 15)
+    start_date = _start_date(edge, "alpaca", "equities_bars", default_days)
     try:
         if start_date == today and not edge._should_fetch_eod_for_day("alpaca", today):
             prev = today - timedelta(days=1)
+            last_ts = edge.bookmarks.get_last_timestamp("alpaca", "equities_bars") if edge.bookmarks else None
             if (not last_ts) or (datetime.fromisoformat(last_ts).date() < prev):
                 start_date = prev
             else:
@@ -48,13 +69,9 @@ def alpaca_minute_units(edge, budget_mgr=None) -> Iterator[dict]:
         return
     symbols = edge._symbols_universe()
     today = _today_date()
-    last_ts = edge.bookmarks.get_last_timestamp("alpaca", "equities_bars_minute") if edge.bookmarks else None
-    start_days = 7
-    try:
-        start_days = int(os.getenv("ALPACA_MINUTE_START_DAYS", "7"))
-    except Exception:
-        start_days = 7
-    start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=start_days))
+    # Default: 2 years of minute bars (free-tier practical window per Playbook)
+    default_days = _int_env("ALPACA_MINUTE_START_DAYS", 365 * 2)
+    start_date = _start_date(edge, "alpaca", "equities_bars_minute", default_days)
     from math import ceil
     alp_bad = set([s.upper() for s in edge._vendor_bad_symbols.get("alpaca", set())]) | edge.bad_symbols.vendor_set("alpaca")
     syms = [s for s in symbols if s.upper() not in alp_bad]
@@ -78,11 +95,13 @@ def polygon_bars_units(edge, budget_mgr=None) -> Iterator[dict]:
         return
     symbols = edge._symbols_universe()
     today = _today_date()
-    last_ts = edge.bookmarks.get_last_timestamp("polygon", "equities_bars") if edge.bookmarks else None
-    start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=7))
+    # Default: 10 years of daily bars
+    default_days = _int_env("POLYGON_DAY_START_DAYS", 365 * 10)
+    start_date = _start_date(edge, "polygon", "equities_bars", default_days)
     try:
         if start_date == today and not edge._should_fetch_eod_for_day("polygon", today):
             prev = today - timedelta(days=1)
+            last_ts = edge.bookmarks.get_last_timestamp("polygon", "equities_bars") if edge.bookmarks else None
             if (not last_ts) or (datetime.fromisoformat(last_ts).date() < prev):
                 start_date = prev
             else:
@@ -142,8 +161,9 @@ def fred_treasury_units(edge, budget_mgr=None) -> Iterator[dict]:
     if "fred" not in edge.connectors:
         return
     today = _today_date()
-    last_ts = edge.bookmarks.get_last_timestamp("fred", "macro_treasury") if edge.bookmarks else None
-    start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=7))
+    # Default: 50 years of macro history (effectively full modern range)
+    default_days = _int_env("FRED_TREASURY_START_DAYS", 365 * 50)
+    start_date = _start_date(edge, "fred", "macro_treasury", default_days)
     d = start_date
     while d <= today and not edge.shutdown_requested:
         if not edge._should_fetch_eod_for_day("fred", d):
@@ -156,4 +176,3 @@ def fred_treasury_units(edge, budget_mgr=None) -> Iterator[dict]:
             "run": (lambda day=d: edge._run_fred_treasury_day(day, budget_mgr)),
         }
         d += timedelta(days=1)
-

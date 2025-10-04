@@ -99,6 +99,19 @@ class VendorRunner:
                 except Exception:
                     pass
 
+    def _release_lease_now(self):
+        if self.edge.lease_mgr:
+            try:
+                self.edge.lease_mgr.release(self._lease_name)
+            except Exception:
+                pass
+        if self._renew_thread:
+            try:
+                self._renew_thread.join(timeout=1)
+            except Exception:
+                pass
+            self._renew_thread = None
+
     def _producers_for_vendor(self) -> List[Iterator[dict]]:
         from .producers import (
             alpaca_bars_units,
@@ -151,6 +164,8 @@ class VendorRunner:
         producers = [p for p in self._producers_for_vendor() if p is not None]
         if not producers:
             logger.info(f"{self.vendor}: no runnable producers (connector missing or tasks not requested)")
+            # No work; release lease promptly
+            self._release_lease_now()
             return
 
         self._executor = ThreadPoolExecutor(max_workers=cap)
@@ -174,6 +189,7 @@ class VendorRunner:
                         continue
                     tokens = int(unit.get("tokens", 1))
                     if self._can_submit(tokens):
+                        logger.info(f"{self.vendor}: submitting unit desc='{unit.get('desc')}' tokens={tokens}")
                         fut = self._executor.submit(unit["run"])  # returns (status, rows, msg)
                         active[fut] = unit
                         active_started[fut] = time.time()
@@ -184,6 +200,12 @@ class VendorRunner:
                             break
                 if not progressed:
                     break
+
+            # If no work was scheduled at all, release lease and exit to avoid holding it idly
+            if not active:
+                logger.info(f"{self.vendor}: no units scheduled; releasing lease")
+                self._release_lease_now()
+                return
 
             while active and not self._shutdown and not self.edge.shutdown_requested:
                 done_set, _ = wait(list(active.keys()), timeout=2.0, return_when=FIRST_COMPLETED)
@@ -225,6 +247,7 @@ class VendorRunner:
                                 continue
                             tokens2 = int(unit2.get("tokens", 1))
                             if self._can_submit(tokens2):
+                                logger.info(f"{self.vendor}: submitting unit desc='{unit2.get('desc')}' tokens={tokens2}")
                                 f2 = self._executor.submit(unit2["run"])
                                 active[f2] = unit2
                                 active_started[f2] = time.time()
@@ -282,6 +305,18 @@ class VendorSupervisor:
 
         try:
             while self.runners and not self.edge.shutdown_requested:
+                # Reap completed runners promptly (release leases early)
+                for r in list(self.runners):
+                    th = r._runner_thread
+                    if th and not th.is_alive():
+                        try:
+                            r.stop(timeout=0.5)
+                        except Exception:
+                            pass
+                        try:
+                            self.runners.remove(r)
+                        except Exception:
+                            pass
                 alive = any((r._runner_thread and r._runner_thread.is_alive()) for r in self.runners)
                 if not alive:
                     break
@@ -289,4 +324,3 @@ class VendorSupervisor:
         finally:
             for r in self.runners:
                 r.stop(timeout=2.0)
-
