@@ -437,8 +437,31 @@ case "$cmd" in
     ensure_mc_alias
     prune_locks
     python scripts/node.py --selfcheck
-    echo "Starting Pi Node loop..."
-    run_loop
+    echo "Starting per-vendor workers..."
+    # Logs directory
+    log_dir="${LOG_DIR:-./logs}"
+    mkdir -p "$log_dir"
+    
+    start_vendor() {
+      vendor="$1"; conc="$2"; rpm="$3"; budget="$4"
+      # Export vendor-specific env for this process only
+      echo "Launching $vendor worker (conc=$conc rpm=$rpm budget=$budget)"
+      nohup \
+        VENDOR="$vendor" \
+        CONCURRENCY="$conc" \
+        RPM_LIMIT="$rpm" \
+        BUDGET="$budget" \
+        python -m trademl.workers.vendor_worker \
+          >> "$log_dir/${vendor}.log" 2>&1 &
+      echo "$vendor started (pid $!)"
+    }
+
+    # Example defaults; tune via editing below or exporting env before calling
+    start_vendor polygon 1 5   1000
+    start_vendor alpaca  8 200 0
+    start_vendor finnhub 4 60  0
+    start_vendor fred    2 60  0
+    echo "✓ Workers launched. Tail logs in $log_dir/*.log"
     ;;
   *)
     echo "Unknown command: $cmd" >&2

@@ -116,6 +116,9 @@ class VendorRunner:
         from .producers import (
             alpaca_bars_units,
             alpaca_minute_units,
+            alpaca_options_bars_units,
+            alpaca_options_chain_units,
+            alpaca_corporate_actions_units,
             polygon_bars_units,
             finnhub_options_units,
             fred_treasury_units,
@@ -288,6 +291,8 @@ class VendorSupervisor:
         mapping: Dict[str, List[str]] = {"alpaca": [], "polygon": [], "finnhub": [], "fred": []}
         for t in tasks:
             if t in ("alpaca_bars", "alpaca_minute"):
+                mapping["alpaca"].append(t)
+            elif t in ("alpaca_options_bars", "alpaca_options_chain", "alpaca_corporate_actions"):
                 mapping["alpaca"].append(t)
             elif t == "polygon_bars":
                 mapping["polygon"].append(t)
