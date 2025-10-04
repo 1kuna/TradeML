@@ -32,6 +32,7 @@ from utils.concurrency import max_inflight_for, worker_count
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ops.ssot.budget import BudgetManager
 from utils.s3_writer import S3Writer
+from utils.bad_symbols import BadSymbolCache
 
 
 class EdgeCollector:
@@ -61,13 +62,21 @@ class EdgeCollector:
             except Exception as e:
                 logger.warning(f"Failed to start S3 writer: {e}")
                 self.s3_writer = None
+            # Persistent bad-symbol cache
+            try:
+                self.bad_symbols = BadSymbolCache(self.s3)
+            except Exception as e:
+                logger.warning(f"BadSymbolCache init failed (S3): {e}")
+                self.bad_symbols = BadSymbolCache(None)
         else:
             self.s3 = None
             self.lease_mgr = None
             self.bookmarks = None
             self.s3_writer = None
+            # Local bad-symbol cache
+            self.bad_symbols = BadSymbolCache(None)
 
-        # Cache of vendor->set(symbols) to skip during this run (e.g., invalid tickers)
+        # In-memory cache (session) in addition to persisted bad-symbols
         self._vendor_bad_symbols = {"polygon": set(), "alpaca": set(), "finnhub": set(), "fred": set()}
 
         # Connectors
@@ -509,14 +518,21 @@ class EdgeCollector:
             start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=30))
             d = start_date
             while d <= today and not self.shutdown_requested:
+                # Gate 'today' until cutoff
+                if not self._should_fetch_eod_for_day("alpaca", d):
+                    d += timedelta(days=1)
+                    continue
                 # Estimate tokens: ceil(len(symbols)/100)
                 from math import ceil
-                tokens = max(1, ceil(len(symbols) / 100))
+                # Skip persisted bad symbols for alpaca (best-effort; Alpaca batch drops invalids silently)
+                alp_bad = set([s.upper() for s in self._vendor_bad_symbols.get("alpaca", set())]) | self.bad_symbols.vendor_set("alpaca")
+                syms = [s for s in symbols if s.upper() not in alp_bad]
+                tokens = max(1, ceil(len(syms) / 100))
                 yield {
                     "vendor": "alpaca",
                     "desc": f"alpaca {d}",
                     "tokens": tokens,
-                    "run": lambda day=d: self._run_alpaca_day(symbols, day, budget),
+                    "run": lambda day=d, syms=syms: self._run_alpaca_day(syms, day, budget),
                 }
                 d += timedelta(days=1)
 
@@ -531,8 +547,12 @@ class EdgeCollector:
                 if not self._should_fetch_eod_for_day("polygon", d):
                     d += timedelta(days=1)
                     continue
+                # Skip persisted bad symbols
+                pg_bad = set([s.upper() for s in self._vendor_bad_symbols.get("polygon", set())]) | self.bad_symbols.vendor_set("polygon")
+                val_syms = [s for s in symbols if s.upper() not in pg_bad]
                 for i in range(0, len(symbols), BATCH):
-                    chunk = symbols[i:i+BATCH]
+                    chunk_all = symbols[i:i+BATCH]
+                    chunk = [s for s in chunk_all if s.upper() not in pg_bad]
                     tokens = len(chunk)  # ~1 req per symbol-day
                     yield {
                         "vendor": "polygon",
@@ -547,8 +567,14 @@ class EdgeCollector:
                 return
             # options chains best-effort for today on a subset
             per_run = max(1, int(os.getenv("NODE_FINNHUB_UL_PER_UNIT", "5")))
-            for i in range(0, min(len(symbols), per_run)):
-                sym = symbols[i]
+            fh_bad = set([s.upper() for s in self._vendor_bad_symbols.get("finnhub", set())]) | self.bad_symbols.vendor_set("finnhub")
+            picked = 0
+            for sym in symbols:
+                if picked >= per_run:
+                    break
+                if sym.upper() in fh_bad:
+                    continue
+                picked += 1
                 yield {
                     "vendor": "finnhub",
                     "desc": f"finnhub options {sym}",
@@ -559,13 +585,21 @@ class EdgeCollector:
         def fred_units():
             if "fred" not in self.connectors:
                 return
-            # One unit: today's curve
-            yield {
-                "vendor": "fred",
-                "desc": f"fred treasury {today}",
-                "tokens": 1,
-                "run": lambda day=today: self._run_fred_treasury_day(day, budget),
-            }
+            # Iterate from bookmark → gated end_day (yesterday before cutoff, else today)
+            last_ts = self.bookmarks.get_last_timestamp("fred", "macro_treasury") if self.bookmarks else None
+            start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=7))
+            d = start_date
+            while d <= today and not self.shutdown_requested:
+                if not self._should_fetch_eod_for_day("fred", d):
+                    d += timedelta(days=1)
+                    continue
+                yield {
+                    "vendor": "fred",
+                    "desc": f"fred treasury {d}",
+                    "tokens": 1,
+                    "run": lambda day=d: self._run_fred_treasury_day(day, budget),
+                }
+                d += timedelta(days=1)
 
         producers = {}
         for t in tasks:
@@ -787,6 +821,11 @@ class EdgeCollector:
                 if any(s in emsg.lower() for s in ["invalid", "not found", "ticker"]):
                     try:
                         self._vendor_bad_symbols.setdefault("polygon", set()).add(sym)
+                        try:
+                            # two-strike persist within 24h
+                            self.bad_symbols.strike("polygon", sym, reason="invalid symbol")
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 df = pd.DataFrame()
@@ -821,6 +860,14 @@ class EdgeCollector:
             emsg = str(e)
             if "429" in emsg or "rate" in emsg.lower():
                 return ("ratelimited", 0, emsg)
+            # Treat symbol not found as invalid
+            if any(s in emsg.lower() for s in ["invalid", "not found", "ticker"]):
+                try:
+                    self._vendor_bad_symbols.setdefault("finnhub", set()).add(symbol)
+                    # two-strike persist within 24h
+                    self.bad_symbols.strike("finnhub", symbol, reason="invalid symbol")
+                except Exception:
+                    pass
             return ("error", 0, emsg)
         if df.empty:
             return ("empty", 0, "no data")

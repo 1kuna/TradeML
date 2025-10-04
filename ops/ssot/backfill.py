@@ -28,6 +28,7 @@ from ops.ssot.budget import BudgetManager
 from data_layer.connectors.finnhub_connector import FinnhubConnector
 from data_layer.connectors.polygon_connector import PolygonConnector
 from data_layer.connectors.fred_connector import FREDConnector
+from data_layer.connectors.fmp_connector import FMPConnector
 from utils.concurrency import partition_lock, worker_count
 import json
 
@@ -342,11 +343,41 @@ def _backfill_window_equities_eod(connector: AlpacaConnector, universe: List[str
 
         logger.info(f"Backfill sweep {d0} → {d1} for {len(universe)} symbols")
         df = connector.fetch_bars(symbols=universe, start_date=d0, end_date=d1, timeframe="1Day")
-        if df.empty:
-            d1 = d0 - timedelta(days=1)
-            continue
-        for ds, sub in df.groupby("date"):
-            _append_raw_partition(sub, source="alpaca", table="equities_bars", ds=ds)
+        fetched_days = set()
+        if not df.empty:
+            for ds, sub in df.groupby("date"):
+                _append_raw_partition(sub, source="alpaca", table="equities_bars", ds=ds)
+                fetched_days.add(ds)
+        # FMP EOD gap-fill for days not fetched by Alpaca (bounded)
+        try:
+            if os.getenv("FMP_API_KEY"):
+                # Limit per-day symbols to respect free-tier
+                per_day_limit = int(os.getenv("FMP_GAPFILL_PER_DAY_LIMIT", "50"))
+                fmp = FMPConnector(api_key=os.getenv("FMP_API_KEY"))
+                for ds in window_days:
+                    if ds in fetched_days:
+                        continue
+                    # Budget: estimate one request per symbol-day
+                    done = 0
+                    rows = []
+                    for sym in universe:
+                        if done >= per_day_limit:
+                            break
+                        if budget and not budget.try_consume("fmp", 1):
+                            logger.warning("FMP budget exhausted; stopping EOD gap-fill")
+                            break
+                        try:
+                            sub = fmp.fetch_eod_day(sym, ds)
+                        except Exception:
+                            sub = pd.DataFrame()
+                        if not sub.empty:
+                            rows.append(sub)
+                            done += 1
+                    if rows:
+                        out = pd.concat(rows, ignore_index=True)
+                        _append_raw_partition(out, source="fmp", table="equities_bars", ds=ds)
+        except Exception as e:
+            logger.warning(f"FMP EOD gap-fill failed: {e}")
         # Update backfill mark to the earliest date we just covered
         _update_backfill_mark("equities_eod", d0)
         d1 = d0 - timedelta(days=1)
@@ -557,7 +588,7 @@ def backfill_run(budget: Dict[str, int] | None = None) -> None:
         tcfg_m = targets["equities_minute"]
         earliest_m = pd.to_datetime(tcfg_m.get("earliest", "2010-01-01")).date()
         chunk_days_m = int(tcfg_m.get("chunk_days", 5))
-        _backfill_window_equities_minute(connector, universe, earliest=earliest_m, chunk_days=chunk_days_m, top_n=50, budget=bm)
+        _backfill_window_equities_minute(connector, universe, earliest=earliest_m, chunk_days=chunk_days_m, top_n=100, budget=bm)
 
     # 3) Options chains exploratory (forward only, small budget)
     if "options_chains" in targets:

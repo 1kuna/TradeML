@@ -165,6 +165,13 @@ def main():
             update_reference()
         except Exception as e:
             logger.exception(f"Reference update failed: {e}")
+        # Delistings snapshot (FMP stable)
+        try:
+            from ops.reference.delistings import update_delistings_fmp
+            if os.getenv("FMP_API_KEY"):
+                update_delistings_fmp()
+        except Exception as e:
+            logger.warning(f"Delistings update failed: {e}")
 
         # Corporate actions updater for current universe (limited set per cycle)
         try:

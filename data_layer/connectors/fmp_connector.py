@@ -32,6 +32,7 @@ class FMPConnector(BaseConnector):
     """
 
     API_URL = "https://financialmodelingprep.com/api/v3"
+    STABLE_URL = "https://financialmodelingprep.com/stable"
 
     def __init__(
         self,
@@ -93,6 +94,26 @@ class FMPConnector(BaseConnector):
             logger.error(f"FMP API error: {e}")
             raise ConnectorError(f"Failed to fetch from FMP: {e}")
 
+    def _fetch_stable(self, endpoint: str, **params) -> Any:
+        """Fetch raw data from FMP stable API.
+
+        Args:
+            endpoint: Stable API endpoint path
+            **params: Query parameters
+
+        Returns:
+            Raw JSON response
+        """
+        url = f"{self.STABLE_URL}/{endpoint}"
+        api_params = {"apikey": self.api_key, **params}
+        try:
+            response = self._get(url, params=api_params)
+            data = response.json()
+            return data
+        except Exception as e:
+            logger.error(f"FMP stable API error: {e}")
+            raise ConnectorError(f"Failed to fetch from FMP stable: {e}")
+
     def _transform(self, raw_data: Any, **kwargs) -> pd.DataFrame:
         """
         Transform FMP response to our schema.
@@ -108,9 +129,9 @@ class FMPConnector(BaseConnector):
         Returns:
             DataFrame with delisted symbols
         """
-        logger.info("Fetching delisted companies from FMP")
+        logger.info("Fetching delisted companies from FMP (stable)")
 
-        raw_data = self._fetch_raw("delisted-companies")
+        raw_data = self._fetch_stable("delisted-companies")
 
         # Parse delisted data
         rows = []
@@ -158,7 +179,12 @@ class FMPConnector(BaseConnector):
         if end_date:
             params["to"] = end_date.strftime("%Y-%m-%d")
 
-        raw_data = self._fetch_raw(f"historical-price-full/{symbol}", **params)
+        # Prefer stable light EOD if no explicit range requested; otherwise fall back to full and filter
+        raw_data: Any
+        if not start_date and not end_date:
+            raw_data = self._fetch_stable("historical-price-eod/light", symbol=symbol)
+        else:
+            raw_data = self._fetch_raw(f"historical-price-full/{symbol}", **params)
 
         # Parse historical data
         rows = []
@@ -189,6 +215,60 @@ class FMPConnector(BaseConnector):
             df = df.sort_values("date").reset_index(drop=True)
 
         return df
+
+    def fetch_eod_series(self, symbol: str, variant: str = "light") -> pd.DataFrame:
+        """Fetch EOD OHLCV series from stable historical-price-eod (light/full).
+
+        Args:
+            symbol: Ticker
+            variant: 'light' or 'full'
+        Returns:
+            DataFrame with columns date,symbol,session_id,open,high,low,close,volume
+        """
+        logger.info(f"FMP EOD {variant} for {symbol}")
+        data = self._fetch_stable(f"historical-price-eod/{variant}", symbol=symbol)
+        # Response may be a list or {'historical': [...]} depending on plan
+        series = []
+        if isinstance(data, dict):
+            series = data.get("historical", []) or data.get("results", []) or []
+        elif isinstance(data, list):
+            series = data
+        rows = []
+        for bar in series:
+            d = bar.get("date") or bar.get("Date")
+            if not d:
+                continue
+            try:
+                dt = datetime.strptime(str(d)[:10], "%Y-%m-%d").date()
+            except Exception:
+                continue
+            rows.append({
+                "date": dt,
+                "symbol": symbol,
+                "session_id": dt.strftime("%Y%m%d"),
+                "open": float(bar.get("open") or bar.get("Open") or 0.0),
+                "high": float(bar.get("high") or bar.get("High") or 0.0),
+                "low": float(bar.get("low") or bar.get("Low") or 0.0),
+                "close": float(bar.get("close") or bar.get("Close") or 0.0),
+                "vwap": None,
+                "volume": int(bar.get("volume") or bar.get("Volume") or 0),
+                "nbbo_spread": None,
+                "trades": None,
+                "imbalance": None,
+            })
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = self._add_metadata(df, source_uri=f"fmp://historical-price-eod/{variant}/{symbol}")
+            df = df.sort_values("date").reset_index(drop=True)
+        return df
+
+    def fetch_eod_day(self, symbol: str, day: date) -> pd.DataFrame:
+        """Fetch single EOD row for a given day using stable light series."""
+        df = self.fetch_eod_series(symbol, variant="light")
+        if df.empty:
+            return df
+        sub = df[df["date"] == day]
+        return sub.reset_index(drop=True)
 
     def fetch_company_profile(self, symbol: str) -> Dict:
         """
