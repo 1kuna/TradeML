@@ -20,11 +20,49 @@ set -euo pipefail
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_DIR"
 
+# Per-repo temp dir for safe, atomic edits (avoids sed* litter)
+TMP_DIR="$REPO_DIR/.tmp"
+mkdir -p "$TMP_DIR" 2>/dev/null || true
+# Cleanup temp dir on exit/interrupt
+cleanup_tmp() { rm -rf "$TMP_DIR" 2>/dev/null || true; }
+trap cleanup_tmp EXIT INT TERM
+
 MIN_PY_DEPS=(boto3 pandas pyarrow pyyaml python-dotenv loguru alpaca-py requests)
 
 ensure_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     return 1
+  fi
+}
+
+# Normalize CRLF to LF for given files (in-place via temp file)
+normalize_lf() {
+  for f in "$@"; do
+    [[ -f "$f" ]] || continue
+    local tf
+    tf=$(mktemp -p "$TMP_DIR" eol.XXXXXX)
+    # Strip trailing CR if present
+    awk '{ sub(/\r$/, ""); print }' "$f" > "$tf" && mv "$tf" "$f" || rm -f "$tf"
+  done
+}
+
+# Upsert key=value into a .env-style file without in-place sed
+# Modes: always (replace if exists), if-empty (only add if absent)
+set_env_kv() {
+  local file="$1" key="$2" value="$3" mode="${4:-always}"
+  # Validate key name
+  if ! printf '%s' "$key" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
+    return 0
+  fi
+  if [[ "$mode" == "if-empty" ]] && grep -q "^$key=" "$file" 2>/dev/null; then
+    return 0
+  fi
+  if grep -q "^$key=" "$file" 2>/dev/null; then
+    local tf
+    tf=$(mktemp -p "$TMP_DIR" env.XXXXXX)
+    awk -v k="$key" -v v="$value" 'BEGIN{r=0} $0 ~ ("^"k"="){print k"="v; r=1; next} {print} END{exit (r?0:0)}' "$file" > "$tf" && mv "$tf" "$file" || rm -f "$tf"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$file"
   fi
 }
 
@@ -244,11 +282,7 @@ ensure_env() {
     # Replace or append keys
     while IFS='=' read -r k v; do
       [[ -z "$k" ]] && continue
-      if grep -q "^$k=" .env; then
-        sed -i.bak "s|^$k=.*|$k=$v|" .env
-      else
-        echo "$k=$v" >> .env
-      fi
+      set_env_kv ".env" "$k" "$v" "always"
     done < .env.s3
     echo "✓ Updated .env with S3 credentials"
   fi
@@ -256,7 +290,7 @@ ensure_env() {
   # Controlled S3 creds merge (never|if-empty|always), default if-empty
   if [[ -f .env.s3 ]] && [[ "${S3_ENV_MERGE_MODE:-if-empty}" != "legacy" ]]; then
     mode=${S3_ENV_MERGE_MODE:-if-empty}
-    sed -i 's/\r$//' .env.s3 .env 2>/dev/null || true
+    normalize_lf .env.s3 .env
     while IFS='=' read -r k v; do
       [[ -z "$k" ]] && continue
       if ! printf '%s' "$k" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
@@ -266,16 +300,10 @@ ensure_env() {
         never)
           ;;
         if-empty|*)
-          if ! grep -q "^$k=" .env; then
-            echo "$k=$v" >> .env
-          fi
+          set_env_kv ".env" "$k" "$v" "if-empty"
           ;;
         always)
-          if grep -q "^$k=" .env; then
-            sed -i.bak "s|^$k=.*|$k=$v|" .env
-          else
-            echo "$k=$v" >> .env
-          fi
+          set_env_kv ".env" "$k" "$v" "always"
           ;;
       esac
     done < .env.s3
@@ -289,18 +317,38 @@ ensure_env() {
     ensure_mc_alias || true
     if command -v mc >/dev/null 2>&1; then
       if ! mc ls "minio/${S3_BUCKET:-}/" >/dev/null 2>&1; then
-        echo "[WARN] S3 creds validation failed; reverting .env to pre-merge"
-        if [[ -f .env.premerge ]]; then
-          mv .env.premerge .env
+        echo "[WARN] S3 creds validation failed; attempting forced merge from .env.s3"
+        if [[ -f .env.s3 ]]; then
+          # Force merge .env.s3 values (overwrite)
+          while IFS='=' read -r k v; do
+            [[ -z "$k" ]] && continue
+            set_env_kv ".env" "$k" "$v" "always"
+          done < .env.s3
+          # Re-export and try again
+          set -a; source .env; set +a
+          ensure_mc_alias || true
+          if mc ls "minio/${S3_BUCKET:-}/" >/dev/null 2>&1; then
+            echo "✓ Forced merge succeeded; using updated S3 credentials"
+          else
+            echo "[WARN] Forced merge did not validate; reverting .env to pre-merge"
+            if [[ -f .env.premerge ]]; then
+              mv .env.premerge .env
+            fi
+            set -a; source .env; set +a
+          fi
+        else
+          echo "[WARN] No .env.s3 present to force-merge; reverting to pre-merge if available"
+          if [[ -f .env.premerge ]]; then
+            mv .env.premerge .env
+          fi
+          set -a; source .env; set +a
         fi
-        # Re-export reverted env
-        set -a; source .env; set +a
       fi
     fi
   fi
 
   # Force required toggles
-  sed -i.bak "s|^STORAGE_BACKEND=.*|STORAGE_BACKEND=s3|" .env || true
+  set_env_kv ".env" "STORAGE_BACKEND" "s3" "always"
   if ! grep -q "^ROLE=" .env; then echo "ROLE=edge" >> .env; fi
 
   # Cleanup pre-merge backup if still present (successful merge)
@@ -352,6 +400,8 @@ case "$cmd" in
     ensure_env
     ensure_python
     ensure_mc_alias
+    # Avoid ambient AWS_* overriding .env inside Python
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
     python scripts/node.py --selfcheck
     ;;
   up)
