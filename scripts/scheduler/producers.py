@@ -176,3 +176,91 @@ def fred_treasury_units(edge, budget_mgr=None) -> Iterator[dict]:
             "run": (lambda day=d: edge._run_fred_treasury_day(day, budget_mgr)),
         }
         d += timedelta(days=1)
+
+
+def alpaca_options_bars_units(edge, budget_mgr=None) -> Iterator[dict]:
+    if "alpaca" not in edge.connectors:
+        return
+    symbols = edge._symbols_universe()
+    today = _today_date()
+    # Default: collect the past 7 days unless bookmark exists
+    default_days = _int_env("ALPACA_OPTIONS_BARS_START_DAYS", 7)
+    start_date = _start_date(edge, "alpaca", "options_bars", default_days)
+    try:
+        ul_per_unit = max(1, int(os.getenv("NODE_ALPACA_OPTIONS_UL_PER_UNIT", "3")))
+    except Exception:
+        ul_per_unit = 3
+    try:
+        timeframe = os.getenv("ALPACA_OPTIONS_TIMEFRAME", "1Day")
+    except Exception:
+        timeframe = "1Day"
+    picked = 0
+    d = start_date
+    while d <= today and not edge.shutdown_requested:
+        if not edge._should_fetch_eod_for_day("alpaca", d):
+            d += timedelta(days=1)
+            continue
+        picked = 0
+        for sym in symbols:
+            if picked >= ul_per_unit:
+                break
+            picked += 1
+            run_fn = (lambda ul=sym, day=d, tf=timeframe: edge._run_alpaca_options_bars_for_underlier(ul, day, tf, budget_mgr))
+            yield {
+                "vendor": "alpaca",
+                "desc": f"alpaca options bars {sym} {d}",
+                "tokens": 1,
+                "run": run_fn,
+            }
+        d += timedelta(days=1)
+
+
+def alpaca_options_chain_units(edge, budget_mgr=None) -> Iterator[dict]:
+    if "alpaca" not in edge.connectors:
+        return
+    symbols = edge._symbols_universe()
+    today = _today_date()
+    default_days = _int_env("ALPACA_OPTIONS_CHAIN_START_DAYS", 7)
+    start_date = _start_date(edge, "alpaca", "options_chain", default_days)
+    try:
+        ul_per_unit = max(1, int(os.getenv("NODE_ALPACA_OPTIONS_UL_PER_UNIT", "3")))
+    except Exception:
+        ul_per_unit = 3
+    d = start_date
+    while d <= today and not edge.shutdown_requested:
+        if not edge._should_fetch_eod_for_day("alpaca", d):
+            d += timedelta(days=1)
+            continue
+        picked = 0
+        for sym in symbols:
+            if picked >= ul_per_unit:
+                break
+            picked += 1
+            yield {
+                "vendor": "alpaca",
+                "desc": f"alpaca options chain {sym} {d}",
+                "tokens": 1,
+                "run": (lambda ul=sym, day=d: edge._run_alpaca_options_chain_underlier(ul, day, budget_mgr)),
+            }
+        d += timedelta(days=1)
+
+
+def alpaca_corporate_actions_units(edge, budget_mgr=None) -> Iterator[dict]:
+    if "alpaca" not in edge.connectors:
+        return
+    today = _today_date()
+    default_days = _int_env("ALPACA_CORPACTIONS_START_DAYS", 5475)
+    start_date = _start_date(edge, "alpaca", "corporate_actions", default_days)
+    d = start_date
+    while d <= today and not edge.shutdown_requested:
+        # Corporate actions are day-stamped; no EOD gating needed, but reuse alpaca gating
+        if not edge._should_fetch_eod_for_day("alpaca", d):
+            d += timedelta(days=1)
+            continue
+        yield {
+            "vendor": "alpaca",
+            "desc": f"alpaca corporate actions {d}",
+            "tokens": 1,
+            "run": (lambda day=d: edge._run_alpaca_corporate_actions_day(day, budget_mgr)),
+        }
+        d += timedelta(days=1)

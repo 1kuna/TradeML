@@ -76,8 +76,27 @@ def build_iv(asof: date, underliers: List[str], min_contracts: int = 10) -> Dict
         df = pd.read_parquet(path)
         if df.empty or "nbbo_mid" not in df.columns:
             continue
+        # Guard: never use indicative quotes (e.g., Alpaca indicative feed)
+        try:
+            if "quote_quality" in df.columns:
+                df = df[df["quote_quality"].astype(str).str.lower() != "indicative"]
+            if "indicative" in df.columns:
+                # boolean flag means row used indicative quotes; drop
+                df = df[~df["indicative"].astype(bool)]
+        except Exception:
+            pass
+        if df.empty:
+            continue
         rows = []
         for _, row in df.iterrows():
+            # Per-row guard for robustness
+            try:
+                if str(row.get("quote_quality", "")).lower() == "indicative":
+                    continue
+                if bool(row.get("indicative", False)):
+                    continue
+            except Exception:
+                pass
             exp = pd.to_datetime(row["expiry"]).date() if pd.notna(row.get("expiry")) else None
             if not exp:
                 continue

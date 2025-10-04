@@ -269,6 +269,16 @@ def main():
                     logger.info(f"SVI surface fit status: {_.get('status')}")
                 except Exception as _e:
                     logger.warning(f"Options SVI fit failed: {_e}")
+            # Options QA: compare Alpaca vs Finnhub chains for today
+            try:
+                if os.getenv("NODE_ENABLE_OPTIONS_QA", "true").lower() == "true":
+                    from ops.monitoring.options_qa import chain_consistency_report
+                    from datetime import date as _Date
+                    uni_file = REPO_ROOT / "data_layer" / "reference" / "universe_symbols.txt"
+                    qa_underliers = [s.strip() for s in uni_file.read_text().splitlines() if s.strip()][:10] if uni_file.exists() else ["AAPL", "MSFT"]
+                    chain_consistency_report(_Date.today(), qa_underliers)
+            except Exception as _e:
+                logger.warning(f"Options QA failed: {_e}")
             # Polygon options sampling (contracts + aggregates) — best effort
             try:
                 if os.getenv("NODE_ENABLE_POLYGON_OPTIONS", "true").lower() == "true" and os.getenv("POLYGON_API_KEY"):

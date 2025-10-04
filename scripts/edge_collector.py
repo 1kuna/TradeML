@@ -1096,6 +1096,123 @@ class EdgeCollector:
             self.bookmarks.set("fred", "macro_treasury", day.isoformat(), int(len(df)))
         return ("ok", int(len(df)), "")
 
+    def _run_alpaca_options_bars_for_underlier(self, underlying: str, day: date, timeframe: str = "1Day", budget: Optional[BudgetManager] = None):
+        """Fetch Alpaca option bars for a single underlier by selecting a subset of contracts from chain.
+
+        Persists a single Parquet per date+underlier to:
+          raw/alpaca/options_bars/date=YYYY-MM-DD/underlier=UNDERLIER/data.parquet
+        """
+        conn = self.connectors.get("alpaca")
+        if not conn:
+            return ("empty", 0, "no connector")
+        # Determine feed for chain snapshots (opra|indicative)
+        feed = os.getenv("ALPACA_OPTIONS_FEED")
+        try:
+            limit = max(1, int(os.getenv("ALPACA_OPTIONS_CONTRACTS_PER_UNIT", "50")))
+        except Exception:
+            limit = 50
+        try:
+            contracts = conn.fetch_option_chain_symbols(underlying, feed=feed, limit=limit)
+        except Exception as e:
+            emsg = str(e)
+            if "429" in emsg or "rate" in emsg.lower():
+                return ("ratelimited", 0, emsg)
+            return ("error", 0, emsg)
+        if not contracts:
+            return ("empty", 0, "no contracts")
+        try:
+            df = conn.fetch_option_bars(contracts, start_date=day, end_date=day, timeframe=timeframe)
+        except Exception as e:
+            emsg = str(e)
+            if "429" in emsg or "rate" in emsg.lower():
+                return ("ratelimited", 0, emsg)
+            return ("error", 0, emsg)
+        if df.empty:
+            return ("empty", 0, "no data")
+        # Persist partitioned by date + underlier
+        if self.s3:
+            key = f"raw/alpaca/options_bars/date={day.isoformat()}/underlier={underlying}/data.parquet"
+            fut = self._upload_parquet_key(df, key, async_write=True)
+            try:
+                if fut is not None:
+                    self._wait_future_with_logs(fut, desc=f"alpaca options bars {underlying} {day} parquet upload")
+            except Exception as e:
+                return ("error", 0, str(e))
+        else:
+            out = Path("data_layer/raw/alpaca/options_bars") / f"date={day.isoformat()}" / f"underlier={underlying}"
+            out.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(out / "data.parquet", index=False)
+        if self.bookmarks:
+            self.bookmarks.set("alpaca", "options_bars", day.isoformat(), int(len(df)))
+        return ("ok", int(len(df)), "")
+
+    def _run_alpaca_options_chain_underlier(self, underlying: str, day: date, budget: Optional[BudgetManager] = None):
+        """Fetch and persist Alpaca option chain snapshot for an underlier for this day.
+
+        Stores at raw/alpaca/options_chain/date=YYYY-MM-DD/underlier=UNDERLIER/data.parquet
+        """
+        conn = self.connectors.get("alpaca")
+        if not conn:
+            return ("empty", 0, "no connector")
+        feed = os.getenv("ALPACA_OPTIONS_FEED")
+        try:
+            limit = max(1, int(os.getenv("ALPACA_OPTIONS_CHAIN_CONTRACTS_LIMIT", "1000")))
+        except Exception:
+            limit = 1000
+        try:
+            df = conn.fetch_option_chain_snapshot_df(underlying, feed=feed, limit=limit)
+        except Exception as e:
+            emsg = str(e)
+            if "429" in emsg or "rate" in emsg.lower():
+                return ("ratelimited", 0, emsg)
+            return ("error", 0, emsg)
+        if df.empty:
+            return ("empty", 0, "no data")
+        if self.s3:
+            key = f"raw/alpaca/options_chain/date={day.isoformat()}/underlier={underlying}/data.parquet"
+            fut = self._upload_parquet_key(df, key, async_write=True)
+            try:
+                if fut is not None:
+                    self._wait_future_with_logs(fut, desc=f"alpaca options chain {underlying} {day} parquet upload")
+            except Exception as e:
+                return ("error", 0, str(e))
+        else:
+            out = Path("data_layer/raw/alpaca/options_chain") / f"date={day.isoformat()}" / f"underlier={underlying}"
+            out.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(out / "data.parquet", index=False)
+        if self.bookmarks:
+            self.bookmarks.set("alpaca", "options_chain", day.isoformat(), int(len(df)))
+        return ("ok", int(len(df)), "")
+
+    def _run_alpaca_corporate_actions_day(self, day: date, budget: Optional[BudgetManager] = None):
+        conn = self.connectors.get("alpaca")
+        if not conn:
+            return ("empty", 0, "no connector")
+        try:
+            df = conn.fetch_corporate_actions(day, day, symbols=None)
+        except Exception as e:
+            emsg = str(e)
+            if "429" in emsg or "rate" in emsg.lower():
+                return ("ratelimited", 0, emsg)
+            return ("error", 0, emsg)
+        if df.empty:
+            return ("empty", 0, "no data")
+        if self.s3:
+            key = f"raw/alpaca/corporate_actions/date={day.isoformat()}/data.parquet"
+            fut = self._upload_parquet_key(df, key, async_write=True)
+            try:
+                if fut is not None:
+                    self._wait_future_with_logs(fut, desc=f"alpaca corporate actions {day} parquet upload")
+            except Exception as e:
+                return ("error", 0, str(e))
+        else:
+            out = Path("data_layer/raw/alpaca/corporate_actions") / f"date={day.isoformat()}"
+            out.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(out / "data.parquet", index=False)
+        if self.bookmarks:
+            self.bookmarks.set("alpaca", "corporate_actions", day.isoformat(), int(len(df)))
+        return ("ok", int(len(df)), "")
+
     def run(self, scheduler_mode: Optional[str] = None):
         """Run edge collector."""
         logger.info("Edge collector starting...")

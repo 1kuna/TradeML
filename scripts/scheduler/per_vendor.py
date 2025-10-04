@@ -127,6 +127,12 @@ class VendorRunner:
                 prods.append(alpaca_bars_units(self.edge, self.budget))
             if "alpaca_minute" in self.tasks:
                 prods.append(alpaca_minute_units(self.edge, self.budget))
+            if "alpaca_options_bars" in self.tasks:
+                prods.append(alpaca_options_bars_units(self.edge, self.budget))
+            if "alpaca_options_chain" in self.tasks:
+                prods.append(alpaca_options_chain_units(self.edge, self.budget))
+            if "alpaca_corporate_actions" in self.tasks:
+                prods.append(alpaca_corporate_actions_units(self.edge, self.budget))
         elif self.vendor == "polygon":
             if "polygon_bars" in self.tasks:
                 prods.append(polygon_bars_units(self.edge, self.budget))

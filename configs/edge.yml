@@ -10,6 +10,9 @@ tasks:
   - finnhub_options
   - fred_treasury
   - alpaca_minute
+  - alpaca_options_bars
+  - alpaca_options_chain
+  - alpaca_corporate_actions
 
 # Policy: daily API budgets (governed by BudgetManager)
 policy:

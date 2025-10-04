@@ -296,6 +296,10 @@ ensure_env() {
       if ! printf '%s' "$k" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
         continue
       fi
+      # Skip applying empty values to avoid wiping populated keys
+      if [[ -z "$v" ]]; then
+        continue
+      fi
       case "$mode" in
         never)
           ;;
@@ -322,6 +326,10 @@ ensure_env() {
           # Force merge .env.s3 values (overwrite)
           while IFS='=' read -r k v; do
             [[ -z "$k" ]] && continue
+            # Skip empty values to avoid clobbering keys with blanks
+            if [[ -z "$v" ]]; then
+              continue
+            fi
             set_env_kv ".env" "$k" "$v" "always"
           done < .env.s3
           # Re-export and try again

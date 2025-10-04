@@ -15,7 +15,15 @@ from datetime import datetime, date
 from typing import List, Optional, Dict, Any
 import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.historical.option import OptionHistoricalDataClient
+from alpaca.data.historical.corporate_actions import CorporateActionsClient
+from alpaca.data.requests import (
+    StockBarsRequest,
+    OptionBarsRequest,
+    OptionTradesRequest,
+    OptionChainRequest,
+    CorporateActionsRequest,
+)
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from loguru import logger
 
@@ -74,6 +82,18 @@ class AlpacaConnector(BaseConnector):
 
         # Initialize Alpaca client
         self.client = StockHistoricalDataClient(api_key, secret_key)
+        # Initialize options client (for options bars/trades/chain when entitled)
+        try:
+            self.opt_client = OptionHistoricalDataClient(api_key, secret_key)
+        except Exception as e:
+            logger.warning(f"Alpaca options client unavailable: {e}")
+            self.opt_client = None
+        # Corporate actions client
+        try:
+            self.ca_client = CorporateActionsClient(api_key, secret_key)
+        except Exception as e:
+            logger.warning(f"Alpaca corporate actions client unavailable: {e}")
+            self.ca_client = None
         self.secret_key = secret_key
 
         logger.info("Alpaca connector initialized")
@@ -240,6 +260,226 @@ class AlpacaConnector(BaseConnector):
 
         logger.info(f"Fetched {len(result)} bars for {len(symbols)} symbols")
         return result
+
+    # ---------------- Options (SDK) ----------------
+
+    def fetch_option_bars(
+        self,
+        contracts: List[str],
+        start_date: date,
+        end_date: date,
+        timeframe: str = "1Day",
+    ) -> pd.DataFrame:
+        """Fetch option bars for a list of contract symbols over a date range.
+
+        Returns combined DataFrame with columns:
+          symbol, timestamp, open, high, low, close, volume, trade_count, vwap
+        """
+        if not self.opt_client:
+            raise ConnectorError("Alpaca options client not initialized (no entitlement?)")
+        if timeframe not in self.TIMEFRAME_MAP:
+            raise ConnectorError(f"Invalid timeframe for options: {timeframe}")
+        if not contracts:
+            return pd.DataFrame()
+        req = OptionBarsRequest(
+            symbol_or_symbols=contracts,
+            timeframe=self.TIMEFRAME_MAP[timeframe],
+            start=datetime.combine(start_date, datetime.min.time()),
+            end=datetime.combine(end_date, datetime.max.time()),
+        )
+        try:
+            bars = self.opt_client.get_option_bars(req)
+        except Exception as e:
+            raise ConnectorError(f"Alpaca options bars failed: {e}")
+        # Flatten BarSet -> records
+        rows = []
+        try:
+            for sym, blist in bars.data.items():
+                for b in blist:
+                    rows.append(
+                        {
+                            "symbol": sym,
+                            "timestamp": b.timestamp,
+                            "open": b.open,
+                            "high": b.high,
+                            "low": b.low,
+                            "close": b.close,
+                            "volume": b.volume,
+                            "trade_count": b.trade_count,
+                            "vwap": b.vwap,
+                        }
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to parse bars: {e}")
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame.from_records(rows)
+        return df
+
+    def fetch_option_trades(
+        self,
+        contracts: List[str],
+        start_date: date,
+        end_date: date,
+    ) -> pd.DataFrame:
+        """Fetch option trades for a list of contract symbols. Alpaca trades API typically covers recent week.
+
+        Returns combined DataFrame with columns:
+          symbol, timestamp, price, size, exchange, tape, id
+        """
+        if not self.opt_client:
+            raise ConnectorError("Alpaca options client not initialized (no entitlement?)")
+        if not contracts:
+            return pd.DataFrame()
+        req = OptionTradesRequest(
+            symbol_or_symbols=contracts,
+            start=datetime.combine(start_date, datetime.min.time()),
+            end=datetime.combine(end_date, datetime.max.time()),
+        )
+        try:
+            trades = self.opt_client.get_option_trades(req)
+        except Exception as e:
+            raise ConnectorError(f"Alpaca options trades failed: {e}")
+        rows = []
+        try:
+            for sym, tlist in trades.data.items():
+                for t in tlist:
+                    rows.append(
+                        {
+                            "symbol": sym,
+                            "timestamp": t.timestamp,
+                            "price": t.price,
+                            "size": t.size,
+                            "exchange": getattr(t, "exchange", None),
+                            "tape": getattr(t, "tape", None),
+                            "id": getattr(t, "id", None),
+                        }
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to parse trades: {e}")
+        return pd.DataFrame.from_records(rows) if rows else pd.DataFrame()
+
+    def fetch_option_chain_symbols(self, underlying_symbol: str, feed: Optional[str] = None, limit: int = 200) -> List[str]:
+        """Get available contract symbols for an underlier via OptionChainRequest.
+
+        When options entitlements are not present, falls back to indicative feed if available.
+        Returns a list of contract symbols (strings)."""
+        if not self.opt_client:
+            raise ConnectorError("Alpaca options client not initialized (no entitlement?)")
+        # feed: 'opra' or 'indicative' or None
+        from alpaca.data.enums import OptionsFeed
+        feed_param = None
+        try:
+            if feed:
+                feed_param = OptionsFeed(feed)
+        except Exception:
+            feed_param = None
+        try:
+            req = OptionChainRequest(underlying_symbol=underlying_symbol, feed=feed_param)
+            snapshots = self.opt_client.get_option_chain(req)
+        except Exception as e:
+            raise ConnectorError(f"Alpaca option chain failed: {e}")
+        # snapshots is dict[contract_symbol] -> OptionsSnapshot
+        symbols = list(snapshots.keys()) if isinstance(snapshots, dict) else []
+        if limit and len(symbols) > limit:
+            symbols = symbols[:limit]
+        return symbols
+
+    def fetch_option_chain_snapshot_df(self, underlying_symbol: str, feed: Optional[str] = None, limit: int = 1000) -> pd.DataFrame:
+        """Fetch current option chain snapshots for an underlying and flatten to DataFrame.
+
+        Columns include contract symbol, underlier, IV, greeks (delta,gamma,theta,vega,rho),
+        last trade (price,size,timestamp), last quote (bid,ask,bid_size,ask_size,timestamp).
+        """
+        if not self.opt_client:
+            raise ConnectorError("Alpaca options client not initialized (no entitlement?)")
+        from alpaca.data.enums import OptionsFeed
+        feed_param = None
+        try:
+            if feed:
+                feed_param = OptionsFeed(feed)
+        except Exception:
+            feed_param = None
+        try:
+            req = OptionChainRequest(underlying_symbol=underlying_symbol, feed=feed_param)
+            snapshots = self.opt_client.get_option_chain(req)
+        except Exception as e:
+            raise ConnectorError(f"Alpaca option chain failed: {e}")
+        rows = []
+        if isinstance(snapshots, dict):
+            items = list(snapshots.items())
+            if limit and len(items) > limit:
+                items = items[:limit]
+            # Control handling of indicative quotes
+            save_ind_qq = os.getenv("ALPACA_OPTIONS_SAVE_INDICATIVE_QUOTES", "false").lower() in ("1","true","yes","on")
+            is_indicative = str(feed).lower() == "indicative"
+            for sym, snap in items:
+                try:
+                    lt = getattr(snap, "latest_trade", None)
+                    lq = getattr(snap, "latest_quote", None)
+                    greeks = getattr(snap, "greeks", None)
+                    if is_indicative and not save_ind_qq:
+                        lq = None
+                        greeks = None
+                    rows.append(
+                        {
+                            "contract": sym,
+                            "underlier": underlying_symbol,
+                            "iv": getattr(snap, "implied_volatility", None) if not (is_indicative and not save_ind_qq) else None,
+                            "delta": getattr(greeks, "delta", None) if greeks else None,
+                            "gamma": getattr(greeks, "gamma", None) if greeks else None,
+                            "theta": getattr(greeks, "theta", None) if greeks else None,
+                            "vega": getattr(greeks, "vega", None) if greeks else None,
+                            "rho": getattr(greeks, "rho", None) if greeks else None,
+                            "last_trade_price": getattr(lt, "price", None) if lt else None,
+                            "last_trade_size": getattr(lt, "size", None) if lt else None,
+                            "last_trade_time": getattr(lt, "timestamp", None) if lt else None,
+                            "bid": getattr(lq, "bid_price", None) if lq else None,
+                            "ask": getattr(lq, "ask_price", None) if lq else None,
+                            "bid_size": getattr(lq, "bid_size", None) if lq else None,
+                            "ask_size": getattr(lq, "ask_size", None) if lq else None,
+                            "quote_time": getattr(lq, "timestamp", None) if lq else None,
+                            "feed": str(feed) if feed else None,
+                            "indicative": is_indicative,
+                            "quote_quality": ("indicative" if is_indicative else "opra"),
+                        }
+                    )
+                except Exception:
+                    continue
+        return pd.DataFrame.from_records(rows) if rows else pd.DataFrame()
+
+    def fetch_corporate_actions(self, start: date, end: date, symbols: Optional[List[str]] = None) -> pd.DataFrame:
+        """Fetch corporate actions between dates (inclusive) and flatten to a DataFrame.
+
+        Includes splits, dividends, mergers, spinoffs, name changes, etc.
+        """
+        if not self.ca_client:
+            raise ConnectorError("Alpaca corporate actions client not initialized")
+        try:
+            from alpaca.data.enums import CorporateActionsType
+        except Exception:
+            CorporateActionsType = None  # Not required; types optional
+        req = CorporateActionsRequest(
+            symbols=symbols,
+            start=start,
+            end=end,
+            # types=None (all)
+        )
+        try:
+            ca = self.ca_client.get_corporate_actions(req)
+        except Exception as e:
+            raise ConnectorError(f"Alpaca corporate actions failed: {e}")
+        rows = []
+        if getattr(ca, "data", None):
+            for ca_type, arr in ca.data.items():
+                for item in arr:
+                    try:
+                        d = item.__dict__.copy()
+                        d["type"] = ca_type
+                        rows.append(d)
+                    except Exception:
+                        continue
+        return pd.DataFrame.from_records(rows) if rows else pd.DataFrame()
 
     def fetch_universe(
         self,
