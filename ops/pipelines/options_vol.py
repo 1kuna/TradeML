@@ -14,12 +14,14 @@ from datetime import date
 from pathlib import Path
 from typing import List, Optional, Dict
 
+import json
 import numpy as np
 import pandas as pd
 from loguru import logger
 
 from feature_store.options.iv import calculate_iv_from_price, BlackScholesIV
 from feature_store.options.svi import fit_svi_slice
+from models.options_vol import OptionsModelConfig, save_model, train_options_model
 
 
 @dataclass
@@ -62,6 +64,7 @@ def run_options_vol(cfg: OptionsVolConfig) -> Dict:
         return {"status": "no_data"}
 
     results = {}
+    feature_rows = []
     for ul in cfg.underliers:
         p = base / f"underlier={ul}" / "data.parquet"
         if not p.exists():
@@ -71,6 +74,7 @@ def run_options_vol(cfg: OptionsVolConfig) -> Dict:
             continue
         spot = float(iv_df.iloc[0].get("underlying_price", 100.0))
         svi_results = {}
+        rmse_vals = []
         for exp, slice_df in iv_df.groupby("expiry"):
             if len(slice_df) < cfg.min_contracts:
                 continue
@@ -80,12 +84,55 @@ def run_options_vol(cfg: OptionsVolConfig) -> Dict:
             if T <= 0:
                 continue
             fit = fit_svi_slice(strikes=np.asarray(strikes), spot=spot, ivs=np.asarray(ivs), T=T)
+            rmse = getattr(fit.get("metrics"), "rmse", None) if fit.get("metrics") is not None else None
             svi_results[str(pd.to_datetime(exp).date())] = {
                 "fit_successful": fit["fit_successful"],
-                "rmse": getattr(fit.get("metrics"), "rmse", None) if fit.get("metrics") is not None else None,
+                "rmse": rmse,
             }
+            if rmse is not None:
+                rmse_vals.append(float(rmse))
         if svi_results:
             results[ul] = {"svi": svi_results}
+            feature_rows.append(
+                {
+                    "underlier": ul,
+                    "spot": spot,
+                    "avg_iv": float(iv_df["iv"].mean()),
+                    "num_contracts": int(len(iv_df)),
+                    "rmse_mean": float(np.mean(rmse_vals)) if rmse_vals else np.nan,
+                    "rmse_std": float(np.std(rmse_vals)) if rmse_vals else np.nan,
+                }
+            )
+
+    artifact = None
+    if feature_rows:
+        feat_df = pd.DataFrame(feature_rows).dropna(subset=["rmse_mean"])
+        if not feat_df.empty:
+            target = -feat_df["rmse_mean"]  # lower rmse -> higher edge proxy
+            X = feat_df.drop(columns=["underlier", "rmse_mean"])
+            try:
+                model, metrics = train_options_model(X, target, OptionsModelConfig())
+                artifact_dir = Path("models/options_vol/artifacts")
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                model_path = artifact_dir / "options_vol.pkl"
+                save_model(model, model_path)
+                (artifact_dir / "options_summary.json").write_text(
+                    json.dumps({
+                        "metrics": metrics,
+                        "train_rows": int(len(X)),
+                        "timestamp": pd.Timestamp.utcnow().isoformat(),
+                        "model_path": str(model_path),
+                    }, indent=2)
+                )
+                artifact = {"model_path": str(model_path), "metrics": metrics}
+            except Exception as exc:
+                logger.warning(f"Options model training failed: {exc}")
 
     status = "ok" if results else "no_data"
-    return {"status": status, "asof": cfg.asof, "underliers": list(results.keys()), "results": results}
+    return {
+        "status": status,
+        "asof": cfg.asof,
+        "underliers": list(results.keys()),
+        "results": results,
+        "artifact": artifact,
+    }

@@ -1,0 +1,7 @@
+dataset_path: data_layer/curated/offline_rl/trajectories.parquet
+artifact_dir: models/rl/artifacts
+algorithm: cql
+test_size: 0.2
+random_state: 42
+update_router: false
+router_cfg_path: configs/router.yml

@@ -1,0 +1,11 @@
+start_date: "2015-01-01"
+end_date: "2024-12-31"
+universe: ["AAPL", "MSFT", "GOOGL"]
+oof_sources:
+  equities_xs: models/equities_xs/artifacts/latest/oof_scores.parquet
+label_type: horizon
+horizon_days: 5
+artifact_dir: models/meta/artifacts
+algorithm: ridge
+update_router: true
+router_cfg_path: configs/router.yml

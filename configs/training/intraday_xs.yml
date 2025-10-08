@@ -1,0 +1,13 @@
+dependencies: [equities_minute]
+green_threshold: { window_years: 3, min_ratio: 0.9 }
+feature_config:
+  resample_minutes: 5
+  min_bars: 30
+  ofi_window: 10
+  rolling_vol_window: 30
+model:
+  context_length: 128
+  d_model: 64
+  dropout: 0.1
+  epochs: 10
+  lr: 0.001

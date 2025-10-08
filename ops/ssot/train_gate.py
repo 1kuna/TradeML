@@ -15,6 +15,8 @@ from loguru import logger
 from .registry import log_run
 
 from data_layer.reference.calendars import get_trading_days
+from ops.pipelines.offline_rl import OfflineRLConfig, run_offline_rl
+from ops.pipelines.stacker_train import StackerTrainConfig, run_stacker_pipeline
 
 
 def _load_ledger() -> pd.DataFrame:
@@ -114,46 +116,70 @@ def train_if_ready(model_name: str) -> None:
                 pass
         except Exception as e:
             logger.exception(f"Training pipeline failed: {e}")
-    else:
-        # Intraday XS pipeline
-        if model_name == "intraday_xs":
-            cfg_path = "configs/training/equities_xs.yml"  # reuse green thresholds via equities_eod/minute
-            if not _meets_green_threshold(cfg_path, ledger):
-                logger.error("Training blocked: GREEN threshold not met for intraday_xs")
-                return
-            end = date.today()
-            start = date(end.year - 1, end.month, end.day)
+    elif model_name == "intraday_xs":
+        cfg_path = "configs/training/equities_xs.yml"  # reuse green thresholds via equities_eod/minute
+        if not _meets_green_threshold(cfg_path, ledger):
+            logger.error("Training blocked: GREEN threshold not met for intraday_xs")
+            return
+        end = date.today()
+        start = date(end.year - 1, end.month, end.day)
+        uni_file = Path("data_layer/reference/universe_symbols.txt")
+        universe = [s.strip() for s in uni_file.read_text().splitlines() if s.strip()] if uni_file.exists() else ["AAPL", "MSFT", "GOOGL"]
+        try:
+            from ops.pipelines.intraday_xs import IntradayConfig, run_intraday
+
+            _ = run_intraday(IntradayConfig(start_date=start.isoformat(), end_date=end.isoformat(), universe=universe))
+            logger.info("Intraday_xs run complete")
+        except Exception as e:
+            logger.exception(f"Intraday pipeline failed: {e}")
+    elif model_name == "options_vol":
+        cfg_path = "configs/training/options_vol.yml"
+        if not _meets_green_threshold(cfg_path, ledger):
+            logger.error("Training blocked: GREEN threshold not met for options_vol")
+            return
+        end = date.today()
+        try:
+            from ops.pipelines.options_vol import OptionsVolConfig, run_options_vol
+
             uni_file = Path("data_layer/reference/universe_symbols.txt")
-            universe = [s.strip() for s in uni_file.read_text().splitlines() if s.strip()] if uni_file.exists() else ["AAPL", "MSFT", "GOOGL"]
+            underliers = [s.strip() for s in uni_file.read_text().splitlines() if s.strip()][:20] if uni_file.exists() else ["AAPL", "MSFT"]
+            _ = run_options_vol(OptionsVolConfig(asof=end.isoformat(), underliers=underliers))
+            logger.info("options_vol run complete")
             try:
-                from ops.pipelines.intraday_xs import IntradayConfig, run_intraday
-                _ = run_intraday(IntradayConfig(start_date=start.isoformat(), end_date=end.isoformat(), universe=universe))
-                logger.info("Intraday_xs run complete")
-            except Exception as e:
-                logger.exception(f"Intraday pipeline failed: {e}")
-        else:
-            # Options volatility pipeline
-            if model_name == "options_vol":
-                cfg_path = "configs/training/options_vol.yml"
-                if not _meets_green_threshold(cfg_path, ledger):
-                    logger.error("Training blocked: GREEN threshold not met for options_vol")
-                    return
-                end = date.today()
-                try:
-                    from ops.pipelines.options_vol import OptionsVolConfig, run_options_vol
-                    # Use small underlier subset if universe exists
-                    uni_file = Path("data_layer/reference/universe_symbols.txt")
-                    underliers = [s.strip() for s in uni_file.read_text().splitlines() if s.strip()][:20] if uni_file.exists() else ["AAPL", "MSFT"]
-                    _ = run_options_vol(OptionsVolConfig(asof=end.isoformat(), underliers=underliers))
-                    logger.info("options_vol run complete")
-                    try:
-                        log_run(metrics={"status_ok": 1.0 if _.get("status") == "ok" else 0.0}, params={"model": model_name}, tags={"stage": "Challenger"})
-                    except Exception:
-                        pass
-                except Exception as e:
-                    logger.exception(f"Options_vol pipeline failed: {e}")
-            else:
-                logger.warning(f"Model not supported yet: {model_name}")
+                log_run(metrics={"status_ok": 1.0 if _.get("status") == "ok" else 0.0}, params={"model": model_name}, tags={"stage": "Challenger"})
+            except Exception:
+                pass
+        except Exception as e:
+            logger.exception(f"Options_vol pipeline failed: {e}")
+    elif model_name == "stacker":
+        cfg_path = "configs/training/stacker.yml"
+        if not Path(cfg_path).exists():
+            logger.error("Stacker config missing; create configs/training/stacker.yml")
+            return
+        with open(cfg_path) as f:
+            raw_cfg = yaml.safe_load(f) or {}
+        try:
+            result = run_stacker_pipeline(StackerTrainConfig(**raw_cfg))
+            log_run(metrics=result.get("metrics"), params={"model": model_name}, tags={"stage": "Challenger"})
+        except Exception as e:
+            logger.exception(f"Stacker training failed: {e}")
+    elif model_name == "offline_rl":
+        cfg_path = "configs/training/rl.yml"
+        if not Path(cfg_path).exists():
+            logger.error("RL config missing; create configs/training/rl.yml")
+            return
+        with open(cfg_path) as f:
+            raw_cfg = yaml.safe_load(f) or {}
+        try:
+            outcome = run_offline_rl(OfflineRLConfig(**raw_cfg))
+            metrics = {"mse": outcome.get("mse")}
+            if outcome.get("ope"):
+                metrics.update({f"ope_{k}": v for k, v in outcome["ope"].items() if isinstance(v, (int, float))})
+            log_run(metrics=metrics, params={"model": model_name}, tags={"stage": "Challenger"})
+        except Exception as e:
+            logger.exception(f"Offline RL pipeline failed: {e}")
+    else:
+        logger.warning(f"Model not supported yet: {model_name}")
 
 
 def run_cpcv(model_name: str) -> Dict:

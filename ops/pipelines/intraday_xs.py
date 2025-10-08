@@ -18,6 +18,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from feature_store.intraday import IntradayFeatureConfig, build_intraday_features
+from models.intraday_xs import PatchConfig, predict_patchtst, train_patchtst
 from ops.reports.emitter import emit_daily
 
 
@@ -62,31 +64,37 @@ def run_intraday(cfg: IntradayConfig) -> Dict:
     if not dates:
         return {"status": "no_data"}
 
-    rows = []
+    feature_rows = []
     for ds in dates:
         df = _load_minute_day(ds)
-        if df.empty or not set(["symbol", "open", "high", "low", "close"]).issubset(df.columns):
+        if df.empty or not set(["symbol", "open", "high", "low", "close", "volume"]).issubset(df.columns):
             continue
         sub = df[df["symbol"].isin(cfg.universe)].copy()
         if sub.empty:
             continue
-        # Aggregate features per symbol for the day
-        agg = sub.groupby("symbol").agg(
-            oc_ret=("close", lambda x: x.iloc[-1] / x.iloc[0] - 1.0 if len(x) > 1 else 0.0),
-            hl_range=("high", "max"),
-            ll_range=("low", "min"),
-            vol=("close", lambda x: x.pct_change().std(ddof=1) if len(x) > 2 else 0.0),
-        ).reset_index()
-        agg["hl_spread"] = (agg["hl_range"] - agg["ll_range"]) / agg["hl_range"].replace(0, np.nan)
-        agg["score"] = agg["oc_ret"].fillna(0.0) / (agg["vol"].replace(0, np.nan))
-        agg["date"] = ds
-        rows.append(agg[["date", "symbol", "score"]])
+        feats = build_intraday_features(sub, IntradayFeatureConfig())
+        feats["date"] = ds
+        feature_rows.append(feats)
 
-    if not rows:
+    if not feature_rows:
         return {"status": "no_data"}
-    scores = pd.concat(rows, ignore_index=True)
 
-    # Convert scores to weights per day (z-score within day)
+    features = pd.concat(feature_rows, ignore_index=True)
+    target = features["close_ret"].fillna(0.0)
+    feature_cols = [c for c in features.columns if c not in {"symbol", "date", "close_ret"}]
+    X = features[feature_cols].fillna(0.0)
+
+    training_metrics = {}
+    try:
+        model, training_metrics = train_patchtst(X, target, PatchConfig())
+        preds = predict_patchtst(model, X)
+        features["score"] = preds
+    except Exception as exc:
+        logger.warning(f"Intraday model training failed; fallback to vwap dislocation: {exc}")
+        features["score"] = features.get("vwap_dislocation", 0.0)
+
+    scores = features[["date", "symbol", "score"]].copy()
+
     def zgroup(g):
         s = g["score"]
         if len(s) < 2 or s.std(ddof=1) == 0:
@@ -100,7 +108,12 @@ def run_intraday(cfg: IntradayConfig) -> Dict:
     last_date = weights["date"].max()
     last_positions = weights[weights["date"] == last_date][["symbol", "target_w"]]
 
-    metrics = {"status": "ok", "days": int(weights["date"].nunique())}
+    metrics = {
+        "status": "ok",
+        "days": int(weights["date"].nunique()),
+    }
+    for k, v in training_metrics.items():
+        if isinstance(v, (int, float, np.floating, str)):
+            metrics[f"model_{k}"] = v
     emit_daily(last_date, last_positions, metrics)
     return {"status": "ok", "weights": weights}
-

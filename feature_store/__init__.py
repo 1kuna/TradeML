@@ -1,10 +1,10 @@
 """Feature store package.
 
-Holds feature engineering logic for equities and options.
+Holds feature engineering logic for equities, options, and intraday sleeves.
 """
 
 __all__ = [
     "equities",
     "options",
+    "intraday",
 ]
-

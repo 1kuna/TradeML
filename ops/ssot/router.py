@@ -13,12 +13,18 @@ signals are present and an OOS dataset is available (not implemented here).
 
 from datetime import date
 from functools import lru_cache
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import yaml
 from loguru import logger
+
+from models.meta import load_stacker, stack_scores
+
+_ROUTER_CFG_CACHE: Dict[str, object] = {"mtime": None, "config": {}}
+_STACKER_CACHE: Dict[str, object] = {"path": None, "obj": None, "meta": {}}
 
 
 class RouterContext:
@@ -80,6 +86,50 @@ def _unique_score(value) -> float:
         if flag == "partial":
             return 0.5
     return 0.0
+
+
+def _router_config(path: str = "configs/router.yml") -> Dict:
+    cfg_path = Path(path)
+    try:
+        mtime = cfg_path.stat().st_mtime
+    except FileNotFoundError:
+        if _ROUTER_CFG_CACHE["config"]:
+            _ROUTER_CFG_CACHE.update({"mtime": None, "config": {}})
+        return {}
+
+    if _ROUTER_CFG_CACHE.get("mtime") != mtime:
+        try:
+            with open(cfg_path) as f:
+                _ROUTER_CFG_CACHE["config"] = yaml.safe_load(f) or {}
+        except Exception as exc:
+            logger.warning(f"Failed to load router config: {exc}")
+            _ROUTER_CFG_CACHE["config"] = {}
+        _ROUTER_CFG_CACHE["mtime"] = mtime
+    return _ROUTER_CFG_CACHE.get("config", {})
+
+
+def _get_stacker(stack_cfg: Dict) -> Tuple[object | None, Dict]:
+    if not stack_cfg.get("enabled"):
+        weights = stack_cfg.get("linear_weights")
+        if weights:
+            return weights, {"feature_columns": list(weights.keys()), "type": "linear_weights"}
+        return None, {}
+
+    metadata_path = stack_cfg.get("metadata_path")
+    if metadata_path:
+        if _STACKER_CACHE.get("path") != metadata_path:
+            try:
+                obj, meta = load_stacker(metadata_path)
+                _STACKER_CACHE.update({"path": metadata_path, "obj": obj, "meta": meta})
+            except Exception as exc:
+                logger.warning(f"Failed to load stacker metadata {metadata_path}: {exc}")
+                _STACKER_CACHE.update({"path": metadata_path, "obj": None, "meta": {}})
+        return _STACKER_CACHE.get("obj"), _STACKER_CACHE.get("meta", {})
+
+    weights = stack_cfg.get("linear_weights")
+    if weights:
+        return weights, {"feature_columns": list(weights.keys()), "type": "linear_weights"}
+    return None, {}
 
 
 def route_dataset(dataset: str, want_date: date, universe: List[str] | None = None, endpoints_path: str = "configs/endpoints.yml") -> List[str]:
@@ -174,27 +224,28 @@ def meta_blend(model_scores: Dict[str, float], weights: Dict[str, float] | None 
     """
     if not model_scores:
         return 0.0
-    # Load router weights from config if not provided
-    stack_cfg = {}
-    if weights is None:
+    cfg = _router_config()
+    router_section = (cfg.get("router") or {})
+    stack_cfg = router_section.get("stacker") or {}
+
+    stacker_obj, metadata = _get_stacker(stack_cfg)
+    if stacker_obj is not None:
         try:
-            with open("configs/router.yml") as f:
-                cfg = yaml.safe_load(f) or {}
-            rcfg = (cfg.get("router") or {})
-            weights = rcfg.get("weights", {})
-            stack_cfg = rcfg.get("stacker", {}) or {}
-        except Exception:
-            weights = {}
-    # If a linear stacker is configured with explicit per-model weights, prefer those
-    lw = (stack_cfg.get("linear_weights") or {}) if isinstance(stack_cfg, dict) else {}
-    if stack_cfg.get("enabled") and lw:
-        w = lw
-    else:
-        w = weights or {"equities_xs": 0.6, "intraday_xs": 0.3, "options_vol": 0.1}
+            df_scores = pd.DataFrame([model_scores])
+            blended = stack_scores(df_scores, stacker_obj, metadata)
+            return float(blended[0])
+        except Exception as exc:
+            logger.warning(f"Stacker blend failed, reverting to static weights: {exc}")
+
+    if weights is None:
+        weights = router_section.get("weights", {})
+    if not weights:
+        weights = stack_cfg.get("linear_weights", {}) or {"equities_xs": 0.6, "intraday_xs": 0.3, "options_vol": 0.1}
+
     tot = 0.0
     denom = 0.0
     for k, v in model_scores.items():
-        wk = float(w.get(k, 0.0))
+        wk = float(weights.get(k, 0.0))
         tot += wk * float(v)
         denom += wk
     return tot / denom if denom > 0 else float(np.mean(list(model_scores.values())))

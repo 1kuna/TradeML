@@ -6,10 +6,11 @@ router:
     options_vol: 0.1
   stacker:
     enabled: false
-    model: lightgbm
-    folds: 8
-    # Optional explicit linear weights to use when enabled=true (acts as a simple stacker)
+    metadata_path: models/meta/artifacts/latest/metadata.json
     linear_weights:
       equities_xs: 0.7
       intraday_xs: 0.2
       options_vol: 0.1
+  rl_policy:
+    enabled: false
+    model_path: models/rl/artifacts/policy_cql.pkl

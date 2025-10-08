@@ -4,34 +4,50 @@ Equities cross-sectional pipeline (long-term name).
 End-to-end steps:
 1) Load curated prices for universe and date range
 2) Build features and labels
-3) Run CPCV and fit baseline model (logistic for triple-barrier; ridge for horizon)
+3) Run CPCV and fit LightGBM baseline (fallbacks to ridge/logit if unavailable)
 4) Collect OOS predictions as scores
 5) Build portfolio target weights from scores
 6) Convert to target quantities using price and run backtest with costs
 7) Report metrics incl. Sharpe, DSR; compute PBO over a small config grid
-8) Emit daily positions JSON/MD for the last as-of date
+8) Emit daily positions JSON/MD for the last as-of date and persist artifacts
 """
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional
+import time
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
+from pathlib import Path
+from typing import Dict, List, Literal, Optional
 
 import numpy as np
 import pandas as pd
-from loguru import logger
 import yaml
+from loguru import logger
 
+try:
+    import joblib
+except Exception:  # pragma: no cover
+    joblib = None  # type: ignore
+
+from backtest.engine.backtester import MinimalBacktester
 from data_layer.curated.loaders import load_price_panel
 from feature_store.equities.dataset import build_training_dataset
-from models.equities_xs.baselines import train_logistic_regression, train_ridge_regression
+from models.equities_xs import (
+    LGBMParams,
+    export_lgbm_onnx,
+    fit_lgbm,
+    predict_lgbm,
+    save_lgbm_pickle,
+    train_logistic_regression,
+    train_ridge_regression,
+)
 from portfolio.build import build as build_portfolio
-from backtest.engine.backtester import MinimalBacktester
+from ops.reports.emitter import emit_daily
 from validation import CPCV, DSRCalculator, PBOCalculator
 from validation.calibration import binary_calibration
-from ops.reports.emitter import emit_daily
 
 
 def _to_date(d: object) -> date:
@@ -104,6 +120,76 @@ def _regime_allow_mask(dates: pd.Series, regime_cfg: list[dict]) -> np.ndarray:
     return mask
 
 
+def _json_default(obj):
+    if isinstance(obj, (np.generic,)):
+        return obj.item()
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Path):
+        return str(obj)
+    return obj
+
+
+def _create_artifact_dir(end_date: date) -> Path:
+    base = Path("models") / "equities_xs" / "artifacts"
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = base / f"{end_date.isoformat()}_{ts}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _persist_artifacts(
+    artifact_dir: Path,
+    cfg: PipelineConfig,
+    training_cfg: dict,
+    feature_cols: List[str],
+    oof_scores: pd.DataFrame,
+    fold_metrics: List[Dict],
+    final_metrics: Dict[str, float],
+    model_backend: str,
+    onnx_exported: bool,
+    model_path: Optional[Path] = None,
+    onnx_path: Optional[Path] = None,
+) -> Dict[str, str]:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "feature_list.json").write_text(json.dumps(feature_cols, indent=2))
+    summary = {
+        "pipeline_config": asdict(cfg),
+        "training_cfg": training_cfg,
+        "fold_metrics": fold_metrics,
+        "final_metrics": final_metrics,
+        "model_backend": model_backend,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "onnx_exported": onnx_exported,
+        "model_path": str(model_path) if model_path else None,
+        "onnx_path": str(onnx_path) if onnx_path else None,
+    }
+    (artifact_dir / "training_summary.json").write_text(
+        json.dumps(summary, indent=2, default=_json_default)
+    )
+    try:
+        oof_scores.to_parquet(artifact_dir / "oof_scores.parquet", index=False)
+    except Exception as exc:
+        logger.warning(f"Failed to persist OOF scores to parquet: {exc}")
+        oof_scores.to_csv(artifact_dir / "oof_scores.csv", index=False)
+
+    # Maintain a 'latest' pointer for quick loading
+    latest_pointer = artifact_dir.parent / "latest"
+    try:
+        if latest_pointer.exists() or latest_pointer.is_symlink():
+            latest_pointer.unlink()
+        latest_pointer.symlink_to(artifact_dir, target_is_directory=True)
+    except Exception:
+        # Symlinks may not be available (e.g., Windows without admin); fallback to text pointer
+        (artifact_dir.parent / "latest.txt").write_text(str(artifact_dir))
+
+    return {
+        "feature_list": str(artifact_dir / "feature_list.json"),
+        "training_summary": str(artifact_dir / "training_summary.json"),
+        "oof_scores": str(artifact_dir / "oof_scores.parquet"),
+    }
+
+
 @dataclass
 class PipelineConfig:
     start_date: str
@@ -163,39 +249,132 @@ def run_pipeline(cfg: PipelineConfig) -> Dict:
 
     # Collect OOS predictions
     oos_rows: List[Dict] = []
+    fold_metrics: List[Dict[str, float]] = []
     # Load training config for regime/time-decay
     tcfg = _load_training_cfg()
     hl_months = float(((tcfg.get("time_decay") or {}).get("half_life_months", 0)))
     regime_cfg = (tcfg.get("regime_masks") or [])
 
     end_date = _to_date(cfg.end_date)
-    all_weights = _time_decay_weights(X_sorted["date"], end=end_date, half_life_months=hl_months) if hl_months > 0 else np.ones(len(X_sorted))
+    all_weights = (
+        _time_decay_weights(X_sorted["date"], end=end_date, half_life_months=hl_months)
+        if hl_months > 0
+        else np.ones(len(X_sorted))
+    )
     allow_mask = _regime_allow_mask(X_sorted["date"], regime_cfg)
+    feature_cols = [c for c in X_sorted.columns if c not in ("date", "symbol")]
+    X_features = X_sorted[feature_cols]
 
     for fold_id, (tr, te) in enumerate(splits):
-        X_tr = X_sorted.drop(columns=["date", "symbol"]).iloc[tr]
-        y_tr = y_sorted.iloc[tr]
-        X_te = X_sorted.drop(columns=["date", "symbol"]).iloc[te]
         meta_te = X_sorted.iloc[te][["date", "symbol"]].reset_index(drop=True)
+        mask_idx = np.where(allow_mask[tr])[0]
+        if mask_idx.size == 0:
+            logger.warning(f"Fold {fold_id} has no samples after regime filtering; skipping.")
+            continue
 
-        # Apply regime filter and time-decay weights on train set
-        tr_mask = allow_mask[tr]
-        X_tr_f = X_tr.iloc[tr_mask]
-        y_tr_f = y_tr.iloc[tr_mask]
-        w_tr = all_weights[tr][tr_mask]
+        X_tr_fold = X_features.iloc[tr].iloc[mask_idx]
+        y_tr_fold = y_sorted.iloc[tr].iloc[mask_idx]
+        sample_w = all_weights[tr][mask_idx] if all_weights is not None else None
+        X_te_fold = X_features.iloc[te]
 
-        if clf_task:
-            model, _ = train_logistic_regression(X_tr_f, y_tr_f, sample_weight=w_tr)
-            score = model.predict_proba(X_te)[:, 1]
-        else:
-            model, _ = train_ridge_regression(X_tr_f, y_tr_f, sample_weight=w_tr)
-            score = model.predict(X_te)
+        backend = "lightgbm"
+        try:
+            model, met = fit_lgbm(X_tr_fold, y_tr_fold, sample_weight=sample_w)
+            score = predict_lgbm(model, X_te_fold)
+        except ImportError as exc:
+            backend = "sklearn"
+            logger.warning(f"LightGBM unavailable in fold {fold_id}; falling back to baseline: {exc}")
+            if clf_task:
+                model, met = train_logistic_regression(X_tr_fold, y_tr_fold, sample_weight=sample_w)
+                score = model.predict_proba(X_te_fold)[:, 1]
+            else:
+                model, met = train_ridge_regression(X_tr_fold, y_tr_fold, sample_weight=sample_w)
+                score = model.predict(X_te_fold)
+        except Exception as exc:
+            backend = "sklearn"
+            logger.exception(f"Fold {fold_id} LightGBM failed; reverting to baseline models: {exc}")
+            if clf_task:
+                model, met = train_logistic_regression(X_tr_fold, y_tr_fold, sample_weight=sample_w)
+                score = model.predict_proba(X_te_fold)[:, 1]
+            else:
+                model, met = train_ridge_regression(X_tr_fold, y_tr_fold, sample_weight=sample_w)
+                score = model.predict(X_te_fold)
 
+        met = met or {}
+        met["backend"] = backend
+        met["fold"] = fold_id
+        fold_metrics.append(
+            {
+                k: float(v)
+                if isinstance(v, (int, float, np.floating))
+                else v
+                for k, v in met.items()
+            }
+        )
         fold_scores = pd.DataFrame({"date": meta_te["date"], "symbol": meta_te["symbol"], "score": score})
         fold_scores["fold"] = fold_id
         oos_rows.append(fold_scores)
 
+    if not oos_rows:
+        raise RuntimeError("No OOF scores produced; check regime masks and CPCV splits.")
     oos_scores = pd.concat(oos_rows, ignore_index=True)
+
+    artifact_dir = _create_artifact_dir(end_date)
+    fit_idx = np.where(allow_mask)[0]
+    if fit_idx.size == 0:
+        logger.warning("Regime masks removed all samples; training on full dataset.")
+        fit_idx = np.arange(len(X_sorted))
+    X_fit = X_features.iloc[fit_idx]
+    y_fit = y_sorted.iloc[fit_idx]
+    weight_fit = all_weights[fit_idx] if all_weights is not None else None
+
+    model_backend = "lightgbm"
+    final_metrics: Dict[str, float] = {}
+    final_model_path: Optional[Path] = None
+    onnx_path: Optional[Path] = None
+    onnx_exported = False
+
+    try:
+        final_model, final_metrics = fit_lgbm(X_fit, y_fit, sample_weight=weight_fit)
+        final_model_path = artifact_dir / "model.pkl"
+        save_lgbm_pickle(final_model, final_model_path)
+        try:
+            onnx_path = artifact_dir / "model.onnx"
+            export_lgbm_onnx(final_model, feature_cols, onnx_path)
+            onnx_exported = True
+        except Exception as exc:  # pragma: no cover - optional dependency
+            onnx_exported = False
+            onnx_path = None
+            logger.warning(f"ONNX export skipped: {exc}")
+    except ImportError as exc:
+        model_backend = "sklearn"
+        logger.warning(f"LightGBM unavailable for final model; falling back to ridge/logit: {exc}")
+        if clf_task:
+            final_model, final_metrics = train_logistic_regression(X_fit, y_fit, sample_weight=weight_fit)
+        else:
+            final_model, final_metrics = train_ridge_regression(X_fit, y_fit, sample_weight=weight_fit)
+        if joblib is None:
+            raise ImportError("joblib is required to persist fallback models.") from exc
+        final_model_path = artifact_dir / "model.pkl"
+        joblib.dump(final_model, final_model_path)
+    except Exception as exc:
+        model_backend = "error"
+        final_metrics = {"status": "failed", "error": str(exc)}
+        logger.exception(f"Final model training failed: {exc}")
+
+    artifact_files = _persist_artifacts(
+        artifact_dir=artifact_dir,
+        cfg=cfg,
+        training_cfg=tcfg,
+        feature_cols=feature_cols,
+        oof_scores=oos_scores,
+        fold_metrics=fold_metrics,
+        final_metrics=final_metrics,
+        model_backend=model_backend,
+        onnx_exported=onnx_exported,
+        model_path=final_model_path,
+        onnx_path=onnx_path,
+    )
 
     # Portfolio construction
     risk_cfg = {
@@ -314,6 +493,11 @@ def run_pipeline(cfg: PipelineConfig) -> Dict:
     }
     if calib is not None:
         metrics_report.update({"brier": calib.get("brier"), "logloss": calib.get("logloss")})
+    metrics_report["model_backend"] = model_backend
+    metrics_report["onnx_exported"] = onnx_exported
+    for mk, mv in (final_metrics or {}).items():
+        if isinstance(mv, (int, float, np.floating)):
+            metrics_report[f"model_{mk}"] = round(float(mv), 6)
     emit_daily(last_date, last_positions, metrics_report)
 
     return {
@@ -323,6 +507,16 @@ def run_pipeline(cfg: PipelineConfig) -> Dict:
         "pbo": pbo_res,
         "target_weights": tw,
         "signals": signals[["date", "symbol", "target_quantity"]],
+        "calibration": calib,
+        "artifacts": {
+            "dir": str(artifact_dir),
+            **artifact_files,
+            "model_path": str(final_model_path) if final_model_path else None,
+            "onnx_path": str(onnx_path) if onnx_path else None,
+            "backend": model_backend,
+        },
+        "fold_metrics": fold_metrics,
+        "final_model_metrics": final_metrics,
     }
 
 
