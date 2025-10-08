@@ -8,10 +8,11 @@ Supports:
 - Options chains (calls/puts)
 - Quote data
 - Company fundamentals
+- Daily OHLC candles (free tier)
 """
 
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import List, Optional, Dict, Any
 import pandas as pd
 from loguru import logger
@@ -222,6 +223,79 @@ class FinnhubConnector(BaseConnector):
         expiries.sort()
 
         return expiries
+
+    def fetch_candle_daily(
+        self,
+        symbol: str,
+        start_date: date,
+        end_date: date,
+    ) -> pd.DataFrame:
+        """
+        Fetch daily OHLCV candles for an equity.
+
+        Args:
+            symbol: Equity ticker
+            start_date: Inclusive start date
+            end_date: Inclusive end date
+
+        Returns:
+            DataFrame matching EQUITY_BARS schema (or empty when no data).
+        """
+        if end_date < start_date:
+            raise ValueError("end_date must be on or after start_date")
+
+        def _to_unix(dt: date) -> int:
+            return int(datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc).timestamp())
+
+        params = {
+            "symbol": symbol,
+            "resolution": "D",
+            "from": _to_unix(start_date),
+            "to": _to_unix(end_date),
+        }
+
+        raw = self._fetch_raw("stock/candle", **params)
+        if not raw or raw.get("s") != "ok":
+            logger.debug(f"Finnhub candle daily returned status={raw.get('s')} for {symbol}")
+            return pd.DataFrame()
+
+        closes = raw.get("c", [])
+        opens = raw.get("o", [])
+        highs = raw.get("h", [])
+        lows = raw.get("l", [])
+        volumes = raw.get("v", [])
+        timestamps = raw.get("t", [])
+
+        rows = []
+        for idx, ts in enumerate(timestamps or []):
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+            rows.append(
+                {
+                    "date": dt,
+                    "symbol": symbol,
+                    "session_id": dt.strftime("%Y%m%d"),
+                    "open": float(opens[idx]) if idx < len(opens) else float("nan"),
+                    "high": float(highs[idx]) if idx < len(highs) else float("nan"),
+                    "low": float(lows[idx]) if idx < len(lows) else float("nan"),
+                    "close": float(closes[idx]) if idx < len(closes) else float("nan"),
+                    "vwap": None,
+                    "volume": int(volumes[idx]) if idx < len(volumes) else 0,
+                    "nbbo_spread": None,
+                    "trades": None,
+                    "imbalance": None,
+                }
+            )
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+
+        df = self._add_metadata(
+            df,
+            source_uri=f"finnhub://stock/candle?symbol={symbol}&resolution=D",
+        )
+        df = df.sort_values("date").reset_index(drop=True)
+        return df
 
 
 # CLI for testing

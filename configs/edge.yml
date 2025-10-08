@@ -2,17 +2,19 @@ locks:
   lease_seconds: 120
   renew_seconds: 45
 
-# Tasks to run on the edge collector
-# Supported: alpaca_bars, polygon_bars, finnhub_options, fred_treasury
 tasks:
   - alpaca_bars
-  - polygon_bars
-  - finnhub_options
-  - fred_treasury
   - alpaca_minute
   - alpaca_options_bars
   - alpaca_options_chain
   - alpaca_corporate_actions
+  - polygon_bars
+  - finnhub_options
+  - finnhub_daily
+  - fred_treasury
+  - av_corp_actions
+  - av_options_hist
+  - fmp_fundamentals
 
 # Policy: daily API budgets (governed by BudgetManager)
 policy:
@@ -21,5 +23,7 @@ policy:
     polygon: { requests: 7000 }
     finnhub: { requests: 86400 }
     fred:    { requests: 10000 }
+    av:      { requests: 25 }
+    fmp:     { requests: 250 }
 
 # Optional: connector-specific settings can be added here later

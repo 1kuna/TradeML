@@ -2,7 +2,19 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
-from typing import Iterator, Optional
+from typing import Iterator, Optional, List
+
+from ops.ssot.router import route_dataset
+
+
+def _provider_allowed(provider: str, dataset: str, want_date, universe: List[str]) -> bool:
+    try:
+        order = route_dataset(dataset, want_date, universe)
+    except Exception:
+        return True
+    if not order:
+        return True
+    return order[0] == provider
 
 
 def _today_date():
@@ -33,6 +45,8 @@ def alpaca_bars_units(edge, budget_mgr=None) -> Iterator[dict]:
         return
     symbols = edge._symbols_universe()
     today = _today_date()
+    if not _provider_allowed("finnhub", "options_chain", today, symbols):
+        return
     # Default: 15 years of daily bars (SSOT green threshold ~15y)
     default_days = _int_env("ALPACA_DAY_START_DAYS", 365 * 15)
     start_date = _start_date(edge, "alpaca", "equities_bars", default_days)
@@ -52,6 +66,9 @@ def alpaca_bars_units(edge, budget_mgr=None) -> Iterator[dict]:
     syms = [s for s in symbols if s.upper() not in alp_bad]
     while d <= today and not edge.shutdown_requested:
         if not edge._should_fetch_eod_for_day("alpaca", d):
+            d += timedelta(days=1)
+            continue
+        if not _provider_allowed("alpaca", "equities_eod", d, syms):
             d += timedelta(days=1)
             continue
         tokens = max(1, ceil(len(syms) / 100))
@@ -78,6 +95,9 @@ def alpaca_minute_units(edge, budget_mgr=None) -> Iterator[dict]:
     d = start_date
     while d <= today and not edge.shutdown_requested:
         if not edge._should_fetch_eod_for_day("alpaca", d):
+            d += timedelta(days=1)
+            continue
+        if not _provider_allowed("alpaca", "equities_minute", d, syms):
             d += timedelta(days=1)
             continue
         tokens = max(1, ceil(len(syms) / 100))
@@ -117,6 +137,9 @@ def polygon_bars_units(edge, budget_mgr=None) -> Iterator[dict]:
     d = start_date
     while d <= today and not edge.shutdown_requested:
         if not edge._should_fetch_eod_for_day("polygon", d):
+            d += timedelta(days=1)
+            continue
+        if not _provider_allowed("polygon", "equities_eod", d, symbols):
             d += timedelta(days=1)
             continue
         val_syms = [s for s in symbols if s.upper() not in pg_bad]
@@ -200,6 +223,9 @@ def alpaca_options_bars_units(edge, budget_mgr=None) -> Iterator[dict]:
         if not edge._should_fetch_eod_for_day("alpaca", d):
             d += timedelta(days=1)
             continue
+        if not _provider_allowed("alpaca", "options_bars", d, symbols):
+            d += timedelta(days=1)
+            continue
         picked = 0
         for sym in symbols:
             if picked >= ul_per_unit:
@@ -231,6 +257,9 @@ def alpaca_options_chain_units(edge, budget_mgr=None) -> Iterator[dict]:
         if not edge._should_fetch_eod_for_day("alpaca", d):
             d += timedelta(days=1)
             continue
+        if not _provider_allowed("alpaca", "options_chain", d, symbols):
+            d += timedelta(days=1)
+            continue
         picked = 0
         for sym in symbols:
             if picked >= ul_per_unit:
@@ -257,6 +286,9 @@ def alpaca_corporate_actions_units(edge, budget_mgr=None) -> Iterator[dict]:
         if not edge._should_fetch_eod_for_day("alpaca", d):
             d += timedelta(days=1)
             continue
+        if not _provider_allowed("alpaca", "corp_actions", d, [""]):
+            d += timedelta(days=1)
+            continue
         yield {
             "vendor": "alpaca",
             "desc": f"alpaca corporate actions {d}",
@@ -264,3 +296,96 @@ def alpaca_corporate_actions_units(edge, budget_mgr=None) -> Iterator[dict]:
             "run": (lambda day=d: edge._run_alpaca_corporate_actions_day(day, budget_mgr)),
         }
         d += timedelta(days=1)
+
+
+def finnhub_daily_units(edge, budget_mgr=None) -> Iterator[dict]:
+    if "finnhub" not in edge.connectors:
+        return
+    symbols = edge._symbols_universe()
+    if not symbols:
+        return
+    today = _today_date()
+    default_days = _int_env("FINNHUB_DAILY_START_DAYS", 365)
+    start_date = _start_date(edge, "finnhub", "equities_eod_fn", default_days)
+    chunk = max(1, int(os.getenv("NODE_FINNHUB_DAILY_SYMBOLS_PER_UNIT", "5")))
+    vendor_key = "finnhub-daily"
+    d = start_date
+    while d <= today and not edge.shutdown_requested:
+        if not edge._should_fetch_eod_for_day("finnhub", d):
+            d += timedelta(days=1)
+            continue
+        if not _provider_allowed("finnhub", "equities_eod", d, symbols):
+            d += timedelta(days=1)
+            continue
+        chunk_syms = edge._rotate_symbols(vendor_key, symbols, chunk) if hasattr(edge, "_rotate_symbols") else symbols[:chunk]
+        if not chunk_syms:
+            break
+        yield {
+            "vendor": "finnhub",
+            "desc": f"finnhub daily {d} ({len(chunk_syms)} syms)",
+            "tokens": len(chunk_syms),
+            "run": (lambda day=d, syms=list(chunk_syms): edge._run_finnhub_daily_day(syms, day, budget_mgr)),
+        }
+        d += timedelta(days=1)
+
+
+def av_corp_actions_units(edge, budget_mgr=None) -> Iterator[dict]:
+    if "av" not in edge.connectors:
+        return
+    symbols = edge._symbols_universe()
+    if not symbols:
+        return
+    today = _today_date()
+    if not _provider_allowed("av", "corp_actions", today, symbols):
+        return
+    per_unit = max(1, int(os.getenv("NODE_AV_CORPACTIONS_PER_UNIT", "5")))
+    chunk_syms = edge._rotate_symbols("av-corp-actions", symbols, per_unit) if hasattr(edge, "_rotate_symbols") else symbols[:per_unit]
+    if not chunk_syms:
+        return
+    yield {
+        "vendor": "av",
+        "desc": f"av corp actions {','.join(chunk_syms[:2])}{'…' if len(chunk_syms) > 2 else ''}",
+        "tokens": len(chunk_syms),
+        "run": (lambda syms=list(chunk_syms): edge._run_alpha_vantage_corp_actions(syms, budget_mgr)),
+    }
+
+
+def av_options_hist_units(edge, budget_mgr=None) -> Iterator[dict]:
+    if "av" not in edge.connectors:
+        return
+    symbols = edge._symbols_universe()
+    if not symbols:
+        return
+    today = _today_date()
+    if not _provider_allowed("av", "options_chain_hist", today, symbols):
+        return
+    per_unit = max(1, int(os.getenv("NODE_AV_OPTIONS_PER_UNIT", "1")))
+    chunk_syms = edge._rotate_symbols("av-options-hist", symbols, per_unit) if hasattr(edge, "_rotate_symbols") else symbols[:per_unit]
+    for sym in chunk_syms:
+        yield {
+            "vendor": "av",
+            "desc": f"av options hist {sym}",
+            "tokens": 1,
+            "run": (lambda s=sym: edge._run_alpha_vantage_options_hist(s, expiry=None, budget=budget_mgr)),
+        }
+
+
+def fmp_fundamentals_units(edge, budget_mgr=None) -> Iterator[dict]:
+    if "fmp" not in edge.connectors:
+        return
+    symbols = edge._symbols_universe()
+    if not symbols:
+        return
+    today = _today_date()
+    if not _provider_allowed("fmp", "fundamentals", today, symbols):
+        return
+    per_unit = max(1, int(os.getenv("NODE_FMP_FUNDS_PER_UNIT", "1")))
+    period = os.getenv("FMP_FUNDS_PERIOD", "annual")
+    chunk_syms = edge._rotate_symbols("fmp-fundamentals", symbols, per_unit) if hasattr(edge, "_rotate_symbols") else symbols[:per_unit]
+    for sym in chunk_syms:
+        yield {
+            "vendor": "fmp",
+            "desc": f"fmp fundamentals {sym} ({period})",
+            "tokens": 3,
+            "run": (lambda s=sym, per=period: edge._run_fmp_fundamentals(s, per, budget_mgr)),
+        }

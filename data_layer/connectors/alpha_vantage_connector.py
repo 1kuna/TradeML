@@ -1,5 +1,5 @@
 """
-Alpha Vantage connector for corporate actions and delisting data.
+Alpha Vantage connector for corporate actions and reference data.
 
 Free tier: 25 requests/day (generous for periodic updates)
 API Docs: https://www.alphavantage.co/documentation/
@@ -8,11 +8,13 @@ Supports:
 - Corporate actions (splits, dividends)
 - Listing status (active/delisted)
 - Company overview
+- Historical options with greeks (daily snapshots)
 """
 
+import math
 import os
 from datetime import datetime, date
-from typing import List, Optional, Dict, Any
+from typing import Optional, Dict, Any
 import pandas as pd
 from loguru import logger
 
@@ -272,6 +274,176 @@ class AlphaVantageConnector(BaseConnector):
         raw_data = self._fetch_raw(function="OVERVIEW", symbol=symbol)
         return raw_data
 
+    def fetch_historical_options(
+        self,
+        symbol: str,
+        expiry: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Fetch historical options chain snapshots with greeks.
+
+        Args:
+            symbol: Underlying ticker
+            expiry: Optional expiry filter (YYYY-MM-DD)
+
+        Returns:
+            DataFrame aligned to OPTIONS_IV schema (daily snapshot rows).
+        """
+        params: Dict[str, Any] = {}
+        if expiry:
+            params["expiration"] = expiry
+
+        raw = self._fetch_raw(function="HISTORICAL_OPTIONS", symbol=symbol, **params)
+        data = raw.get("data") or raw.get("historical") or []
+        underlying_price = raw.get("underlying_price") or raw.get("underlyingPrice")
+
+        rows = []
+
+        def _as_float(val, default=None):
+            if val is None or val == "":
+                return default
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                try:
+                    return float(str(val).replace("%", "")) / 100.0 if isinstance(val, str) and val.endswith("%") else float(str(val).replace(",", ""))
+                except Exception:
+                    return default
+
+        def _parse_contract(contract: Dict[str, Any], expiry_date: Optional[date], snapshot_date: Optional[date], cp: str):
+            strike = _as_float(contract.get("strike") or contract.get("strikePrice"), default=math.nan)
+            iv = _as_float(contract.get("impliedVolatility"), default=math.nan)
+            bid = _as_float(contract.get("bid"))
+            ask = _as_float(contract.get("ask"))
+            last_price = _as_float(contract.get("lastPrice") or contract.get("price"))
+            nbbo_mid = None
+            if bid is not None and ask is not None and not math.isnan(bid) and not math.isnan(ask):
+                nbbo_mid = (bid + ask) / 2.0
+            elif last_price is not None and not math.isnan(last_price):
+                nbbo_mid = last_price
+            else:
+                nbbo_mid = 0.0
+
+            und_px = _as_float(
+                contract.get("underlyingPrice")
+                or contract.get("underlying_price")
+                or underlying_price,
+                default=0.0,
+            )
+
+            expiry_dt = pd.to_datetime(expiry_date or contract.get("expirationDate") or contract.get("expiration"), errors="coerce")
+            if pd.isna(expiry_dt):
+                expiry_dt = pd.NaT
+            snapshot_dt = pd.to_datetime(
+                snapshot_date
+                or contract.get("lastTradeDate")
+                or contract.get("exerciseDate")
+                or contract.get("dataDate"),
+                errors="coerce",
+            )
+            if pd.isna(snapshot_dt):
+                snapshot_dt = pd.Timestamp.utcnow().normalize()
+
+            days_to_expiry = 0.0
+            if pd.notna(expiry_dt):
+                diff = (expiry_dt - snapshot_dt).days
+                days_to_expiry = max(diff, 0) / 365.0
+
+            is_itm = bool(contract.get("inTheMoney") or contract.get("inTheMoneyFlag") or contract.get("inTheMoneyValue"))
+            delta = _as_float(contract.get("delta"))
+            gamma = _as_float(contract.get("gamma"))
+            theta = _as_float(contract.get("theta"))
+            vega = _as_float(contract.get("vega"))
+            rho = _as_float(contract.get("rho"))
+
+            row = {
+                "date": snapshot_dt.date(),
+                "underlier": symbol,
+                "expiry": expiry_dt.date() if pd.notna(expiry_dt) else snapshot_dt.date(),
+                "strike": strike,
+                "cp_flag": cp,
+                "iv": iv,
+                "delta": delta,
+                "gamma": gamma,
+                "theta": theta,
+                "vega": vega,
+                "rho": rho,
+                "underlying_price": und_px if und_px is not None and not math.isnan(und_px) else 0.0,
+                "risk_free_rate": _as_float(contract.get("riskFreeRate"), default=0.0) or 0.0,
+                "dividend_yield": _as_float(contract.get("dividendYield"), default=None),
+                "time_to_expiry": days_to_expiry,
+                "nbbo_mid": nbbo_mid if nbbo_mid is not None and not math.isnan(nbbo_mid) else 0.0,
+                "is_itm": bool(is_itm),
+                "iv_valid": bool(iv is not None and not math.isnan(iv)),
+                "is_crossed": bool(bid is not None and ask is not None and bid > ask),
+            }
+            return row
+
+        if isinstance(data, list):
+            for block in data:
+                expiry_block = pd.to_datetime(block.get("expirationDate") or block.get("expiration"), errors="coerce")
+                snapshot_block = pd.to_datetime(block.get("date") or block.get("recordDate"), errors="coerce")
+                for cp_key, cp_flag in (("calls", "C"), ("puts", "P")):
+                    contracts = block.get(cp_key) or []
+                    for contract in contracts:
+                        rows.append(_parse_contract(contract, expiry_block.date() if pd.notna(expiry_block) else None, snapshot_block.date() if pd.notna(snapshot_block) else None, cp_flag))
+                # Some payloads flatten to "options" array with type indicator
+                options_flat = block.get("options") or []
+                for contract in options_flat:
+                    cp_flag = str(contract.get("type") or contract.get("optionType") or "C").upper()
+                    cp_flag = "P" if cp_flag.startswith("P") else "C"
+                    rows.append(_parse_contract(contract, expiry_block.date() if pd.notna(expiry_block) else None, snapshot_block.date() if pd.notna(snapshot_block) else None, cp_flag))
+        elif isinstance(data, dict):
+            # Single expiry return style: {"calls": [...], "puts": [...]}
+            expiry_block = pd.to_datetime(data.get("expirationDate") or data.get("expiration"), errors="coerce")
+            for cp_key, cp_flag in (("calls", "C"), ("puts", "P")):
+                for contract in data.get(cp_key, []) or []:
+                    rows.append(_parse_contract(contract, expiry_block.date() if pd.notna(expiry_block) else None, None, cp_flag))
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+
+        expected_cols = [
+            "date",
+            "underlier",
+            "expiry",
+            "strike",
+            "cp_flag",
+            "iv",
+            "delta",
+            "gamma",
+            "theta",
+            "vega",
+            "rho",
+            "underlying_price",
+            "risk_free_rate",
+            "dividend_yield",
+            "time_to_expiry",
+            "nbbo_mid",
+            "is_itm",
+            "iv_valid",
+            "is_crossed",
+        ]
+        defaults = {
+            "iv": math.nan,
+            "delta": math.nan,
+            "gamma": math.nan,
+            "theta": math.nan,
+            "vega": math.nan,
+            "rho": math.nan,
+            "dividend_yield": None,
+        }
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = defaults.get(col, 0.0 if col in {"underlying_price", "risk_free_rate", "time_to_expiry", "nbbo_mid"} else None)
+        df = df[expected_cols]
+
+        df = self._add_metadata(
+            df,
+            source_uri=f"alpha_vantage://HISTORICAL_OPTIONS/{symbol}{'/' + expiry if expiry else ''}",
+        )
+        return df
 
 # CLI for testing
 if __name__ == "__main__":

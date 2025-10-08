@@ -29,6 +29,7 @@ from data_layer.connectors.finnhub_connector import FinnhubConnector
 from data_layer.connectors.polygon_connector import PolygonConnector
 from data_layer.connectors.fred_connector import FREDConnector
 from data_layer.connectors.fmp_connector import FMPConnector
+from data_layer.connectors.alpha_vantage_connector import AlphaVantageConnector
 from utils.concurrency import partition_lock, worker_count
 import json
 
@@ -463,6 +464,98 @@ def _backfill_options_chains(universe: List[str], budget: Optional[BudgetManager
         pass
 
 
+def _backfill_options_chain_hist(conn: AlphaVantageConnector, symbols: List[str], per_day_limit: int, budget: Optional[BudgetManager] = None):
+    if per_day_limit <= 0:
+        return
+    done = 0
+    for sym in symbols:
+        if done >= per_day_limit:
+            break
+        if budget and not budget.try_consume("av", 1):
+            logger.warning("Alpha Vantage budget exhausted; yielding options_chain_hist")
+            _yield_on_budget()
+            break
+        try:
+            df = conn.fetch_historical_options(sym)
+        except Exception as e:
+            logger.warning(f"AV options hist fetch failed for {sym}: {e}")
+            continue
+        if df.empty:
+            continue
+        for ds, sub in df.groupby("date"):
+            _append_raw_partition(sub, source="alpha_vantage", table="options_iv", ds=ds)
+        done += 1
+
+
+def _backfill_fundamentals(conn: FMPConnector, symbols: List[str], period: str = "annual", limit: int = 5, per_day_limit: int = 3, budget: Optional[BudgetManager] = None):
+    if per_day_limit <= 0:
+        return
+    backend = os.getenv("STORAGE_BACKEND", "local").lower()
+    done = 0
+    for sym in symbols:
+        if done >= per_day_limit:
+            break
+        if budget and not budget.try_consume("fmp", 3):
+            logger.warning("FMP budget exhausted; yielding fundamentals backfill")
+            _yield_on_budget()
+            break
+        try:
+            frames = []
+            for kind in ("income", "balance", "cashflow"):
+                try:
+                    df = conn.fetch_statements(sym, kind=kind, period=period, limit=limit)
+                except Exception as e:
+                    logger.warning(f"FMP {kind} statements failed for {sym}: {e}")
+                    continue
+                if df.empty:
+                    continue
+                frames.append((kind, df))
+            if not frames:
+                continue
+            for kind, df in frames:
+                if backend == "s3":
+                    s3 = get_s3_client()
+                    import io
+                    buf = io.BytesIO()
+                    df.to_parquet(buf, index=False)
+                    key = f"raw/fmp/fundamentals/statement={kind}/period={period}/symbol={sym}/data.parquet"
+                    s3.put_object(key, buf.getvalue())
+                else:
+                    out = Path("data_layer/raw/fmp/fundamentals") / f"statement={kind}" / f"period={period}" / f"symbol={sym}"
+                    out.mkdir(parents=True, exist_ok=True)
+                    df.to_parquet(out / "data.parquet", index=False)
+            done += 1
+        except Exception as outer:
+            logger.warning(f"Fundamentals backfill failed for {sym}: {outer}")
+
+
+def _backfill_equities_eod_finnhub(conn: FinnhubConnector, symbols: List[str], earliest: date, chunk_days: int, top_n: int = 100, budget: Optional[BudgetManager] = None):
+    subset = symbols[:max(1, top_n)]
+    if not subset:
+        return
+    today = date.today()
+    d1 = today
+    while d1 >= earliest:
+        d0 = max(earliest, d1 - timedelta(days=chunk_days - 1))
+        for sym in subset:
+            if budget and not budget.try_consume("finnhub", 1):
+                logger.warning("Finnhub budget exhausted during equities_eod_fn backfill")
+                _yield_on_budget()
+                return
+            try:
+                df = conn.fetch_candle_daily(sym, d0, d1)
+            except Exception as e:
+                logger.warning(f"Finnhub candle backfill failed for {sym}: {e}")
+                continue
+            if df.empty:
+                continue
+            for ds, sub in df.groupby("date"):
+                _append_raw_partition(sub, source="finnhub", table="equities_bars", ds=ds)
+        try:
+            _update_backfill_mark("equities_eod_fn", d0)
+        except Exception:
+            pass
+        d1 = d0 - timedelta(days=1)
 def _backfill_macro_treasury(earliest: date, chunk_days: int, budget: Optional[BudgetManager] = None):
     """Backfill macro Treasury curve from FRED by yearly windows.
 
@@ -574,6 +667,24 @@ def backfill_run(budget: Dict[str, int] | None = None) -> None:
 
     universe = _load_universe()
     connector = AlpacaConnector(api_key=os.getenv("ALPACA_API_KEY"), secret_key=os.getenv("ALPACA_SECRET_KEY"))
+    finnhub_conn: Optional[FinnhubConnector] = None
+    if os.getenv("FINNHUB_API_KEY"):
+        try:
+            finnhub_conn = FinnhubConnector(api_key=os.getenv("FINNHUB_API_KEY"))
+        except Exception as e:
+            logger.warning(f"Finnhub connector unavailable for backfill: {e}")
+    av_conn: Optional[AlphaVantageConnector] = None
+    if os.getenv("ALPHA_VANTAGE_API_KEY"):
+        try:
+            av_conn = AlphaVantageConnector(api_key=os.getenv("ALPHA_VANTAGE_API_KEY"))
+        except Exception as e:
+            logger.warning(f"Alpha Vantage connector unavailable for backfill: {e}")
+    fmp_conn: Optional[FMPConnector] = None
+    if os.getenv("FMP_API_KEY"):
+        try:
+            fmp_conn = FMPConnector(api_key=os.getenv("FMP_API_KEY"))
+        except Exception as e:
+            logger.warning(f"FMP connector unavailable for backfill: {e}")
 
     # 1) Process queue items first
     rows = _fetch_queue_batch(limit=200)
@@ -614,5 +725,26 @@ def backfill_run(budget: Dict[str, int] | None = None) -> None:
         series = targets["macro_vintages"].get("series", [])
         if isinstance(series, list) and series:
             _backfill_macro_vintages(series, budget=bm)
+
+    if "equities_eod_fn" in targets and finnhub_conn:
+        tcfg_fn = targets["equities_eod_fn"]
+        earliest_fn = pd.to_datetime(tcfg_fn.get("earliest", "2000-01-01")).date()
+        chunk_days_fn = max(1, int(tcfg_fn.get("chunk_days", 30)))
+        top_n_fn = int(tcfg_fn.get("top_n", int(os.getenv("BACKFILL_FINNHUB_TOP_N", "150"))))
+        _backfill_equities_eod_finnhub(finnhub_conn, universe, earliest=earliest_fn, chunk_days=chunk_days_fn, top_n=top_n_fn, budget=bm)
+
+    if "options_chain_hist" in targets and av_conn:
+        tcfg_hist = targets["options_chain_hist"]
+        per_day_hist = max(1, int(tcfg_hist.get("chunk_days", 1)))
+        symbols_hist = universe[:int(os.getenv("BACKFILL_AV_OPTIONS_TOP_N", "25"))]
+        _backfill_options_chain_hist(av_conn, symbols_hist, per_day_limit=per_day_hist, budget=bm)
+
+    if "fundamentals" in targets and fmp_conn:
+        tcfg_fund = targets["fundamentals"]
+        per_day_fund = max(1, int(tcfg_fund.get("chunk_days", 1)))
+        period = tcfg_fund.get("period", os.getenv("BACKFILL_FUNDAMENTALS_PERIOD", "annual"))
+        limit = int(tcfg_fund.get("limit", os.getenv("BACKFILL_FUNDAMENTALS_LIMIT", "5")))
+        symbols_fund = universe[:int(os.getenv("BACKFILL_FUNDAMENTALS_TOP_N", "50"))]
+        _backfill_fundamentals(fmp_conn, symbols_fund, period=period, limit=limit, per_day_limit=per_day_fund, budget=bm)
 
     logger.info("Backfill run complete")

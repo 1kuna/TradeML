@@ -9,11 +9,13 @@ Supports:
 - Historical price data
 - Financial statements
 - Company profiles
+- Bulk statement downloads (income, balance, cash flow)
 """
 
+import json
 import os
 from datetime import datetime, date
-from typing import List, Optional, Dict, Any
+from typing import Optional, Dict, Any, Literal
 import pandas as pd
 from loguru import logger
 
@@ -321,6 +323,83 @@ class FMPConnector(BaseConnector):
         if not df.empty:
             df = df.sort_values("symbol").reset_index(drop=True)
 
+        return df
+
+    def fetch_statements(
+        self,
+        symbol: str,
+        kind: Literal["income", "balance", "cashflow"] = "income",
+        period: Literal["annual", "quarter"] = "annual",
+        limit: int = 5,
+    ) -> pd.DataFrame:
+        """
+        Fetch bulk financial statements for a symbol.
+
+        Args:
+            symbol: Equity ticker
+            kind: Statement type ('income', 'balance', 'cashflow')
+            period: Reporting period ('annual' or 'quarter')
+            limit: Maximum filings to return
+
+        Returns:
+            DataFrame with one row per filing enriched with metadata.
+        """
+        endpoint_map = {
+            "income": "income-statement",
+            "balance": "balance-sheet-statement",
+            "cashflow": "cash-flow-statement",
+        }
+        kind_key = endpoint_map.get(kind)
+        if not kind_key:
+            raise ValueError(f"Unsupported statement kind '{kind}'. Expected one of {list(endpoint_map)}")
+
+        params = {"period": period, "limit": limit}
+        raw = self._fetch_raw(f"{kind_key}/{symbol}", **params)
+        if not isinstance(raw, list) or not raw:
+            logger.debug(f"FMP statements returned empty payload for {symbol} ({kind}, {period})")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(raw)
+        if df.empty:
+            return df
+
+        if "symbol" in df.columns:
+            df["symbol"] = df["symbol"].fillna(symbol)
+        else:
+            df["symbol"] = symbol
+        df["statement_type"] = kind
+        df["report_period"] = period
+
+        fiscal_ts = pd.to_datetime(df["date"], errors="coerce") if "date" in df else pd.Series(pd.NaT, index=df.index)
+        df["fiscal_date"] = fiscal_ts.dt.date
+
+        filing_ts = pd.Series(pd.NaT, index=df.index)
+        if "fillingDate" in df:
+            filing_ts = pd.to_datetime(df["fillingDate"], errors="coerce")
+        if "filingDate" in df:
+            alt_ts = pd.to_datetime(df["filingDate"], errors="coerce")
+            filing_ts = filing_ts.fillna(alt_ts) if "fillingDate" in df else alt_ts
+        df["filing_date"] = filing_ts.dt.date
+
+        if "acceptedDate" in df:
+            accepted_ts = pd.to_datetime(df["acceptedDate"], errors="coerce")
+            df["accepted_date"] = accepted_ts.dt.date
+        else:
+            df["accepted_date"] = [None] * len(df)
+
+        df["currency"] = df["reportedCurrency"] if "reportedCurrency" in df else None
+
+        # Preserve raw JSON for downstream parsing while avoiding nested dicts in parquet
+        keys = sorted({k for item in raw for k in item.keys()})
+        df["raw_payload"] = df.apply(
+            lambda row: json.dumps({k: row.get(k, None) for k in keys}, default=str),
+            axis=1,
+        )
+
+        df = self._add_metadata(
+            df,
+            source_uri=f"fmp://{kind_key}/{symbol}?period={period}&limit={limit}",
+        )
         return df
 
 

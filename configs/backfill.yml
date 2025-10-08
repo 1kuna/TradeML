@@ -18,6 +18,7 @@ policy:
     - { table: equities_minute,  weight: 80 }
     - { table: options_chains,   weight: 70 }
     - { table: options_nbbo,     weight: 60 }
+    - { table: fundamentals,     weight: 60 }
 
 targets:
   equities_eod:    { earliest: '2000-01-01', chunk_days: 30, expect_rows: 1 }
@@ -25,6 +26,9 @@ targets:
   options_chains:  { earliest: '2015-01-01', chunk_days: 1,  expect_contracts_min: 50 }
   macro_treasury:  { earliest: '2000-01-01', chunk_days: 365, expect_rows: 5 }
   macro_vintages:  { series: ['DGS10','CPIAUCSL'] }
+  fundamentals:     { earliest: '2000-01-01', chunk_days: 1 }
+  options_chain_hist:{ earliest: '2015-01-01', chunk_days: 1 }
+  equities_eod_fn:  { earliest: '2000-01-01', chunk_days: 30 }
 
 qc_thresholds:
   green_min_ratio: 0.98

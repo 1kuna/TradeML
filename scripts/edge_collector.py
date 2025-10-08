@@ -13,7 +13,7 @@ import time
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta, date
-from typing import Optional, List
+from typing import Optional, List, Dict
 import threading
 
 import yaml
@@ -77,7 +77,16 @@ class EdgeCollector:
             self.bad_symbols = BadSymbolCache(None)
 
         # In-memory cache (session) in addition to persisted bad-symbols
-        self._vendor_bad_symbols = {"polygon": set(), "alpaca": set(), "finnhub": set(), "fred": set()}
+        self._vendor_bad_symbols = {
+            "polygon": set(),
+            "alpaca": set(),
+            "finnhub": set(),
+            "fred": set(),
+            "av": set(),
+            "fmp": set(),
+        }
+
+        self._vendor_symbol_cursor: Dict[str, int] = {}
 
         # Connectors
         self.connectors = self._init_connectors()
@@ -454,6 +463,24 @@ class EdgeCollector:
         except Exception as e:
             logger.warning(f"FRED connector not available: {e}")
 
+        # Alpha Vantage connector (optional)
+        try:
+            if os.getenv("ALPHA_VANTAGE_API_KEY"):
+                from data_layer.connectors.alpha_vantage_connector import AlphaVantageConnector
+                connectors["av"] = AlphaVantageConnector(api_key=os.getenv("ALPHA_VANTAGE_API_KEY"))
+                logger.info("Initialized Alpha Vantage connector")
+        except Exception as e:
+            logger.warning(f"Alpha Vantage connector not available: {e}")
+
+        # FMP connector (optional)
+        try:
+            if os.getenv("FMP_API_KEY"):
+                from data_layer.connectors.fmp_connector import FMPConnector
+                connectors["fmp"] = FMPConnector(api_key=os.getenv("FMP_API_KEY"))
+                logger.info("Initialized FMP connector")
+        except Exception as e:
+            logger.warning(f"FMP connector not available: {e}")
+
         return connectors
 
     def _should_fetch_eod_for_day(self, vendor: str, day: date) -> bool:
@@ -481,6 +508,18 @@ class EdgeCollector:
             with open(universe_file) as f:
                 return [line.strip() for line in f if line.strip()]
         return ["AAPL", "MSFT", "GOOGL"]
+
+    def _rotate_symbols(self, vendor: str, symbols: List[str], count: int) -> List[str]:
+        if not symbols or count <= 0:
+            return []
+        cursor = self._vendor_symbol_cursor.get(vendor, 0)
+        picked: List[str] = []
+        n = len(symbols)
+        for _ in range(min(count, n)):
+            picked.append(symbols[cursor % n])
+            cursor += 1
+        self._vendor_symbol_cursor[vendor] = cursor % n
+        return picked
 
     def _lease_name_for_task(self, task_name: str) -> str:
         mapping = {
@@ -1217,6 +1256,138 @@ class EdgeCollector:
         if self.bookmarks:
             self.bookmarks.set("alpaca", "corporate_actions", day.isoformat(), int(len(df)))
         return ("ok", int(len(df)), "")
+
+    def _run_finnhub_daily_day(self, symbols: List[str], day: date, budget: Optional[BudgetManager]):
+        conn = self.connectors.get("finnhub")
+        if not conn:
+            return ("empty", 0, "no connector")
+        frames = []
+        for sym in symbols:
+            try:
+                df = conn.fetch_candle_daily(sym, day, day)
+            except Exception as e:
+                emsg = str(e)
+                if "429" in emsg or "rate" in emsg.lower():
+                    return ("ratelimited", 0, emsg)
+                self._vendor_bad_symbols.setdefault("finnhub", set()).add(sym)
+                logger.warning(f"Finnhub daily fetch failed for {sym}: {e}")
+                continue
+            if df.empty:
+                continue
+            frames.append(df)
+
+        if not frames:
+            return ("empty", 0, "no data")
+
+        df_total = pd.concat(frames, ignore_index=True)
+        if self.s3:
+            key = f"raw/finnhub/equities_bars/date={day.isoformat()}/data.parquet"
+            fut = self._upload_parquet_key(df_total, key, async_write=True)
+            try:
+                if fut is not None:
+                    self._wait_future_with_logs(fut, desc=f"finnhub daily {day} parquet upload")
+            except Exception as e:
+                return ("error", 0, str(e))
+        else:
+            out = Path("data_layer/raw/finnhub/equities_bars") / f"date={day.isoformat()}"
+            out.mkdir(parents=True, exist_ok=True)
+            df_total.to_parquet(out / "data.parquet", index=False)
+        if self.bookmarks:
+            self.bookmarks.set("finnhub", "equities_bars", day.isoformat(), int(len(df_total)))
+        return ("ok", int(len(df_total)), "")
+
+    def _run_alpha_vantage_corp_actions(self, symbols: List[str], budget: Optional[BudgetManager]):
+        conn = self.connectors.get("av")
+        if not conn:
+            return ("empty", 0, "no connector")
+        rows_written = 0
+        for sym in symbols:
+            try:
+                df = conn.fetch_corporate_actions(sym)
+            except Exception as e:
+                emsg = str(e)
+                if "429" in emsg or "rate" in emsg.lower():
+                    return ("ratelimited", rows_written, emsg)
+                logger.warning(f"Alpha Vantage corporate actions failed for {sym}: {e}")
+                continue
+            if df.empty:
+                continue
+            if self.s3:
+                key = f"raw/alpha_vantage/corp_actions/symbol={sym}/data.parquet"
+                try:
+                    self._upload_parquet_key(df, key, async_write=False)
+                except Exception as e:
+                    return ("error", rows_written, str(e))
+            else:
+                out = Path("data_layer/raw/alpha_vantage/corp_actions") / f"symbol={sym}"
+                out.mkdir(parents=True, exist_ok=True)
+                df.to_parquet(out / "data.parquet", index=False)
+            rows_written += len(df)
+        if rows_written == 0:
+            return ("empty", 0, "no data")
+        return ("ok", rows_written, "")
+
+    def _run_alpha_vantage_options_hist(self, symbol: str, expiry: Optional[str], budget: Optional[BudgetManager]):
+        conn = self.connectors.get("av")
+        if not conn:
+            return ("empty", 0, "no connector")
+        try:
+            df = conn.fetch_historical_options(symbol, expiry=expiry)
+        except Exception as e:
+            emsg = str(e)
+            if "429" in emsg or "rate" in emsg.lower():
+                return ("ratelimited", 0, emsg)
+            return ("error", 0, emsg)
+        if df.empty:
+            return ("empty", 0, "no data")
+        total_rows = int(len(df))
+        grouped = df.groupby(df["date"])
+        for dt, sub in grouped:
+            if isinstance(dt, pd.Timestamp):
+                dt = dt.date()
+            if self.s3:
+                key = f"raw/alpha_vantage/options_iv/date={dt.isoformat()}/underlier={symbol}/data.parquet"
+                try:
+                    self._upload_parquet_key(sub, key, async_write=False)
+                except Exception as e:
+                    return ("error", total_rows, str(e))
+            else:
+                out = Path("data_layer/raw/alpha_vantage/options_iv") / f"date={dt.isoformat()}" / f"underlier={symbol}"
+                out.mkdir(parents=True, exist_ok=True)
+                sub.to_parquet(out / "data.parquet", index=False)
+        return ("ok", total_rows, "")
+
+    def _run_fmp_fundamentals(self, symbol: str, period: str, budget: Optional[BudgetManager]):
+        conn = self.connectors.get("fmp")
+        if not conn:
+            return ("empty", 0, "no connector")
+        statement_types = ("income", "balance", "cashflow")
+        rows_written = 0
+        for kind in statement_types:
+            try:
+                df = conn.fetch_statements(symbol, kind=kind, period=period)
+            except Exception as e:
+                emsg = str(e)
+                if "429" in emsg or "rate" in emsg.lower():
+                    return ("ratelimited", rows_written, emsg)
+                logger.warning(f"FMP statements fetch failed for {symbol} {kind}: {e}")
+                continue
+            if df.empty:
+                continue
+            rows_written += len(df)
+            if self.s3:
+                key = f"raw/fmp/fundamentals/statement={kind}/period={period}/symbol={symbol}/data.parquet"
+                try:
+                    self._upload_parquet_key(df, key, async_write=False)
+                except Exception as e:
+                    return ("error", rows_written, str(e))
+            else:
+                out = Path("data_layer/raw/fmp/fundamentals") / f"statement={kind}" / f"period={period}" / f"symbol={symbol}"
+                out.mkdir(parents=True, exist_ok=True)
+                df.to_parquet(out / "data.parquet", index=False)
+        if rows_written == 0:
+            return ("empty", 0, "no data")
+        return ("ok", rows_written, "")
 
     def run(self, scheduler_mode: Optional[str] = None):
         """Run edge collector."""

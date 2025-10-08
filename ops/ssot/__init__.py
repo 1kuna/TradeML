@@ -7,7 +7,7 @@ from .audit import audit_scan
 from .backfill import backfill_run
 from .curate import curate_incremental
 from .train_gate import train_if_ready, run_cpcv, promote_if_beat_champion
-from .router import route
+from .router import route, route_dataset
 
 __all__ = [
     "audit_scan",
@@ -17,5 +17,5 @@ __all__ = [
     "run_cpcv",
     "promote_if_beat_champion",
     "route",
+    "route_dataset",
 ]
-

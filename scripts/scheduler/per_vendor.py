@@ -19,6 +19,8 @@ def _vendor_lease_name(vendor: str) -> str:
         "polygon": "edge-polygon-collector",
         "finnhub": "edge-finnhub-collector",
         "fred": "edge-fred-collector",
+        "av": "edge-av-collector",
+        "fmp": "edge-fmp-collector",
     }
     return mapping.get(vendor, f"edge-{vendor}-collector")
 
@@ -32,7 +34,7 @@ def _vendor_freeze_seconds(vendor: str) -> int:
 
 
 def _vendor_cap(vendor: str) -> int:
-    defaults = {"alpaca": 2, "polygon": 1, "finnhub": 2, "fred": 2}
+    defaults = {"alpaca": 2, "polygon": 1, "finnhub": 2, "fred": 2, "av": 1, "fmp": 1}
     return max(1, max_inflight_for(vendor, default=defaults.get(vendor, 1)))
 
 
@@ -122,6 +124,10 @@ class VendorRunner:
             polygon_bars_units,
             finnhub_options_units,
             fred_treasury_units,
+            finnhub_daily_units,
+            av_corp_actions_units,
+            av_options_hist_units,
+            fmp_fundamentals_units,
         )
 
         prods: List[Iterator[dict]] = []
@@ -142,9 +148,19 @@ class VendorRunner:
         elif self.vendor == "finnhub":
             if "finnhub_options" in self.tasks:
                 prods.append(finnhub_options_units(self.edge, self.budget))
+            if "finnhub_daily" in self.tasks:
+                prods.append(finnhub_daily_units(self.edge, self.budget))
         elif self.vendor == "fred":
             if "fred_treasury" in self.tasks:
                 prods.append(fred_treasury_units(self.edge, self.budget))
+        elif self.vendor == "av":
+            if "av_corp_actions" in self.tasks:
+                prods.append(av_corp_actions_units(self.edge, self.budget))
+            if "av_options_hist" in self.tasks:
+                prods.append(av_options_hist_units(self.edge, self.budget))
+        elif self.vendor == "fmp":
+            if "fmp_fundamentals" in self.tasks:
+                prods.append(fmp_fundamentals_units(self.edge, self.budget))
         return prods
 
     def _can_submit(self, tokens: int) -> bool:
@@ -300,7 +316,7 @@ class VendorSupervisor:
         self.runners: List[VendorRunner] = []
 
     def _group_tasks_by_vendor(self, tasks: List[str]) -> Dict[str, List[str]]:
-        mapping: Dict[str, List[str]] = {"alpaca": [], "polygon": [], "finnhub": [], "fred": []}
+        mapping: Dict[str, List[str]] = {"alpaca": [], "polygon": [], "finnhub": [], "fred": [], "av": [], "fmp": []}
         for t in tasks:
             if t in ("alpaca_bars", "alpaca_minute"):
                 mapping["alpaca"].append(t)
@@ -308,10 +324,14 @@ class VendorSupervisor:
                 mapping["alpaca"].append(t)
             elif t == "polygon_bars":
                 mapping["polygon"].append(t)
-            elif t == "finnhub_options":
+            elif t in ("finnhub_options", "finnhub_daily"):
                 mapping["finnhub"].append(t)
             elif t == "fred_treasury":
                 mapping["fred"].append(t)
+            elif t in ("av_corp_actions", "av_options_hist"):
+                mapping["av"].append(t)
+            elif t == "fmp_fundamentals":
+                mapping["fmp"].append(t)
         return {v: ts for v, ts in mapping.items() if ts}
 
     def run(self, tasks: List[str]) -> None:

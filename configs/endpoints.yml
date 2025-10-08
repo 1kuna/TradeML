@@ -1,0 +1,118 @@
+# Central registry describing which provider powers each dataset on the
+# free-tier plan. This informs routing, budgeting, and backfill defaults.
+# Values are approximate and can be tuned without code changes.
+
+providers:
+  alpaca:
+    rpm: 200            # documented free-tier REST limit
+    daily_cap: 250000   # practical upper bound given rpm * 24h
+    datasets:
+      equities_eod:
+        endpoint: alpaca.bars
+        unique: false
+        weight: 3
+        notes: Primary daily OHLCV when Polygon throttle hits.
+      equities_minute:
+        endpoint: alpaca.minute
+        unique: true
+        weight: 5
+        notes: Only scalable minute bars on free tier.
+      options_bars:
+        endpoint: alpaca.options.bars
+        unique: partial
+        weight: 3
+        notes: Indicative options bars (non-OPRA).
+      options_chain:
+        endpoint: alpaca.options.chain
+        unique: false
+        weight: 2
+        notes: Complements Finnhub for redundancy.
+      corp_actions:
+        endpoint: alpaca.corporate_actions
+        unique: false
+        weight: 2
+  polygon:
+    rpm: 5
+    daily_cap: 7000
+    datasets:
+      equities_eod:
+        endpoint: polygon.aggs.day
+        unique: false
+        weight: 4
+        notes: High quality aggregates; use when budget available.
+      options_contracts:
+        endpoint: polygon.options.contracts
+        unique: true
+        weight: 5
+        notes: Contract master; only practical source on free tier.
+  finnhub:
+    rpm: 60
+    daily_cap: 86400
+    datasets:
+      options_chain:
+        endpoint: finnhub.option_chain
+        unique: true
+        weight: 5
+        notes: Broad options coverage including OTC.
+      equities_eod:
+        endpoint: finnhub.candle.daily
+        unique: false
+        weight: 2
+        notes: Daily candles fallback when Alpaca throttles.
+      fundamentals_snapshot:
+        endpoint: finnhub.company.profile
+        unique: false
+        weight: 1
+        notes: Point-in-time fundamentals; supplement FMP.
+  alpha_vantage:
+    rpm: 0.4
+    daily_cap: 25
+    datasets:
+      corp_actions:
+        endpoint: av.corp_actions
+        unique: true
+        weight: 5
+        notes: Full history splits/dividends.
+      delistings:
+        endpoint: av.listing_status
+        unique: true
+        weight: 5
+        notes: Only free-tier delistings feed with coverage.
+      options_chain_hist:
+        endpoint: av.historical_options
+        unique: true
+        weight: 4
+        notes: Daily IV snapshots for historical expirations.
+  fmp:
+    rpm: 0.17
+    daily_cap: 250
+    datasets:
+      fundamentals:
+        endpoint: fmp.statements
+        unique: true
+        weight: 5
+        notes: Bulk financial statements (income, balance, cash).
+      symbols_bulk:
+        endpoint: fmp.stock_list
+        unique: true
+        weight: 3
+        notes: Exchange symbol master.
+      equities_eod:
+        endpoint: fmp.historical_price
+        unique: false
+        weight: 1
+        notes: Gap-fill for equities when other feeds miss.
+  fred:
+    rpm: 120
+    daily_cap: 10000
+    datasets:
+      treasuries:
+        endpoint: fred.treasury_curve
+        unique: true
+        weight: 5
+        notes: Daily Treasury yields.
+      series:
+        endpoint: fred.series
+        unique: true
+        weight: 4
+        notes: Macro time-series downloader.
