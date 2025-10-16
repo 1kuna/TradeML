@@ -45,8 +45,6 @@ def alpaca_bars_units(edge, budget_mgr=None) -> Iterator[dict]:
         return
     symbols = edge._symbols_universe()
     today = _today_date()
-    if not _provider_allowed("finnhub", "options_chain", today, symbols):
-        return
     # Default: 15 years of daily bars (SSOT green threshold ~15y)
     default_days = _int_env("ALPACA_DAY_START_DAYS", 365 * 15)
     start_date = _start_date(edge, "alpaca", "equities_bars", default_days)

@@ -835,7 +835,7 @@ class EdgeCollector:
             except Exception:
                 max_wait_val = 60
             max_wait = None if max_wait_val <= 0 else max_wait_val
-            break_on_timeout = os.getenv("EDGE_SCHEDULER_BREAK_ON_TIMEOUT", "true").lower() in ("1","true","yes","on")
+            break_on_timeout = os.getenv("EDGE_SCHEDULER_BREAK_ON_TIMEOUT", "false").lower() in ("1","true","yes","on")
 
             while active and not self.shutdown_requested:
                     # As futures complete, schedule replacements (with timeout to avoid deadlock)
@@ -1293,6 +1293,8 @@ class EdgeCollector:
             out.mkdir(parents=True, exist_ok=True)
             df_total.to_parquet(out / "data.parquet", index=False)
         if self.bookmarks:
+            self.bookmarks.set("finnhub", "equities_eod_fn", day.isoformat(), int(len(df_total)))
+            # Maintain legacy bookmark key for backward compatibility until old readers migrate
             self.bookmarks.set("finnhub", "equities_bars", day.isoformat(), int(len(df_total)))
         return ("ok", int(len(df_total)), "")
 
