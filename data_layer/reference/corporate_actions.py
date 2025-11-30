@@ -65,7 +65,11 @@ class CorporateActionsProcessor:
             symbol: Symbol to calculate for
 
         Returns:
-            DataFrame with dates and adjustment factors
+            DataFrame with dates and adjustment factors.
+            Columns:
+                - ex_date: split effective date
+                - split_ratio: per-split ratio (e.g., 4.0 for 4:1)
+                - cumulative_factor: product of split ratios from that ex_date backward
         """
         # Filter to splits for this symbol
         splits = events[
@@ -74,13 +78,19 @@ class CorporateActionsProcessor:
         ].copy()
 
         if splits.empty:
-            return pd.DataFrame()
+            return pd.DataFrame(columns=['ex_date', 'split_ratio', 'cumulative_factor'])
 
-        # Sort by ex_date ascending so factors apply chronologically
-        splits = splits.sort_values('ex_date', ascending=True)
+        # Sort by ex_date descending so cumulative factors are built from the most recent split backwards
+        splits['ex_date'] = pd.to_datetime(splits['ex_date']).dt.date
+        splits = splits.sort_values('ex_date', ascending=False)
 
-        # Each split ratio should be applied once, sequentially; avoid cumulative reuse
-        adjustments = splits[['ex_date', 'ratio']].rename(columns={'ratio': 'factor'}).reset_index(drop=True)
+        # Keep both the per-event ratio and the cumulative factor that downstream
+        # callers (and tests) rely on for PIT adjustments.
+        splits['split_ratio'] = splits['ratio']
+        splits['cumulative_factor'] = splits['split_ratio'].cumprod()
+
+        adjustments = splits[['ex_date', 'split_ratio', 'cumulative_factor']].reset_index(drop=True)
+        logger.info(f"Calculated {len(adjustments)} split adjustments for {symbol}")
         return adjustments
 
     def apply_split_adjustments(
@@ -93,7 +103,10 @@ class CorporateActionsProcessor:
 
         Args:
             prices: OHLCV DataFrame with 'date' column
-            adjustments: Adjustment factors with 'ex_date' and 'cumulative_factor'
+            adjustments: Adjustment factors with required columns:
+                - ex_date
+                - split_ratio
+                - cumulative_factor (computed if absent)
 
         Returns:
             Adjusted prices DataFrame
@@ -106,9 +119,10 @@ class CorporateActionsProcessor:
             return adj
 
         adj = prices.copy()
+        adj_factors = adjustments.copy()
 
         # Ensure date is proper datetime for comparison
-        if pd.api.types.is_categorical_dtype(adj['date']):
+        if isinstance(adj['date'].dtype, pd.CategoricalDtype):
             adj['date'] = pd.to_datetime(adj['date'].astype(str)).dt.date
         elif not isinstance(adj['date'].iloc[0], date):
             adj['date'] = pd.to_datetime(adj['date']).dt.date
@@ -116,10 +130,24 @@ class CorporateActionsProcessor:
         adj['adjustment_factor'] = 1.0
         adj['last_adjustment_date'] = None
 
+        # Validate schema
+        if 'ex_date' not in adj_factors.columns:
+            raise ValueError("Split adjustments must include an 'ex_date' column.")
+        if 'split_ratio' not in adj_factors.columns:
+            raise ValueError("Split adjustments must include a 'split_ratio' column.")
+
+        adj_factors['ex_date'] = pd.to_datetime(adj_factors['ex_date']).dt.date
+
+        if 'cumulative_factor' not in adj_factors.columns:
+            raise ValueError("Split adjustments must include a 'cumulative_factor' column.")
+
+        # Apply in chronological order so last_adjustment_date reflects the latest split
+        adj_factors = adj_factors.sort_values('ex_date', ascending=True).reset_index(drop=True)
+
         # Apply adjustments backwards in time
-        for _, row in adjustments.iterrows():
+        for _, row in adj_factors.iterrows():
             ex_date = row['ex_date']
-            factor = row['factor']
+            factor = row['split_ratio']
 
             # Adjust all prices BEFORE ex_date
             mask = adj['date'] < ex_date
@@ -258,7 +286,7 @@ class CorporateActionsProcessor:
 
         # Ensure dates are comparable
         raw = raw.copy()
-        if pd.api.types.is_categorical_dtype(raw['date']):
+        if isinstance(raw['date'].dtype, pd.CategoricalDtype):
             raw['date'] = pd.to_datetime(raw['date'].astype(str)).dt.date
         elif not isinstance(raw['date'].iloc[0], date):
             raw['date'] = pd.to_datetime(raw['date']).dt.date

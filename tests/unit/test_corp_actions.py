@@ -144,6 +144,62 @@ class TestPriceAdjustmentApplication:
         assert adjusted["close"].tolist() == sample_prices["close"].tolist()
         assert (adjusted["adjustment_factor"] == 1.0).all()
 
+    def test_multiple_splits_apply_correct_cumulative_factor(self, processor):
+        """Verify multiple splits apply the right cumulative factor and last adjustment date."""
+        prices = pd.DataFrame({
+            "date": [date(2013, 1, 2), date(2015, 1, 2), date(2021, 1, 2)],
+            "symbol": ["AAPL"] * 3,
+            "open": [10.0, 20.0, 40.0],
+            "high": [10.5, 20.5, 40.5],
+            "low": [9.5, 19.5, 39.5],
+            "close": [10.0, 20.0, 40.0],
+            "volume": [28_000, 28_000, 28_000],
+        })
+
+        adjustments = pd.DataFrame({
+            "ex_date": [date(2020, 8, 31), date(2014, 6, 9)],
+            "split_ratio": [4.0, 7.0],
+            "cumulative_factor": [4.0, 28.0],
+        })
+
+        adjusted = processor.apply_split_adjustments(prices, adjustments)
+
+        # Pre-2014 data sees both splits (4 * 7)
+        jan2013 = adjusted[adjusted["date"] == date(2013, 1, 2)].iloc[0]
+        assert np.isclose(jan2013["close"], 10.0 * 28, rtol=1e-6)
+        assert jan2013["adjustment_factor"] == 28.0
+        assert jan2013["last_adjustment_date"] == date(2020, 8, 31)
+
+        # Between 2014 and 2020 sees only the 2020 split
+        jan2015 = adjusted[adjusted["date"] == date(2015, 1, 2)].iloc[0]
+        assert np.isclose(jan2015["close"], 20.0 * 4, rtol=1e-6)
+        assert jan2015["adjustment_factor"] == 4.0
+        assert jan2015["last_adjustment_date"] == date(2020, 8, 31)
+
+        # Post-2020 unchanged
+        jan2021 = adjusted[adjusted["date"] == date(2021, 1, 2)].iloc[0]
+        assert np.isclose(jan2021["close"], 40.0, rtol=1e-6)
+        assert jan2021["adjustment_factor"] == 1.0
+        assert pd.isna(jan2021["last_adjustment_date"]) or jan2021["last_adjustment_date"] is None
+
+    def test_missing_required_column_raises(self, processor, sample_prices):
+        """Verify apply_split_adjustments enforces the unified schema."""
+        bad_adjustments = pd.DataFrame({
+            "ex_date": [date(2022, 8, 25)],
+            # split_ratio intentionally omitted
+        })
+
+        with pytest.raises(ValueError):
+            processor.apply_split_adjustments(sample_prices, bad_adjustments)
+
+        missing_cumulative = pd.DataFrame({
+            "ex_date": [date(2022, 8, 25)],
+            "split_ratio": [3.0],
+        })
+
+        with pytest.raises(ValueError):
+            processor.apply_split_adjustments(sample_prices, missing_cumulative)
+
 
 class TestDividendReturn:
     """Test dividend return calculation."""
