@@ -400,3 +400,39 @@ class TestCorporateActionsLogic:
         adjusted_volume = int(volume / factor)
 
         assert adjusted_volume == 250_000
+
+
+class TestPITHelpers:
+    """Tests for PIT helper methods added to CorporateActionsProcessor."""
+
+    @pytest.fixture
+    def processor(self):
+        from data_layer.reference.corporate_actions import CorporateActionsProcessor
+        return CorporateActionsProcessor()
+
+    @pytest.fixture
+    def sample_events(self) -> pd.DataFrame:
+        return pd.DataFrame({
+            "symbol": ["AAPL", "AAPL", "AAPL"],
+            "event_type": ["split", "split", "dividend"],
+            "ex_date": [date(2020, 8, 31), date(2014, 6, 9), date(2021, 5, 1)],
+            "ratio": [4.0, 7.0, 1.0],
+            "amount": [0.0, 0.0, 0.82],
+        })
+
+    def test_get_adjustment_factor_pit(self, processor, sample_events):
+        """Verify adjustment factor only applies splits after the bar date."""
+        processor.events = sample_events
+
+        # Before both splits -> both apply (4 * 7)
+        assert processor.get_adjustment_factor("AAPL", date(2013, 1, 1)) == 28.0
+        # Between splits -> only the later split applies
+        assert processor.get_adjustment_factor("AAPL", date(2015, 1, 1)) == 4.0
+        # After all splits -> no future splits
+        assert processor.get_adjustment_factor("AAPL", date(2021, 1, 1)) == 1.0
+
+    def test_get_dividend_amount(self, processor, sample_events):
+        """Verify dividend amount is returned for matching ex-date."""
+        processor.events = sample_events
+        assert processor.get_dividend_amount("AAPL", date(2021, 5, 1)) == 0.82
+        assert processor.get_dividend_amount("AAPL", date(2021, 5, 2)) == 0.0

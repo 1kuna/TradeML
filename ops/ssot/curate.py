@@ -63,6 +63,7 @@ class IncrementalCurator:
         self.manifests = get_manifest_manager()
         self._ca_processor: Optional[CorporateActionsProcessor] = None
         self._ca_hash: Optional[str] = None
+        self._ca_events: Optional[pd.DataFrame] = None
 
         logger.info("IncrementalCurator initialized")
 
@@ -74,6 +75,12 @@ class IncrementalCurator:
 
         try:
             self._ca_processor = CorporateActionsProcessor()
+            # Load events for PIT-safe adjustments
+            try:
+                self._ca_events = self._ca_processor.load_events_from_dir(str(root))
+            except Exception as e:
+                logger.warning(f"Failed to load corporate actions events: {e}")
+                self._ca_events = None
             # Compute hash over corp_actions parquet files
             hash_parts = []
             for p in sorted(root.glob("*.parquet")):
@@ -188,44 +195,37 @@ class IncrementalCurator:
         df2["date"] = pd.to_datetime(df2["date"]).dt.date
 
         # Load corporate actions if not already loaded
-        if self._ca_processor is None:
+        if self._ca_processor is None or self._ca_events is None:
             self._load_corp_actions()
 
-        # Apply adjustments
-        out_rows = []
-        for (ds, sym), sub in df2.groupby(["date", "symbol"], as_index=False):
-            adj_factor = 1.0
-            div_cash = 0.0
+        out_frames: List[pd.DataFrame] = []
+        for sym, sub in df2.groupby("symbol"):
+            sym_events = None
+            if self._ca_events is not None:
+                sym_events = self._ca_events[self._ca_events["symbol"] == sym] if "symbol" in self._ca_events.columns else self._ca_events
 
-            if self._ca_processor is not None:
-                try:
-                    adj_factor = self._ca_processor.get_adjustment_factor(sym, ds)
-                    div_cash = self._ca_processor.get_dividend_amount(sym, ds)
-                except Exception:
-                    pass
+            if self._ca_processor is None:
+                logger.warning("Corporate actions processor unavailable; returning raw bars")
+                adjusted = sub.copy()
+            else:
+                adjusted = self._ca_processor.generate_adjusted_series(
+                    sub.sort_values("date"),
+                    sym_events,
+                    sym,
+                )
 
-            row = {
-                "date": ds,
-                "symbol": sym,
-                "session_id": sub.get("session_id", pd.Series([None])).iloc[0],
-                "open_adj": sub["open"].iloc[0] / adj_factor if "open" in sub.columns else None,
-                "high_adj": sub["high"].iloc[0] / adj_factor if "high" in sub.columns else None,
-                "low_adj": sub["low"].iloc[0] / adj_factor if "low" in sub.columns else None,
-                "close_adj": sub["close"].iloc[0] / adj_factor if "close" in sub.columns else None,
-                "vwap_adj": sub["vwap"].iloc[0] / adj_factor if "vwap" in sub.columns and pd.notna(sub["vwap"].iloc[0]) else None,
-                "volume_adj": int(sub["volume"].iloc[0] * adj_factor) if "volume" in sub.columns else None,
-                "div_cash": div_cash,
-                "close_raw": sub["close"].iloc[0] if "close" in sub.columns else None,
-                "adjustment_factor": float(adj_factor),
-                "last_adjustment_date": None,
-                "ingested_at": sub["ingested_at"].iloc[0] if "ingested_at" in sub.columns else pd.Timestamp.utcnow(),
-                "source_name": sub["source_name"].iloc[0] if "source_name" in sub.columns else "curator",
-                "source_uri": sub["source_uri"].iloc[0] if "source_uri" in sub.columns else "curator://equities_ohlcv_adj",
-                "transform_id": "equities_ohlcv_adj_v2",
-            }
-            out_rows.append(row)
+            # Ensure metadata is preserved and transform is labeled
+            if "ingested_at" not in adjusted.columns:
+                adjusted["ingested_at"] = pd.Timestamp.utcnow()
+            if "source_name" not in adjusted.columns:
+                adjusted["source_name"] = "curator"
+            if "source_uri" not in adjusted.columns:
+                adjusted["source_uri"] = "curator://equities_ohlcv_adj"
+            adjusted["transform_id"] = "equities_ohlcv_adj_v2"
 
-        return pd.DataFrame(out_rows) if out_rows else pd.DataFrame()
+            out_frames.append(adjusted)
+
+        return pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
 
     def _detect_changes(
         self,

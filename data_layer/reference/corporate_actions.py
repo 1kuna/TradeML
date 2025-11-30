@@ -11,11 +11,12 @@ Ensures PIT discipline - adjustments applied ONLY using information available at
 """
 
 from datetime import date, datetime
-from typing import List, Dict, Optional, Tuple
-import pandas as pd
-import numpy as np
-from loguru import logger
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from loguru import logger
 
 
 class CorporateActionsProcessor:
@@ -29,8 +30,9 @@ class CorporateActionsProcessor:
     4. Volume adjusted for splits (not dividends)
     """
 
-    def __init__(self):
+    def __init__(self, events: Optional[pd.DataFrame] = None):
         """Initialize corporate actions processor."""
+        self.events = events
         logger.info("Corporate actions processor initialized")
 
     def load_events(self, path: str) -> pd.DataFrame:
@@ -51,6 +53,31 @@ class CorporateActionsProcessor:
             df['ex_date'] = pd.to_datetime(df['ex_date']).dt.date
 
         return df
+
+    def load_events_from_dir(self, root: str = "data_layer/reference/corp_actions") -> pd.DataFrame:
+        """
+        Load and concatenate all corporate actions parquet files under a directory.
+
+        Args:
+            root: Directory containing *_corp_actions.parquet files
+
+        Returns:
+            DataFrame with all events; empty DataFrame if none found.
+        """
+        root_path = Path(root)
+        frames: List[pd.DataFrame] = []
+        for p in sorted(root_path.glob("*.parquet")):
+            try:
+                frames.append(self.load_events(str(p)))
+            except Exception as e:
+                logger.warning(f"Failed to load corp actions from {p}: {e}")
+        if not frames:
+            logger.warning(f"No corporate actions parquet files found under {root}")
+            return pd.DataFrame()
+
+        events = pd.concat(frames, ignore_index=True)
+        self.events = events
+        return events
 
     def calculate_split_adjustment(
         self,
@@ -92,6 +119,71 @@ class CorporateActionsProcessor:
         adjustments = splits[['ex_date', 'split_ratio', 'cumulative_factor']].reset_index(drop=True)
         logger.info(f"Calculated {len(adjustments)} split adjustments for {symbol}")
         return adjustments
+
+    def get_adjustment_factor(self, symbol: str, asof: date, events: Optional[pd.DataFrame] = None) -> float:
+        """
+        Point-in-time cumulative split factor applicable strictly before `asof`.
+
+        Args:
+            symbol: Ticker
+            asof: Date for which the factor should apply (PIT – only splits after this date)
+            events: Optional overrides for events DataFrame
+
+        Returns:
+            Cumulative split factor; 1.0 if no applicable splits.
+        """
+        events_df = events if events is not None else self.events
+        if events_df is None or events_df.empty:
+            return 1.0
+
+        splits = events_df[
+            (events_df["symbol"] == symbol) &
+            (events_df["event_type"] == "split")
+        ].copy()
+        if splits.empty:
+            return 1.0
+
+        splits["ex_date"] = pd.to_datetime(splits["ex_date"]).dt.date
+        # Only apply splits with ex_date strictly after the current bar (PIT discipline)
+        applicable = splits[splits["ex_date"] > asof]
+        if applicable.empty:
+            return 1.0
+
+        factor = float(applicable["ratio"].prod())
+        return factor
+
+    def get_dividend_amount(self, symbol: str, ex_date: date, events: Optional[pd.DataFrame] = None) -> float:
+        """
+        Return per-share cash dividend amount on ex_date for symbol.
+
+        Args:
+            symbol: Ticker
+            ex_date: Ex-dividend date
+            events: Optional overrides for events DataFrame
+
+        Returns:
+            Dividend amount if present, else 0.0
+        """
+        events_df = events if events is not None else self.events
+        if events_df is None or events_df.empty:
+            return 0.0
+
+        divs = events_df[
+            (events_df["symbol"] == symbol) &
+            (events_df["event_type"] == "dividend")
+        ].copy()
+        if divs.empty:
+            return 0.0
+
+        divs["ex_date"] = pd.to_datetime(divs["ex_date"]).dt.date
+        match = divs[divs["ex_date"] == ex_date]
+        if match.empty:
+            return 0.0
+
+        try:
+            return float(match.iloc[0].get("amount", 0.0) or 0.0)
+        except Exception:
+            return 0.0
 
     def apply_split_adjustments(
         self,
@@ -215,7 +307,7 @@ class CorporateActionsProcessor:
     def generate_adjusted_series(
         self,
         raw_prices: pd.DataFrame,
-        corp_actions: pd.DataFrame,
+        corp_actions: Optional[pd.DataFrame],
         symbol: str
     ) -> pd.DataFrame:
         """
@@ -231,14 +323,19 @@ class CorporateActionsProcessor:
         """
         logger.info(f"Generating adjusted series for {symbol}")
 
+        # Use cached events if none supplied
+        events_df = corp_actions if corp_actions is not None else self.events
+        if events_df is None:
+            events_df = pd.DataFrame()
+
         # Calculate split adjustments
-        split_adj = self.calculate_split_adjustment(corp_actions, symbol)
+        split_adj = self.calculate_split_adjustment(events_df, symbol)
 
         # Apply split adjustments to prices
         adjusted = self.apply_split_adjustments(raw_prices, split_adj)
 
         # Add dividend returns (not price-adjusted, but informational)
-        adjusted = self.calculate_dividend_return(corp_actions, adjusted, symbol)
+        adjusted = self.calculate_dividend_return(events_df, adjusted, symbol)
 
         # Store original close for reference
         adjusted['close_raw'] = raw_prices['close']

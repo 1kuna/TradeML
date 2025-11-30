@@ -60,6 +60,66 @@ class ManifestManager:
     Uses write-to-temp-then-rename pattern for crash safety.
     """
 
+    def _use_db_backend(self) -> bool:
+        """Whether to use Postgres as the authoritative backend."""
+        return os.getenv("MANIFESTS_BACKEND", "").lower() == "postgres"
+
+    def _db_connect(self):
+        import psycopg2
+
+        return psycopg2.connect(
+            host=os.getenv("PGHOST") or os.getenv("POSTGRES_HOST", "localhost"),
+            port=int(os.getenv("PGPORT") or os.getenv("POSTGRES_PORT", "5432")),
+            user=os.getenv("PGUSER") or os.getenv("POSTGRES_USER", "trademl"),
+            password=os.getenv("PGPASSWORD") or os.getenv("POSTGRES_PASSWORD", "trademl"),
+            dbname=os.getenv("PGDATABASE") or os.getenv("POSTGRES_DB", "trademl"),
+        )
+
+    def _ensure_db_tables(self) -> None:
+        """Create tables if they do not exist."""
+        if not self._use_db_backend():
+            return
+        try:
+            conn = self._db_connect()
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS connector_bookmarks (
+                        vendor TEXT NOT NULL,
+                        dataset TEXT NOT NULL,
+                        last_date TEXT,
+                        last_timestamp TEXT,
+                        row_count INT,
+                        status TEXT,
+                        updated_at TEXT,
+                        metadata JSONB,
+                        PRIMARY KEY (vendor, dataset)
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS backfill_marks (
+                        dataset TEXT NOT NULL,
+                        symbol TEXT,
+                        window_start TEXT,
+                        window_end TEXT,
+                        current_position TEXT,
+                        rows_backfilled INT,
+                        gaps_remaining INT,
+                        status TEXT,
+                        priority INT,
+                        created_at TEXT,
+                        updated_at TEXT,
+                        metadata JSONB,
+                        PRIMARY KEY (dataset, symbol)
+                    );
+                    """
+                )
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to ensure manifests tables: {e}")
+
     def __init__(
         self,
         manifests_dir: str = "data_layer/manifests",
@@ -80,6 +140,9 @@ class ManifestManager:
 
         # Ensure directory exists
         self.manifests_dir.mkdir(parents=True, exist_ok=True)
+
+        # Ensure DB tables if configured
+        self._ensure_db_tables()
 
         # Initialize files if they don't exist
         self._init_files()
@@ -137,6 +200,43 @@ class ManifestManager:
         Returns:
             ConnectorBookmark if exists, None otherwise
         """
+        if self._use_db_backend():
+            try:
+                conn = self._db_connect()
+                with conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT vendor, dataset, last_date, last_timestamp, row_count, status, updated_at, metadata
+                        FROM connector_bookmarks
+                        WHERE vendor = %s AND dataset = %s
+                        """,
+                        (vendor, dataset),
+                    )
+                    row = cur.fetchone()
+                conn.close()
+                if row:
+                    meta = row[7]
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except Exception:
+                            meta = None
+                    elif not isinstance(meta, dict):
+                        meta = None
+                    return ConnectorBookmark(
+                        vendor=row[0],
+                        dataset=row[1],
+                        last_date=row[2],
+                        last_timestamp=row[3],
+                        row_count=int(row[4]),
+                        status=row[5],
+                        updated_at=row[6],
+                        metadata=meta,
+                    )
+                return None
+            except Exception as e:
+                logger.warning(f"DB bookmark fetch failed, falling back to local: {e}")
+
         data = self._load_json(self.bookmarks_path)
         bookmarks = data.get("bookmarks", {})
 
@@ -165,11 +265,42 @@ class ManifestManager:
             status: Fetch status
             metadata: Optional additional metadata
         """
+        try:
+            now = datetime.now(datetime.UTC).isoformat()
+        except Exception:
+            from datetime import timezone
+            now = datetime.now(timezone.utc).isoformat()
+
+        if self._use_db_backend():
+            try:
+                conn = self._db_connect()
+                with conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO connector_bookmarks
+                            (vendor, dataset, last_date, last_timestamp, row_count, status, updated_at, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (vendor, dataset)
+                        DO UPDATE SET
+                            last_date = EXCLUDED.last_date,
+                            last_timestamp = EXCLUDED.last_timestamp,
+                            row_count = EXCLUDED.row_count,
+                            status = EXCLUDED.status,
+                            updated_at = EXCLUDED.updated_at,
+                            metadata = EXCLUDED.metadata
+                        """,
+                        (vendor, dataset, last_date, now, row_count, status, now, json.dumps(metadata) if metadata else None),
+                    )
+                conn.close()
+                logger.debug(f"[DB] Bookmark updated: {vendor}:{dataset} -> {last_date} ({row_count} rows)")
+                return
+            except Exception as e:
+                logger.warning(f"DB bookmark update failed, falling back to local: {e}")
+
         data = self._load_json(self.bookmarks_path)
         bookmarks = data.get("bookmarks", {})
 
         key = f"{vendor}:{dataset}"
-        now = datetime.utcnow().isoformat()
 
         bookmarks[key] = asdict(ConnectorBookmark(
             vendor=vendor,
@@ -189,6 +320,43 @@ class ManifestManager:
 
     def get_all_bookmarks(self) -> Dict[str, ConnectorBookmark]:
         """Get all connector bookmarks."""
+        if self._use_db_backend():
+            try:
+                conn = self._db_connect()
+                with conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT vendor, dataset, last_date, last_timestamp, row_count, status, updated_at, metadata
+                        FROM connector_bookmarks
+                        """
+                    )
+                    rows = cur.fetchall()
+                conn.close()
+                out: Dict[str, ConnectorBookmark] = {}
+                for r in rows:
+                    meta = r[7]
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except Exception:
+                            meta = None
+                    elif not isinstance(meta, dict):
+                        meta = None
+                    key = f"{r[0]}:{r[1]}"
+                    out[key] = ConnectorBookmark(
+                        vendor=r[0],
+                        dataset=r[1],
+                        last_date=r[2],
+                        last_timestamp=r[3],
+                        row_count=int(r[4]),
+                        status=r[5],
+                        updated_at=r[6],
+                        metadata=meta,
+                    )
+                return out
+            except Exception as e:
+                logger.warning(f"DB bookmark fetch failed, falling back to local: {e}")
+
         data = self._load_json(self.bookmarks_path)
         bookmarks = data.get("bookmarks", {})
         return {k: ConnectorBookmark(**v) for k, v in bookmarks.items()}
@@ -200,6 +368,22 @@ class ManifestManager:
 
     def delete_bookmark(self, vendor: str, dataset: str) -> bool:
         """Delete a bookmark."""
+        if self._use_db_backend():
+            try:
+                conn = self._db_connect()
+                with conn, conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM connector_bookmarks WHERE vendor = %s AND dataset = %s",
+                        (vendor, dataset),
+                    )
+                    deleted = cur.rowcount
+                conn.close()
+                if deleted:
+                    logger.info(f"[DB] Bookmark deleted: {vendor}:{dataset}")
+                    return True
+            except Exception as e:
+                logger.warning(f"DB bookmark delete failed, falling back to local: {e}")
+
         data = self._load_json(self.bookmarks_path)
         bookmarks = data.get("bookmarks", {})
 
@@ -229,6 +413,48 @@ class ManifestManager:
         Returns:
             BackfillMark if exists, None otherwise
         """
+        if self._use_db_backend():
+            try:
+                conn = self._db_connect()
+                with conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT dataset, symbol, window_start, window_end, current_position,
+                               rows_backfilled, gaps_remaining, status, priority, created_at, updated_at, metadata
+                        FROM backfill_marks
+                        WHERE dataset = %s AND (symbol = %s OR (symbol IS NULL AND %s IS NULL))
+                        """,
+                        (dataset, symbol, symbol),
+                    )
+                    row = cur.fetchone()
+                conn.close()
+                if row:
+                    meta = row[11]
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except Exception:
+                            meta = None
+                    elif not isinstance(meta, dict):
+                        meta = None
+                    return BackfillMark(
+                        dataset=row[0],
+                        symbol=row[1],
+                        window_start=row[2],
+                        window_end=row[3],
+                        current_position=row[4],
+                        rows_backfilled=int(row[5]),
+                        gaps_remaining=int(row[6]),
+                        status=row[7],
+                        priority=int(row[8]),
+                        created_at=row[9],
+                        updated_at=row[10],
+                        metadata=meta,
+                    )
+                return None
+            except Exception as e:
+                logger.warning(f"DB backfill mark fetch failed, falling back to local: {e}")
+
         data = self._load_json(self.backfill_marks_path)
         marks = data.get("marks", {})
 
@@ -269,7 +495,45 @@ class ManifestManager:
         marks = data.get("marks", {})
 
         key = f"{dataset}:{symbol}" if symbol else dataset
-        now = datetime.utcnow().isoformat()
+        try:
+            now = datetime.now(datetime.UTC).isoformat()
+        except Exception:
+            from datetime import timezone
+            now = datetime.now(timezone.utc).isoformat()
+
+        if self._use_db_backend():
+            try:
+                conn = self._db_connect()
+                with conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO backfill_marks (
+                            dataset, symbol, window_start, window_end, current_position,
+                            rows_backfilled, gaps_remaining, status, priority, created_at, updated_at, metadata
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (dataset, symbol)
+                        DO UPDATE SET
+                            window_start = EXCLUDED.window_start,
+                            window_end = EXCLUDED.window_end,
+                            current_position = EXCLUDED.current_position,
+                            rows_backfilled = EXCLUDED.rows_backfilled,
+                            gaps_remaining = EXCLUDED.gaps_remaining,
+                            status = EXCLUDED.status,
+                            priority = EXCLUDED.priority,
+                            updated_at = EXCLUDED.updated_at,
+                            metadata = EXCLUDED.metadata
+                        """,
+                        (
+                            dataset, symbol, window_start, window_end, current_position,
+                            rows_backfilled, gaps_remaining, status, priority, now, now,
+                            json.dumps(metadata) if metadata else None,
+                        ),
+                    )
+                conn.close()
+                logger.debug(f"[DB] Backfill mark updated: {key} -> {current_position} ({status})")
+                return
+            except Exception as e:
+                logger.warning(f"DB backfill mark update failed, falling back to local: {e}")
 
         # Preserve created_at if updating
         existing = marks.get(key, {})
@@ -297,6 +561,48 @@ class ManifestManager:
 
     def get_all_backfill_marks(self) -> Dict[str, BackfillMark]:
         """Get all backfill marks."""
+        if self._use_db_backend():
+            try:
+                conn = self._db_connect()
+                with conn, conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT dataset, symbol, window_start, window_end, current_position,
+                               rows_backfilled, gaps_remaining, status, priority, created_at, updated_at, metadata
+                        FROM backfill_marks
+                        """
+                    )
+                    rows = cur.fetchall()
+                conn.close()
+                out: Dict[str, BackfillMark] = {}
+                for r in rows:
+                    key = f"{r[0]}:{r[1]}" if r[1] is not None else r[0]
+                    meta = r[11]
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except Exception:
+                            meta = None
+                    elif not isinstance(meta, dict):
+                        meta = None
+                    out[key] = BackfillMark(
+                        dataset=r[0],
+                        symbol=r[1],
+                        window_start=r[2],
+                        window_end=r[3],
+                        current_position=r[4],
+                        rows_backfilled=int(r[5]),
+                        gaps_remaining=int(r[6]),
+                        status=r[7],
+                        priority=int(r[8]),
+                        created_at=r[9],
+                        updated_at=r[10],
+                        metadata=meta,
+                    )
+                return out
+            except Exception as e:
+                logger.warning(f"DB backfill fetch failed, falling back to local: {e}")
+
         data = self._load_json(self.backfill_marks_path)
         marks = data.get("marks", {})
         return {k: BackfillMark(**v) for k, v in marks.items()}
@@ -353,10 +659,27 @@ class ManifestManager:
 
     def delete_backfill_mark(self, dataset: str, symbol: Optional[str] = None) -> bool:
         """Delete a backfill mark."""
+        key = f"{dataset}:{symbol}" if symbol else dataset
+
+        if self._use_db_backend():
+            try:
+                conn = self._db_connect()
+                with conn, conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM backfill_marks WHERE dataset = %s AND (symbol = %s OR (symbol IS NULL AND %s IS NULL))",
+                        (dataset, symbol, symbol),
+                    )
+                    deleted = cur.rowcount
+                conn.close()
+                if deleted:
+                    logger.info(f"[DB] Backfill mark deleted: {key}")
+                    return True
+            except Exception as e:
+                logger.warning(f"DB backfill delete failed, falling back to local: {e}")
+
         data = self._load_json(self.backfill_marks_path)
         marks = data.get("marks", {})
 
-        key = f"{dataset}:{symbol}" if symbol else dataset
         if key in marks:
             del marks[key]
             data["marks"] = marks

@@ -116,6 +116,11 @@ class CPCV:
         """
         has_symbols = 'symbol' in label_times.columns
 
+        # Optional purge buffer expressed as fraction of dataset length
+        purge_window = int(len(label_times) * self.purge_pct) if self.purge_pct and len(label_times) > 0 else 0
+        ordered_idx = label_times.sort_values("t0").index.tolist()
+        ordered_pos = {idx: pos for pos, idx in enumerate(ordered_idx)}
+
         if not has_symbols:
             # Original logic: purge based on time overlap only
             test_t0_min = label_times.iloc[test_indices]['t0'].min()
@@ -154,6 +159,17 @@ class CPCV:
                 overlap_mask |= (same_symbol_mask & time_overlap_mask).values
 
             purged_train = train_indices[~overlap_mask]
+
+        # Apply purge window around test folds (index-based guardrail)
+        if purge_window > 0 and len(purged_train) > 0:
+            blocked: set[int] = set()
+            test_positions = [ordered_pos[idx] for idx in test_indices if idx in ordered_pos]
+            for pos in test_positions:
+                start = max(0, pos - purge_window)
+                end = min(len(ordered_idx), pos + purge_window + 1)
+                blocked.update(ordered_idx[start:end])
+            purge_mask = ~np.isin(purged_train, list(blocked))
+            purged_train = purged_train[purge_mask]
 
         n_purged = len(train_indices) - len(purged_train)
         if n_purged > 0:
@@ -219,6 +235,11 @@ class CPCV:
         """
         n_samples = len(X)
 
+        # Time-order the panel to enforce walk-forward discipline
+        order = np.argsort(pd.to_datetime(labels[date_col]))
+        X = X.iloc[order].reset_index(drop=True)
+        labels = labels.iloc[order].reset_index(drop=True)
+
         # Calculate label times (with symbol if present)
         label_times = self.get_label_times(labels, date_col, horizon_col, symbol_col)
 
@@ -276,6 +297,11 @@ class CPCV:
         Returns:
             List of (train_indices, test_indices) tuples
         """
+        # Time-order the panel first
+        order = np.argsort(pd.to_datetime(labels[date_col]))
+        X = X.iloc[order].reset_index(drop=True)
+        labels = labels.iloc[order].reset_index(drop=True)
+
         n_samples = len(X)
         label_times = self.get_label_times(labels, date_col, horizon_col, symbol_col)
 

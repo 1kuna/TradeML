@@ -276,12 +276,20 @@ def _check_green_threshold(table: str, threshold: float, lookback_days: int = 25
     Returns:
         True if GREEN coverage >= threshold
     """
+    # Map curated table identifiers to ledger table names
+    TABLE_ALIASES = {
+        "curated/equities_ohlcv_adj": "equities_eod",
+        "curated/equities_minute": "equities_minute",
+        "curated/options_iv": "options_chains",
+    }
+    table_for_ledger = TABLE_ALIASES.get(table, table)
+
     try:
         from datetime import timedelta as td
 
         end_dt = date.today()
         start_dt = end_dt - td(days=lookback_days)
-        coverage, _ = get_green_coverage(table, start_dt, end_dt)
+        coverage, _ = get_green_coverage(table_for_ledger, start_dt, end_dt)
         return coverage >= threshold
     except Exception:
         return False
@@ -425,27 +433,72 @@ def _step_evaluate(cfg: NightlyConfig, asof: date) -> Dict[str, Any]:
         "models_evaluated": [],
     }
 
-    try:
-        # Load and evaluate each model's artifacts
-        artifact_dirs = [
-            Path("models/equities_xs/artifacts"),
-            Path("models/options_vol/artifacts"),
-            Path("models/intraday_xs/artifacts"),
-        ]
+    def _latest_artifact_dir(model_root: Path) -> Optional[Path]:
+        latest_symlink = model_root / "artifacts" / "latest"
+        if latest_symlink.exists():
+            try:
+                return latest_symlink.resolve()
+            except Exception:
+                pass
+        art_root = model_root / "artifacts"
+        if not art_root.exists():
+            return None
+        dirs = [p for p in art_root.iterdir() if p.is_dir()]
+        if not dirs:
+            return None
+        return sorted(dirs, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
-        for artifact_dir in artifact_dirs:
-            summary_path = artifact_dir / f"{artifact_dir.parent.name}_summary.json"
+    def _evaluate_model(model_name: str) -> Dict[str, Any]:
+        model_root = Path("models") / model_name
+        latest_dir = _latest_artifact_dir(model_root)
+        if latest_dir is None:
+            return {"model": model_name, "status": "skipped", "reason": "no_artifacts"}
+
+        summary_path = latest_dir / "training_summary.json"
+        oof_path = latest_dir / "oof_scores.parquet"
+
+        metrics: Dict[str, Any] = {"model": model_name, "artifact_dir": str(latest_dir)}
+
+        try:
             if summary_path.exists():
+                summary = json.loads(summary_path.read_text())
+                final_metrics = summary.get("final_metrics", {})
+                fold_metrics = summary.get("fold_metrics", [])
+                # NOTE(2025-11-30): True CPCV/DSR/PBO recomputation requires raw features/labels
+                # or deterministic loaders per model. Add paths/loader contracts for each model
+                # (equities_xs, options_vol, intraday_xs) to enable full re-eval here.
+                metrics["fold_metrics"] = fold_metrics
+                metrics["final_metrics"] = final_metrics
+                # Re-aggregate CPCV-like stats from fold metrics if present
+                if fold_metrics:
+                    sharpe_values = [fm.get("sharpe") for fm in fold_metrics if fm.get("sharpe") is not None]
+                    if sharpe_values:
+                        metrics["cpcv_results"] = {
+                            "mean_sharpe": float(pd.Series(sharpe_values).mean()),
+                            "min_sharpe": float(pd.Series(sharpe_values).min()),
+                            "max_sharpe": float(pd.Series(sharpe_values).max()),
+                        }
+            # Optional: recompute simple diagnostics from OOF scores if available
+            if oof_path.exists():
                 try:
-                    summary = json.loads(summary_path.read_text())
-                    model_name = artifact_dir.parent.name
-                    results["models_evaluated"].append({
-                        "model": model_name,
-                        "cpcv_results": summary.get("cpcv_results"),
-                        "train_samples": summary.get("train_samples"),
-                    })
+                    oof_df = pd.read_parquet(oof_path)
+                    if "score" in oof_df.columns:
+                        metrics["oof_count"] = int(len(oof_df))
+                        metrics["oof_score_mean"] = float(oof_df["score"].mean())
                 except Exception as e:
-                    logger.debug(f"Failed to load summary from {summary_path}: {e}")
+                    logger.debug(f"Failed to load OOF scores from {oof_path}: {e}")
+
+            metrics["status"] = "ok"
+        except Exception as e:
+            metrics["status"] = "error"
+            metrics["error"] = str(e)
+
+        return metrics
+
+    try:
+        for model_name in ("equities_xs", "options_vol", "intraday_xs"):
+            metrics = _evaluate_model(model_name)
+            results["models_evaluated"].append(metrics)
 
     except Exception as e:
         logger.error(f"Evaluate failed: {e}")

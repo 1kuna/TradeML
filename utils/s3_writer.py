@@ -34,6 +34,8 @@ class S3Writer:
         self._th = threading.Thread(target=self._run, name="S3Writer", daemon=True)
         self._started = False
         self._stopping = False
+        # Prefer zstd for dense numerical data; fall back gracefully if unavailable
+        self.compression = os.getenv("PARQUET_COMPRESSION", "zstd")
 
     def start(self):
         if not self._started:
@@ -86,11 +88,16 @@ class S3Writer:
         df = task.df
         # Convert to parquet bytes
         try:
-            logger.debug(f"S3Writer: begin serialize parquet {key} rows={len(df)}")
+            logger.debug(f"S3Writer: begin serialize parquet {key} rows={len(df)} compression={self.compression}")
         except Exception:
             logger.debug(f"S3Writer: begin serialize parquet {key}")
         buffer = io.BytesIO()
-        df.to_parquet(buffer, index=False)
+        try:
+            df.to_parquet(buffer, index=False, compression=self.compression)
+        except Exception as e:
+            # Fallback to default compression if env-provided codec is unavailable
+            logger.warning(f"Parquet compression '{self.compression}' failed ({e}); falling back to default codec")
+            df.to_parquet(buffer, index=False)
         data = buffer.getvalue()
         # Upload with temp key pattern, idempotent if final exists
         temp_key = f"{key}.tmp"

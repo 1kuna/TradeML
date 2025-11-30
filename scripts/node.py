@@ -39,42 +39,33 @@ def _require_env(keys):
     return [k for k in keys if not os.getenv(k)]
 
 
-def _check_s3():
+def _check_local_storage(root: Path) -> tuple[bool, str]:
     try:
-        from data_layer.storage.s3_client import get_s3_client
-    except Exception as e:
-        return False, f"Cannot import S3 client: {e}"
-
-    try:
-        s3 = get_s3_client()
-        key = f"manifests/healthcheck-{int(time.time())}.json"
+        root.mkdir(parents=True, exist_ok=True)
+        test_file = root / f".healthcheck-{int(time.time())}.json"
         payload = {"ok": True, "ts": datetime.utcnow().isoformat()}
-        s3.put_object(key, json.dumps(payload).encode("utf-8"))
-        data, _ = s3.get_object(key)
-        s3.delete_object(key)
-        ok = json.loads(data.decode("utf-8")).get("ok") is True
-        return (True, "S3 connectivity OK") if ok else (False, "S3 connectivity unexpected payload")
+        test_file.write_text(json.dumps(payload))
+        data = json.loads(test_file.read_text())
+        test_file.unlink(missing_ok=True)
+        ok = data.get("ok") is True
+        return (True, "Local storage OK") if ok else (False, "Local storage unexpected payload")
     except Exception as e:
-        return False, f"S3 connectivity failed: {e}"
+        return False, f"Local storage failed: {e}"
 
 
 def selfcheck(verbose=True) -> bool:
     errors = []
     warns = []
 
-    backend = os.getenv("STORAGE_BACKEND", "s3").lower()
-    if backend != "s3":
-        warns.append("STORAGE_BACKEND is not 's3'. Running in local mode (dev only).")
+    backend = os.getenv("STORAGE_BACKEND", "local").lower()
+    data_root = Path(os.getenv("DATA_ROOT", REPO_ROOT / "data"))
 
-    # S3 connectivity check only when using s3 backend
-    if backend == "s3":
-        has_s3 = all(os.getenv(k) for k in ["S3_ENDPOINT", "S3_BUCKET", "S3_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"])
-        if not has_s3:
-            errors.append("Missing S3 env vars (S3_ENDPOINT, S3_BUCKET, S3_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)")
-        else:
-            ok, msg = _check_s3()
-            if not ok:
-                errors.append(msg)
+    if backend != "local":
+        warns.append(f"STORAGE_BACKEND={backend}; SSOT default is local SSD (no object store)")
+
+    ok, msg = _check_local_storage(data_root)
+    if not ok:
+        errors.append(msg)
 
     # Vendor keys (start minimal with Alpaca). Missing keys are warnings; tasks
     # that require them will be skipped and retried next cycle.
@@ -128,8 +119,9 @@ def main():
     # Force .env to override any ambient AWS_* that might be set in the shell
     load_dotenv(dotenv_path=REPO_ROOT / ".env", override=True)
 
-    # File logger
-    log_dir = REPO_ROOT / "logs"
+    # Storage root for logs/data (external SSD recommended)
+    data_root = Path(os.getenv("DATA_ROOT", REPO_ROOT / "data"))
+    log_dir = data_root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     logger.add(log_dir / "node.log", rotation="10 MB", retention=5)
 

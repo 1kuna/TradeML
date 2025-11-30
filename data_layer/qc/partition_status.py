@@ -61,6 +61,23 @@ def _get_ledger_dir() -> Path:
     return Path("data_layer/qc")
 
 
+def _use_db_backend() -> bool:
+    """Check if Postgres should be used as the authoritative backend."""
+    return os.getenv("PARTITION_STATUS_BACKEND", "").lower() == "postgres"
+
+
+def _connect_db():
+    import psycopg2
+
+    return psycopg2.connect(
+        host=os.getenv("PGHOST") or os.getenv("POSTGRES_HOST", "localhost"),
+        port=int(os.getenv("PGPORT") or os.getenv("POSTGRES_PORT", "5432")),
+        user=os.getenv("PGUSER") or os.getenv("POSTGRES_USER", "trademl"),
+        password=os.getenv("PGPASSWORD") or os.getenv("POSTGRES_PASSWORD", "trademl"),
+        dbname=os.getenv("PGDATABASE") or os.getenv("POSTGRES_DB", "trademl"),
+    )
+
+
 def load_partition_status() -> pd.DataFrame:
     """
     Load the partition status ledger from disk.
@@ -69,6 +86,38 @@ def load_partition_status() -> pd.DataFrame:
         DataFrame with partition status or empty DataFrame with correct schema
         if ledger doesn't exist.
     """
+    # Prefer Postgres if explicitly enabled
+    if _use_db_backend():
+        try:
+            conn = _connect_db()
+            query = """
+                SELECT
+                    COALESCE(source_name, source) AS source_name,
+                    table_name,
+                    symbol,
+                    dt,
+                    partition_key,
+                    status,
+                    qc_score,
+                    row_count,
+                    expected_rows,
+                    qc_code,
+                    first_observed_at,
+                    last_observed_at,
+                    notes
+                FROM partition_status
+            """
+            df_db = pd.read_sql_query(query, conn)
+            conn.close()
+            if not df_db.empty:
+                df_db["dt"] = pd.to_datetime(df_db["dt"])
+                logger.debug(f"Loaded partition_status ledger from DB with {len(df_db)} rows")
+                return df_db
+        except ImportError:
+            logger.debug("psycopg2 not installed; falling back to parquet ledger")
+        except Exception as e:
+            logger.warning(f"Failed to load partition_status from DB: {e}")
+
     path = _get_ledger_path()
 
     if path.exists():
@@ -137,6 +186,45 @@ def save_partition_status(df: pd.DataFrame) -> None:
         if tmp_path.exists():
             tmp_path.unlink()
         raise RuntimeError(f"Failed to save partition_status ledger: {e}") from e
+
+    # Optional DB mirror as authoritative store
+    if _use_db_backend():
+        try:
+            import psycopg2
+
+            conn = _connect_db()
+            with conn, conn.cursor() as cur:
+                for row in df.to_dict("records"):
+                    cur.execute(
+                        """
+                        INSERT INTO partition_status (
+                            source_name, table_name, symbol, dt, partition_key,
+                            status, qc_score, row_count, expected_rows,
+                            qc_code, first_observed_at, last_observed_at, notes
+                        ) VALUES (
+                            %(source_name)s, %(table_name)s, %(symbol)s, %(dt)s, %(partition_key)s,
+                            %(status)s, %(qc_score)s, %(row_count)s, %(expected_rows)s,
+                            %(qc_code)s, %(first_observed_at)s, %(last_observed_at)s, %(notes)s
+                        )
+                        ON CONFLICT (source_name, table_name, symbol, dt)
+                        DO UPDATE SET
+                            partition_key = EXCLUDED.partition_key,
+                            status = EXCLUDED.status,
+                            qc_score = EXCLUDED.qc_score,
+                            row_count = EXCLUDED.row_count,
+                            expected_rows = EXCLUDED.expected_rows,
+                            qc_code = EXCLUDED.qc_code,
+                            last_observed_at = EXCLUDED.last_observed_at,
+                            notes = EXCLUDED.notes
+                        """,
+                        row,
+                    )
+            conn.close()
+            logger.info("Saved partition_status ledger to Postgres backend")
+        except ImportError:
+            logger.debug("psycopg2 not installed; skipped DB mirror for partition_status")
+        except Exception as e:
+            logger.warning(f"Failed to mirror partition_status to DB: {e}")
 
 
 def update_partition_status(new_rows: List[dict]) -> pd.DataFrame:

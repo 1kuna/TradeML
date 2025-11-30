@@ -113,8 +113,8 @@ def log_run(
             if artifacts_dir and Path(artifacts_dir).exists():
                 mlflow.log_artifacts(artifacts_dir)
 
-            # Set tags
-            default_tags = {"stage": "challenger"}
+            # Set tags (consistent casing)
+            default_tags = {"stage": "Challenger"}
             if tags:
                 default_tags.update(tags)
             mlflow.set_tags(default_tags)
@@ -209,7 +209,7 @@ def get_challenger_runs(
             return []
 
         # Search for challenger runs
-        filter_parts = ["tags.stage = 'challenger'"]
+        filter_parts = ["tags.stage = 'Challenger'"]
         if min_sharpe is not None:
             filter_parts.append(f"metrics.sharpe >= {min_sharpe}")
         if max_pbo is not None:
@@ -361,4 +361,3 @@ def load_champion_model(model_name: str) -> Optional[Any]:
     except Exception as e:
         logger.error(f"Failed to load champion model: {e}")
         return None
-

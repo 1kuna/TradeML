@@ -142,10 +142,11 @@ In case of conflict between docs or code comments, precedence is:
 
 ### 1.2 Services & storage
 
-- Storage: Parquet on MinIO/S3 (versioning ON), partitioned by date/symbol or logical keys.
-- Metadata: Postgres for run logs, partition_status, backfill_queue, model_runs.
+- **Storage (current)**: Local-first on external SSD, Parquet + zstd, partitioned by date/symbol or logical keys. All ingest artifacts, manifests/bookmarks, QC ledgers, and logs live on the SSD so it can be moved to the workstation for training/eval without extra services.
+- **Future addition**: Optional remote/object-store replication (MinIO/S3) for multi-node or cloud sync. Not required for the baseline flow.
+- Metadata/control: SQLite/DuckDB on the SSD for manifests/bookmarks/partition_status; Postgres remains optional for richer ops metrics when available.
 - Orchestration: Pi node loop + optional Prefect/Airflow.
-- Registry: MLflow for experiments, champion/challenger registry, and artifacts.
+- Registry: MLflow for experiments, champion/challenger registry, and artifacts (reachable from workstation; optional on Pi).
 
 ### 1.3 Time & calendar conventions
 
@@ -880,3 +881,25 @@ TradeML is considered fully aligned with this SSOT v2 when:
 
 Once these conditions are validated, this SSOT v2 becomes the reference for any future refactors, vendor upgrades, and model extensions. Any changes to these guarantees must be made via a new SSOT version, reviewed alongside config changes and code PRs.
 
+---
+
+## 10. Wizardized Operations (Edge + Workstation)
+
+We standardize on interactive CLI wizards as the primary UX for all operational flows. Each wizard must be single-command start (`python <wizard>.py`), fully guided, resume-safe, and loud on unexpected failures.
+
+**Edge (Pi) data collection wizard**
+- Responsibilities: create/activate venv, install ingest deps, select storage root (external SSD by default), generate/patch `.env`, initialize control tables (partition_status/manifests) on SSD, start edge scheduler/node loop, and stream logs to durable files with clear `tail -f` instructions.
+- Storage: Parquet + zstd on the SSD; control data (bookmarks/manifests/partition_status/logs) co-located on the SSD so unplug/reattach works without cloud deps. Future addition: optional replication to remote/object storage for multi-node sync.
+- Resume: wizard reads SSD state (paths, node_id, manifests/bookmarks) and continues from last offsets automatically.
+- UX: prints actionable next steps (e.g., how to view logs); fails loudly on schema/gating issues (rate-limit backoff handled silently).
+
+**Workstation wizards (train/eval/inference/paper trade)**
+- Single entrypoints for training, evaluation, shadow/paper trading, and inference serving; reuse the same patterns: venv/bootstrap, env/config selection, artifact discovery (champion/challenger), GREEN gating checks, CPCV/DSR/PBO runs, and promotion decisions.
+- Data access: must work offline from the SSD copy (Parquet + zstd). Future addition: optional remote/object-store sync for multi-node/cloud use.
+- Output: consistent log capture to file from start of run; expose links for MLflow UI, reports, or any web dashboards started by the wizard.
+
+**Wizard invariants**
+- One-command launch, zero hidden prerequisites; all required services are started or instructions are printed.
+- Timezone-aware logging (UTC) from process start; logs are persisted even if not tailed.
+- No silent degradation: schema/version mismatches, missing GREEN dependencies, or promotion gates trigger loud, blocking errors with remediation hints.
+- State stored with the data so plugging the SSD into another machine preserves progress and resumes deterministically.

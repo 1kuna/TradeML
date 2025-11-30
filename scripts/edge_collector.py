@@ -28,6 +28,11 @@ from data_layer.storage.s3_client import get_s3_client
 from data_layer.storage.lease_manager import LeaseManager
 from data_layer.storage.bookmarks import BookmarkManager
 from data_layer.connectors.alpaca_connector import AlpacaConnector
+from data_layer.connectors.polygon_connector import PolygonConnector
+from data_layer.connectors.finnhub_connector import FinnhubConnector
+from data_layer.connectors.fred_connector import FREDConnector
+from data_layer.connectors.alpha_vantage_connector import AlphaVantageConnector
+from data_layer.connectors.fmp_connector import FMPConnector
 from utils.concurrency import max_inflight_for, worker_count
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ops.ssot.budget import BudgetManager
@@ -43,9 +48,11 @@ class EdgeCollector:
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
 
-        # Storage backend
+        # Storage backend and data root
         self.storage_backend = os.getenv("STORAGE_BACKEND", "local")
-        logger.info(f"Storage backend: {self.storage_backend}")
+        self.parquet_compression = os.getenv("PARQUET_COMPRESSION", "zstd")
+        self.data_root = Path(os.getenv("DATA_ROOT", Path(__file__).resolve().parents[1] / "data"))
+        logger.info(f"Storage backend: {self.storage_backend} (data_root={self.data_root})")
 
         if self.storage_backend == "s3":
             self.s3 = get_s3_client()
@@ -75,6 +82,11 @@ class EdgeCollector:
             self.s3_writer = None
             # Local bad-symbol cache
             self.bad_symbols = BadSymbolCache(None)
+            # Local bookmarks on SSD
+            self.bookmarks = BookmarkManager(
+                s3_client=None,
+                local_path=os.getenv("BOOKMARKS_PATH", str(self.data_root / "data_layer" / "manifests" / "bookmarks.json")),
+            )
 
         # In-memory cache (session) in addition to persisted bad-symbols
         self._vendor_bad_symbols = {
@@ -111,7 +123,40 @@ class EdgeCollector:
             )
             logger.info("Initialized Alpaca connector")
 
-        # Add other connectors as needed...
+        if os.getenv("POLYGON_API_KEY"):
+            try:
+                connectors["polygon"] = PolygonConnector(api_key=os.getenv("POLYGON_API_KEY"))
+                logger.info("Initialized Polygon connector")
+            except Exception as e:
+                logger.warning(f"Polygon connector init failed: {e}")
+
+        if os.getenv("FINNHUB_API_KEY"):
+            try:
+                connectors["finnhub"] = FinnhubConnector(api_key=os.getenv("FINNHUB_API_KEY"))
+                logger.info("Initialized Finnhub connector")
+            except Exception as e:
+                logger.warning(f"Finnhub connector init failed: {e}")
+
+        if os.getenv("FRED_API_KEY"):
+            try:
+                connectors["fred"] = FREDConnector(api_key=os.getenv("FRED_API_KEY"))
+                logger.info("Initialized FRED connector")
+            except Exception as e:
+                logger.warning(f"FRED connector init failed: {e}")
+
+        if os.getenv("ALPHA_VANTAGE_API_KEY"):
+            try:
+                connectors["av"] = AlphaVantageConnector(api_key=os.getenv("ALPHA_VANTAGE_API_KEY"))
+                logger.info("Initialized Alpha Vantage connector")
+            except Exception as e:
+                logger.warning(f"Alpha Vantage connector init failed: {e}")
+
+        if os.getenv("FMP_API_KEY"):
+            try:
+                connectors["fmp"] = FMPConnector(api_key=os.getenv("FMP_API_KEY"))
+                logger.info("Initialized FMP connector")
+            except Exception as e:
+                logger.warning(f"FMP connector init failed: {e}")
 
         return connectors
 
@@ -180,10 +225,13 @@ class EdgeCollector:
         """Upload dataframe to S3 with partitioning."""
         if not self.s3:
             # Local storage fallback (source-first layout for consistency)
-            local_dir = Path(f"data_layer/raw/{source}/{table}/date={date}")
+            local_dir = self.data_root / "data_layer" / "raw" / source / table / f"date={date}"
             local_dir.mkdir(parents=True, exist_ok=True)
             local_file = local_dir / "data.parquet"
-            df.to_parquet(local_file, index=False)
+            try:
+                df.to_parquet(local_file, index=False, compression=self.parquet_compression)
+            except Exception:
+                df.to_parquet(local_file, index=False)
             logger.info(f"Saved locally: {local_file}")
             return
 
@@ -198,25 +246,25 @@ class EdgeCollector:
             if fut is not None:
                 fut.result()
                 return
-            import io
-            buffer = io.BytesIO()
+        import io
+        buffer = io.BytesIO()
+        try:
+            df.to_parquet(buffer, index=False, compression=self.parquet_compression)
+        except Exception:
             df.to_parquet(buffer, index=False)
-            data = buffer.getvalue()
-            temp_key = f"{key}.tmp"
-            self.s3.put_object(temp_key, data)
-            if self.s3.object_exists(key):
-                logger.debug(f"Object already exists, skipping: {key}")
-                self.s3.delete_object(temp_key)
-                return
-            self.s3.put_object(key, data)
+        data = buffer.getvalue()
+        temp_key = f"{key}.tmp"
+        self.s3.put_object(temp_key, data)
+        if self.s3.object_exists(key):
+            logger.debug(f"Object already exists, skipping: {key}")
             self.s3.delete_object(temp_key)
-            logger.info(f"Uploaded to S3: {key} ({len(df)} rows, {len(data)} bytes)")
+            return
+        self.s3.put_object(key, data)
+        self.s3.delete_object(temp_key)
+        logger.info(f"Uploaded to S3: {key} ({len(df)} rows, {len(data)} bytes)")
 
     def _write_manifest(self, source: str, table: str, date: str, row_count: int):
         """Write manifest log for audit trail."""
-        if not self.s3:
-            return  # Skip in local mode
-
         manifest_key = f"manifests/{date}/manifest-{source}-{table}.jsonl"
         manifest_entry = {
             "source": source,
@@ -226,12 +274,21 @@ class EdgeCollector:
             "timestamp": datetime.utcnow().isoformat(),
         }
 
+        if not self.s3:
+            # Local append on SSD
+            out_path = self.data_root / "data_layer" / manifest_key
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with out_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(manifest_entry) + "\n")
+            logger.debug(f"Updated manifest (local): {out_path}")
+            return
+
         # Append to manifest (read, append, write)
         import json
         try:
             existing_data, etag = self.s3.get_object(manifest_key)
             lines = existing_data.decode('utf-8').strip().split('\n')
-        except:
+        except Exception:
             lines = []
 
         lines.append(json.dumps(manifest_entry))

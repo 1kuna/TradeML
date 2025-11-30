@@ -36,6 +36,7 @@ class Curator:
             self.config = yaml.safe_load(f)
 
         self.storage_backend = os.getenv("STORAGE_BACKEND", "local")
+        self.data_root = Path(os.getenv("DATA_ROOT", Path(__file__).resolve().parents[1] / "data"))
         logger.info(f"Storage backend: {self.storage_backend}")
 
         if self.storage_backend == "s3":
@@ -46,7 +47,11 @@ class Curator:
             self.watermarks = BookmarkManager(self.s3, bookmark_key=bookmark_key)
         else:
             self.s3 = None
-            self.watermarks = None
+            bookmark_key = self.config.get("watermark", {}).get("bookmark_key", "manifests/curator_watermarks.json")
+            self.watermarks = BookmarkManager(
+                s3_client=None,
+                local_path=self.data_root / "data_layer" / bookmark_key,
+            )
 
         # Preload corporate actions (splits + dividends)
         self._corp_actions = self._load_corp_actions()

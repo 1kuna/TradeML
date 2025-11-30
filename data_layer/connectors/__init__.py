@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from datetime import date
 from pathlib import Path
 from typing import Dict, Optional, Any
@@ -16,9 +17,19 @@ from .fred_connector import FREDConnector
 from .finnhub_connector import FinnhubConnector
 from .fmp_connector import FMPConnector
 from .polygon_connector import PolygonConnector
+# Expose EdgeCollector for tests/mocks while keeping lazy import in run_edge_scheduler
+try:
+    from scripts.edge_collector import EdgeCollector  # type: ignore
+except Exception:
+    EdgeCollector = None  # type: ignore
 
 
-def run_edge_scheduler(asof: Optional[str] = None, config_path: str = "configs/edge.yml") -> Dict[str, Any]:
+def run_edge_scheduler(
+    asof: Optional[str] = None,
+    config_path: str = "configs/edge.yml",
+    node_id: Optional[str] = None,
+    budgets: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
     """
     Run the edge scheduler to collect data for the given date.
 
@@ -27,6 +38,8 @@ def run_edge_scheduler(asof: Optional[str] = None, config_path: str = "configs/e
     Args:
         asof: As-of date string (YYYY-MM-DD). Defaults to today.
         config_path: Path to edge collector config.
+        node_id: Logical node identity (EDGE_NODE_ID) for leases/logs.
+        budgets: Optional per-vendor request budgets to enforce.
 
     Returns:
         Dict with dataset results keyed by dataset name.
@@ -39,14 +52,22 @@ def run_edge_scheduler(asof: Optional[str] = None, config_path: str = "configs/e
 
     try:
         # Import EdgeCollector from scripts
-        import sys
         scripts_path = str(Path(__file__).parent.parent.parent / "scripts")
         if scripts_path not in sys.path:
             sys.path.insert(0, scripts_path)
 
-        from edge_collector import EdgeCollector
+        from edge_collector import EdgeCollector as _EdgeCollector  # type: ignore
 
-        collector = EdgeCollector(config_path)
+        # Inject asof into environment for the collector to honor
+        if asof:
+            os.environ["EDGE_ASOF"] = asof
+        if node_id:
+            os.environ["EDGE_NODE_ID"] = node_id
+        if budgets:
+            for vendor, limit in budgets.items():
+                os.environ[f"NODE_MAX_INFLIGHT_{vendor.upper()}"] = str(limit)
+
+        collector = _EdgeCollector(config_path)
         collector.run()
 
         # Return basic status - detailed metrics would be in logs
@@ -54,6 +75,9 @@ def run_edge_scheduler(asof: Optional[str] = None, config_path: str = "configs/e
             "status": "ok",
             "config": config_path,
             "asof": asof,
+            "node_id": node_id or os.getenv("EDGE_NODE_ID"),
+            "budgets": budgets or {},
+            "datasets": getattr(collector, "_vendor_symbol_cursor", {}),
         }
 
     except ImportError as e:
@@ -106,7 +130,12 @@ def backfill_partition(
             cur.execute(
                 """
                 SELECT id FROM backfill_queue
-                WHERE table_name = %s AND dt = %s AND (symbol = %s OR %s IS NULL)
+                WHERE table_name = %s
+                  AND dt = %s
+                  AND (
+                        (symbol IS NULL AND %s IS NULL)
+                        OR (symbol = %s)
+                  )
                 LIMIT 1
                 """,
                 (table, date, symbol, symbol),
@@ -133,15 +162,48 @@ def backfill_partition(
         conn.close()
 
     except ImportError:
-        logger.debug("psycopg2 not available; falling back to direct backfill")
+        logger.debug("psycopg2 not available; falling back to direct, single-partition backfill")
         results["status"] = "queue_unavailable"
-        results["fallback"] = "direct"
+        results["fallback"] = "direct_single"
 
-        # Attempt direct backfill
+        # Direct backfill requires a symbol to avoid blasting entire universes
+        if symbol is None:
+            results["error"] = "symbol_required_for_direct_backfill"
+            return results
+
         try:
-            from ops.ssot.backfill import backfill_run
-            backfill_run(budget={"alpaca": 10, "finnhub": 5})
-            results["status"] = "direct_backfill_triggered"
+            import pandas as pd
+            from data_layer.connectors.alpaca_connector import AlpacaConnector
+
+            connector = AlpacaConnector(
+                api_key=os.getenv("ALPACA_API_KEY"),
+                secret_key=os.getenv("ALPACA_SECRET_KEY"),
+            )
+            asof = pd.to_datetime(date).date()
+            timeframe = "1Day" if table == "equities_eod" else "1Min"
+            df = connector.fetch_and_transform(
+                symbols=[symbol],
+                start_date=asof,
+                end_date=asof,
+                timeframe=timeframe,
+                source_uri=f"backfill://{table}/{date}/{symbol}",
+            )
+            if df.empty:
+                results["status"] = "no_data"
+                results["rows"] = 0
+                return results
+
+            if table == "equities_eod":
+                out_root = Path("data_layer/raw/alpaca/equities_bars")
+            elif table == "equities_minute":
+                out_root = Path("data_layer/raw/alpaca/equities_bars_minute")
+            else:
+                results["status"] = "unsupported_table"
+                return results
+
+            connector.write_parquet(df, out_root, partition_cols=["date"])
+            results["status"] = "direct_backfill_written"
+            results["rows"] = len(df)
         except Exception as e:
             results["status"] = "error"
             results["error"] = str(e)
