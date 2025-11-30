@@ -9,9 +9,11 @@ Computes per-(source, table, symbol, dt) completeness using:
 - actual observed raw partitions
 
 Writes:
-- data_layer/qc/partition_status.parquet (canonical ledger)
+- data_layer/qc/partition_status.parquet (canonical ledger) via atomic writes
 - DB mirror (partition_status) if DB is reachable
 - enqueues RED/AMBER rows into backfill_queue with priority policy
+
+SSOT v2 Section 2.3: Completeness & GREEN/AMBER/RED
 """
 
 import os
@@ -26,6 +28,12 @@ from loguru import logger
 
 from data_layer.storage.s3_client import get_s3_client
 from data_layer.connectors.polygon_connector import PolygonConnector
+from data_layer.qc.partition_status import (
+    update_partition_status,
+    init_ledger,
+    load_partition_status,
+    get_green_coverage,
+)
 from ops.ssot.budget import BudgetManager
 from data_layer.reference.calendars import get_trading_days
 
@@ -37,12 +45,13 @@ def _load_universe(path: str = "data_layer/reference/universe_symbols.txt") -> L
     return [s.strip() for s in p.read_text().splitlines() if s.strip()]
 
 
-def _save_partition_status(df: pd.DataFrame):
-    out_dir = Path("data_layer/qc")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "partition_status.parquet"
-    df.to_parquet(out_path, index=False)
-    logger.info(f"Wrote completeness ledger to {out_path}")
+def _save_partition_status(rows: List[dict]):
+    """Save partition status using atomic writes via partition_status module."""
+    # Initialize ledger if needed
+    init_ledger()
+    # Use atomic upsert
+    update_partition_status(rows)
+    logger.info(f"Updated completeness ledger with {len(rows)} rows")
 
 
 def _db_insert_partition_status(rows: List[dict]):
@@ -328,8 +337,8 @@ def audit_scan(tables: List[str]) -> None:
         logger.info("No partitions evaluated; audit finished with no rows")
         return
 
-    ledger = pd.DataFrame(all_rows)
-    _save_partition_status(ledger)
+    # Save via atomic writes
+    _save_partition_status(all_rows)
     _db_insert_partition_status(all_rows)
     # Enqueue only the most recent X days per symbol to keep queue bounded (simple heuristic)
     if enqueue_rows:

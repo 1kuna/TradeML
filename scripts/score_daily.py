@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Daily scoring script using trained equities_xs artifacts."""
+"""
+Daily scoring script using trained equities_xs artifacts.
+
+Supports two model loading modes:
+1. MLflow registry (preferred): Loads champion model from MLflow
+2. Local artifacts (fallback): Loads from models/equities_xs/artifacts/latest/
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,7 @@ import argparse
 import json
 from datetime import date
 from pathlib import Path
-from typing import List
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,6 +29,8 @@ from data_layer.curated.loaders import load_price_panel
 from feature_store.equities.features import compute_equity_features
 from models.equities_xs import predict_lgbm
 from ops.reports.emitter import emit_daily
+from ops.ssot.registry import get_champion, load_champion_model, get_model_artifact_path
+from ops.ssot.shadow import log_signals
 from portfolio.build import build as build_portfolio
 
 
@@ -60,6 +68,44 @@ def _resolve_universe(args: argparse.Namespace) -> List[str]:
     raise ValueError("Universe not provided; pass --symbols or ensure universe file exists")
 
 
+def _load_model_from_mlflow(model_name: str) -> Tuple[Optional[Any], Optional[List[str]]]:
+    """
+    Try to load champion model from MLflow registry.
+
+    Returns:
+        Tuple of (model, feature_list) or (None, None) if not available
+    """
+    champion = get_champion(model_name)
+    if champion is None:
+        logger.info(f"No champion found in MLflow for '{model_name}'")
+        return None, None
+
+    run_id, metrics = champion
+    logger.info(f"Found champion model: run_id={run_id}, sharpe={metrics.get('sharpe', 'N/A')}")
+
+    # Load the model
+    model = load_champion_model(model_name)
+    if model is None:
+        logger.warning("Failed to load champion model from MLflow")
+        return None, None
+
+    # Try to get feature list from artifacts
+    artifact_uri = get_model_artifact_path(model_name, run_id)
+    feature_list = None
+    if artifact_uri:
+        # Try to load feature_list.json from artifacts
+        try:
+            import mlflow  # type: ignore
+            local_path = mlflow.artifacts.download_artifacts(
+                artifact_uri=f"{artifact_uri}/feature_list.json"
+            )
+            feature_list = _load_feature_list(Path(local_path))
+        except Exception as e:
+            logger.warning(f"Could not load feature list from MLflow artifacts: {e}")
+
+    return model, feature_list
+
+
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     load_dotenv(dotenv_path=repo_root / ".env", override=False)
@@ -67,26 +113,43 @@ def main() -> None:
     args = parse_args()
     universe = _resolve_universe(args)
 
-    if joblib is None:
-        raise ImportError("joblib is required to load trained models")
+    model = None
+    feature_list = None
 
-    model_path = Path(args.model)
-    feature_path = Path(args.features)
-    if not model_path.exists() or not feature_path.exists():
-        raise FileNotFoundError("Model or feature list not found; run training first")
+    # Try MLflow first (unless --model explicitly provided)
+    if args.model == "models/equities_xs/artifacts/latest/model.pkl":
+        model, feature_list = _load_model_from_mlflow("equities_xs")
 
-    model = joblib.load(model_path)
-    feature_list = _load_feature_list(feature_path)
+    # Fallback to local artifacts
+    if model is None:
+        if joblib is None:
+            raise ImportError("joblib is required to load trained models")
+
+        model_path = Path(args.model)
+        feature_path = Path(args.features)
+        if not model_path.exists() or not feature_path.exists():
+            raise FileNotFoundError("Model or feature list not found; run training first")
+
+        model = joblib.load(model_path)
+        feature_list = _load_feature_list(feature_path)
+        logger.info(f"Loaded model from local artifacts: {model_path}")
 
     feats = compute_equity_features(args.asof, universe)
     if feats.empty:
         raise RuntimeError("No features generated for scoring; ensure curated data is available")
 
+    # Prepare features for scoring
     X = feats[[c for c in feats.columns if c.startswith("feature_")]].copy()
-    missing = [f for f in feature_list if f not in X.columns]
-    for col in missing:
-        X[col] = 0.0
-    X = X[feature_list]
+
+    if feature_list:
+        # Use known feature list - add missing columns, reorder
+        missing = [f for f in feature_list if f not in X.columns]
+        for col in missing:
+            X[col] = 0.0
+        X = X[feature_list]
+    else:
+        # No feature list - use all available features
+        logger.warning("No feature list available; using all computed features")
 
     # Generate scores
     try:
@@ -128,6 +191,9 @@ def main() -> None:
         "kelly_fraction": args.kelly,
     }
     emit_daily(date.fromisoformat(args.asof), signals[["symbol", "target_w"]], metrics)
+
+    # Log shadow signals for later PnL evaluation
+    log_signals(date.fromisoformat(args.asof), signals[["symbol", "target_w"]])
 
 
 if __name__ == "__main__":

@@ -76,29 +76,12 @@ class CorporateActionsProcessor:
         if splits.empty:
             return pd.DataFrame()
 
-        # Sort by ex_date descending (most recent first)
-        splits = splits.sort_values('ex_date', ascending=False)
+        # Sort by ex_date ascending so factors apply chronologically
+        splits = splits.sort_values('ex_date', ascending=True)
 
-        # Calculate cumulative adjustment
-        # For a 2:1 split, ratio=2.0, we multiply older prices by 2.0
-        splits['adjustment_factor'] = splits['ratio'].cumprod()
-
-        # Create adjustment schedule
-        adjustments = []
-        cumulative = 1.0
-
-        for _, row in splits.iterrows():
-            adjustments.append({
-                'ex_date': row['ex_date'],
-                'split_ratio': row['ratio'],
-                'cumulative_factor': cumulative * row['ratio']
-            })
-            cumulative *= row['ratio']
-
-        df = pd.DataFrame(adjustments)
-        df = df.sort_values('ex_date')  # Ascending for application
-
-        return df
+        # Each split ratio should be applied once, sequentially; avoid cumulative reuse
+        adjustments = splits[['ex_date', 'ratio']].rename(columns={'ratio': 'factor'}).reset_index(drop=True)
+        return adjustments
 
     def apply_split_adjustments(
         self,
@@ -136,7 +119,7 @@ class CorporateActionsProcessor:
         # Apply adjustments backwards in time
         for _, row in adjustments.iterrows():
             ex_date = row['ex_date']
-            factor = row['cumulative_factor']
+            factor = row['factor']
 
             # Adjust all prices BEFORE ex_date
             mask = adj['date'] < ex_date

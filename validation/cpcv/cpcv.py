@@ -358,6 +358,113 @@ class CPCV:
         }
 
 
+def run_cpcv(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: pd.Series,
+    n_splits: int = 5,
+    n_test_splits: int = 2,
+    embargo_days: int = 5,
+    purge_days: int = 5,
+    model=None,
+) -> Dict:
+    """
+    Convenience function to run CPCV validation.
+
+    Args:
+        X: Feature matrix
+        y: Target series
+        dates: Date series for each sample
+        n_splits: Number of CV folds
+        n_test_splits: Number of folds to use as test set
+        embargo_days: Embargo period in days
+        purge_days: Purge period in days (converted to purge_pct)
+        model: Optional sklearn-compatible model (default: LightGBM or RF)
+
+    Returns:
+        Dict with mean_score, std_score, scores, etc.
+    """
+    from sklearn.metrics import mean_squared_error, r2_score
+
+    # Create labels DataFrame for CPCV
+    labels_df = pd.DataFrame({
+        "date": dates.values,
+        "horizon_days": 5,  # Default horizon
+    })
+
+    # Initialize CPCV
+    cv = CPCV(
+        n_folds=n_splits,
+        embargo_days=embargo_days,
+        purge_pct=purge_days / len(X) if len(X) > 0 else 0.01,
+    )
+
+    # Generate splits
+    try:
+        splits = cv.combinatorial_split(X, labels_df, n_test_folds=n_test_splits)
+    except Exception as e:
+        logger.warning(f"Combinatorial split failed, using regular split: {e}")
+        splits = cv.split(X, labels_df)
+
+    if not splits:
+        logger.warning("No valid CPCV splits generated")
+        return {"mean_score": np.nan, "std_score": np.nan, "scores": []}
+
+    # Create model if not provided
+    if model is None:
+        try:
+            import lightgbm as lgb
+            model = lgb.LGBMRegressor(
+                n_estimators=100,
+                learning_rate=0.05,
+                num_leaves=31,
+                random_state=42,
+                verbose=-1,
+            )
+        except ImportError:
+            from sklearn.ensemble import RandomForestRegressor
+            model = RandomForestRegressor(n_estimators=100, random_state=42)
+
+    # Run cross-validation
+    scores = []
+    r2_scores = []
+
+    for train_idx, test_idx in splits:
+        try:
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+            # Fit
+            model.fit(X_train, y_train)
+
+            # Predict
+            y_pred = model.predict(X_test)
+
+            # Score (negative RMSE for consistency with sklearn)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            r2 = r2_score(y_test, y_pred)
+
+            scores.append(-rmse)  # Negative so higher is better
+            r2_scores.append(r2)
+
+        except Exception as e:
+            logger.warning(f"CPCV split failed: {e}")
+            continue
+
+    if not scores:
+        return {"mean_score": np.nan, "std_score": np.nan, "scores": []}
+
+    return {
+        "mean_score": float(np.mean(scores)),
+        "std_score": float(np.std(scores)),
+        "min_score": float(np.min(scores)),
+        "max_score": float(np.max(scores)),
+        "mean_r2": float(np.mean(r2_scores)),
+        "n_splits": len(scores),
+        "scores": [float(s) for s in scores],
+    }
+
+
 # CLI for testing
 if __name__ == "__main__":
     # Simple test

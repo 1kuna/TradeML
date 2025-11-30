@@ -87,18 +87,29 @@ def _atm_iv(iv_df: pd.DataFrame, spot: float) -> Optional[float]:
 
 
 def estimate_delta_hedged_straddle_pnl(asof: date, underlier: str) -> Optional[StraddlePnl]:
-    next_day = asof + timedelta(days=1)
-    # Find next available curated price day
+    # Anchor on first available price from asof forward (up to ~1 week)
+    anchor_day = asof
+    s0: Optional[float] = None
     for _ in range(6):
-        s0 = _load_spot(asof, underlier)
-        s1 = _load_spot(next_day, underlier)
-        if s0 is not None and s1 is not None:
+        s0 = _load_spot(anchor_day, underlier)
+        if s0 is not None:
             break
-        next_day = next_day + timedelta(days=1)
-    if s0 is None or s1 is None:
+        anchor_day = anchor_day + timedelta(days=1)
+    if s0 is None:
         return None
 
-    iv0 = _load_iv(asof, underlier)
+    # Find next available price after anchor
+    next_day = anchor_day + timedelta(days=1)
+    s1: Optional[float] = None
+    for _ in range(6):
+        s1 = _load_spot(next_day, underlier)
+        if s1 is not None:
+            break
+        next_day = next_day + timedelta(days=1)
+    if s1 is None:
+        return None
+
+    iv0 = _load_iv(anchor_day, underlier)
     iv1 = _load_iv(next_day, underlier)
     if iv0.empty or iv1.empty:
         return None
@@ -131,4 +142,3 @@ def estimate_delta_hedged_straddle_pnl(asof: date, underlier: str) -> Optional[S
         est_vega=float(est_vega),
         pnl_delta_hedged=float(pnl),
     )
-

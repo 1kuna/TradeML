@@ -1,0 +1,37 @@
+{
+  "asof": "2025-11-30",
+  "started_at": "2025-11-30T07:06:32.153205+00:00",
+  "status": "ok",
+  "steps": {
+    "qc": {
+      "status": "ok",
+      "coverage": {
+        "equities_eod": {
+          "green_ratio": 1.0,
+          "counts": {
+            "GREEN": 1,
+            "AMBER": 0,
+            "RED": 0
+          }
+        },
+        "options_chains": {
+          "green_ratio": 0.0,
+          "counts": {
+            "GREEN": 0,
+            "AMBER": 0,
+            "RED": 0
+          }
+        },
+        "equities_minute": {
+          "green_ratio": 0.0,
+          "counts": {
+            "GREEN": 0,
+            "AMBER": 0,
+            "RED": 0
+          }
+        }
+      }
+    }
+  },
+  "finished_at": "2025-11-30T07:06:32.156342+00:00"
+}

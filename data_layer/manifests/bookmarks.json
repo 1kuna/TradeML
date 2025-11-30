@@ -1,0 +1,15 @@
+{
+  "bookmarks": {
+    "alpaca:equities_eod": {
+      "vendor": "alpaca",
+      "dataset": "equities_eod",
+      "last_date": "2025-01-01",
+      "last_timestamp": "2025-11-30T06:42:54.735861",
+      "row_count": 1000,
+      "status": "success",
+      "updated_at": "2025-11-30T06:42:54.735861",
+      "metadata": null
+    }
+  },
+  "version": 1
+}

@@ -23,8 +23,11 @@ class DataType(str, Enum):
     OPTIONS_SURFACE = "options_surface"
     CORP_ACTIONS = "corp_actions"
     DELISTINGS = "delistings"
+    INDEX_MEMBERSHIP = "index_membership"
+    TICK_SIZE_REGIME = "tick_size_regime"
     MACRO = "macro"
     CALENDARS = "calendars"
+    FUNDAMENTALS = "fundamentals"
 
 
 # ===== Equities Schemas =====
@@ -253,6 +256,35 @@ DELISTINGS_SCHEMA = pa.schema([
 ])
 
 
+INDEX_MEMBERSHIP_SCHEMA = pa.schema([
+    # Index constituent tracking for PIT universe filtering
+    ("date", pa.date32(), False),           # Effective date of the event
+    ("index_name", pa.string(), False),     # e.g., "SP500", "R1000", "R2000"
+    ("symbol", pa.string(), False),         # Constituent symbol
+    ("action", pa.string(), False),         # "ADD" or "REMOVE"
+
+    # Metadata
+    ("source_name", pa.string(), False),
+    ("ingested_at", pa.timestamp("us"), False),
+    ("source_uri", pa.string(), False),
+])
+
+
+TICK_SIZE_REGIME_SCHEMA = pa.schema([
+    # Tick size regime tracking for microstructure features
+    ("effective_date", pa.date32(), False), # When regime starts
+    ("symbol", pa.string(), True),          # NULL for market-wide rules
+    ("tick_size", pa.float64(), False),     # Minimum tick increment (e.g., 0.01)
+    ("regime_name", pa.string(), False),    # e.g., "REG_NMS", "TICK_PILOT", "STANDARD"
+    ("notes", pa.string(), True),           # Additional context
+
+    # Metadata
+    ("source_name", pa.string(), False),
+    ("ingested_at", pa.timestamp("us"), False),
+    ("source_uri", pa.string(), False),
+])
+
+
 MACRO_SCHEMA = pa.schema([
     # Generic macro/rates time series
     ("series_id", pa.string(), False),      # e.g., 'DGS10' for 10Y Treasury
@@ -261,6 +293,57 @@ MACRO_SCHEMA = pa.schema([
 
     # For ALFRED vintages (real-time vs revised data)
     ("vintage_date", pa.date32(), True),    # Date this value was published
+
+    # Metadata
+    ("source_name", pa.string(), False),
+    ("ingested_at", pa.timestamp("us"), False),
+    ("source_uri", pa.string(), False),
+])
+
+
+# ===== Fundamentals Schema =====
+
+FUNDAMENTALS_SCHEMA = pa.schema([
+    # Identifier and period
+    ("symbol", pa.string(), False),
+    ("filing_date", pa.date32(), False),        # When the filing was released
+    ("period_end", pa.date32(), False),         # End of reporting period
+    ("period_type", pa.string(), False),        # 'annual' or 'quarter'
+    ("fiscal_year", pa.int32(), False),
+    ("fiscal_quarter", pa.int32(), True),       # null for annual
+
+    # Income statement metrics
+    ("revenue", pa.float64(), True),
+    ("cost_of_revenue", pa.float64(), True),
+    ("gross_profit", pa.float64(), True),
+    ("operating_income", pa.float64(), True),
+    ("net_income", pa.float64(), True),
+    ("ebitda", pa.float64(), True),
+    ("eps_basic", pa.float64(), True),
+    ("eps_diluted", pa.float64(), True),
+
+    # Balance sheet metrics
+    ("total_assets", pa.float64(), True),
+    ("total_liabilities", pa.float64(), True),
+    ("total_equity", pa.float64(), True),
+    ("cash_and_equivalents", pa.float64(), True),
+    ("total_debt", pa.float64(), True),
+    ("working_capital", pa.float64(), True),
+
+    # Cash flow metrics
+    ("operating_cash_flow", pa.float64(), True),
+    ("capital_expenditure", pa.float64(), True),
+    ("free_cash_flow", pa.float64(), True),
+    ("dividends_paid", pa.float64(), True),
+
+    # Derived ratios (computed at curation)
+    ("gross_margin", pa.float64(), True),       # gross_profit / revenue
+    ("operating_margin", pa.float64(), True),   # operating_income / revenue
+    ("net_margin", pa.float64(), True),         # net_income / revenue
+    ("roe", pa.float64(), True),                # net_income / equity (annualized)
+    ("roa", pa.float64(), True),                # net_income / assets (annualized)
+    ("debt_to_equity", pa.float64(), True),     # total_debt / equity
+    ("current_ratio", pa.float64(), True),      # current_assets / current_liabilities
 
     # Metadata
     ("source_name", pa.string(), False),
@@ -281,7 +364,10 @@ SCHEMAS: Dict[DataType, pa.Schema] = {
     DataType.OPTIONS_SURFACE: OPTIONS_SURFACE_SCHEMA,
     DataType.CORP_ACTIONS: CORP_ACTIONS_SCHEMA,
     DataType.DELISTINGS: DELISTINGS_SCHEMA,
+    DataType.INDEX_MEMBERSHIP: INDEX_MEMBERSHIP_SCHEMA,
+    DataType.TICK_SIZE_REGIME: TICK_SIZE_REGIME_SCHEMA,
     DataType.MACRO: MACRO_SCHEMA,
+    DataType.FUNDAMENTALS: FUNDAMENTALS_SCHEMA,
 }
 
 

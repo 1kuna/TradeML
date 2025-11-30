@@ -46,6 +46,7 @@ from models.equities_xs import (
 )
 from portfolio.build import build as build_portfolio
 from ops.reports.emitter import emit_daily
+from ops.ssot.registry import log_run, promote_to_champion, get_champion
 from validation import CPCV, DSRCalculator, PBOCalculator
 from validation.calibration import binary_calibration
 
@@ -500,6 +501,79 @@ def run_pipeline(cfg: PipelineConfig) -> Dict:
             metrics_report[f"model_{mk}"] = round(float(mv), 6)
     emit_daily(last_date, last_positions, metrics_report)
 
+    # Log run to MLflow registry
+    mlflow_params = {
+        "start_date": cfg.start_date,
+        "end_date": cfg.end_date,
+        "universe_size": len(cfg.universe),
+        "label_type": cfg.label_type,
+        "horizon_days": cfg.horizon_days,
+        "n_folds": cfg.n_folds,
+        "embargo_days": cfg.embargo_days,
+        "model_backend": model_backend,
+        "spread_bps": cfg.spread_bps,
+        "gross_cap": cfg.gross_cap,
+        "max_name": cfg.max_name,
+    }
+    mlflow_metrics = {
+        "total_return": float(metrics_bt.total_return),
+        "sharpe": float(metrics_bt.sharpe_ratio),
+        "dsr": float(dsr_res["dsr"]),
+        "max_drawdown": float(metrics_bt.max_drawdown),
+        "calmar": float(metrics_bt.calmar_ratio),
+        "pbo": float(pbo_res["pbo"]),
+        "win_rate": float(metrics_bt.win_rate),
+        "turnover": float(metrics_bt.turnover),
+        "num_trades": float(metrics_bt.num_trades),
+    }
+    if calib:
+        mlflow_metrics["brier"] = float(calib.get("brier", 0))
+        mlflow_metrics["logloss"] = float(calib.get("logloss", 0))
+
+    run_id = log_run(
+        experiment_name="equities_xs",
+        params=mlflow_params,
+        metrics=mlflow_metrics,
+        artifacts_dir=str(artifact_dir),
+        tags={"stage": "challenger", "model_backend": model_backend},
+        model_path=str(final_model_path) if final_model_path else None,
+        model_name="equities_xs_model",
+    )
+
+    # Check if this run beats current champion per SSOT go/no-go criteria
+    # Go criteria: sharpe >= 0.8, dsr >= 0.5, pbo <= 0.4, max_dd >= -0.15
+    go_criteria_met = (
+        mlflow_metrics["sharpe"] >= 0.8
+        and mlflow_metrics["dsr"] >= 0.5
+        and mlflow_metrics["pbo"] <= 0.4
+        and mlflow_metrics["max_drawdown"] >= -0.15
+    )
+
+    promoted = False
+    if go_criteria_met and run_id:
+        current_champion = get_champion("equities_xs")
+        if current_champion is None:
+            # No champion yet, promote this one
+            promoted = promote_to_champion("equities_xs", run_id)
+            logger.info(f"Promoted run {run_id} as first champion (no prior champion)")
+        else:
+            # Compare with existing champion
+            _, champ_metrics = current_champion
+            champ_sharpe = champ_metrics.get("sharpe", 0)
+            if mlflow_metrics["sharpe"] > champ_sharpe:
+                promoted = promote_to_champion("equities_xs", run_id)
+                logger.info(f"Promoted run {run_id} as new champion (sharpe {mlflow_metrics['sharpe']:.2f} > {champ_sharpe:.2f})")
+            else:
+                logger.info(f"Run {run_id} did not beat champion (sharpe {mlflow_metrics['sharpe']:.2f} <= {champ_sharpe:.2f})")
+    elif run_id:
+        logger.info(
+            f"Run {run_id} did not meet go criteria: "
+            f"sharpe={mlflow_metrics['sharpe']:.2f} (>= 0.8), "
+            f"dsr={mlflow_metrics['dsr']:.2f} (>= 0.5), "
+            f"pbo={mlflow_metrics['pbo']:.2f} (<= 0.4), "
+            f"max_dd={mlflow_metrics['max_drawdown']:.2f} (>= -0.15)"
+        )
+
     return {
         "equity_curve": equity_curve,
         "backtest_metrics": metrics_bt,
@@ -517,7 +591,14 @@ def run_pipeline(cfg: PipelineConfig) -> Dict:
         },
         "fold_metrics": fold_metrics,
         "final_model_metrics": final_metrics,
+        "mlflow_run_id": run_id,
+        "promoted_to_champion": promoted,
     }
+
+
+# DAG-friendly aliases
+EquitiesConfig = PipelineConfig
+run_equities_xs = run_pipeline
 
 
 if __name__ == "__main__":

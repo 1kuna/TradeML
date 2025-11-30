@@ -10,7 +10,7 @@ Daily frequency backtester with:
 """
 
 from datetime import date, datetime
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from collections import deque
 import pandas as pd
@@ -40,20 +40,25 @@ class Trade:
     quantity: float
     price: float
     fees: float
+    impact: float
     value: float
     pnl: Optional[float] = None
 
 
 @dataclass
 class PerformanceMetrics:
-    """Performance statistics."""
+    """Performance statistics per SSOT §4.9."""
     total_return: float
     sharpe_ratio: float
     max_drawdown: float
+    calmar_ratio: float
     win_rate: float
     avg_trade_pnl: float
     num_trades: int
     turnover: float
+    dsr: float  # Deflated Sharpe Ratio
+    total_fees: float
+    total_impact: float
 
 
 class MinimalBacktester:
@@ -92,6 +97,7 @@ class MinimalBacktester:
         self.positions: Dict[str, deque] = {}  # symbol -> deque of Position objects
         self.trades: List[Trade] = []
         self.equity_curve: List[Tuple[date, float]] = []
+        self.last_prices: Dict[str, float] = {}  # carry forward missing quotes
 
         logger.info(
             f"Backtester initialized: capital=${initial_capital:,.0f}, "
@@ -103,19 +109,23 @@ class MinimalBacktester:
         symbol: str,
         quantity: float,
         price: float,
-        side: str
-    ) -> float:
+        side: str,
+        volatility: Optional[float] = None,
+        adv: Optional[float] = None
+    ) -> Tuple[float, float]:
         """
-        Calculate transaction costs.
+        Calculate transaction costs including market impact.
 
         Args:
             symbol: Symbol
             quantity: Number of shares
             price: Execution price
             side: 'buy' or 'sell'
+            volatility: Optional daily volatility (sigma) for impact calculation
+            adv: Optional average daily volume for impact calculation
 
         Returns:
-            Total cost
+            Tuple of (fees, impact) where fees = commission + spread
         """
         # Commission
         commission = abs(quantity) * self.fee_per_share
@@ -123,14 +133,28 @@ class MinimalBacktester:
         # Spread cost (pay half spread each way)
         spread_cost = abs(quantity) * price * (self.spread_bps / 10000) / 2
 
-        return commission + spread_cost
+        fees = commission + spread_cost
+
+        # Market impact using square-root law per SSOT
+        # impact = sigma * sqrt(qty/ADV) * price * qty
+        impact = 0.0
+        if volatility is not None and adv is not None and adv > 0:
+            participation = abs(quantity) / adv
+            if participation > 0:
+                # Square-root impact model: impact_bps = sigma * sqrt(participation)
+                impact_bps = volatility * np.sqrt(participation)
+                impact = abs(quantity) * price * impact_bps
+
+        return fees, impact
 
     def execute_trade(
         self,
         trade_date: date,
         symbol: str,
         target_quantity: float,
-        price: float
+        price: float,
+        volatility: Optional[float] = None,
+        adv: Optional[float] = None
     ) -> Optional[Trade]:
         """
         Execute a trade with costs.
@@ -140,6 +164,8 @@ class MinimalBacktester:
             symbol: Symbol
             target_quantity: Target position (positive=long, negative=short, 0=close)
             price: Execution price
+            volatility: Optional daily volatility for impact calculation
+            adv: Optional average daily volume for impact calculation
 
         Returns:
             Trade object or None if no trade
@@ -155,14 +181,14 @@ class MinimalBacktester:
 
         side = 'buy' if trade_qty > 0 else 'sell'
 
-        # Calculate costs
-        fees = self.calculate_costs(symbol, trade_qty, price, side)
+        # Calculate costs (fees and market impact)
+        fees, impact = self.calculate_costs(symbol, trade_qty, price, side, volatility, adv)
 
         # Calculate value
         value = trade_qty * price
 
-        # Update cash
-        self.cash -= (value + fees)
+        # Update cash (deduct value, fees, and impact)
+        self.cash -= (value + fees + impact)
 
         # Update positions
         pnl = 0.0
@@ -209,6 +235,7 @@ class MinimalBacktester:
             quantity=abs(trade_qty),
             price=price,
             fees=fees,
+            impact=impact,
             value=abs(value),
             pnl=pnl if trade_qty < 0 else None
         )
@@ -216,7 +243,7 @@ class MinimalBacktester:
 
         logger.debug(
             f"{trade_date} {side.upper()} {abs(trade_qty):.0f} {symbol} @ ${price:.2f}, "
-            f"fees=${fees:.2f}"
+            f"fees=${fees:.2f}, impact=${impact:.2f}"
         )
 
         return trade
@@ -241,8 +268,11 @@ class MinimalBacktester:
 
         for symbol, pos_queue in self.positions.items():
             quantity = sum(pos.quantity for pos in pos_queue)
-            if symbol in prices:
-                position_value += quantity * prices[symbol]
+            px = prices.get(symbol, self.last_prices.get(symbol))
+            if px is None:
+                logger.warning(f"Missing price for held symbol {symbol}; valuing at $0 for now")
+                continue
+            position_value += quantity * px
 
         return self.cash + position_value
 
@@ -273,6 +303,8 @@ class MinimalBacktester:
             # Get prices for this date
             day_prices = prices[prices['date'] == trade_date]
             price_map = dict(zip(day_prices['symbol'], day_prices['close']))
+            # Update carry-forward cache
+            self.last_prices.update(price_map)
 
             # Execute trades
             for _, row in day_signals.iterrows():
@@ -281,6 +313,8 @@ class MinimalBacktester:
 
                 if symbol in price_map:
                     self.execute_trade(trade_date, symbol, target_qty, price_map[symbol])
+                else:
+                    logger.warning(f"Skipping trade for {symbol} on {trade_date}: missing price")
 
             # Daily borrow carry for existing short positions
             if self.borrow_bps and self.borrow_bps > 0:
@@ -288,8 +322,9 @@ class MinimalBacktester:
                 carry_cost = 0.0
                 for symbol, pos_queue in list(self.positions.items()):
                     qty = sum(p.quantity for p in pos_queue)
-                    if qty < 0 and symbol in price_map:
-                        carry_cost += abs(qty) * price_map[symbol] * daily_rate
+                    px = price_map.get(symbol, self.last_prices.get(symbol))
+                    if qty < 0 and px is not None:
+                        carry_cost += abs(qty) * px * daily_rate
                 if carry_cost:
                     self.cash -= carry_cost
 
@@ -303,10 +338,20 @@ class MinimalBacktester:
         equity_df = pd.DataFrame(self.equity_curve, columns=['date', 'equity'])
         return equity_df
 
-    def calculate_performance(self) -> PerformanceMetrics:
-        """Calculate performance metrics."""
+    def calculate_performance(self, num_trials: int = 1) -> PerformanceMetrics:
+        """
+        Calculate performance metrics per SSOT §4.9.
+
+        Args:
+            num_trials: Number of strategy variants tested (for DSR calculation)
+        """
         if not self.equity_curve:
-            return PerformanceMetrics(0, 0, 0, 0, 0, 0, 0)
+            return PerformanceMetrics(
+                total_return=0.0, sharpe_ratio=0.0, max_drawdown=0.0,
+                calmar_ratio=0.0, win_rate=0.0, avg_trade_pnl=0.0,
+                num_trades=0, turnover=0.0, dsr=0.0,
+                total_fees=0.0, total_impact=0.0
+            )
 
         equity_df = pd.DataFrame(self.equity_curve, columns=['date', 'equity'])
 
@@ -323,6 +368,15 @@ class MinimalBacktester:
         cummax = equity_df['equity'].cummax()
         drawdown = (equity_df['equity'] - cummax) / cummax
         max_dd = drawdown.min()
+
+        # Calmar ratio (annualized return / abs(max drawdown))
+        calmar = 0.0
+        if max_dd < 0:
+            # Annualize return: (1 + total_return)^(252/n_days) - 1
+            n_days = len(returns)
+            if n_days > 0:
+                ann_return = (1 + total_return) ** (252 / n_days) - 1
+                calmar = ann_return / abs(max_dd)
 
         # Trade statistics
         realized_trades = [t for t in self.trades if t.pnl is not None]
@@ -341,19 +395,92 @@ class MinimalBacktester:
         avg_equity = equity_df['equity'].mean()
         turnover = total_trade_value / avg_equity if avg_equity > 0 else 0
 
+        # Total fees and impact from actual trades
+        total_fees = sum(t.fees for t in self.trades)
+        total_impact = sum(t.impact for t in self.trades)
+
+        # Deflated Sharpe Ratio (DSR) per Bailey & Lopez de Prado
+        # DSR = SR * sqrt(1 - skew*SR/3 + (kurt-3)*SR^2/24) / sqrt(var_sr)
+        # Simplified approximation: penalize for multiple trials
+        dsr = self._calculate_dsr(sharpe, returns, num_trials)
+
         return PerformanceMetrics(
             total_return=total_return,
             sharpe_ratio=sharpe,
             max_drawdown=max_dd,
+            calmar_ratio=calmar,
             win_rate=win_rate,
             avg_trade_pnl=avg_trade_pnl,
             num_trades=num_trades,
-            turnover=turnover
+            turnover=turnover,
+            dsr=dsr,
+            total_fees=total_fees,
+            total_impact=total_impact
         )
 
-    def print_summary(self):
+    def _calculate_dsr(
+        self,
+        sharpe: float,
+        returns: pd.Series,
+        num_trials: int = 1
+    ) -> float:
+        """
+        Calculate Deflated Sharpe Ratio per Bailey & Lopez de Prado.
+
+        Adjusts Sharpe ratio for:
+        - Multiple testing (num_trials)
+        - Non-normal return distribution (skewness, kurtosis)
+
+        Args:
+            sharpe: Annualized Sharpe ratio
+            returns: Daily returns series
+            num_trials: Number of strategy variants tested
+
+        Returns:
+            Deflated Sharpe Ratio
+        """
+        from scipy import stats
+
+        if len(returns) < 10 or sharpe <= 0:
+            return 0.0
+
+        n = len(returns)
+
+        # Skewness and kurtosis of returns
+        skew = returns.skew()
+        kurt = returns.kurtosis()  # Excess kurtosis
+
+        # Standard error of Sharpe ratio
+        # SE(SR) = sqrt((1 + 0.5*SR^2 - skew*SR + (kurt+3)/4*SR^2) / (n-1))
+        sr_daily = sharpe / np.sqrt(252)  # Convert to daily SR for calculation
+        se_sr = np.sqrt(
+            (1 + 0.5 * sr_daily**2 - skew * sr_daily + (kurt + 3) / 4 * sr_daily**2)
+            / (n - 1)
+        )
+
+        if se_sr <= 0:
+            return sharpe
+
+        # Expected maximum Sharpe under null hypothesis (multiple testing)
+        # E[max(SR)] ≈ sqrt(2*log(num_trials)) * se_sr (for large num_trials)
+        if num_trials > 1:
+            expected_max_sr = np.sqrt(2 * np.log(num_trials)) * se_sr * np.sqrt(252)
+        else:
+            expected_max_sr = 0.0
+
+        # DSR = probability that observed SR exceeds expected max SR under null
+        # Approximation: DSR ≈ SR - expected_max_sr (bounded below by 0)
+        # More rigorous: use t-distribution CDF
+        t_stat = (sharpe - expected_max_sr) / (se_sr * np.sqrt(252))
+        dsr = stats.t.cdf(t_stat, df=n-1)
+
+        # Scale to make interpretable (0-1 maps to haircut on Sharpe)
+        # Return as adjusted Sharpe: SR * DSR
+        return sharpe * dsr
+
+    def print_summary(self, num_trials: int = 1):
         """Print backtest summary."""
-        metrics = self.calculate_performance()
+        metrics = self.calculate_performance(num_trials)
 
         print("\n" + "="*60)
         print("BACKTEST SUMMARY")
@@ -362,11 +489,17 @@ class MinimalBacktester:
         print(f"Final Equity:       ${self.equity_curve[-1][1]:,.0f}")
         print(f"Total Return:       {metrics.total_return*100:.2f}%")
         print(f"Sharpe Ratio:       {metrics.sharpe_ratio:.2f}")
+        print(f"Deflated SR (DSR):  {metrics.dsr:.2f}")
         print(f"Max Drawdown:       {metrics.max_drawdown*100:.2f}%")
+        print(f"Calmar Ratio:       {metrics.calmar_ratio:.2f}")
+        print("-"*60)
         print(f"Number of Trades:   {metrics.num_trades}")
         print(f"Win Rate:           {metrics.win_rate*100:.1f}%")
         print(f"Avg Trade P&L:      ${metrics.avg_trade_pnl:,.2f}")
         print(f"Turnover:           {metrics.turnover:.2f}x")
+        print("-"*60)
+        print(f"Total Fees:         ${metrics.total_fees:,.2f}")
+        print(f"Total Impact:       ${metrics.total_impact:,.2f}")
         print("="*60)
 
 

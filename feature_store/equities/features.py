@@ -1,11 +1,30 @@
 """
 Equity feature engineering (PIT-safe).
 
+SSOT v2 Section 3.1: Equities_xs - features
+
 Minimal API (from blueprint):
     features.compute_equity_features(date, universe) -> pd.DataFrame
 
 Inputs: OHLCV (adjusted) up to as-of date; corporate actions assumed applied.
 Output columns: `symbol`, `asof`, `feature_*` (standardized, lag-safe).
+
+Feature Set (equities_xs v1 per SSOT):
+- Price-based:
+  - Multi-horizon momentum: 5, 20, 60, 126-day log returns
+  - Gap statistics (overnight, open-to-close) and recent drawdowns
+- Volatility:
+  - 20 and 60-day realized volatility
+  - Rolling downside volatility (semi-deviation)
+- Liquidity:
+  - 20-day ADV
+  - Turnover, Amihud illiquidity
+- Seasonality & calendar:
+  - Day-of-week and month-of-year encoded as sin/cos
+  - Distance to earnings (placeholder)
+- Risk / cross-sectional context:
+  - Size proxies (market cap)
+  - Sector/industry dummies (from reference data)
 
 Data discovery:
 - Looks for curated Parquet per-symbol under `CURATED_EQUITY_BARS_ADJ_DIR`
@@ -150,6 +169,13 @@ def _compute_symbol_features(
     """Compute PIT-safe features for a single symbol as-of date.
 
     Returns a dict with keys: symbol, asof, feature_* (z-scored).
+
+    Feature categories (SSOT v2 Section 3.1):
+    - Price-based: momentum, gap stats, drawdowns
+    - Volatility: realized vol, downside vol
+    - Liquidity: ADV, turnover, Amihud
+    - Seasonality: day-of-week, month-of-year
+    - Size: market cap proxy
     """
     df = _ensure_ohlcv_columns(hist)
 
@@ -160,49 +186,124 @@ def _compute_symbol_features(
         # No bar for as-of -> cannot produce features
         return None
 
+    # ============ PRICE-BASED FEATURES ============
+
     # Daily simple returns
     df["ret_1d"] = df["close"].pct_change()
 
-    # Momentum (k-day horizon) as-of: using close/close.shift(k) - 1 at as-of
-    for k in (5, 20, 60):
+    # Multi-horizon momentum (k-day horizon) as-of: using close/close.shift(k) - 1
+    for k in (5, 20, 60, 126):
         df[f"mom_{k}d"] = df["close"] / df["close"].shift(k) - 1.0
 
-    # Realized volatility (not annualized), rolling std of daily returns
+    # Gap statistics (overnight return and open-to-close return)
+    if "open" in df.columns:
+        # Overnight gap: today's open vs yesterday's close
+        df["gap_overnight"] = df["open"] / df["close"].shift(1) - 1.0
+        # Intraday move: today's close vs today's open
+        df["gap_intraday"] = df["close"] / df["open"] - 1.0
+        # Rolling average of overnight gaps (mean reversion signal)
+        df["gap_overnight_avg_20d"] = df["gap_overnight"].rolling(window=20, min_periods=5).mean()
+    else:
+        df["gap_overnight"] = np.nan
+        df["gap_intraday"] = np.nan
+        df["gap_overnight_avg_20d"] = np.nan
+
+    # Recent drawdown (current price vs 20d high, 60d high)
+    if "high" in df.columns:
+        df["high_20d"] = df["high"].rolling(window=20, min_periods=5).max()
+        df["high_60d"] = df["high"].rolling(window=60, min_periods=10).max()
+        df["drawdown_20d"] = df["close"] / df["high_20d"] - 1.0
+        df["drawdown_60d"] = df["close"] / df["high_60d"] - 1.0
+    else:
+        df["drawdown_20d"] = df["close"] / df["close"].rolling(window=20, min_periods=5).max() - 1.0
+        df["drawdown_60d"] = df["close"] / df["close"].rolling(window=60, min_periods=10).max() - 1.0
+
+    # ============ VOLATILITY FEATURES ============
+
+    # Realized volatility (rolling std of daily returns)
     for k in (20, 60):
         df[f"rv_{k}d"] = df["ret_1d"].rolling(window=k, min_periods=max(5, k // 2)).std(ddof=1)
 
-    # Liquidity: ADV over 20d (USD)
+    # Downside volatility (semi-deviation) - only negative returns
+    def _downside_vol(ret_series, window, min_periods):
+        """Compute rolling downside volatility (negative returns only)."""
+        neg_rets = ret_series.clip(upper=0)  # Only negative returns
+        return neg_rets.rolling(window=window, min_periods=min_periods).std(ddof=1)
+
+    df["downside_vol_20d"] = _downside_vol(df["ret_1d"], 20, 10)
+    df["downside_vol_60d"] = _downside_vol(df["ret_1d"], 60, 20)
+
+    # ============ LIQUIDITY FEATURES ============
+
+    # Dollar volume and ADV
     df["dollar_volume"] = df["close"] * df["volume"].astype(float)
     df["adv_20d"] = df["dollar_volume"].rolling(window=20, min_periods=10).mean()
 
-    # Seasonality encodings at the as-of date
-    # We use deterministic calendar info from as-of only (no leakage)
-    # Encode day-of-week via sin/cos
+    # Turnover (volume / shares outstanding proxy - use volume/avg_volume as substitute)
+    avg_vol = df["volume"].rolling(window=60, min_periods=20).mean()
+    df["turnover"] = df["volume"] / avg_vol.replace(0, np.nan)
+
+    # Amihud illiquidity (|return| / dollar_volume)
+    df["amihud"] = df["ret_1d"].abs() / (df["dollar_volume"] + 1e-10)
+    df["amihud_20d"] = df["amihud"].rolling(window=20, min_periods=10).mean()
+
+    # ============ SEASONALITY FEATURES ============
+
     asof_ts = pd.to_datetime(asof)
+
+    # Day-of-week via sin/cos
     dow = asof_ts.weekday()  # 0..6, equity trading typically 0..4
     dow_sin = np.sin(2 * np.pi * dow / 7.0)
     dow_cos = np.cos(2 * np.pi * dow / 7.0)
 
+    # Month-of-year via sin/cos
+    month = asof_ts.month  # 1..12
+    moy_sin = np.sin(2 * np.pi * (month - 1) / 12.0)
+    moy_cos = np.cos(2 * np.pi * (month - 1) / 12.0)
+
+    # ============ SIZE FEATURES ============
+
+    # Market cap proxy (use average dollar volume as proxy for size)
+    # Real market cap would require shares outstanding from fundamentals
+    df["mktcap_proxy"] = df["adv_20d"] * 20  # Rough proxy
+
+    # ============ COLLECT FEATURES ============
+
     # Select the last row (as-of)
     last = df.iloc[-1]
 
-    # Standardize key numeric features via rolling z-score (PIT)
+    # Features to z-score standardize
     feats_raw = {
         "mom_5d": df["mom_5d"],
         "mom_20d": df["mom_20d"],
         "mom_60d": df["mom_60d"],
+        "mom_126d": df["mom_126d"],
         "rv_20d": df["rv_20d"],
         "rv_60d": df["rv_60d"],
+        "downside_vol_20d": df["downside_vol_20d"],
+        "downside_vol_60d": df["downside_vol_60d"],
         "adv_20d": df["adv_20d"],
+        "turnover": df["turnover"],
+        "amihud_20d": df["amihud_20d"],
+        "mktcap_proxy": df["mktcap_proxy"],
+        "gap_overnight": df["gap_overnight"],
+        "gap_intraday": df["gap_intraday"],
+        "gap_overnight_avg_20d": df["gap_overnight_avg_20d"],
+        "drawdown_20d": df["drawdown_20d"],
+        "drawdown_60d": df["drawdown_60d"],
     }
 
     features = {
         "symbol": last.get("symbol", None),
         "asof": asof,
+        # Seasonality (already bounded, no need to z-score)
         "feature_dow_sin": float(dow_sin),
         "feature_dow_cos": float(dow_cos),
+        "feature_moy_sin": float(moy_sin),
+        "feature_moy_cos": float(moy_cos),
     }
 
+    # Z-score standardize numeric features via rolling window (PIT-safe)
     for name, series in feats_raw.items():
         z = _standardize_last_row_by_rolling(series, window=standardize_window, min_periods=20)
         features[f"feature_{name}"] = float(z) if z is not None and not pd.isna(z) else np.nan
