@@ -85,7 +85,11 @@ class AlphaVantageConnector(BaseConnector):
 
         try:
             response = self._get(self.API_URL, params=params)
-            data = response.json()
+            try:
+                data = response.json()
+            except Exception:
+                # Some endpoints (LISTING_STATUS) return CSV; pass raw text through
+                return response.text
 
             # Check for API errors
             if "Error Message" in data:

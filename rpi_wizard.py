@@ -24,6 +24,7 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -252,6 +253,34 @@ def ensure_data_paths(data_root: Path, logger: logging.Logger):
             pass
 
 
+def _test_write(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    probe = path / ".rpi_wizard_write_test"
+    probe.write_text("ok")
+    probe.unlink(missing_ok=True)
+
+
+def prompt_storage_path(default_path: Path, logger: logging.Logger) -> Path:
+    while True:
+        raw = input(f"Enter storage path [{default_path}]: ").strip()
+        candidate = Path(raw or default_path).expanduser()
+        if not candidate.is_absolute():
+            print("Please provide an absolute path like /data or /mnt/ssd/trademl")
+            continue
+        try:
+            _test_write(candidate)
+            return candidate
+        except FileNotFoundError:
+            print(f"Path not found: {candidate}. If this is a mount, ensure it is mounted first.")
+        except PermissionError:
+            print(f"Permission denied writing to {candidate}. Choose a different path or adjust permissions.")
+        except OSError as e:
+            print(f"Path error ({e}); please try another path.")
+        except Exception as e:
+            logger.warning(f"Unexpected storage path error: {e}")
+            print("Unable to use that path; please try another.")
+
+
 def run_cmd(cmd: List[str], logger: logging.Logger, env: Optional[Dict[str, str]] = None, cwd: Optional[Path] = None, dry_run: bool = False) -> None:
     msg = f"Running: {' '.join(cmd)}"
     if dry_run:
@@ -288,6 +317,7 @@ def install_deps(venv_path: Path, logger: logging.Logger, mode: str, dry_run: bo
             "boto3",
             "pandas",
             "pyarrow",
+            "pyyaml",
             "python-dotenv",
             "loguru",
             "alpaca-py",
@@ -295,6 +325,7 @@ def install_deps(venv_path: Path, logger: logging.Logger, mode: str, dry_run: bo
             "exchange-calendars",
             "finnhub-python",
             "duckdb",
+            "scikit-learn",
         ]
         run_cmd(base_cmd + ["install"] + pkgs, logger, dry_run=dry_run)
     logger.info(f"Dependencies installed ({mode})")
@@ -323,6 +354,67 @@ def start_node_loop(venv_path: Path, log_dir: Path, logger: logging.Logger, inte
     return proc.pid
 
 
+def write_systemd_unit(
+    venv_path: Path,
+    data_root: Path,
+    interval: int,
+    env_path: Path,
+    logger: logging.Logger,
+    enable: bool = False,
+    dry_run: bool = False,
+) -> Optional[Path]:
+    systemctl = shutil.which("systemctl")
+    if sys.platform != "linux" or not systemctl:
+        logger.info("Systemd not available on this platform; skipping unit creation")
+        return None
+
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    unit_path = unit_dir / "trademl-node.service"
+    logs_dir = data_root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    content = textwrap.dedent(
+        f"""
+        [Unit]
+        Description=TradeML Node Loop
+        After=network-online.target
+
+        [Service]
+        WorkingDirectory={REPO_ROOT}
+        Environment=PYTHONPATH={REPO_ROOT}
+        Environment=DATA_ROOT={data_root}
+        EnvironmentFile={env_path}
+        ExecStart={venv_path}/bin/python {REPO_ROOT}/scripts/node.py --interval {interval}
+        Restart=always
+        RestartSec=10
+        StandardOutput=append:{logs_dir}/node.service.log
+        StandardError=append:{logs_dir}/node.service.err
+
+        [Install]
+        WantedBy=default.target
+        """
+    ).strip() + "\n"
+
+    if dry_run:
+        logger.info(f"[dry-run] Would write systemd unit to {unit_path}")
+        return unit_path
+
+    unit_path.write_text(content)
+    logger.info(f"Wrote systemd unit: {unit_path}")
+
+    try:
+        subprocess.run([systemctl, "--user", "daemon-reload"], check=True)
+        if enable:
+            subprocess.run([systemctl, "--user", "enable", "--now", unit_path.name], check=True)
+            logger.info("Enabled systemd unit for auto-start")
+        else:
+            logger.info(f"Enable with: systemctl --user enable --now {unit_path.name}")
+    except Exception as e:
+        logger.warning(f"Failed to enable systemd unit automatically: {e}")
+
+    return unit_path
+
+
 def pid_is_running(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -339,11 +431,14 @@ def summarize(logger: logging.Logger, summary: Dict[str, str]) -> None:
         f"- Env file: {summary.get('env_path')}",
         f"- Venv: {summary.get('venv_path')}",
         f"- Logs: tail -f {summary.get('wizard_log')} (wizard) | tail -f {summary.get('node_log','logs/node.log')} (node)",
+        f"- Live node log: tail -f {summary.get('node_log','logs/node.log')}",
     ]
     if summary.get("node_pid"):
         lines.append(f"- Node loop pid: {summary['node_pid']}")
     if summary.get("mlflow_ui"):
         lines.append(f"- MLflow UI: {summary['mlflow_ui']}")
+    if summary.get("stop_cmd"):
+        lines.append(f"- Stop node: {summary['stop_cmd']}")
     logger.info("\n".join(lines))
 
 
@@ -353,7 +448,13 @@ def main():
     parser.add_argument("--interval", type=int, default=int(os.getenv("RUN_INTERVAL_SECONDS", "900")), help="Sleep seconds between node cycles")
     parser.add_argument("--dry-run", action="store_true", help="Show actions without executing them")
     parser.add_argument("--fresh", action="store_true", help="Ignore saved wizard state and prompt for everything")
+    parser.add_argument("--write-systemd", action="store_true", help="Write systemd user unit for node loop")
+    parser.add_argument("--enable-systemd", action="store_true", help="Enable and start systemd unit after writing")
     args = parser.parse_args()
+
+    if sys.version_info < (3, 10):
+        sys.stderr.write(f"Python 3.10+ required, found {sys.version.split()[0]}. Install newer Python and re-run.\n")
+        sys.exit(2)
 
     logger, log_file = setup_logging(LOG_ROOT)
     state = WizardState(STATE_FILE)
@@ -375,14 +476,22 @@ def main():
             logger.info(f"Auto mode: DATA_ROOT={data_root}, EDGE_NODE_ID={edge_node_id}, VENV={venv_path}")
         else:
             mounts = detect_mounts()
-            default_root = Path(prev.get("data_root") or (mounts[0] if mounts else (REPO_ROOT / "data")))
+            default_root = Path(prev.get("data_root") or (REPO_ROOT / "data"))
             print("\nSelect storage path (external SSD recommended).")
             if mounts:
                 print("Detected mounts:")
                 for m in mounts:
                     print(f" - {m}")
-            data_root_input = input(f"Data root [{default_root}]: ").strip()
-            data_root = Path(data_root_input or default_root).expanduser()
+            storage_choice = prompt_choice("Use local /data or custom path?", ["local", "custom"], default="local")
+            if storage_choice == "local":
+                data_root = Path("/data")
+                try:
+                    _test_write(data_root)
+                except Exception as e:
+                    print(f"Cannot use /data ({e}); please choose a custom path.")
+                    data_root = prompt_storage_path(default_root, logger)
+            else:
+                data_root = prompt_storage_path(default_root, logger)
             edge_node_id = input(f"Edge node id [{os.uname().nodename}]: ").strip() or os.uname().nodename
             venv_path = Path(prev.get("venv_path") or (REPO_ROOT / "venv"))
             venv_input = input(f"Venv path [{venv_path}]: ").strip()
@@ -437,7 +546,11 @@ def main():
             log_dir=data_root / "logs",
             logger=logger,
             interval=args.interval,
-            env_overrides={"EDGE_NODE_ID": edge_node_id, "DATA_ROOT": str(data_root)},
+            env_overrides={
+                "EDGE_NODE_ID": edge_node_id,
+                "DATA_ROOT": str(data_root),
+                "STORAGE_BACKEND": "local",
+            },
             dry_run=args.dry_run,
         )
 
@@ -456,8 +569,28 @@ def main():
         "node_log": str(data_root / "logs" / "node.log"),
         "node_pid": str(node_pid) if node_pid else "",
         "mlflow_ui": mlflow_ui,
+        "stop_cmd": "./bootstrap.sh stop",
     }
     summarize(logger, summary)
+
+    if not args.dry_run:
+        wants_systemd = False
+        if args.write_systemd:
+            wants_systemd = True
+        elif not auto_mode:
+            print("\nOptional: auto-run the node on reboot using systemd (user service).")
+            print("This will keep ingestion running in the background even if you close the terminal.")
+            wants_systemd = prompt_yes_no("Set up systemd now?", default=False)
+        if wants_systemd:
+            write_systemd_unit(
+                venv_path=venv_path,
+                data_root=data_root,
+                interval=args.interval,
+                env_path=DEFAULT_ENV,
+                logger=logger,
+                enable=args.enable_systemd,
+                dry_run=args.dry_run,
+            )
 
     if args.dry_run:
         logger.info("Dry-run complete. No changes were executed.")

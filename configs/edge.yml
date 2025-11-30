@@ -10,7 +10,6 @@ tasks:
   - alpaca_corporate_actions
   - polygon_bars
   - finnhub_options
-  - finnhub_daily
   - fred_treasury
   - av_corp_actions
   - av_options_hist

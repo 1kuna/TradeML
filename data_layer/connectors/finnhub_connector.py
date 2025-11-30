@@ -16,6 +16,7 @@ from datetime import datetime, date, timezone
 from typing import List, Optional, Dict, Any
 import pandas as pd
 from loguru import logger
+from requests import HTTPError
 
 from .base import BaseConnector, ConnectorError
 from ..schemas import DataType, get_schema
@@ -89,6 +90,12 @@ class FinnhubConnector(BaseConnector):
 
             return data
 
+        except HTTPError as he:
+            status = he.response.status_code if he.response else None
+            body = he.response.text if he.response is not None else ""
+            msg = f"Finnhub HTTP {status}: {body}"
+            logger.error(msg)
+            raise ConnectorError(msg)
         except Exception as e:
             logger.error(f"Finnhub API error: {e}")
             raise ConnectorError(f"Failed to fetch from Finnhub: {e}")
