@@ -550,6 +550,20 @@ class EdgeCollector:
 
         return connectors
 
+    def reset_connector_session(self, vendor: str):
+        """Force a connector to rebuild its HTTP session after network failures."""
+        conn = self.connectors.get(vendor)
+        if not conn:
+            return
+        reset_fn = getattr(conn, "reset_session", None)
+        if not callable(reset_fn):
+            return
+        try:
+            reset_fn()
+            logger.warning(f"{vendor}: connector HTTP session reset (network recovery)")
+        except Exception as e:
+            logger.warning(f"{vendor}: failed to reset HTTP session: {e}")
+
     def _should_fetch_eod_for_day(self, vendor: str, day: date) -> bool:
         """Gate EOD/day timeframe fetches for 'today' unless past cutoff or explicitly allowed.
 

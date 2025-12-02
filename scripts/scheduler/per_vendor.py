@@ -40,6 +40,40 @@ def _vendor_cap(vendor: str) -> int:
     return max(1, max_inflight_for(vendor, default=defaults.get(vendor, 1)))
 
 
+def _vendor_network_backoff_seconds(vendor: str) -> int:
+    env_key = f"NODE_NETWORK_BACKOFF_SECONDS_{vendor.upper()}"
+    try:
+        return max(5, int(os.getenv(env_key, os.getenv("NODE_NETWORK_BACKOFF_SECONDS", "120"))))
+    except Exception:
+        return 120
+
+
+def _network_error_threshold() -> int:
+    try:
+        return max(1, int(os.getenv("NODE_NETWORK_ERROR_THRESHOLD", "5")))
+    except Exception:
+        return 5
+
+
+def _is_network_error(msg: str) -> bool:
+    if not msg:
+        return False
+    m = msg.lower()
+    patterns = [
+        "no route to host",
+        "failed to establish a new connection",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "name resolution",
+        "network is unreachable",
+        "connection refused",
+        "connection reset by peer",
+        "connection timed out",
+        "tls handshake timeout",
+    ]
+    return any(p in m for p in patterns)
+
+
 @dataclass
 class RunnerStats:
     submitted: int = 0
@@ -65,6 +99,7 @@ class VendorRunner:
 
         self._freeze_until: float = 0.0
         self._stats = RunnerStats()
+        self._consecutive_net_errors: int = 0
 
     def start(self):
         if self.edge.lease_mgr:
@@ -183,6 +218,24 @@ class VendorRunner:
         elif status == "error":
             self._stats.errors += 1
             logger.warning(f"{self.vendor}: unit error [{unit.get('desc')}]: {msg}")
+
+        # Network health: if repeated network faults, pause and reset HTTP session to force reconnects
+        if status in ("error", "ratelimited") and _is_network_error(msg):
+            self._consecutive_net_errors += 1
+            if self._consecutive_net_errors >= _network_error_threshold():
+                backoff = _vendor_network_backoff_seconds(self.vendor)
+                self._freeze_until = max(self._freeze_until, time.time() + backoff)
+                self._consecutive_net_errors = 0
+                logger.error(
+                    f"{self.vendor}: network unreachable ({msg}); freezing submissions for {backoff}s and resetting session"
+                )
+                try:
+                    self.edge.reset_connector_session(self.vendor)
+                except Exception as e:
+                    logger.warning(f"{self.vendor}: failed to reset connector session after network error: {e}")
+        else:
+            # Any non-network status resets the counter
+            self._consecutive_net_errors = 0
 
     def _write_heartbeat(self, inflight: int):
         """Persist lightweight heartbeat for external monitors."""

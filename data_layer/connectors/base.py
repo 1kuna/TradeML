@@ -87,6 +87,15 @@ class BaseConnector(ABC):
 
         return session
 
+    def reset_session(self):
+        """Rebuild the HTTP session after network faults to force new connections."""
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = self._create_session()
+        logger.warning(f"{self.source_name}: HTTP session reset after network failure")
+
     def _rate_limit(self):
         """Enforce rate limiting between requests (global pacer + local fallback)."""
         try:
