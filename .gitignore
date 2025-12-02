@@ -12,6 +12,10 @@
 secrets/
 credentials/
 
+# ===== Local Data & Logs =====
+/data/
+/logs
+
 # ===== Data Files =====
 data_layer/raw/*
 !data_layer/raw/*.py
