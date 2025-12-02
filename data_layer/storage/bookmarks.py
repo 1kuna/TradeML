@@ -65,12 +65,61 @@ class BookmarkManager:
 
     def _load(self) -> Dict[str, Bookmark]:
         """Load bookmarks from storage."""
+        def _normalize_record(key: str, raw: dict) -> Optional[Bookmark]:
+            """
+            Accept legacy shapes and normalize to Bookmark.
+
+            Legacy shapes we observed:
+            - { "alpaca:equities_eod": "2025-11-30" }
+            - { "last_timestamp": "...", "last_row_count": 123 }
+            """
+            if isinstance(raw, Bookmark):
+                return raw
+            # Fully shaped dict
+            if isinstance(raw, dict) and {"source", "table", "last_timestamp"}.issubset(raw.keys()):
+                return Bookmark(
+                    source=raw.get("source") or key.split(":")[0],
+                    table=raw.get("table") or (key.split(":")[1] if ":" in key else key),
+                    last_timestamp=raw.get("last_timestamp"),
+                    last_row_count=int(raw.get("last_row_count", raw.get("row_count", 0) or 0)),
+                    updated_at=raw.get("updated_at") or datetime.utcnow().isoformat(),
+                )
+            # Keyed by source:table -> timestamp/row_count
+            if isinstance(raw, dict) and len(raw.keys()) == 1 and ":" in list(raw.keys())[0]:
+                inner_key, inner_val = list(raw.items())[0]
+                src, tbl = inner_key.split(":", 1)
+                if isinstance(inner_val, str):
+                    return Bookmark(source=src, table=tbl, last_timestamp=inner_val, last_row_count=0, updated_at=datetime.utcnow().isoformat())
+            # Simple timestamp string
+            if isinstance(raw, str):
+                src, tbl = (key.split(":", 1) + ["unknown"])[:2] if ":" in key else (key, key)
+                return Bookmark(source=src, table=tbl, last_timestamp=raw, last_row_count=0, updated_at=datetime.utcnow().isoformat())
+            return None
+
         if self.s3:
             try:
                 data, etag = self.s3.get_json(self.bookmark_key)
                 self._etag = etag
-                self._cache = {k: Bookmark(**v) for k, v in data.items()}
+                migrated = False
+                normalized: Dict[str, Bookmark] = {}
+                for k, v in data.items():
+                    try:
+                        normalized[k] = Bookmark(**v)
+                    except Exception:
+                        bk = _normalize_record(k, v)
+                        if bk:
+                            normalized[k] = bk
+                            migrated = True
+                        else:
+                            logger.warning(f"Skipping unrecognized bookmark record for key={k}: {v}")
+                self._cache = normalized
                 logger.debug(f"Loaded {len(self._cache)} bookmarks (ETag: {etag})")
+                if migrated:
+                    logger.info("Detected legacy bookmark schema; rewriting normalized bookmarks")
+                    try:
+                        self._save(self._cache)
+                    except Exception as e:
+                        logger.warning(f"Failed to persist migrated bookmarks: {e}")
                 return self._cache
             except ClientError as e:
                 if e.response.get('Error', {}).get('Code') == 'NoSuchKey':
@@ -87,8 +136,26 @@ class BookmarkManager:
                 return {}
             try:
                 data = json.loads(path.read_text())
-                self._cache = {k: Bookmark(**v) for k, v in data.items()}
+                migrated = False
+                normalized: Dict[str, Bookmark] = {}
+                for k, v in data.items():
+                    try:
+                        normalized[k] = Bookmark(**v)
+                    except Exception:
+                        bk = _normalize_record(k, v)
+                        if bk:
+                            normalized[k] = bk
+                            migrated = True
+                        else:
+                            logger.warning(f"Skipping unrecognized bookmark record for key={k}: {v}")
+                self._cache = normalized
                 logger.debug(f"Loaded {len(self._cache)} local bookmarks from {path}")
+                if migrated:
+                    logger.info("Detected legacy local bookmark schema; rewriting normalized bookmarks")
+                    try:
+                        self._save(self._cache)
+                    except Exception as e:
+                        logger.warning(f"Failed to persist migrated local bookmarks: {e}")
                 return self._cache
             except Exception as e:
                 logger.warning(f"Failed to load local bookmarks ({path}): {e}; starting fresh")

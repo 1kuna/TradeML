@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from itertools import cycle
 from typing import Dict, Iterator, List, Optional
+import json
+from pathlib import Path
 
 from loguru import logger
 
@@ -182,6 +184,24 @@ class VendorRunner:
             self._stats.errors += 1
             logger.warning(f"{self.vendor}: unit error [{unit.get('desc')}]: {msg}")
 
+    def _write_heartbeat(self, inflight: int):
+        """Persist lightweight heartbeat for external monitors."""
+        try:
+            hb_path = Path(os.getenv("NODE_HEARTBEAT_PATH", "logs/edge_heartbeat.json"))
+            hb_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "vendor": self.vendor,
+                "submitted": self._stats.submitted,
+                "ok": self._stats.completed_ok,
+                "errors": self._stats.errors,
+                "ratelimited": self._stats.ratelimited,
+                "inflight": inflight,
+                "timestamp": time.time(),
+            }
+            hb_path.write_text(json.dumps(payload, indent=2))
+        except Exception:
+            pass
+
     def _run_loop(self):
         cap = _vendor_cap(self.vendor)
         logger.info(f"{self.vendor}: runner starting with cap={cap}")
@@ -261,6 +281,7 @@ class VendorRunner:
                             f"{self.vendor}: hb submitted={self._stats.submitted} ok={self._stats.completed_ok} "
                             f"err={self._stats.errors} rl={self._stats.ratelimited} inflight={len(active)} budget={self.budget.remaining(self.vendor) if self.budget else 'na'}"
                         )
+                        self._write_heartbeat(len(active))
                         last_heartbeat = now
                 else:
                     for fut in list(done_set):

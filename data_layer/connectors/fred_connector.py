@@ -47,7 +47,7 @@ class FREDConnector(BaseConnector):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        rate_limit_per_sec: float = 1.7,  # ~102 rpm (85% of 120 rpm heuristic)
+        rate_limit_per_sec: float = 1.8,  # stay under documented 2 rps limit
     ):
         """
         Initialize FRED connector.
@@ -236,6 +236,72 @@ class FREDConnector(BaseConnector):
         combined = combined.sort_values(["date", "tenor"]).reset_index(drop=True)
 
         return combined
+
+    def fetch_release_observations_v2(
+        self,
+        release_id: str,
+        observation_start: Optional[date] = None,
+        observation_end: Optional[date] = None,
+        limit: int = 1000,
+    ) -> pd.DataFrame:
+        """
+        Fetch observations for a release using FRED v2 cursor pagination (better for bulk).
+        """
+        url = f"{self.API_URL}/v2/release/observations"
+        params: Dict[str, Any] = {
+            "api_key": self.api_key,
+            "file_type": "json",
+            "release_id": release_id,
+            "limit": limit,
+        }
+        if observation_start:
+            params["observation_start"] = observation_start.strftime("%Y-%m-%d")
+        if observation_end:
+            params["observation_end"] = observation_end.strftime("%Y-%m-%d")
+
+        observations = []
+        next_cursor = None
+        while True:
+            if next_cursor:
+                params["next_cursor"] = next_cursor
+            try:
+                resp = self._get(url, params=params)
+                data = resp.json()
+            except Exception as e:
+                raise ConnectorError(f"Failed to fetch FRED v2 release observations: {e}")
+
+            obs = data.get("observations", [])
+            observations.extend(obs)
+            next_cursor = data.get("next_cursor")
+            has_more = data.get("has_more", False)
+            if not has_more or not next_cursor:
+                break
+
+        rows = []
+        for obs in observations:
+            try:
+                series_id = obs.get("series_id")
+                if not series_id:
+                    continue
+                if obs.get("value") == ".":
+                    continue
+                rows.append(
+                    {
+                        "series_id": series_id,
+                        "date": datetime.strptime(obs["date"], "%Y-%m-%d").date(),
+                        "value": float(obs["value"]),
+                        "vintage_date": None,
+                    }
+                )
+            except Exception:
+                continue
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows).sort_values(["series_id", "date"]).reset_index(drop=True)
+        df = self._add_metadata(df, source_uri=f"fred://release/{release_id}")
+        return df
 
     def fetch_alfred_vintages(
         self,

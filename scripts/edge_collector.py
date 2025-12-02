@@ -40,6 +40,11 @@ from utils.s3_writer import S3Writer
 from utils.bad_symbols import BadSymbolCache
 
 
+def _is_name_resolution_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return ("name resolution" in m) or ("failed to resolve" in m) or ("temporary failure in name resolution" in m)
+
+
 class EdgeCollector:
     """Edge collector with distributed locking and resume capability."""
 
@@ -356,6 +361,7 @@ class EdgeCollector:
             return connector.fetch_bars(symbols=chunk, start_date=ds, end_date=ds, timeframe=timeframe)
 
         results = []
+        first_error: Optional[Exception] = None
         with ThreadPoolExecutor(max_workers=inflight) as ex:
             futs = [ex.submit(_fetch_chunk, ch) for ch in chunks]
             try:
@@ -368,12 +374,16 @@ class EdgeCollector:
                             results.append(dfp)
                     except Exception as e:
                         logger.warning(f"Alpaca chunk fetch failed: {e}")
+                        if first_error is None:
+                            first_error = e
             except KeyboardInterrupt:
                 for f in futs:
                     f.cancel()
                 raise
 
         if not results:
+            if first_error:
+                raise first_error
             return pd.DataFrame()
         return pd.concat(results, ignore_index=True)
 
@@ -1035,7 +1045,13 @@ class EdgeCollector:
         if not connector:
             return ("empty", 0, "no connector")
         logger.debug(f"_run_alpaca_day start: {day} symbols={len(symbols)}")
-        df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1, timeframe="1Day")
+        try:
+            df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1, timeframe="1Day")
+        except Exception as e:
+            emsg = str(e)
+            if _is_name_resolution_error(emsg):
+                return ("ratelimited", 0, emsg)
+            return ("error", 0, emsg)
         if df.empty:
             return ("empty", 0, "no data")
         fut = self._upload_to_s3(df, "alpaca", "equities_bars", day.isoformat(), async_write=True)
@@ -1055,7 +1071,13 @@ class EdgeCollector:
         if not connector:
             return ("empty", 0, "no connector")
         logger.debug(f"_run_alpaca_minute_day start: {day} symbols={len(symbols)}")
-        df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1, timeframe="1Min")
+        try:
+            df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1, timeframe="1Min")
+        except Exception as e:
+            emsg = str(e)
+            if _is_name_resolution_error(emsg):
+                return ("ratelimited", 0, emsg)
+            return ("error", 0, emsg)
         if df.empty:
             return ("empty", 0, "no data")
         fut = self._upload_to_s3(df, "alpaca", "equities_bars_minute", day.isoformat(), async_write=True)

@@ -14,6 +14,7 @@ import os
 from datetime import datetime, date
 from typing import List, Optional, Dict, Any
 import pandas as pd
+import requests
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
@@ -145,8 +146,74 @@ class AlpacaConnector(BaseConnector):
             logger.debug(f"Alpaca get_stock_bars done in {dt:.2f}s: tf={timeframe}")
             return bars.dict()  # Convert to dict for processing
         except Exception as e:
+            # Alpaca SDK occasionally throws NameError on internal json handling; fall back to REST
+            emsg = str(e)
+            if isinstance(e, NameError) or "local variable 'json'" in emsg:
+                logger.error(f"Alpaca SDK NameError (json bug) detected; falling back to REST: {emsg}")
+                return self._fetch_raw_rest(symbols, start_date, end_date, timeframe)
             logger.error(f"Alpaca API error: {e}")
             raise ConnectorError(f"Failed to fetch data from Alpaca: {e}")
+
+    def _fetch_raw_rest(
+        self,
+        symbols: List[str],
+        start_date: date,
+        end_date: date,
+        timeframe: str,
+    ) -> Dict[str, Any]:
+        """
+        REST fallback when the official SDK misbehaves (e.g., NameError on json).
+        Implements pagination and buckets bars by symbol to match SDK shape.
+        """
+        url = f"{self.base_url}/v2/stocks/bars"
+        params = {
+            "timeframe": timeframe,
+            "start": f"{start_date.isoformat()}T00:00:00Z",
+            "end": f"{end_date.isoformat()}T23:59:59Z",
+            "feed": "iex",
+            "symbols": ",".join(symbols),
+            "limit": 10000,
+        }
+        headers = {
+            "APCA-API-KEY-ID": self.api_key,
+            "APCA-API-SECRET-KEY": self.secret_key,
+        }
+
+        bucket: Dict[str, List[Dict[str, Any]]] = {s: [] for s in symbols}
+        page_token: Optional[str] = None
+
+        while True:
+            p = dict(params)
+            if page_token:
+                p["page_token"] = page_token
+            try:
+                resp = self._get(url, params=p, headers=headers)  # type: ignore[attr-defined]
+            except requests.exceptions.RequestException as rexc:
+                raise ConnectorError(f"Failed to fetch data from Alpaca REST: {rexc}")
+            data = resp.json()
+            bars = data.get("bars", [])
+            for bar in bars:
+                sym = bar.get("S") or bar.get("symbol")
+                if not sym:
+                    continue
+                bucket.setdefault(sym, []).append(
+                    {
+                        "timestamp": bar.get("t"),
+                        "open": bar.get("o"),
+                        "high": bar.get("h"),
+                        "low": bar.get("l"),
+                        "close": bar.get("c"),
+                        "vwap": bar.get("vw"),
+                        "volume": bar.get("v"),
+                        "trade_count": bar.get("n"),
+                    }
+                )
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+
+        # Remove symbols with no data to mirror SDK dict output
+        return {k: v for k, v in bucket.items() if v}
 
     def _transform(
         self,

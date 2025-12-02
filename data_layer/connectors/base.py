@@ -16,6 +16,7 @@ from pathlib import Path
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib3.exceptions import NameResolutionError
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -142,6 +143,11 @@ class BaseConnector(ABC):
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
+            if isinstance(getattr(e, "reason", None), NameResolutionError) or "Failed to resolve" in str(e):
+                # DNS failures can cascade; slow down hard so caller can decide to freeze the vendor.
+                sleep_s = min(30, 2 * (1 + random.random()))
+                logger.error(f"Name resolution failure for {url}; sleeping {sleep_s:.1f}s before raising")
+                time.sleep(sleep_s)
             logger.error(f"Request failed for {url}: {e}")
             raise
 
