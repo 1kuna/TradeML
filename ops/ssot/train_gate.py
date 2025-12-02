@@ -331,24 +331,52 @@ def promote_if_beat_champion(model_name: str) -> None:
             logger.info("Challenger does not beat champion; skipping promotion")
             return
 
-        # Optional: require multi-week positive shadow PnL before promotion
+        # Enhanced shadow trading evaluation per SSOT v2 §6.4
+        shadow_metrics = None
         try:
             req_shadow_days = 0
+            shadow_bars = {}
             if cfg_path:
                 with open(cfg_path) as f:
                     tc = yaml.safe_load(f)
-                    req_shadow_days = int(((tc.get("promotion_policy") or {}).get("require_shadow_days", 0)))
+                    promo_policy = tc.get("promotion_policy") or {}
+                    req_shadow_days = int(promo_policy.get("require_shadow_days", 0))
+                    shadow_bars = promo_policy.get("shadow_bars", {})
+
             if req_shadow_days and req_shadow_days > 0:
-                from .shadow import evaluate_shadow
+                from .shadow import evaluate_shadow, check_shadow_promotion_bars, log_shadow_decision
+
                 end = date.today()
-                start = end - timedelta(days=req_shadow_days + 2)
-                sh = evaluate_shadow(start, end)
-                if (sh.get("status") != "ok") or (float(sh.get("pnl_mean", 0.0)) <= 0.0):
-                    logger.info("Shadow PnL window not positive; deferring promotion")
+                start = end - timedelta(days=req_shadow_days + 7)  # buffer for weekends
+                min_weeks = max(1, req_shadow_days // 5)
+
+                shadow_metrics = evaluate_shadow(start, end, min_weeks=min_weeks)
+
+                # Check comprehensive metrics against bars
+                passes, reason = check_shadow_promotion_bars(
+                    shadow_metrics,
+                    min_sharpe=float(shadow_bars.get("min_sharpe", 0.0)),
+                    max_drawdown=float(shadow_bars.get("max_drawdown", -0.20)),
+                    min_win_rate=float(shadow_bars.get("min_win_rate", 0.45)),
+                    min_pnl_mean=float(shadow_bars.get("min_pnl_mean", 0.0)),
+                )
+
+                if not passes:
+                    # Log rejection decision
+                    log_shadow_decision(
+                        model_name=model_name,
+                        challenger_run_id=str(challenger["run_id"]),
+                        shadow_metrics=shadow_metrics,
+                        decision="reject",
+                        reason=f"Shadow bars not met: {reason}",
+                    )
+                    logger.info(f"Shadow promotion bars not met: {reason}; deferring promotion")
                     return
-        except Exception:
-            # If shadow evaluator fails, do not block promotion unless required by policy
-            pass
+
+        except Exception as e:
+            # If shadow evaluator fails, log but do not block unless strict mode
+            logger.warning(f"Shadow evaluation failed: {e}")
+            shadow_metrics = {"status": "error", "error": str(e)}
 
         # Promote: set tags on runs
         client = _mlf.tracking.MlflowClient()
@@ -358,6 +386,19 @@ def promote_if_beat_champion(model_name: str) -> None:
             client.set_tag(str(champion["run_id"]), "stage", "Archived")
             client.set_tag(chal_run_id, "previous_champion_run_id", str(champion["run_id"]))
         logger.info(f"Promoted run {chal_run_id} to Champion for {model_name}")
+
+        # Log successful promotion decision for audit trail
+        try:
+            from .shadow import log_shadow_decision
+            log_shadow_decision(
+                model_name=model_name,
+                challenger_run_id=chal_run_id,
+                shadow_metrics=shadow_metrics or {},
+                decision="promote",
+                reason=f"Challenger beat champion on Sharpe/PBO/DSR and passed shadow bars",
+            )
+        except Exception:
+            pass  # Don't fail promotion on logging failure
 
     except Exception as e:
         logger.warning(f"Promotion check skipped: {e}")
