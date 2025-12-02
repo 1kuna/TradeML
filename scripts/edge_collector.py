@@ -1448,6 +1448,47 @@ class EdgeCollector:
             return ("empty", 0, "no data")
         return ("ok", rows_written, "")
 
+    def _run_fmp_delistings(self, budget: Optional[BudgetManager] = None):
+        """Fetch FMP delisted companies list for reference/delistings table."""
+        conn = self.connectors.get("fmp")
+        if not conn:
+            return ("empty", 0, "no connector")
+
+        try:
+            df = conn.fetch_delisted_companies()
+        except Exception as e:
+            emsg = str(e)
+            if "429" in emsg or "rate" in emsg.lower():
+                return ("ratelimited", 0, emsg)
+            logger.warning(f"FMP delistings fetch failed: {e}")
+            return ("error", 0, emsg)
+
+        if df.empty:
+            return ("empty", 0, "no data")
+
+        rows_written = len(df)
+
+        # Write to reference/delistings location
+        if self.s3:
+            key = "reference/delistings_fmp.parquet"
+            try:
+                self._upload_parquet_key(df, key, async_write=False)
+            except Exception as e:
+                return ("error", rows_written, str(e))
+        else:
+            out = Path("data_layer/reference")
+            out.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(out / "delistings_fmp.parquet", index=False)
+
+        # Update bookmark to prevent duplicate fetches today
+        today = date.today()
+        bookmark_key = f"fmp-delistings-{today.isoformat()}"
+        if self.bookmarks:
+            self.bookmarks.update_bookmark("fmp", bookmark_key, {"fetched_at": today.isoformat()})
+
+        logger.info(f"FMP delistings: wrote {rows_written} records")
+        return ("ok", rows_written, "")
+
     def run(self, scheduler_mode: Optional[str] = None):
         """Run edge collector."""
         logger.info("Edge collector starting...")

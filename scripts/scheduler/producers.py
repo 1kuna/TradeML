@@ -387,3 +387,24 @@ def fmp_fundamentals_units(edge, budget_mgr=None) -> Iterator[dict]:
             "tokens": 3,
             "run": (lambda s=sym, per=period: edge._run_fmp_fundamentals(s, per, budget_mgr)),
         }
+
+
+def fmp_delistings_units(edge, budget_mgr=None) -> Iterator[dict]:
+    """Producer for FMP delisted companies data.
+
+    Fetches the full list of delisted US equities for reference/delistings table.
+    This is a single API call that returns all delistings, not per-symbol.
+    """
+    if "fmp" not in edge.connectors:
+        return
+    today = _today_date()
+    # Check if we already fetched delistings today via bookmark
+    bookmark_key = f"fmp-delistings-{today.isoformat()}"
+    if hasattr(edge, "bookmarks") and edge.bookmarks.get_bookmark("fmp", bookmark_key):
+        return
+    yield {
+        "vendor": "fmp",
+        "desc": f"fmp delistings {today}",
+        "tokens": 1,
+        "run": (lambda: edge._run_fmp_delistings(budget_mgr)),
+    }
