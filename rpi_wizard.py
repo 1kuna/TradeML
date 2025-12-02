@@ -21,6 +21,7 @@ import argparse
 import json
 import logging
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,7 @@ LOG_ROOT = REPO_ROOT / "logs"
 STATE_FILE = LOG_ROOT / "rpi_wizard_state.json"
 DEFAULT_ENV = REPO_ROOT / ".env"
 ENV_TEMPLATE = REPO_ROOT / ".env.template"
+ENV_PATH = Path(os.getenv("RPI_WIZARD_ENV_PATH", DEFAULT_ENV))
 
 
 # ---------- Logging ----------
@@ -45,11 +47,58 @@ def _utc_formatter() -> logging.Formatter:
     return formatter
 
 
-def setup_logging(log_dir: Path) -> Tuple[logging.Logger, Path]:
+def _next_backup_path(path: Path) -> Path:
+    """Return a unique backup path (path.bak, path.bak1, ...) without overwriting existing files."""
+    idx = 0
+    while True:
+        suffix = ".bak" if idx == 0 else f".bak{idx}"
+        candidate = path.with_name(f"{path.name}{suffix}")
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def _ensure_log_dir(log_dir: Path) -> List[str]:
+    """
+    Make sure log_dir is a real directory (not a broken symlink or stray file).
+    Returns cleanup messages to log after the logger is ready.
+    """
+    messages: List[str] = []
+    if log_dir.is_dir():
+        return messages
+
+    if log_dir.is_symlink():
+        target = None
+        try:
+            target = log_dir.readlink()
+        except OSError:
+            pass
+        messages.append(f"Resetting log path {log_dir} (broken symlink -> {target or 'missing'})")
+        log_dir.unlink(missing_ok=True)
+    elif log_dir.exists():
+        backup = _next_backup_path(log_dir)
+        log_dir.rename(backup)
+        messages.append(f"Moved existing log file {log_dir} to {backup} to create log directory")
+    else:
+        messages.append(f"Creating log directory at {log_dir}")
+
     log_dir.mkdir(parents=True, exist_ok=True)
+    return messages
+
+
+def setup_logging(log_dir: Path) -> Tuple[logging.Logger, Path]:
+    prep_messages = _ensure_log_dir(log_dir)
     log_file = log_dir / f"rpi_wizard_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.log"
     logger = logging.getLogger("rpi_wizard")
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+    logger.handlers.clear()
     logger.setLevel(logging.INFO)
+    logger.propagate = False
     # File handler (persist from start)
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setFormatter(_utc_formatter())
@@ -58,6 +107,8 @@ def setup_logging(log_dir: Path) -> Tuple[logging.Logger, Path]:
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(_utc_formatter())
     logger.addHandler(ch)
+    for msg in prep_messages:
+        logger.info(msg)
     logger.info(f"Logging to {log_file}")
     return logger, log_file
 
@@ -152,18 +203,85 @@ def _load_env(path: Path) -> Dict[str, str]:
 
 
 def upsert_env(path: Path, updates: Dict[str, str], logger: logging.Logger) -> None:
+    """
+    Merge updates into the env file, de-duplicating keys and preserving the first-seen
+    ordering of existing entries. Ensures a single line per key and removes stale
+    duplicates from prior runs/tests.
+    """
     ensure_env_file(path, logger)
     lines = path.read_text().splitlines()
-    existing = {k: i for i, k in enumerate([ln.split("=", 1)[0] for ln in lines if "=" in ln and not ln.strip().startswith("#")])}
+    preamble: List[str] = []
+    ordered_keys: List[str] = []
+    values: Dict[str, str] = {}
+    in_preamble = True
+
+    for ln in lines:
+        stripped = ln.strip()
+        if in_preamble and (not stripped or stripped.startswith("#")):
+            preamble.append(ln)
+            continue
+        in_preamble = False
+        if not stripped or stripped.startswith("#") or "=" not in ln:
+            continue
+        key, val = ln.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+        values[key] = val  # last occurrence wins
+
     for key, val in updates.items():
-        line = f"{key}={val}"
-        if key in existing:
-            idx = existing[key]
-            lines[idx] = line
-        else:
-            lines.append(line)
-    path.write_text("\n".join(lines) + "\n")
-    logger.info(f"Updated {path} with {', '.join(updates.keys())}")
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+        values[key] = val
+
+    deduped_count = max(0, len(lines) - len(preamble) - len(ordered_keys))
+    out: List[str] = []
+    if preamble:
+        out.extend(preamble)
+    out.extend(f"{k}={values[k]}" for k in ordered_keys)
+    path.write_text("\n".join(out).rstrip() + "\n")
+    msg = f"Updated {path} with {', '.join(updates.keys())}"
+    if deduped_count:
+        msg += f" (removed {deduped_count} duplicate lines)"
+    logger.info(msg)
+
+
+def _sanitize_prev_state(prev: Dict[str, str], logger: logging.Logger) -> Dict[str, str]:
+    """
+    Drop obviously invalid prior state (e.g., macOS paths on Linux, temp pytest paths).
+    Returns a sanitized copy suitable for reuse.
+    """
+    if not prev:
+        return {}
+
+    sanitized: Dict[str, str] = {}
+
+    def _path_ok(path_str: str) -> Optional[Path]:
+        if not path_str:
+            return None
+        p = Path(path_str).expanduser()
+        if not p.is_absolute():
+            logger.warning(f"Ignoring non-absolute path from state: {p}")
+            return None
+        if sys.platform.startswith("linux"):
+            lowered = str(p).lower()
+            if lowered.startswith("/users/") or lowered.startswith("/private/") or "pytest-of-" in lowered:
+                logger.warning(f"Ignoring incompatible path from state on linux: {p}")
+                return None
+        return p
+
+    data_root = _path_ok(prev.get("data_root", ""))
+    venv_path = _path_ok(prev.get("venv_path", ""))
+    edge_node_id = prev.get("edge_node_id", "")
+
+    if data_root:
+        sanitized["data_root"] = str(data_root)
+    if venv_path:
+        sanitized["venv_path"] = str(venv_path)
+    if edge_node_id:
+        sanitized["edge_node_id"] = edge_node_id
+    return sanitized
 
 
 def _safe_merge_dir(src: Path, dst: Path, logger: logging.Logger):
@@ -206,14 +324,26 @@ def ensure_data_paths(data_root: Path, logger: logging.Logger):
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         if src.is_symlink():
-            # Already redirected; ensure it points to the chosen data_root
             try:
-                current = src.resolve()
-                if current != dst:
-                    logger.warning(f"{src} symlink points to {current}, expected {dst}. You may want to realign manually.")
+                current = src.resolve(strict=False)
+                current_exists = current.exists()
             except Exception:
-                logger.warning(f"Failed to resolve symlink {src}; leaving as-is")
-            continue
+                current = None
+                current_exists = False
+
+            if current_exists and current == dst:
+                continue
+
+            if current_exists and current != dst:
+                logger.warning(f"{src} symlink points to {current}, expected {dst}. Leaving in place.")
+                continue
+
+            logger.warning(f"{src} symlink target is missing or invalid; realigning to {dst}")
+            try:
+                src.unlink(missing_ok=True)
+            except Exception:
+                logger.warning(f"Failed to remove broken symlink {src}; skipping realignment")
+                continue
 
         if src.exists():
             if src.is_dir():
@@ -291,12 +421,54 @@ def run_cmd(cmd: List[str], logger: logging.Logger, env: Optional[Dict[str, str]
 
 
 def ensure_venv(venv_path: Path, logger: logging.Logger, dry_run: bool = False) -> Path:
-    if venv_path.exists() and (venv_path / "bin/python").exists():
+    def _venv_health() -> Tuple[bool, str]:
+        python_bin = venv_path / "bin" / "python"
+        if not python_bin.exists():
+            return False, "python executable missing"
+        if not os.access(python_bin, os.X_OK):
+            return False, "python executable is not executable"
+        try:
+            output = subprocess.check_output(
+                [str(python_bin), "-c", "import platform,sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\"); print(sys.platform); print(platform.machine())"],
+                text=True,
+                stderr=subprocess.STDOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 - need raw exception for logging
+            return False, f"python failed to start ({exc})"
+
+        lines = [ln.strip() for ln in output.strip().splitlines() if ln.strip()]
+        if len(lines) < 3:
+            return False, "python health check returned incomplete data"
+
+        venv_version, venv_platform, venv_machine = lines[:3]
+        host_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        host_platform = sys.platform
+        host_machine = platform.machine()
+
+        if venv_version != host_version:
+            return False, f"python version mismatch (venv={venv_version}, host={host_version})"
+        if venv_platform != host_platform:
+            return False, f"platform mismatch (venv={venv_platform}, host={host_platform})"
+        if venv_machine and host_machine and venv_machine != host_machine:
+            return False, f"architecture mismatch (venv={venv_machine}, host={host_machine})"
+        return True, ""
+
+    healthy, reason = _venv_health()
+    if healthy:
         logger.info(f"Using existing venv at {venv_path}")
         return venv_path
+
+    action_reason = reason or "venv missing or unreadable"
     if dry_run:
-        logger.info(f"[dry-run] Would create venv at {venv_path}")
+        verb = "recreate" if venv_path.exists() else "create"
+        logger.info(f"[dry-run] Would {verb} venv at {venv_path} ({action_reason})")
         return venv_path
+
+    if venv_path.exists():
+        logger.warning(f"Rebuilding venv at {venv_path} ({action_reason})")
+        shutil.rmtree(venv_path)
+    else:
+        logger.info(f"Creating venv at {venv_path}")
     venv_path.parent.mkdir(parents=True, exist_ok=True)
     run_cmd([sys.executable, "-m", "venv", str(venv_path)], logger)
     logger.info(f"Created venv at {venv_path}")
@@ -306,6 +478,9 @@ def ensure_venv(venv_path: Path, logger: logging.Logger, dry_run: bool = False) 
 def install_deps(venv_path: Path, logger: logging.Logger, mode: str, dry_run: bool = False) -> None:
     pip_bin = venv_path / "bin" / "pip"
     if not pip_bin.exists():
+        if dry_run:
+            logger.info(f"[dry-run] Would install dependencies ({mode}) into {venv_path}")
+            return
         raise RuntimeError(f"pip not found in venv ({pip_bin})")
     base_cmd = [str(pip_bin)]
     run_cmd(base_cmd + ["install", "--upgrade", "pip"], logger, dry_run=dry_run)
@@ -331,9 +506,12 @@ def install_deps(venv_path: Path, logger: logging.Logger, mode: str, dry_run: bo
     logger.info(f"Dependencies installed ({mode})")
 
 
-def node_selfcheck(venv_path: Path, logger: logging.Logger, dry_run: bool = False) -> None:
+def node_selfcheck(venv_path: Path, logger: logging.Logger, env_overrides: Optional[Dict[str, str]] = None, dry_run: bool = False) -> None:
     python_bin = venv_path / "bin" / "python"
-    run_cmd([str(python_bin), "scripts/node.py", "--selfcheck"], logger, cwd=REPO_ROOT, dry_run=dry_run)
+    env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
+    run_cmd([str(python_bin), "scripts/node.py", "--selfcheck"], logger, cwd=REPO_ROOT, env=env, dry_run=dry_run)
 
 
 def start_node_loop(venv_path: Path, log_dir: Path, logger: logging.Logger, interval: int, env_overrides: Dict[str, str], dry_run: bool = False) -> Optional[int]:
@@ -458,7 +636,8 @@ def main():
 
     logger, log_file = setup_logging(LOG_ROOT)
     state = WizardState(STATE_FILE)
-    prev = state.load()
+    prev_raw = state.load()
+    prev = _sanitize_prev_state(prev_raw, logger)
 
     logger.info("Starting Raspberry Pi data-collection wizard (SSOT-aligned, local-first)")
     auto_mode = os.getenv("RPI_WIZARD_AUTO", "").lower() in {"1", "true", "yes"}
@@ -477,6 +656,8 @@ def main():
         else:
             mounts = detect_mounts()
             default_root = Path(prev.get("data_root") or (REPO_ROOT / "data"))
+            if not default_root.is_absolute():
+                default_root = REPO_ROOT / "data"
             print("\nSelect storage path (external SSD recommended).")
             if mounts:
                 print("Detected mounts:")
@@ -489,14 +670,15 @@ def main():
                     _test_write(data_root)
                 except Exception as e:
                     print(f"Cannot use /data ({e}); please choose a custom path.")
-                    data_root = prompt_storage_path(default_root, logger)
+                    data_root = prompt_storage_path(REPO_ROOT / "data", logger)
             else:
                 data_root = prompt_storage_path(default_root, logger)
             edge_node_id = input(f"Edge node id [{os.uname().nodename}]: ").strip() or os.uname().nodename
-            venv_path = Path(prev.get("venv_path") or (REPO_ROOT / "venv"))
-            venv_input = input(f"Venv path [{venv_path}]: ").strip()
-            if venv_input:
-                venv_path = Path(venv_input).expanduser()
+            venv_default = Path(prev.get("venv_path") or (REPO_ROOT / "venv"))
+            if not venv_default.is_absolute():
+                venv_default = REPO_ROOT / "venv"
+            venv_input = input(f"Venv path [{venv_default}]: ").strip()
+            venv_path = Path(venv_input).expanduser() if venv_input else venv_default
     data_root.mkdir(parents=True, exist_ok=True)
 
     # Move/symlink data paths to SSD
@@ -524,11 +706,17 @@ def main():
         "REQUEST_PACING_ENABLED": "true",
         "PARQUET_COMPRESSION": "zstd",
     }
-    upsert_env(DEFAULT_ENV, env_updates, logger)
+    env_path = ENV_PATH
+    upsert_env(env_path, env_updates, logger)
 
     ensure_venv(venv_path, logger, dry_run=args.dry_run)
     install_deps(venv_path, logger, mode=args.install_mode, dry_run=args.dry_run)
-    node_selfcheck(venv_path, logger, dry_run=args.dry_run)
+    env_overrides = {
+        "EDGE_NODE_ID": edge_node_id,
+        "DATA_ROOT": str(data_root),
+        "STORAGE_BACKEND": "local",
+    }
+    node_selfcheck(venv_path, logger, env_overrides=env_overrides, dry_run=args.dry_run)
 
     node_pid = None
     existing_pid_val = prev.get("last_node_pid") if prev else None
@@ -546,11 +734,7 @@ def main():
             log_dir=data_root / "logs",
             logger=logger,
             interval=args.interval,
-            env_overrides={
-                "EDGE_NODE_ID": edge_node_id,
-                "DATA_ROOT": str(data_root),
-                "STORAGE_BACKEND": "local",
-            },
+            env_overrides=env_overrides,
             dry_run=args.dry_run,
         )
 
@@ -558,12 +742,12 @@ def main():
         state.data["last_node_pid"] = str(node_pid)
         state.save(extra_copy=data_root / "trademl_state" / "rpi_wizard_state.json")
 
-    env_after = _load_env(DEFAULT_ENV)
+    env_after = _load_env(env_path)
     mlflow_ui = env_after.get("MLFLOW_TRACKING_URI") if env_after.get("MLFLOW_TRACKING_URI", "").startswith("http") else ""
     # Final summary
     summary = {
         "data_root": str(data_root),
-        "env_path": str(DEFAULT_ENV),
+        "env_path": str(env_path),
         "venv_path": str(venv_path),
         "wizard_log": str(log_file),
         "node_log": str(data_root / "logs" / "node.log"),
@@ -586,7 +770,7 @@ def main():
                 venv_path=venv_path,
                 data_root=data_root,
                 interval=args.interval,
-                env_path=DEFAULT_ENV,
+                env_path=env_path,
                 logger=logger,
                 enable=args.enable_systemd,
                 dry_run=args.dry_run,

@@ -69,8 +69,49 @@ if [ -z "${PYTHON_BIN:-}" ]; then
   exit 1
 fi
 
-if [ ! -x "$VENV/bin/python" ]; then
-  echo "Creating venv at $VENV using $PYTHON_BIN"
+validate_venv() {
+  if [ ! -x "$VENV/bin/python" ]; then
+    echo "Venv missing or not executable at $VENV/bin/python"
+    return 1
+  fi
+
+  venv_info=$("$VENV/bin/python" - <<'PY' || true
+import platform, sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+print(sys.platform)
+print(platform.machine())
+PY
+)
+  if [ -z "$venv_info" ]; then
+    echo "Existing venv python failed to start"
+    return 1
+  fi
+
+  host_info=$("$PYTHON_BIN" - <<'PY'
+import platform, sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+print(sys.platform)
+print(platform.machine())
+PY
+)
+
+  venv_version=$(printf '%s\n' "$venv_info" | sed -n '1p')
+  venv_platform=$(printf '%s\n' "$venv_info" | sed -n '2p')
+  venv_machine=$(printf '%s\n' "$venv_info" | sed -n '3p')
+  host_version=$(printf '%s\n' "$host_info" | sed -n '1p')
+  host_platform=$(printf '%s\n' "$host_info" | sed -n '2p')
+  host_machine=$(printf '%s\n' "$host_info" | sed -n '3p')
+
+  if [ "$venv_version" != "$host_version" ] || [ "$venv_platform" != "$host_platform" ] || [ "$venv_machine" != "$host_machine" ]; then
+    echo "Existing venv is built for $venv_version/$venv_platform/$venv_machine, host expects $host_version/$host_platform/$host_machine"
+    return 1
+  fi
+  return 0
+}
+
+if ! validate_venv; then
+  echo "Resetting venv at $VENV using $PYTHON_BIN"
+  rm -rf "$VENV"
   "$PYTHON_BIN" -m venv "$VENV"
   "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
 fi

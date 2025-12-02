@@ -115,6 +115,51 @@ def _env_true(name: str, default: bool = True) -> bool:
     return str(val).lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_data_root() -> tuple[Path, list[str]]:
+    """
+    Choose a usable DATA_ROOT. If the configured path is unreachable (e.g., stale
+    Mac path on a Pi), fall back to repo-local data with a warning. Also attempts
+    to reuse the wizard's persisted state when present.
+    """
+    warnings: list[str] = []
+    env_root = os.getenv("DATA_ROOT")
+    candidates = []
+    if env_root:
+        env_path = Path(env_root).expanduser()
+        if sys.platform.startswith("linux") and str(env_path).startswith("/Users/"):
+            warnings.append(f"Ignoring macOS-style DATA_ROOT {env_path} on linux")
+        else:
+            candidates.append(env_path)
+
+    # Wizard state (if reachable)
+    state_path = REPO_ROOT / "logs" / "rpi_wizard_state.json"
+    try:
+        if state_path.exists():
+            import json as _json
+
+            state_data = _json.loads(state_path.read_text())
+            state_root = state_data.get("data_root")
+            if state_root:
+                candidates.append(Path(state_root).expanduser())
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"Could not read wizard state ({exc}); skipping")
+
+    candidates.append(REPO_ROOT / "data")
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate, warnings
+        except Exception as exc:  # noqa: BLE001 - want raw message
+            warnings.append(f"DATA_ROOT {candidate} unusable ({exc}); trying next option")
+
+    # Last resort: current working directory /data
+    fallback = Path.cwd() / "data"
+    fallback.mkdir(parents=True, exist_ok=True)
+    warnings.append(f"Falling back to {fallback}")
+    return fallback, warnings
+
+
 def main():
     parser = argparse.ArgumentParser(description="Node: collector+curator orchestrator")
     parser.add_argument("--selfcheck", action="store_true", help="Run checks and exit")
@@ -123,15 +168,17 @@ def main():
     parser.add_argument("--curator-config", default="configs/curator.yml")
     args = parser.parse_args()
 
-    # Force .env to override any ambient AWS_* that might be set in the shell
-    load_dotenv(dotenv_path=REPO_ROOT / ".env", override=True)
+    # Load .env but keep explicit env overrides (passed by wizard) intact
+    load_dotenv(dotenv_path=REPO_ROOT / ".env", override=False)
 
     # Storage root for logs/data (external SSD recommended)
-    data_root = Path(os.getenv("DATA_ROOT", REPO_ROOT / "data"))
+    data_root, data_root_warnings = _resolve_data_root()
     log_dir = data_root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     logger.remove()  # avoid duplicate handlers
     logger.add(log_dir / "node.log", rotation="10 MB", retention=5, enqueue=True, backtrace=False, diagnose=False)
+    for w in data_root_warnings:
+        logger.warning(w)
 
     enable_edge = _env_true("NODE_ENABLE_EDGE", True)
     enable_audit = _env_true("NODE_ENABLE_AUDIT", True)

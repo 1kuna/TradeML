@@ -15,11 +15,13 @@ def test_wizard_auto_dry_run(tmp_path, monkeypatch):
             "DATA_ROOT": str(data_root),
             "EDGE_NODE_ID": "test-node",
             "RPI_WIZARD_VENV": str(venv_path),
+            "RPI_WIZARD_ENV_PATH": str(tmp_path / ".env"),
         }
     )
+    repo_root = Path(__file__).resolve().parents[2]
     proc = subprocess.run(
         ["python", "rpi_wizard.py", "--dry-run", "--fresh"],
-        cwd=str(Path(__file__).resolve().parents[1]),
+        cwd=str(repo_root),
         env=env,
         capture_output=True,
         text=True,
