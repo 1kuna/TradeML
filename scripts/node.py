@@ -218,7 +218,15 @@ def main():
     log_dir = data_root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     logger.remove()  # avoid duplicate handlers
-    logger.add(log_dir / "node.log", rotation="10 MB", retention=5, enqueue=True, backtrace=False, diagnose=False)
+    logger.add(
+        log_dir / "node.log",
+        rotation="10 MB",
+        retention=5,
+        enqueue=True,
+        backtrace=False,
+        diagnose=False,
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | [{level}] | {message}",
+    )
     for w in data_root_warnings:
         logger.warning(w)
 
