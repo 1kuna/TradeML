@@ -36,6 +36,7 @@ STATE_FILE = LOG_ROOT / "rpi_wizard_state.json"
 DEFAULT_ENV = REPO_ROOT / ".env"
 ENV_TEMPLATE = REPO_ROOT / ".env.template"
 ENV_PATH = Path(os.getenv("RPI_WIZARD_ENV_PATH", DEFAULT_ENV))
+SYSTEMD_UNIT_NAME = "trademl-node.service"
 
 
 # ---------- Logging ----------
@@ -548,7 +549,7 @@ def write_systemd_unit(
 
     unit_dir = Path.home() / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
-    unit_path = unit_dir / "trademl-node.service"
+    unit_path = unit_dir / SYSTEMD_UNIT_NAME
     logs_dir = data_root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     content = textwrap.dedent(
@@ -591,6 +592,36 @@ def write_systemd_unit(
         logger.warning(f"Failed to enable systemd unit automatically: {e}")
 
     return unit_path
+
+
+def systemd_unit_status(unit_name: str = SYSTEMD_UNIT_NAME) -> str:
+    """
+    Return systemd unit status for the user instance.
+    enabled: unit exists and is enabled
+    disabled: unit file exists but disabled
+    missing: unit file not present
+    unavailable: systemd not usable on this platform
+    unknown: failed to determine
+    """
+    systemctl = shutil.which("systemctl")
+    if sys.platform != "linux" or not systemctl:
+        return "unavailable"
+
+    unit_path = Path.home() / ".config" / "systemd" / "user" / unit_name
+    try:
+        enabled_res = subprocess.run(
+            [systemctl, "--user", "is-enabled", unit_name],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if enabled_res.returncode == 0:
+            return "enabled"
+        if unit_path.exists():
+            return "disabled"
+        return "missing"
+    except Exception:
+        return "unknown"
 
 
 def pid_is_running(pid: int) -> bool:
@@ -757,14 +788,29 @@ def main():
     }
     summarize(logger, summary)
 
-    if not args.dry_run:
+    unit_status = systemd_unit_status()
+    if unit_status == "enabled":
+        logger.info(f"Systemd unit {SYSTEMD_UNIT_NAME} is enabled and will auto-start on login/boot.")
+    elif unit_status in {"disabled", "missing"}:
+        logger.info(f"Systemd unit {SYSTEMD_UNIT_NAME} is disabled or missing; you can re-enable it below.")
+    elif unit_status == "unavailable":
+        logger.info("Systemd not available on this platform; skipping systemd setup.")
+    else:
+        logger.info("Systemd unit status unknown; will prompt for setup if applicable.")
+
+    if not args.dry_run and unit_status != "unavailable":
         wants_systemd = False
         if args.write_systemd:
             wants_systemd = True
         elif not auto_mode:
             print("\nOptional: auto-run the node on reboot using systemd (user service).")
             print("This will keep ingestion running in the background even if you close the terminal.")
-            wants_systemd = prompt_yes_no("Set up systemd now?", default=False)
+            prompt_msg = "Set up systemd now?"
+            if unit_status == "enabled":
+                prompt_msg = f"Systemd unit {SYSTEMD_UNIT_NAME} already enabled. Recreate/refresh it?"
+            elif unit_status in {"disabled", "missing"}:
+                prompt_msg = f"Systemd unit {SYSTEMD_UNIT_NAME} is disabled/missing. Set it up now?"
+            wants_systemd = prompt_yes_no(prompt_msg, default=False)
         if wants_systemd:
             write_systemd_unit(
                 venv_path=venv_path,

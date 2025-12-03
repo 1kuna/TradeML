@@ -10,6 +10,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$ROOT/venv"
 STATE_FILE="$ROOT/logs/rpi_wizard_state.json"
+SYSTEMD_UNIT="trademl-node.service"
 
 stop_node() {
   # Try state file pid first
@@ -40,7 +41,43 @@ PY
     echo "Stopping node processes: $pids"
     kill $pids || true
   fi
+
+  stop_systemd_unit
   exit 0
+}
+
+stop_systemd_unit() {
+  if [ "$(uname -s)" != "Linux" ]; then
+    return
+  fi
+
+  systemctl_bin=$(command -v systemctl || true)
+  if [ -z "$systemctl_bin" ]; then
+    echo "systemctl not found; skipping systemd stop"
+    return
+  fi
+
+  unit_path="$HOME/.config/systemd/user/$SYSTEMD_UNIT"
+  if ! "$systemctl_bin" --user list-unit-files "$SYSTEMD_UNIT" >/dev/null 2>&1 && [ ! -f "$unit_path" ]; then
+    echo "Systemd unit $SYSTEMD_UNIT not found; nothing to stop/disable"
+    return
+  fi
+
+  if "$systemctl_bin" --user is-active "$SYSTEMD_UNIT" >/dev/null 2>&1; then
+    echo "Stopping systemd unit $SYSTEMD_UNIT"
+    "$systemctl_bin" --user stop "$SYSTEMD_UNIT" || echo "Warning: failed to stop $SYSTEMD_UNIT"
+  else
+    echo "Systemd unit $SYSTEMD_UNIT is not active"
+  fi
+
+  if "$systemctl_bin" --user is-enabled "$SYSTEMD_UNIT" >/dev/null 2>&1; then
+    echo "Disabling systemd unit $SYSTEMD_UNIT"
+    "$systemctl_bin" --user disable "$SYSTEMD_UNIT" || echo "Warning: failed to disable $SYSTEMD_UNIT"
+  else
+    echo "Systemd unit $SYSTEMD_UNIT already disabled"
+  fi
+
+  "$systemctl_bin" --user daemon-reload || true
 }
 
 if [ "${1:-}" = "stop" ]; then
