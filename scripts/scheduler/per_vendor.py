@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
@@ -48,6 +49,18 @@ def _vendor_network_backoff_seconds(vendor: str) -> int:
         return 120
 
 
+def _vendor_ping_target(vendor: str) -> Optional[tuple[str, int]]:
+    mapping = {
+        "alpaca": ("data.alpaca.markets", 443),
+        "fred": ("api.stlouisfed.org", 443),
+        "polygon": ("api.polygon.io", 443),
+        "finnhub": ("finnhub.io", 443),
+        "av": ("www.alphavantage.co", 443),
+        "fmp": ("financialmodelingprep.com", 443),
+    }
+    return mapping.get(vendor)
+
+
 def _network_error_threshold() -> int:
     try:
         return max(1, int(os.getenv("NODE_NETWORK_ERROR_THRESHOLD", "5")))
@@ -70,6 +83,14 @@ def _is_network_error(msg: str) -> bool:
         "connection reset by peer",
         "connection timed out",
         "tls handshake timeout",
+        "sslzeroreturnerror",
+        "ssleoferror",
+        "ssl/ssl connection has been closed",
+        "tls/ssl connection has been closed",
+        "eof occurred in violation of protocol",
+        "incompleteread",
+        "connection broken",
+        "tls/ssl",
     ]
     return any(p in m for p in patterns)
 
@@ -255,6 +276,32 @@ class VendorRunner:
         except Exception:
             pass
 
+    def _network_preflight(self) -> bool:
+        """Quick TCP probe to vendor host before scheduling work."""
+        target = _vendor_ping_target(self.vendor)
+        if not target:
+            return True
+        host, port = target
+        try:
+            timeout = max(2.0, float(os.getenv("NODE_NETWORK_PING_TIMEOUT", "5")))
+        except Exception:
+            timeout = 5.0
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except Exception as exc:
+            backoff = _vendor_network_backoff_seconds(self.vendor)
+            self._freeze_until = time.time() + backoff
+            logger.error(
+                "{}: network preflight failed to {}:{} ({}); freezing submissions for {}s",
+                self.vendor,
+                host,
+                port,
+                exc,
+                backoff,
+            )
+            return False
+
     def _run_loop(self):
         cap = _vendor_cap(self.vendor)
         logger.info(f"{self.vendor}: runner starting with cap={cap}")
@@ -263,6 +310,10 @@ class VendorRunner:
         if not producers:
             logger.info(f"{self.vendor}: no runnable producers (connector missing or tasks not requested)")
             # No work; release lease promptly
+            self._release_lease_now()
+            return
+
+        if not self._network_preflight():
             self._release_lease_now()
             return
 

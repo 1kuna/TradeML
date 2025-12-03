@@ -83,6 +83,7 @@ class AlpacaConnector(BaseConnector):
 
         # Initialize Alpaca client
         self.client = StockHistoricalDataClient(api_key, secret_key)
+        self.use_sdk_bars = os.getenv("ALPACA_BARS_USE_SDK", "0").lower() in {"1", "true", "yes", "on"}
         # Initialize options client (for options bars/trades/chain when entitled)
         try:
             self.opt_client = OptionHistoricalDataClient(api_key, secret_key)
@@ -98,6 +99,10 @@ class AlpacaConnector(BaseConnector):
         self.secret_key = secret_key
 
         logger.info("Alpaca connector initialized")
+        if not self.use_sdk_bars:
+            logger.info("Alpaca bars will use REST path (ALPACA_BARS_USE_SDK=0)")
+        else:
+            logger.info("Alpaca bars will use SDK path (ALPACA_BARS_USE_SDK=1)")
 
     def _fetch_raw(
         self,
@@ -125,7 +130,11 @@ class AlpacaConnector(BaseConnector):
                 f"Valid: {list(self.TIMEFRAME_MAP.keys())}"
             )
 
-        # Create request
+        # Default to REST path because Alpaca SDK intermittently throws NameError
+        if not self.use_sdk_bars:
+            return self._fetch_raw_rest(symbols, start_date, end_date, timeframe)
+
+        # Create request for SDK path when explicitly enabled
         request = StockBarsRequest(
             symbol_or_symbols=symbols,
             timeframe=self.TIMEFRAME_MAP[timeframe],
@@ -137,6 +146,7 @@ class AlpacaConnector(BaseConnector):
         try:
             # Fetch bars with timing logs to diagnose stalls in Alpaca SDK
             from time import time as _now
+
             t0 = _now()
             logger.debug(
                 f"Alpaca get_stock_bars begin: tf={timeframe} symbols={len(symbols)} start={start_date} end={end_date}"

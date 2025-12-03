@@ -27,12 +27,16 @@ import argparse
 import signal
 from pathlib import Path
 from datetime import datetime, date
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from loguru import logger
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+
+if sys.version_info < (3, 11):
+    raise RuntimeError("Python 3.11+ is required for node orchestration; upgrade the interpreter.")
 
 
 def _require_env(keys):
@@ -53,6 +57,20 @@ def _check_local_storage(root: Path) -> tuple[bool, str]:
         return False, f"Local storage failed: {e}"
 
 
+def _check_s3_storage() -> tuple[bool, str]:
+    try:
+        from data_layer.storage.s3_client import S3Client
+
+        client = S3Client()
+        key = f"healthchecks/node-selfcheck-{uuid4().hex}.json"
+        payload = json.dumps({"ok": True, "ts": datetime.utcnow().isoformat()}).encode()
+        client.put_object(key, payload)
+        client.delete_object(key)
+        return True, "S3 storage OK"
+    except Exception as e:
+        return False, f"S3 storage failed: {e}"
+
+
 def selfcheck(verbose=True) -> bool:
     errors = []
     warns = []
@@ -62,6 +80,11 @@ def selfcheck(verbose=True) -> bool:
 
     if backend != "local":
         warns.append(f"STORAGE_BACKEND={backend}; SSOT default is local SSD (no object store)")
+        s3_ok, s3_msg = _check_s3_storage()
+        if not s3_ok:
+            errors.append(s3_msg)
+        elif verbose:
+            logger.info(s3_msg)
 
     ok, msg = _check_local_storage(data_root)
     if not ok:

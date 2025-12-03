@@ -97,6 +97,31 @@ class S3Client:
         )
 
         logger.info(f"S3Client initialized: endpoint={self.endpoint_url}, bucket={self.bucket}")
+        self._ensure_bucket()
+
+    def _ensure_bucket(self) -> None:
+        """Create bucket if missing; fail fast on unreachable endpoints."""
+        try:
+            self.s3.head_bucket(Bucket=self.bucket)
+            return
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code not in {"NoSuchBucket", "404", "NotFound"}:
+                logger.error(f"S3 head_bucket failed for {self.bucket}: {e}")
+                raise RuntimeError(f"S3 bucket check failed: {e}") from e
+        except Exception as exc:
+            logger.error(f"S3 head_bucket failed for {self.bucket}: {exc}")
+            raise RuntimeError(f"S3 bucket check failed: {exc}") from exc
+
+        create_kwargs = {"Bucket": self.bucket}
+        if self.region and self.region != "us-east-1":
+            create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": self.region}
+        try:
+            self.s3.create_bucket(**create_kwargs)
+            logger.info(f"Created S3 bucket: s3://{self.bucket}")
+        except ClientError as e:
+            logger.error(f"Failed to create bucket {self.bucket}: {e}")
+            raise RuntimeError(f"Could not create S3 bucket {self.bucket}: {e}") from e
 
     def put_object(
         self,
