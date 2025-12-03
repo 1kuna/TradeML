@@ -25,6 +25,7 @@ import time
 import json
 import argparse
 import signal
+import resource
 from pathlib import Path
 from datetime import datetime, date
 from uuid import uuid4
@@ -183,6 +184,24 @@ def _resolve_data_root() -> tuple[Path, list[str]]:
     return fallback, warnings
 
 
+def _bump_nofile_logger():
+    """
+    Raise RLIMIT_NOFILE soft limit to the hard limit (or 65535, whichever is
+    lower). Avoids hitting 'too many open files' on long backfills (e.g., FRED)
+    without requiring users to tweak shell or systemd configs.
+    """
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(hard if hard != resource.RLIM_INFINITY else 65535, 65535)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            logger.info(f"Raised RLIMIT_NOFILE soft limit from {soft} to {target}")
+        else:
+            logger.debug(f"RLIMIT_NOFILE already sufficient (soft={soft}, hard={hard})")
+    except Exception as e:  # pragma: no cover - platform dependent
+        logger.warning(f"Could not raise RLIMIT_NOFILE: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Node: collector+curator orchestrator")
     parser.add_argument("--selfcheck", action="store_true", help="Run checks and exit")
@@ -202,6 +221,9 @@ def main():
     logger.add(log_dir / "node.log", rotation="10 MB", retention=5, enqueue=True, backtrace=False, diagnose=False)
     for w in data_root_warnings:
         logger.warning(w)
+
+    # Lift file descriptor ceiling to avoid FD exhaustion on large backfills
+    _bump_nofile_logger()
 
     enable_edge = _env_true("NODE_ENABLE_EDGE", True)
     enable_audit = _env_true("NODE_ENABLE_AUDIT", True)

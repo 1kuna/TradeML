@@ -15,6 +15,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, date
 from typing import Optional, List, Dict
 import threading
+import time
 
 import yaml
 import pandas as pd
@@ -633,6 +634,12 @@ class EdgeCollector:
         - Use a single global threadpool of size NODE_WORKERS
         - Start with one inflight per vendor; when a vendor pauses (rate limit/no work), slots go to others
         """
+        max_stuck_seconds = 1800
+        try:
+            max_stuck_seconds = max(300, int(os.getenv("EDGE_MAX_STUCK_SECONDS", "1800")))
+        except Exception:
+            max_stuck_seconds = 1800
+        last_progress_ts = time.time()
         # Prepare budget manager
         budget = self._init_budget()
 
@@ -784,11 +791,20 @@ class EdgeCollector:
         def fred_units():
             if "fred" not in self.connectors:
                 return
+            # Cap the number of fred units per edge run to prevent long blocking cycles
+            try:
+                max_units = max(1, int(os.getenv("NODE_FRED_UNITS_PER_RUN", "90")))
+            except Exception:
+                max_units = 90
+            emitted = 0
             # Iterate from bookmark → gated end_day (yesterday before cutoff, else today)
             last_ts = self.bookmarks.get_last_timestamp("fred", "macro_treasury") if self.bookmarks else None
             start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=7))
             d = start_date
             while d <= today and not self.shutdown_requested:
+                if emitted >= max_units:
+                    logger.info(f"fred: reached per-run cap ({max_units} units); will resume next cycle")
+                    break
                 if not self._should_fetch_eod_for_day("fred", d):
                     d += timedelta(days=1)
                     continue
@@ -798,6 +814,7 @@ class EdgeCollector:
                     "tokens": 1,
                     "run": lambda day=d: self._run_fred_treasury_day(day, budget),
                 }
+                emitted += 1
                 d += timedelta(days=1)
 
         try:
@@ -833,7 +850,8 @@ class EdgeCollector:
 
             def vendor_cap(vendor: str) -> int:
                 # Constrain polygon to 1 to avoid parallel long units under strict RPM
-                default_caps = {"alpaca": 2, "polygon": 1, "finnhub": 2, "fred": 2}
+                # Constrain fred to 1 to avoid FD exhaustion on long backfills.
+                default_caps = {"alpaca": 2, "polygon": 1, "finnhub": 2, "fred": 1}
                 return max(1, max_inflight_for(vendor, default=default_caps.get(vendor, 1)))
 
             def can_run(vendor: str, tokens: int) -> bool:
@@ -857,6 +875,9 @@ class EdgeCollector:
             # Seed up to max_workers with RR across tasks, honoring vendor caps
             import random, time as _t
             while len(active) < max_workers and not self.shutdown_requested:
+                if (time.time() - last_progress_ts) >= max_stuck_seconds:
+                    logger.warning(f"Edge run stuck with no progress for {max_stuck_seconds}s; pausing remaining work for next cycle")
+                    break
                 progressed = False
                 for _ in range(len(task_order)):
                     t = next(rr)
@@ -936,6 +957,9 @@ class EdgeCollector:
                                     )
                                 except Exception:
                                     logger.warning(f"No unit finished within {max_wait}s; (active={len(active)})")
+                            if (time.time() - last_progress_ts) >= max_stuck_seconds:
+                                logger.warning(f"Edge run stuck with no completed units for {max_stuck_seconds}s; deferring remaining work")
+                                break
                             if break_on_timeout:
                                 break
                             else:
@@ -951,6 +975,7 @@ class EdgeCollector:
                     except Exception:
                         pass
                     v = unit["vendor"]
+                    last_progress_ts = time.time()
                     status, rows, msg = ("error", 0, "")
                     try:
                         res = done.result()
@@ -1012,6 +1037,9 @@ class EdgeCollector:
                         for tn, it in list(producers.items()):
                             if not it:
                                 continue
+                            if (time.time() - last_progress_ts) >= max_stuck_seconds:
+                                logger.warning(f"Edge run stuck with no progress for {max_stuck_seconds}s; deferring remaining units")
+                                break
                             try:
                                 nxt = next(it)
                             except StopIteration:
