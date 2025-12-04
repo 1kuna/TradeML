@@ -103,3 +103,38 @@ def test_fetch_raw_rest_handles_multibars_payload(monkeypatch):
     assert data["AAPL"][0]["open"] == 101.0
     assert data["MSFT"][0]["timestamp"] == "2024-01-01T00:02:00Z"
     assert data["GOOGL"][0]["volume"] == 300
+
+
+def test_fetch_bars_retries_rest_on_sdk_json_bug(monkeypatch):
+    """fetch_bars should fall back to REST if SDK raises the json NameError."""
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    monkeypatch.setenv("ALPACA_BARS_USE_SDK", "1")
+
+    def raise_nameerror(*_args, **_kwargs):
+        raise NameError("cannot access local variable 'json' where it is not associated with a value")
+
+    rest_payload = {
+        "AAPL": [
+            {
+                "timestamp": "2024-01-01T00:01:00Z",
+                "open": 1.0,
+                "high": 1.1,
+                "low": 0.9,
+                "close": 1.05,
+                "vwap": 1.0,
+                "volume": 100,
+                "trade_count": 3,
+            }
+        ]
+    }
+
+    monkeypatch.setattr(alpaca_connector.AlpacaConnector, "_fetch_raw", raise_nameerror, raising=False)
+    monkeypatch.setattr(alpaca_connector.AlpacaConnector, "_fetch_raw_rest", lambda *a, **k: rest_payload, raising=False)
+
+    conn = alpaca_connector.AlpacaConnector()
+    df = conn.fetch_bars(["AAPL"], date(2024, 1, 1), date(2024, 1, 1), timeframe="1Min")
+
+    assert not df.empty
+    assert df.iloc[0]["symbol"] == "AAPL"
+    assert df.iloc[0]["volume"] == 100

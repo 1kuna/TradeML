@@ -339,12 +339,25 @@ class AlpacaConnector(BaseConnector):
             except Exception:
                 pass
 
-            raw_data = self._fetch_raw(
-                symbols=batch,
-                start_date=start_date,
-                end_date=end_date,
-                timeframe=timeframe,
-            )
+            try:
+                raw_data = self._fetch_raw(
+                    symbols=batch,
+                    start_date=start_date,
+                    end_date=end_date,
+                    timeframe=timeframe,
+                )
+            except Exception as e:
+                emsg = str(e)
+                if isinstance(e, NameError) or "local variable 'json'" in emsg:
+                    logger.error(f"Alpaca SDK json bug detected in fetch_bars; retrying via REST: {emsg}")
+                    raw_data = self._fetch_raw_rest(
+                        symbols=batch,
+                        start_date=start_date,
+                        end_date=end_date,
+                        timeframe=timeframe,
+                    )
+                else:
+                    raise
 
             df = self._transform(raw_data)
 
