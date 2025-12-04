@@ -201,23 +201,44 @@ class AlpacaConnector(BaseConnector):
             except requests.exceptions.RequestException as rexc:
                 raise ConnectorError(f"Failed to fetch data from Alpaca REST: {rexc}")
             data = resp.json()
-            bars = data.get("bars", [])
-            for bar in bars:
-                sym = bar.get("S") or bar.get("symbol")
-                if not sym:
-                    continue
+            bars = data.get("bars") or {}
+
+            def _append_bar(sym: str, bar: Dict[str, Any]) -> None:
+                if not isinstance(bar, dict):
+                    return
                 bucket.setdefault(sym, []).append(
                     {
-                        "timestamp": bar.get("t"),
+                        "timestamp": bar.get("t") or bar.get("timestamp"),
                         "open": bar.get("o"),
                         "high": bar.get("h"),
                         "low": bar.get("l"),
                         "close": bar.get("c"),
                         "vwap": bar.get("vw"),
-                        "volume": bar.get("v"),
-                        "trade_count": bar.get("n"),
+                        "volume": bar.get("v") or bar.get("volume"),
+                        "trade_count": bar.get("n") or bar.get("trade_count"),
                     }
                 )
+
+            if isinstance(bars, dict):
+                if bars:
+                    logger.debug(f"Alpaca REST bars symbols: {list(bars.keys())[:5]}")
+                for sym, bar_list in bars.items():
+                    if not bar_list:
+                        continue
+                    for bar in bar_list:
+                        _append_bar(sym, bar)
+            elif isinstance(bars, list):
+                if bars:
+                    logger.debug(f"Alpaca REST bars list length={len(bars)}")
+                for bar in bars:
+                    if not isinstance(bar, dict):
+                        continue
+                    sym = bar.get("S") or bar.get("symbol")
+                    if not sym:
+                        continue
+                    _append_bar(sym, bar)
+            else:
+                logger.warning(f"Unexpected Alpaca REST bars payload type: {type(bars).__name__}")
             page_token = data.get("next_page_token")
             if not page_token:
                 break
