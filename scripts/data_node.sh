@@ -23,6 +23,16 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$ROOT/venv"
 WIZARD="$ROOT/scripts/pi_data_node_wizard.py"
+
+# Load .env file if it exists (for DATA_ROOT and other config)
+if [ -f "$ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$ROOT/.env"
+    set +a
+fi
+
+# Set defaults after loading .env
 DATA_ROOT="${DATA_ROOT:-$ROOT/data}"
 PID_FILE="$DATA_ROOT/data_node.pid"
 LOG_FILE="$DATA_ROOT/logs/data_node.log"
