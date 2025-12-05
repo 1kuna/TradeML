@@ -97,8 +97,14 @@ echo "  Venv: $VENV"
 # Upgrade pip and install dependencies
 echo ""
 echo "  Installing dependencies..."
-"$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet $DEPS
+"$VENV/bin/pip" install --upgrade pip || { echo "  ERROR: pip upgrade failed"; exit 1; }
+"$VENV/bin/pip" install $DEPS || { echo "  ERROR: dependency install failed"; exit 1; }
+
+# Verify installation
+echo ""
+echo "  Verifying installation..."
+"$VENV/bin/python" -c "import loguru; print(f'    loguru: {loguru.__version__}')" || { echo "  ERROR: loguru not installed"; exit 1; }
+"$VENV/bin/python" -c "import yaml; print('    pyyaml: OK')" || { echo "  ERROR: pyyaml not installed"; exit 1; }
 
 echo "  Done."
 echo ""
