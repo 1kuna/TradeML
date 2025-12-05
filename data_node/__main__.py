@@ -46,18 +46,32 @@ from .stages import get_stage_info, get_current_universe
 from .ui import NodeStatus, Dashboard, setup_log_handler, print_simple_status
 
 
-def configure_logging(log_file: bool = True, verbose: bool = False) -> None:
-    """Configure loguru logging."""
+def configure_logging(
+    log_file: bool = True,
+    verbose: bool = False,
+    console: bool = True,
+) -> None:
+    """
+    Configure loguru logging.
+
+    Args:
+        log_file: Enable file logging
+        verbose: Enable debug level logging
+        console: Enable stderr logging (disable when dashboard is active)
+    """
     logger.remove()
 
-    # Console output
     level = "DEBUG" if verbose else "INFO"
-    logger.add(
-        sys.stderr,
-        format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | <cyan>{name}</cyan> - {message}",
-        level=level,
-        colorize=True,
-    )
+
+    # Console output - only when not using the Rich dashboard
+    # The dashboard has its own log panel via setup_log_handler()
+    if console:
+        logger.add(
+            sys.stderr,
+            format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | <cyan>{name}</cyan> - {message}",
+            level=level,
+            colorize=True,
+        )
 
     # File output
     if log_file:
@@ -205,7 +219,9 @@ def run_node(
         with_ui: Whether to show the Rich dashboard
         verbose: Enable verbose logging
     """
-    configure_logging(log_file=True, verbose=verbose)
+    # When dashboard is active, disable stderr logging to prevent flickering
+    # The dashboard has its own log panel via setup_log_handler()
+    configure_logging(log_file=True, verbose=verbose, console=not with_ui)
 
     logger.info("Starting Pi Data-Node...")
 
