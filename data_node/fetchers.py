@@ -64,6 +64,18 @@ VENDOR_PRIORITY = {
     "fmp": 3,
 }
 
+# Inverse mapping: vendor → datasets it can handle
+# Built from DATASET_VENDORS for vendor-aware task leasing
+VENDOR_DATASETS: dict[str, list[str]] = {}
+for _dataset, _vendors in DATASET_VENDORS.items():
+    for _vendor in _vendors:
+        VENDOR_DATASETS.setdefault(_vendor, []).append(_dataset)
+
+
+def get_datasets_for_vendor(vendor: str) -> list[str]:
+    """Get list of datasets a vendor can handle."""
+    return VENDOR_DATASETS.get(vendor, [])
+
 
 def _ensure_date(val) -> date:
     """Convert val to date if it's a string, or return as-is if already a date."""

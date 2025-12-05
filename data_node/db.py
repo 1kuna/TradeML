@@ -212,6 +212,12 @@ class NodeDB:
                 ON backfill_queue(status, priority, created_at)
             """)
 
+            # Index for vendor-aware lease queries (filters by dataset)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_backfill_queue_dataset
+                ON backfill_queue(dataset, status, priority, created_at)
+            """)
+
             # partition_status mirror table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS partition_status (
@@ -356,6 +362,88 @@ class NodeDB:
 
                 task = self._row_to_task(row)
                 logger.debug(f"Leased task {task.id}: {task.kind.value} {task.dataset}/{task.symbol}")
+                return task
+
+    def lease_next_task_for_vendor(
+        self,
+        vendor: str,
+        datasets: list[str],
+        node_id: str,
+        lease_ttl_seconds: int = 300,
+        now: Optional[datetime] = None,
+    ) -> Optional[Task]:
+        """
+        Lease the next available task for a specific vendor.
+
+        Only considers tasks for datasets that this vendor can handle.
+
+        Args:
+            vendor: Vendor name (for logging)
+            datasets: List of datasets this vendor can handle
+            node_id: This node's identifier for the lease
+            lease_ttl_seconds: How long to hold the lease (default 5 min)
+            now: Current time (for testing); defaults to utcnow()
+
+        Returns:
+            Task if one was leased, None otherwise
+        """
+        if not datasets:
+            return None
+
+        if now is None:
+            now = datetime.now(timezone.utc)
+
+        lease_expires = now + timedelta(seconds=lease_ttl_seconds)
+        now_str = now.isoformat()
+        lease_expires_str = lease_expires.isoformat()
+
+        # Build dataset IN clause
+        placeholders = ",".join("?" * len(datasets))
+
+        with self._lock:
+            with self.transaction() as conn:
+                # Find next eligible task for this vendor's datasets
+                row = conn.execute(f"""
+                    SELECT *
+                    FROM backfill_queue
+                    WHERE dataset IN ({placeholders})
+                      AND (status = 'PENDING' OR (status = 'LEASED' AND lease_expires_at < ?))
+                      AND (next_not_before IS NULL OR next_not_before <= ?)
+                    ORDER BY priority ASC, created_at ASC
+                    LIMIT 1
+                """, (*datasets, now_str, now_str)).fetchone()
+
+                if row is None:
+                    return None
+
+                task_id = row['id']
+
+                # Attempt to lease it
+                cursor = conn.execute("""
+                    UPDATE backfill_queue
+                    SET status = 'LEASED',
+                        lease_owner = ?,
+                        lease_expires_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND (status = 'PENDING' OR (status = 'LEASED' AND lease_expires_at < ?))
+                """, (node_id, lease_expires_str, now_str, task_id, now_str))
+
+                if cursor.rowcount == 0:
+                    # Race condition - someone else got it
+                    return None
+
+                # Re-fetch to confirm
+                row = conn.execute(
+                    "SELECT * FROM backfill_queue WHERE id = ?",
+                    (task_id,)
+                ).fetchone()
+
+                if row is None or row['lease_owner'] != node_id:
+                    return None
+
+                task = self._row_to_task(row)
+                logger.debug(f"Leased task {task.id} for {vendor}: {task.kind.value} {task.dataset}/{task.symbol}")
                 return task
 
     def mark_task_done(self, task_id: int) -> bool:

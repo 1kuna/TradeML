@@ -414,3 +414,316 @@ def run_worker(
         pass
     finally:
         loop.stop()
+
+
+# =============================================================================
+# Per-Vendor Worker Pool (Multi-threaded)
+# =============================================================================
+
+# Default thread counts per vendor (sized for latency resilience)
+DEFAULT_THREAD_COUNTS = {
+    "alpaca": 4,    # 150 rpm - high rate, needs headroom for latency
+    "finnhub": 2,   # 50 rpm
+    "fred": 2,      # 80 rpm
+    "av": 1,        # 4 rpm - so slow 1 is plenty
+    "fmp": 1,       # 3 rpm
+    "massive": 1,   # 4 rpm
+}
+
+
+class VendorWorker:
+    """
+    Single worker thread dedicated to one vendor.
+
+    Continuously leases and processes tasks for datasets this vendor can handle.
+    """
+
+    def __init__(
+        self,
+        vendor: str,
+        worker_id: int,
+        db: Optional[NodeDB] = None,
+        budgets: Optional[BudgetManager] = None,
+        node_id: Optional[str] = None,
+        poll_interval: float = 0.5,
+        idle_interval: float = 5.0,
+    ):
+        """
+        Initialize a vendor worker.
+
+        Args:
+            vendor: Vendor name (alpaca, fred, etc.)
+            worker_id: Unique ID for this worker (for logging)
+            db: Database manager
+            budgets: Budget manager
+            node_id: Node identifier for leasing
+            poll_interval: Seconds between polls when busy
+            idle_interval: Seconds between polls when idle
+        """
+        self.vendor = vendor
+        self.worker_id = worker_id
+        self.db = db or get_db()
+        self.budgets = budgets or get_budget_manager()
+        self.node_id = node_id or os.environ.get("EDGE_NODE_ID", os.uname().nodename)
+        self.poll_interval = poll_interval
+        self.idle_interval = idle_interval
+
+        # Get datasets this vendor can handle
+        from .fetchers import get_datasets_for_vendor
+        self.datasets = get_datasets_for_vendor(vendor)
+
+        self._running = False
+        self._tasks_processed = 0
+
+    def run(self) -> None:
+        """Main worker loop."""
+        self._running = True
+        worker_name = f"{self.vendor}-{self.worker_id}"
+        logger.info(f"VendorWorker {worker_name} starting (datasets: {self.datasets})")
+
+        while self._running:
+            try:
+                processed = self._process_one()
+
+                if processed:
+                    time.sleep(self.poll_interval)
+                else:
+                    # No task available - wait longer
+                    time.sleep(self.idle_interval)
+
+            except Exception as e:
+                logger.exception(f"VendorWorker {worker_name} error: {e}")
+                time.sleep(self.idle_interval)
+
+        logger.info(f"VendorWorker {worker_name} stopped (processed {self._tasks_processed} tasks)")
+
+    def _process_one(self) -> bool:
+        """
+        Process a single task.
+
+        Returns:
+            True if a task was processed, False if none available
+        """
+        # Check budget before leasing
+        # Use GAP as default kind since we don't know the task kind yet
+        if not self.budgets.can_spend(self.vendor, TaskKind.GAP):
+            logger.debug(f"VendorWorker {self.vendor}-{self.worker_id}: budget exhausted, waiting")
+            return False
+
+        # Lease next task for this vendor
+        task = self.db.lease_next_task_for_vendor(
+            vendor=self.vendor,
+            datasets=self.datasets,
+            node_id=self.node_id,
+            lease_ttl_seconds=DEFAULT_LEASE_TTL,
+        )
+
+        if task is None:
+            return False
+
+        # Spend budget token
+        self.budgets.spend(self.vendor)
+
+        # Execute fetch
+        from .fetchers import fetch_task, FetchResult, FetchStatus
+
+        try:
+            result = fetch_task(task, self.vendor)
+            result.vendor_used = self.vendor
+        except Exception as e:
+            logger.exception(f"VendorWorker {self.vendor}-{self.worker_id}: fetch error: {e}")
+            result = FetchResult(
+                status=FetchStatus.ERROR,
+                error=str(e),
+                vendor_used=self.vendor,
+            )
+
+        # Handle result
+        self._handle_result(task, result)
+        self._tasks_processed += 1
+
+        return True
+
+    def _handle_result(self, task: Task, result) -> None:
+        """Handle the result of a fetch operation."""
+        from .fetchers import FetchStatus
+
+        now = datetime.utcnow()
+
+        if result.status == FetchStatus.SUCCESS:
+            if result.partition_status:
+                self.db.upsert_partition_status(
+                    source_name=result.vendor_used or self.vendor,
+                    table_name=task.dataset,
+                    symbol=task.symbol,
+                    dt=task.start_date,
+                    status=result.partition_status,
+                    qc_score=1.0,
+                    row_count=result.rows,
+                    expected_rows=result.rows,
+                    qc_code=result.qc_code,
+                )
+            self.db.mark_task_done(task.id)
+            logger.info(f"Task {task.id} completed: {result.rows} rows from {self.vendor}")
+
+        elif result.status == FetchStatus.EMPTY:
+            from .db import PartitionStatus
+            self.db.upsert_partition_status(
+                source_name=result.vendor_used or self.vendor,
+                table_name=task.dataset,
+                symbol=task.symbol,
+                dt=task.start_date,
+                status=PartitionStatus.GREEN,
+                qc_score=1.0,
+                row_count=0,
+                expected_rows=0,
+                qc_code=result.qc_code or "NO_SESSION",
+            )
+            self.db.mark_task_done(task.id)
+            logger.debug(f"Task {task.id} empty/no-session: {result.qc_code}")
+
+        elif result.status == FetchStatus.RATE_LIMITED:
+            backoff = timedelta(seconds=BACKOFF_BASE_SECONDS * (2 ** task.attempts))
+            backoff = min(backoff, timedelta(seconds=BACKOFF_MAX_SECONDS))
+            backoff_until = now + backoff
+
+            self.db.mark_task_failed(
+                task.id,
+                error=result.error or "Rate limited",
+                backoff_until=backoff_until,
+            )
+            logger.warning(f"Task {task.id} rate limited, retry after {backoff_until}")
+
+        else:  # ERROR, NOT_ENTITLED, NOT_SUPPORTED
+            backoff = timedelta(seconds=BACKOFF_BASE_SECONDS * (2 ** task.attempts))
+            backoff = min(backoff, timedelta(seconds=BACKOFF_MAX_SECONDS))
+            backoff_until = now + backoff
+
+            self.db.mark_task_failed(
+                task.id,
+                error=result.error or "Unknown error",
+                backoff_until=backoff_until,
+            )
+            logger.warning(f"Task {task.id} error, retry after {backoff_until}: {result.error}")
+
+    def stop(self) -> None:
+        """Stop the worker."""
+        self._running = False
+
+    @property
+    def is_running(self) -> bool:
+        """Check if the worker is running."""
+        return self._running
+
+    @property
+    def tasks_processed(self) -> int:
+        """Get count of tasks processed by this worker."""
+        return self._tasks_processed
+
+
+class QueueWorkerPool:
+    """
+    Pool of per-vendor worker threads.
+
+    Spawns dedicated threads for each vendor based on configured thread counts.
+    """
+
+    def __init__(
+        self,
+        thread_counts: Optional[dict[str, int]] = None,
+        db: Optional[NodeDB] = None,
+        budgets: Optional[BudgetManager] = None,
+        node_id: Optional[str] = None,
+    ):
+        """
+        Initialize the worker pool.
+
+        Args:
+            thread_counts: Number of threads per vendor (default: DEFAULT_THREAD_COUNTS)
+            db: Database manager
+            budgets: Budget manager
+            node_id: Node identifier for leasing
+        """
+        self.thread_counts = thread_counts or DEFAULT_THREAD_COUNTS.copy()
+        self.db = db or get_db()
+        self.budgets = budgets or get_budget_manager()
+        self.node_id = node_id or os.environ.get("EDGE_NODE_ID", os.uname().nodename)
+
+        self._workers: list[VendorWorker] = []
+        self._threads: list[threading.Thread] = []
+        self._running = False
+
+    def start(self) -> None:
+        """Start all worker threads."""
+        if self._running:
+            logger.warning("QueueWorkerPool already running")
+            return
+
+        self._running = True
+
+        for vendor, count in self.thread_counts.items():
+            for i in range(count):
+                worker = VendorWorker(
+                    vendor=vendor,
+                    worker_id=i,
+                    db=self.db,
+                    budgets=self.budgets,
+                    node_id=self.node_id,
+                )
+                thread = threading.Thread(
+                    target=worker.run,
+                    name=f"worker-{vendor}-{i}",
+                    daemon=True,
+                )
+
+                self._workers.append(worker)
+                self._threads.append(thread)
+                thread.start()
+
+        total = sum(self.thread_counts.values())
+        logger.info(f"QueueWorkerPool started: {total} worker threads ({self.thread_counts})")
+
+    def stop(self) -> None:
+        """Stop all worker threads."""
+        if not self._running:
+            return
+
+        self._running = False
+
+        # Signal all workers to stop
+        for worker in self._workers:
+            worker.stop()
+
+        # Wait for threads to finish
+        for thread in self._threads:
+            thread.join(timeout=10)
+
+        # Count any that didn't finish
+        still_running = sum(1 for t in self._threads if t.is_alive())
+        if still_running:
+            logger.warning(f"{still_running} worker threads still running after timeout")
+
+        self._workers.clear()
+        self._threads.clear()
+
+        logger.info("QueueWorkerPool stopped")
+
+    @property
+    def is_running(self) -> bool:
+        """Check if the pool is running."""
+        return self._running
+
+    def get_stats(self) -> dict[str, int]:
+        """Get per-vendor task counts."""
+        stats: dict[str, int] = {}
+        for worker in self._workers:
+            stats[worker.vendor] = stats.get(worker.vendor, 0) + worker.tasks_processed
+        return stats
+
+    def get_active_counts(self) -> dict[str, int]:
+        """Get count of currently active workers per vendor."""
+        active: dict[str, int] = {}
+        for worker in self._workers:
+            if worker.is_running:
+                active[worker.vendor] = active.get(worker.vendor, 0) + 1
+        return active

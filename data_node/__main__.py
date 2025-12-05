@@ -39,7 +39,7 @@ load_dotenv()
 
 from .db import get_db, NodeDB
 from .budgets import get_budget_manager, BudgetManager
-from .worker import QueueWorkerLoop
+from .worker import QueueWorkerLoop, QueueWorkerPool
 from .planner import PlannerLoop
 from .maintenance import MaintenanceLoop
 from .stages import get_stage_info, get_current_universe
@@ -253,12 +253,13 @@ def run_node(
     db = get_db()
     budgets = get_budget_manager()
 
-    worker_loop = QueueWorkerLoop()
+    # Use the multi-threaded worker pool for parallel vendor processing
+    worker_pool = QueueWorkerPool(db=db, budgets=budgets)
     planner_loop = PlannerLoop(db=db)
     maintenance_loop = MaintenanceLoop(db=db)
 
     # Register loops in status
-    for name in ["Worker", "Planner", "Maintenance"]:
+    for name in ["Workers", "Planner", "Maintenance"]:
         status.update_loop(name, running=False)
 
     # Shutdown handler
@@ -278,9 +279,9 @@ def run_node(
     # Start loops
     logger.info("Starting loops...")
 
-    worker_loop.start(threaded=True)
-    status.update_loop("Worker", running=True)
-    logger.info("Worker loop started")
+    worker_pool.start()
+    status.update_loop("Workers", running=True)
+    logger.info(f"Worker pool started ({sum(worker_pool.thread_counts.values())} threads)")
 
     planner_loop.start(threaded=True)
     status.update_loop("Planner", running=True)
@@ -323,7 +324,7 @@ def run_node(
                 pass
 
             # Update loop status
-            status.update_loop("Worker", running=worker_loop.is_running)
+            status.update_loop("Workers", running=worker_pool.is_running)
             status.update_loop("Planner", running=planner_loop.is_running)
             status.update_loop("Maintenance", running=maintenance_loop.is_running)
 
@@ -338,8 +339,8 @@ def run_node(
     if dashboard:
         dashboard.stop()
 
-    worker_loop.stop()
-    status.update_loop("Worker", running=False)
+    worker_pool.stop()
+    status.update_loop("Workers", running=False)
 
     planner_loop.stop()
     status.update_loop("Planner", running=False)
