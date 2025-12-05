@@ -16,6 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
+import yaml
 from loguru import logger
 
 from .db import Task, TaskKind, PartitionStatus
@@ -42,17 +43,28 @@ class FetchResult:
     vendor_used: Optional[str] = None
 
 
-# Dataset to vendor capability mapping
-# Based on configs/endpoints.yml
-DATASET_VENDORS = {
-    "equities_eod": ["alpaca", "massive", "finnhub", "fmp"],
-    "equities_minute": ["alpaca", "massive"],
-    "options_chains": ["finnhub", "alpaca"],
-    "options_bars": ["alpaca"],
-    "macros_fred": ["fred"],
-    "corp_actions": ["alpaca", "av"],
-    "fundamentals": ["fmp", "finnhub"],
-}
+# ---------------------------------------------------------------------------
+# Entitlements Config - Source of truth for vendor capabilities
+# ---------------------------------------------------------------------------
+
+def _load_entitlements() -> dict:
+    """Load vendor entitlements from config file."""
+    config_path = Path(__file__).parent.parent / "configs" / "entitlements.yml"
+    if not config_path.exists():
+        logger.warning(f"Entitlements config not found at {config_path}, using defaults")
+        return {}
+    with open(config_path) as f:
+        return yaml.safe_load(f) or {}
+
+
+_ENTITLEMENTS = _load_entitlements()
+
+# Build DATASET_VENDORS from entitlements config
+# Maps dataset -> list of vendors that can handle it
+DATASET_VENDORS: dict[str, list[str]] = {}
+for _vendor, _config in _ENTITLEMENTS.get("vendors", {}).items():
+    for _dataset in _config.get("datasets", []):
+        DATASET_VENDORS.setdefault(_dataset, []).append(_vendor)
 
 # Vendor priority (lower = preferred)
 VENDOR_PRIORITY = {
@@ -65,16 +77,36 @@ VENDOR_PRIORITY = {
 }
 
 # Inverse mapping: vendor → datasets it can handle
-# Built from DATASET_VENDORS for vendor-aware task leasing
 VENDOR_DATASETS: dict[str, list[str]] = {}
-for _dataset, _vendors in DATASET_VENDORS.items():
-    for _vendor in _vendors:
-        VENDOR_DATASETS.setdefault(_vendor, []).append(_dataset)
+for _vendor, _config in _ENTITLEMENTS.get("vendors", {}).items():
+    VENDOR_DATASETS[_vendor] = list(_config.get("datasets", []))
+
+# Excluded datasets per vendor (datasets they should NEVER pick up)
+VENDOR_EXCLUDED: dict[str, set[str]] = {}
+for _vendor, _config in _ENTITLEMENTS.get("vendors", {}).items():
+    VENDOR_EXCLUDED[_vendor] = set(_config.get("excluded", []))
 
 
 def get_datasets_for_vendor(vendor: str) -> list[str]:
     """Get list of datasets a vendor can handle."""
     return VENDOR_DATASETS.get(vendor, [])
+
+
+def get_excluded_datasets(vendor: str) -> set[str]:
+    """Get set of datasets a vendor is explicitly excluded from."""
+    return VENDOR_EXCLUDED.get(vendor, set())
+
+
+def is_vendor_entitled(vendor: str, dataset: str) -> bool:
+    """Check if a vendor is entitled to handle a dataset.
+
+    A vendor is entitled if:
+    1. The dataset is in their datasets list, AND
+    2. The dataset is NOT in their excluded list
+    """
+    can_handle = dataset in VENDOR_DATASETS.get(vendor, [])
+    is_excluded = dataset in VENDOR_EXCLUDED.get(vendor, set())
+    return can_handle and not is_excluded
 
 
 def _ensure_date(val) -> date:

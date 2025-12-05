@@ -468,9 +468,15 @@ class VendorWorker:
         self.poll_interval = poll_interval
         self.idle_interval = idle_interval
 
-        # Get datasets this vendor can handle
-        from .fetchers import get_datasets_for_vendor
-        self.datasets = get_datasets_for_vendor(vendor)
+        # Get datasets this vendor can handle (excluding those they're not entitled to)
+        from .fetchers import get_datasets_for_vendor, get_excluded_datasets
+        all_datasets = get_datasets_for_vendor(vendor)
+        excluded = get_excluded_datasets(vendor)
+        self.datasets = [d for d in all_datasets if d not in excluded]
+        self.excluded_datasets = excluded
+
+        if excluded:
+            logger.info(f"VendorWorker {vendor}: excluding datasets {excluded}")
 
         self._running = False
         self._tasks_processed = 0
