@@ -1,5 +1,5 @@
 """
-Massive.com connector (formerly Polygon.io) - free-tier friendly, 5 req/min limit.
+Massive.com connector - free-tier friendly, 5 req/min limit.
 
 Implements a small subset of endpoints used as supplemental sources:
  - Aggregates (day/minute) for equities bars
@@ -14,7 +14,7 @@ Free tier limits (as of 2025):
  - End-of-day equities, forex, and crypto included
 
 All methods are best-effort and return empty DataFrames on errors. Use
-BudgetManager to govern daily request counts under the 'polygon' vendor.
+BudgetManager to govern daily request counts under the 'massive' vendor.
 
 See: https://massive.com/docs/rest/stocks
 """
@@ -31,12 +31,10 @@ from loguru import logger
 from .base import BaseConnector, ConnectorError
 
 
-class PolygonConnector(BaseConnector):
-    """Connector for Massive.com (formerly Polygon.io) market data API."""
+class MassiveConnector(BaseConnector):
+    """Connector for Massive.com market data API."""
 
-    # Massive.com is the new default; legacy api.polygon.io still works during transition
-    DEFAULT_API_URL = "https://api.massive.com"
-    LEGACY_API_URL = "https://api.polygon.io"
+    API_URL = "https://api.massive.com"
 
     # Free tier historical data limit
     FREE_TIER_HISTORY_DAYS = 730  # ~2 years
@@ -45,19 +43,15 @@ class PolygonConnector(BaseConnector):
         self,
         api_key: Optional[str] = None,
         rate_limit_per_sec: float = 0.08,
-        api_url: Optional[str] = None,
     ):
-        api_key = api_key or os.getenv("POLYGON_API_KEY")
+        api_key = api_key or os.getenv("MASSIVE_API_KEY")
         if not api_key:
-            raise ConnectorError("Polygon/Massive API key not found. Set POLYGON_API_KEY in .env")
-
-        # Allow URL override via env var for transition period
-        self.api_url = api_url or os.getenv("POLYGON_API_URL", self.DEFAULT_API_URL)
+            raise ConnectorError("Massive API key not found. Set MASSIVE_API_KEY in .env")
 
         super().__init__(
-            source_name="polygon",
+            source_name="massive",
             api_key=api_key,
-            base_url=self.api_url,
+            base_url=self.API_URL,
             rate_limit_per_sec=rate_limit_per_sec,
         )
 
@@ -89,7 +83,7 @@ class PolygonConnector(BaseConnector):
                 logger.debug(f"Clamping start_date from {start_date} to {earliest} (free tier limit)")
                 start_date = earliest
 
-        url = f"{self.api_url}/v2/aggs/ticker/{symbol}/range/1/{ts}/{start_date.isoformat()}/{end_date.isoformat()}"
+        url = f"{self.API_URL}/v2/aggs/ticker/{symbol}/range/1/{ts}/{start_date.isoformat()}/{end_date.isoformat()}"
         try:
             r = self._get(url, params=self._auth_params())
             data = r.json()
@@ -98,7 +92,7 @@ class PolygonConnector(BaseConnector):
                 return pd.DataFrame()
             rows = []
             for it in results:
-                # Polygon uses epoch millis in 't'
+                # Massive uses epoch millis in 't'
                 dt = pd.to_datetime(int(it.get("t", 0)), unit="ms").date()
                 rows.append({
                     "date": dt,
@@ -112,12 +106,12 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=url)
         except Exception as e:
-            logger.warning(f"Polygon aggregates fetch failed for {symbol} {start_date}->{end_date} {timespan}: {e}")
+            logger.warning(f"Massive aggregates fetch failed for {symbol} {start_date}->{end_date} {timespan}: {e}")
             return pd.DataFrame()
 
     # -------- Reference: splits & dividends --------
     def fetch_splits(self, symbol: str) -> pd.DataFrame:
-        url = f"{self.api_url}/v3/reference/splits"
+        url = f"{self.API_URL}/v3/reference/splits"
         try:
             r = self._get(url, params={**self._auth_params(), "ticker": symbol, "limit": 1000})
             data = r.json()
@@ -138,11 +132,11 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=f"{url}?ticker={symbol}")
         except Exception as e:
-            logger.warning(f"Polygon splits fetch failed for {symbol}: {e}")
+            logger.warning(f"Massive splits fetch failed for {symbol}: {e}")
             return pd.DataFrame()
 
     def fetch_dividends(self, symbol: str) -> pd.DataFrame:
-        url = f"{self.api_url}/v3/reference/dividends"
+        url = f"{self.API_URL}/v3/reference/dividends"
         try:
             r = self._get(url, params={**self._auth_params(), "ticker": symbol, "limit": 1000})
             data = r.json()
@@ -166,12 +160,12 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=f"{url}?ticker={symbol}")
         except Exception as e:
-            logger.warning(f"Polygon dividends fetch failed for {symbol}: {e}")
+            logger.warning(f"Massive dividends fetch failed for {symbol}: {e}")
             return pd.DataFrame()
 
     # -------- Reference: tickers & market status --------
     def list_active_tickers(self, cursor: Optional[str] = None, limit: int = 1000) -> Tuple[pd.DataFrame, Optional[str]]:
-        url = f"{self.api_url}/v3/reference/tickers"
+        url = f"{self.API_URL}/v3/reference/tickers"
         try:
             params = {**self._auth_params(), "market": "stocks", "active": "true", "limit": limit}
             if cursor:
@@ -195,16 +189,16 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=url), next_cursor
         except Exception as e:
-            logger.warning(f"Polygon tickers fetch failed: {e}")
+            logger.warning(f"Massive tickers fetch failed: {e}")
             return pd.DataFrame(), None
 
     def market_status_now(self) -> Optional[Dict]:
-        url = f"{self.api_url}/v1/marketstatus/now"
+        url = f"{self.API_URL}/v1/marketstatus/now"
         try:
             r = self._get(url, params=self._auth_params())
             return r.json()
         except Exception as e:
-            logger.warning(f"Polygon market status failed: {e}")
+            logger.warning(f"Massive market status failed: {e}")
             return None
 
     # -------- Options (v3 reference + v3 aggregates custom-bars) --------
@@ -219,7 +213,7 @@ class PolygonConnector(BaseConnector):
           - cursor: Pagination cursor
         Returns: (DataFrame, next_cursor)
         """
-        url = f"{self.api_url}/v3/reference/options/contracts"
+        url = f"{self.API_URL}/v3/reference/options/contracts"
         params: Dict[str, object] = {**self._auth_params(), "underlying_ticker": underlying_ticker, "limit": limit}
         if as_of is not None:
             params["as_of"] = as_of.isoformat()
@@ -245,7 +239,7 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=url), next_cursor
         except Exception as e:
-            logger.warning(f"Polygon options contracts fetch failed for {underlying_ticker}: {e}")
+            logger.warning(f"Massive options contracts fetch failed for {underlying_ticker}: {e}")
             return pd.DataFrame(), None
 
     def fetch_option_aggregates(self, option_ticker: str, start_date: date, end_date: date, multiplier: int = 1, timespan: str = "day") -> pd.DataFrame:
@@ -261,7 +255,7 @@ class PolygonConnector(BaseConnector):
             logger.debug(f"Clamping option start_date from {start_date} to {earliest} (free tier limit)")
             start_date = earliest
         tspan = timespan if timespan in ("minute", "hour", "day", "week", "month") else "day"
-        url = f"{self.api_url}/v3/aggs/ticker/{option_ticker}/range/{multiplier}/{tspan}/{start_date.isoformat()}/{end_date.isoformat()}"
+        url = f"{self.API_URL}/v3/aggs/ticker/{option_ticker}/range/{multiplier}/{tspan}/{start_date.isoformat()}/{end_date.isoformat()}"
         try:
             r = self._get(url, params=self._auth_params())
             data = r.json()
@@ -283,5 +277,5 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=url)
         except Exception as e:
-            logger.warning(f"Polygon option aggregates failed for {option_ticker}: {e}")
+            logger.warning(f"Massive option aggregates failed for {option_ticker}: {e}")
             return pd.DataFrame()

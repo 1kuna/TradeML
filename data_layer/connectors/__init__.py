@@ -16,7 +16,7 @@ from .alpha_vantage_connector import AlphaVantageConnector
 from .fred_connector import FREDConnector
 from .finnhub_connector import FinnhubConnector
 from .fmp_connector import FMPConnector
-from .polygon_connector import PolygonConnector
+from .massive_connector import MassiveConnector
 # Expose EdgeCollector for tests/mocks while keeping lazy import in run_edge_scheduler
 # NOTE: EdgeCollector is legacy - new code should use data_node instead
 try:
@@ -227,7 +227,7 @@ __all__ = [
     "FREDConnector",
     "FinnhubConnector",
     "FMPConnector",
-    "PolygonConnector",
+    "MassiveConnector",
     "run_edge_scheduler",
     "backfill_partition",
 ]

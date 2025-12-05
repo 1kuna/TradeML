@@ -141,28 +141,28 @@ class TestAlpacaConnector:
 
 
 # ============================================================================
-# Polygon Connector Tests
+# Massive Connector Tests
 # ============================================================================
 
-class TestPolygonConnector:
-    """E2E tests for Polygon.io connector."""
+class TestMassiveConnector:
+    """E2E tests for Massive.com connector."""
 
     @pytest.fixture
-    def polygon_connector(self):
-        """Create Polygon connector if credentials available."""
-        api_key = os.getenv("POLYGON_API_KEY")
+    def massive_connector(self):
+        """Create Massive connector if credentials available."""
+        api_key = os.getenv("MASSIVE_API_KEY")
 
         if not api_key:
-            pytest.skip("POLYGON_API_KEY not set")
+            pytest.skip("MASSIVE_API_KEY not set")
 
-        from data_layer.connectors.polygon_connector import PolygonConnector
-        return PolygonConnector(api_key=api_key)
+        from data_layer.connectors.massive_connector import MassiveConnector
+        return MassiveConnector(api_key=api_key)
 
-    def test_fetch_aggregates_returns_data(self, polygon_connector, recent_date_range):
+    def test_fetch_aggregates_returns_data(self, massive_connector, recent_date_range):
         """Verify fetch_aggregates returns non-empty DataFrame."""
         start, end = recent_date_range
 
-        df = polygon_connector.fetch_aggregates(
+        df = massive_connector.fetch_aggregates(
             symbol="AAPL",
             start_date=start,
             end_date=end,
@@ -176,9 +176,9 @@ class TestPolygonConnector:
         expected_cols = {"date", "symbol", "open", "high", "low", "close", "volume"}
         assert expected_cols.issubset(df.columns)
 
-    def test_fetch_splits_returns_dataframe(self, polygon_connector):
+    def test_fetch_splits_returns_dataframe(self, massive_connector):
         """Verify fetch_splits returns DataFrame (even if empty)."""
-        df = polygon_connector.fetch_splits("AAPL")
+        df = massive_connector.fetch_splits("AAPL")
 
         assert isinstance(df, pd.DataFrame)
         # AAPL has had splits, should have data
@@ -187,9 +187,9 @@ class TestPolygonConnector:
             assert "event_type" in df.columns
             assert df["event_type"].iloc[0] == "split"
 
-    def test_fetch_dividends_returns_dataframe(self, polygon_connector):
+    def test_fetch_dividends_returns_dataframe(self, massive_connector):
         """Verify fetch_dividends returns DataFrame."""
-        df = polygon_connector.fetch_dividends("AAPL")
+        df = massive_connector.fetch_dividends("AAPL")
 
         assert isinstance(df, pd.DataFrame)
         # AAPL pays dividends
@@ -197,17 +197,17 @@ class TestPolygonConnector:
             assert "amount" in df.columns
             assert df["event_type"].iloc[0] == "dividend"
 
-    def test_market_status_returns_dict(self, polygon_connector):
+    def test_market_status_returns_dict(self, massive_connector):
         """Verify market_status_now returns dict or None."""
-        status = polygon_connector.market_status_now()
+        status = massive_connector.market_status_now()
 
         # May be None if rate limited
         if status is not None:
             assert isinstance(status, dict)
 
-    def test_list_active_tickers(self, polygon_connector):
+    def test_list_active_tickers(self, massive_connector):
         """Verify list_active_tickers returns tickers."""
-        df, next_cursor = polygon_connector.list_active_tickers(limit=10)
+        df, next_cursor = massive_connector.list_active_tickers(limit=10)
 
         if df.empty:
             pytest.skip("No tickers returned (rate limit)")

@@ -120,7 +120,7 @@ class BudgetManager:
             "av": VendorBudget(hard_rpm=4, soft_daily_cap=400, tokens=4.0),
             "fred": VendorBudget(hard_rpm=80, soft_daily_cap=5_000, tokens=80.0),
             "fmp": VendorBudget(hard_rpm=3, soft_daily_cap=200, tokens=3.0),
-            "polygon": VendorBudget(hard_rpm=4, soft_daily_cap=300, tokens=4.0),
+            "massive": VendorBudget(hard_rpm=4, soft_daily_cap=300, tokens=4.0),
         }
         self._budgets = defaults
 

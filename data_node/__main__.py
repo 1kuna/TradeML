@@ -115,7 +115,7 @@ def selfcheck() -> bool:
     if missing_keys:
         errors.append(f"Missing required API keys: {', '.join(missing_keys)}")
 
-    optional_keys = ["FINNHUB_API_KEY", "POLYGON_API_KEY", "FRED_API_KEY"]
+    optional_keys = ["FINNHUB_API_KEY", "MASSIVE_API_KEY", "FRED_API_KEY"]
     missing_optional = [k for k in optional_keys if not os.environ.get(k)]
     if missing_optional:
         warnings.append(f"Missing optional API keys: {', '.join(missing_optional)}")

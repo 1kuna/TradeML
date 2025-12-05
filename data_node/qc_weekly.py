@@ -259,13 +259,13 @@ def get_secondary_vendor(dataset: str, primary_vendor: str) -> Optional[str]:
     # Maps dataset -> {primary: secondary}
     VENDOR_PAIRS = {
         "equities_eod": {
-            "alpaca": "polygon",
-            "polygon": "alpaca",
-            "finnhub": "polygon",
+            "alpaca": "massive",
+            "massive": "alpaca",
+            "finnhub": "massive",
         },
         "equities_minute": {
-            "alpaca": "polygon",
-            "polygon": "alpaca",
+            "alpaca": "massive",
+            "massive": "alpaca",
         },
     }
 
