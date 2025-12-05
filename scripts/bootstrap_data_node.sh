@@ -20,8 +20,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$ROOT/venv"
 WIZARD="$ROOT/scripts/pi_data_node_wizard.py"
 
-# Minimum required dependencies for the wizard
-DEPS="loguru pyyaml python-dotenv"
+# Requirements file
+REQUIREMENTS="$ROOT/requirements.txt"
 
 echo "============================================================"
 echo "  Pi Data-Node Bootstrap"
@@ -96,15 +96,22 @@ echo "  Venv: $VENV"
 
 # Upgrade pip and install dependencies
 echo ""
-echo "  Installing dependencies..."
+echo "  Installing dependencies (this may take a few minutes)..."
 "$VENV/bin/pip" install --upgrade pip || { echo "  ERROR: pip upgrade failed"; exit 1; }
-"$VENV/bin/pip" install $DEPS || { echo "  ERROR: dependency install failed"; exit 1; }
+
+if [ -f "$REQUIREMENTS" ]; then
+    "$VENV/bin/pip" install -r "$REQUIREMENTS" || { echo "  ERROR: requirements install failed"; exit 1; }
+else
+    echo "  WARNING: requirements.txt not found, installing minimal deps"
+    "$VENV/bin/pip" install loguru pyyaml python-dotenv rich exchange-calendars || { echo "  ERROR: dependency install failed"; exit 1; }
+fi
 
 # Verify installation
 echo ""
 echo "  Verifying installation..."
 "$VENV/bin/python" -c "import loguru; print(f'    loguru: {loguru.__version__}')" || { echo "  ERROR: loguru not installed"; exit 1; }
-"$VENV/bin/python" -c "import yaml; print('    pyyaml: OK')" || { echo "  ERROR: pyyaml not installed"; exit 1; }
+"$VENV/bin/python" -c "import rich; print(f'    rich: {rich.__version__}')" || { echo "  ERROR: rich not installed"; exit 1; }
+"$VENV/bin/python" -c "import exchange_calendars; print('    exchange_calendars: OK')" || { echo "  WARNING: exchange_calendars not installed"; }
 
 echo "  Done."
 echo ""
