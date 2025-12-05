@@ -45,8 +45,8 @@ class FetchResult:
 # Dataset to vendor capability mapping
 # Based on configs/endpoints.yml
 DATASET_VENDORS = {
-    "equities_eod": ["alpaca", "polygon", "finnhub", "fmp"],
-    "equities_minute": ["alpaca", "polygon"],
+    "equities_eod": ["alpaca", "massive", "finnhub", "fmp"],
+    "equities_minute": ["alpaca", "massive"],
     "options_chains": ["finnhub", "alpaca"],
     "options_bars": ["alpaca"],
     "macros_fred": ["fred"],
@@ -57,12 +57,19 @@ DATASET_VENDORS = {
 # Vendor priority (lower = preferred)
 VENDOR_PRIORITY = {
     "alpaca": 1,
-    "polygon": 2,
+    "massive": 2,
     "finnhub": 3,
     "fred": 1,
     "av": 2,
     "fmp": 3,
 }
+
+
+def _ensure_date(val) -> date:
+    """Convert val to date if it's a string, or return as-is if already a date."""
+    if isinstance(val, date):
+        return val
+    return date.fromisoformat(val)
 
 
 def get_vendors_for_dataset(dataset: str) -> list[str]:
@@ -118,8 +125,8 @@ def _fetch_equities_eod(task: Task, vendor: str) -> FetchResult:
     try:
         if vendor == "alpaca":
             return _fetch_alpaca_bars(task, timeframe="1Day")
-        elif vendor == "polygon":
-            return _fetch_polygon_bars(task, timeframe="day")
+        elif vendor == "massive":
+            return _fetch_massive_bars(task, timeframe="day")
         elif vendor == "finnhub":
             return _fetch_finnhub_candles(task)
         elif vendor == "fmp":
@@ -136,8 +143,8 @@ def _fetch_equities_minute(task: Task, vendor: str) -> FetchResult:
     try:
         if vendor == "alpaca":
             return _fetch_alpaca_bars(task, timeframe="1Min")
-        elif vendor == "polygon":
-            return _fetch_polygon_bars(task, timeframe="minute")
+        elif vendor == "massive":
+            return _fetch_massive_bars(task, timeframe="minute")
         else:
             return FetchResult(status=FetchStatus.NOT_SUPPORTED, error=f"Vendor {vendor} not supported for equities_minute")
     except ImportError as e:
@@ -216,8 +223,8 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
 
         df = connector.fetch_bars(
             symbols=symbols,
-            start_date=date.fromisoformat(task.start_date),
-            end_date=date.fromisoformat(task.end_date),
+            start_date=_ensure_date(task.start_date),
+            end_date=_ensure_date(task.end_date),
             timeframe=timeframe,
         )
 
@@ -300,8 +307,8 @@ def _fetch_alpaca_corp_actions(task: Task) -> FetchResult:
     try:
         symbols = [task.symbol] if task.symbol else None
         df = connector.fetch_corporate_actions(
-            start=date.fromisoformat(task.start_date),
-            end=date.fromisoformat(task.end_date),
+            start=_ensure_date(task.start_date),
+            end=_ensure_date(task.end_date),
             symbols=symbols,
         )
 
@@ -330,14 +337,14 @@ def _fetch_alpaca_corp_actions(task: Task) -> FetchResult:
 
 
 # -----------------------------------------------------------------------------
-# Polygon fetchers
+# Massive (Polygon.io) fetchers
 # -----------------------------------------------------------------------------
 
-def _fetch_polygon_bars(task: Task, timeframe: str) -> FetchResult:
-    """Fetch bars from Polygon."""
-    from data_layer.connectors.polygon_connector import PolygonConnector
+def _fetch_massive_bars(task: Task, timeframe: str) -> FetchResult:
+    """Fetch bars from Massive (Polygon.io)."""
+    from data_layer.connectors.massive_connector import MassiveConnector
 
-    connector = PolygonConnector()
+    connector = MassiveConnector()
 
     try:
         if not task.symbol:
@@ -345,8 +352,8 @@ def _fetch_polygon_bars(task: Task, timeframe: str) -> FetchResult:
 
         df = connector.fetch_aggregates(
             symbol=task.symbol,
-            start_date=date.fromisoformat(task.start_date),
-            end_date=date.fromisoformat(task.end_date),
+            start_date=_ensure_date(task.start_date),
+            end_date=_ensure_date(task.end_date),
             timespan=timeframe,
         )
 
@@ -356,11 +363,11 @@ def _fetch_polygon_bars(task: Task, timeframe: str) -> FetchResult:
                 rows=0,
                 partition_status=PartitionStatus.GREEN,
                 qc_code="NO_SESSION",
-                vendor_used="polygon",
+                vendor_used="massive",
             )
 
         table_name = "equities_bars" if timeframe == "day" else "equities_bars_minute"
-        raw_path = _get_raw_path("polygon", table_name, task.start_date)
+        raw_path = _get_raw_path("massive", table_name, task.start_date)
         connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
 
         return FetchResult(
@@ -368,11 +375,11 @@ def _fetch_polygon_bars(task: Task, timeframe: str) -> FetchResult:
             rows=len(df),
             partition_status=PartitionStatus.GREEN,
             qc_code="OK",
-            vendor_used="polygon",
+            vendor_used="massive",
         )
 
     except Exception as e:
-        return _handle_exception(e, "polygon")
+        return _handle_exception(e, "massive")
 
 
 # -----------------------------------------------------------------------------
@@ -391,8 +398,8 @@ def _fetch_finnhub_candles(task: Task) -> FetchResult:
 
         df = connector.fetch_candle_daily(
             symbol=task.symbol,
-            start_date=date.fromisoformat(task.start_date),
-            end_date=date.fromisoformat(task.end_date),
+            start_date=_ensure_date(task.start_date),
+            end_date=_ensure_date(task.end_date),
         )
 
         if df is None or df.empty:
@@ -431,7 +438,7 @@ def _fetch_finnhub_options(task: Task) -> FetchResult:
 
         df = connector.fetch_options_chain(
             symbol=task.symbol,
-            date=date.fromisoformat(task.start_date),
+            date=_ensure_date(task.start_date),
         )
 
         if df is None or df.empty:
@@ -503,8 +510,8 @@ def _fetch_fred_treasury(task: Task) -> FetchResult:
 
     try:
         df = connector.fetch_treasury_curve(
-            start_date=date.fromisoformat(task.start_date),
-            end_date=date.fromisoformat(task.end_date),
+            start_date=_ensure_date(task.start_date),
+            end_date=_ensure_date(task.end_date),
         )
 
         if df is None or df.empty:
@@ -587,8 +594,8 @@ def _fetch_fmp_eod(task: Task) -> FetchResult:
 
         df = connector.fetch_historical_price(
             symbol=task.symbol,
-            start_date=date.fromisoformat(task.start_date),
-            end_date=date.fromisoformat(task.end_date),
+            start_date=_ensure_date(task.start_date),
+            end_date=_ensure_date(task.end_date),
         )
 
         if df is None or df.empty:

@@ -38,7 +38,7 @@ DEFAULT_MAX_INFLIGHT = {
     "fred": 1,
     "av": 1,
     "fmp": 1,
-    "polygon": 1,
+    "massive": 1,
 }
 
 # Default lease TTL in seconds
