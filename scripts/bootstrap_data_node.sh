@@ -20,8 +20,13 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$ROOT/venv"
 WIZARD="$ROOT/scripts/pi_data_node_wizard.py"
 
-# Requirements file
-REQUIREMENTS="$ROOT/requirements.txt"
+# Requirements file - use lightweight Pi version on ARM
+ARCH=$(uname -m)
+if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "armv7l" ]; then
+    REQUIREMENTS="$ROOT/requirements-pi.txt"
+else
+    REQUIREMENTS="$ROOT/requirements.txt"
+fi
 
 echo "============================================================"
 echo "  Pi Data-Node Bootstrap"
@@ -93,6 +98,8 @@ if ! validate_venv; then
 fi
 
 echo "  Venv: $VENV"
+echo "  Arch: $ARCH"
+echo "  Requirements: $(basename $REQUIREMENTS)"
 
 # Upgrade pip and install dependencies
 echo ""
