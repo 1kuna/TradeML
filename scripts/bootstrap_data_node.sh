@@ -117,8 +117,8 @@ fi
 echo ""
 echo "  Verifying installation..."
 "$VENV/bin/python" -c "import loguru; print(f'    loguru: {loguru.__version__}')" || { echo "  ERROR: loguru not installed"; exit 1; }
-"$VENV/bin/python" -c "import rich; print(f'    rich: {rich.__version__}')" || { echo "  ERROR: rich not installed"; exit 1; }
-"$VENV/bin/python" -c "import exchange_calendars; print('    exchange_calendars: OK')" || { echo "  WARNING: exchange_calendars not installed"; }
+"$VENV/bin/python" -c "import rich; print('    rich: OK')" || { echo "  ERROR: rich not installed"; exit 1; }
+"$VENV/bin/python" -c "import exchange_calendars; print('    exchange_calendars: OK')" || echo "  WARNING: exchange_calendars not installed"
 
 echo "  Done."
 echo ""
