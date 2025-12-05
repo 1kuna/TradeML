@@ -230,12 +230,12 @@ Concurrency on RPi:
 - Writes to `raw/<source>/<table>/date=*` are idempotent and guarded with S3 ETag retries to avoid races; bookmarks advance only after persist.
 
 Multi-source fan-out:
-- Edge fan-outs one unit per source (Alpaca/Polygon/Finnhub/FRED) and dynamically redistributes idle slots when a source runs out of work or cools down (rate limits).
+- Edge fan-outs one unit per source (Alpaca/Massive/Finnhub/FRED) and dynamically redistributes idle slots when a source runs out of work or cools down (rate limits).
 - Daily budgets gate scheduling per vendor; short per-minute bursts are smoothed by connector-level backoff. When a source pauses, free workers shift to other sources automatically.
 
 Per-vendor scheduler (default):
 - Enabled by default. To use the old scheduler, set `EDGE_SCHEDULER_MODE=legacy` or pass `--scheduler legacy`.
-- Runs one executor per vendor so slow vendors (e.g., Polygon) never block faster ones.
+- Runs one executor per vendor so slow vendors (e.g., Massive) never block faster ones.
 - Env knobs: `NODE_MAX_INFLIGHT_<VENDOR>` caps, `NODE_VENDOR_FREEZE_SECONDS_<VENDOR>` cooldowns.
 
 Request pacing (global):

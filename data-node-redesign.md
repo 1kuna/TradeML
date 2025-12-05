@@ -12,7 +12,7 @@ This section is intentionally descriptive so a reader/LLM can see what exists to
 ### Bootstrap & Node
 - `bootstrap.sh` + `rpi_wizard.py` set up the venv, .env, data/log symlinks, and start the **node loop** (`scripts/node.py`).
 - The node loop runs the **edge collector** (`scripts/edge_collector.py`), which:
-  - Initializes connectors (alpaca, polygon, fred, etc.).
+  - Initializes connectors (alpaca, massive, fred, etc.).
   - Schedules ingest tasks (per-vendor schedulers) for equities bars (day/minute), options bars, macro, etc.
   - Writes raw parquet to `data_layer/raw/<vendor>/<table>/date=YYYY-MM-DD/data.parquet`.
   - Writes manifests to `data_layer/manifests/<vendor>/<table>/manifest-*.jsonl`.
@@ -109,7 +109,7 @@ This is the **preferred direction** for how gaps should be filled, but the exact
 - **Vendor capabilities & priority**:
   - A registry defines which datasets each vendor can fill (equities, options, macro, etc.), plus:
     - Entitlements and known coverage.
-    - Relative preference/quality (e.g., Alpaca preferred over Polygon for equities, etc.).
+    - Relative preference/quality (e.g., Alpaca preferred over Massive for equities, etc.).
     - Per-vendor budgets (max RPM, daily call budgets).
   - This captures “dibs” semantics: higher-priority vendor gets first claim, but others can pick up tasks when the preferred vendor is busy or not applicable.
 - **Scoring/dispatch on top of FIFO**:

@@ -74,11 +74,11 @@ Proposed defaults (soft caps):
 - **FMP**
   - `hard_rpm = 3` (gives breathing room vs 250/day).  
   - `soft_daily_cap = 200` (below 250/day).
-- **Polygon**
+- **Massive (Polygon.io)**
   - `hard_rpm = 4` (below 5/min).  
   - `soft_daily_cap = 300`.
 
-Where `backfill.yml` already defines numbers (e.g. Alpaca/FRED/AV), keep them; only add Finnhub/FMP/Polygon entries based on the values above.
+Where `backfill.yml` already defines numbers (e.g. Alpaca/FRED/AV), keep them; only add Finnhub/FMP/Massive entries based on the values above.
 
 ### 1.2 Per‑kind daily budget fractions
 
@@ -105,7 +105,7 @@ On the Pi:
 - `NODE_MAX_INFLIGHT_DEFAULT = 3`
 - Vendor‑specific caps:
   - `ALPACA = 2`, `FINNHUB = 2`
-  - `FRED = 1`, `ALPHAVANTAGE = 1`, `FMP = 1`, `POLYGON = 1`
+  - `FRED = 1`, `ALPHAVANTAGE = 1`, `FMP = 1`, `MASSIVE = 1`
 
 Agent should wire these into the new queue worker so at most `NODE_MAX_INFLIGHT_VENDOR` tasks per vendor are leased at once, and no more than `NODE_MAX_INFLIGHT_DEFAULT` overall.
 
@@ -366,7 +366,7 @@ Implement `scripts/pi_data_node_wizard.py` that:
    - Set `EDGE_NODE_ID`, `TRADEML_ENV=local`, and conservative scheduler defaults (from SSOT_V2 §1.4).
 
 2. **Collects API keys**:
-   - Alpaca, Finnhub, Alpha Vantage, FRED, FMP, Polygon.
+   - Alpaca, Finnhub, Alpha Vantage, FRED, FMP, Massive.
    - Writes them into `.env` / config files exactly where existing connectors expect them.
 
 3. **Initializes control DB & stage**:
@@ -440,7 +440,7 @@ Concretely:
 **Step 0 — Wire SSOT & configs**
 
 - [ ] Update `SSOT_V2.md` as in §9.  
-- [ ] Verify `configs/backfill.yml` and `configs/endpoints.yml` contain limits for all vendors; add Finnhub/FMP/Polygon entries following §1.1 and the free‑tier tables.
+- [ ] Verify `configs/backfill.yml` and `configs/endpoints.yml` contain limits for all vendors; add Finnhub/FMP/Massive entries following §1.1 and the free‑tier tables.
 
 **Step 1 — Control DB & queue**
 

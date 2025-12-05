@@ -54,7 +54,7 @@ In case of conflict between docs or code comments, precedence is:
 /repo
   /infra                  # Docker, DB, MinIO, MLflow, Redis
   /data_layer
-    connectors/           # Alpaca, Polygon, Finnhub, AV, FMP, FRED...
+    connectors/           # Alpaca, Massive (Polygon.io), Finnhub, AV, FMP, FRED...
     raw/                  # immutable vendor payloads
     curated/              # adjusted, PIT‑safe tables
     reference/            # corp_actions, delistings, calendars, universe...
@@ -198,9 +198,9 @@ Under `/data_layer` we standardize these core tables:
 
 **Raw:**
 
-- `raw/equities_bars` — daily/minute bars from Alpaca / Finnhub / Polygon
+- `raw/equities_bars` — daily/minute bars from Alpaca / Finnhub / Massive
   - Columns: `date`, `symbol`, `open`, `high`, `low`, `close`, `vwap`, `volume`, `nbbo_spread`, `trades`, `session_id`, metadata (`ingested_at`, `source_name`, `source_uri`, `vendor_ts`, `api_version`).
-- `raw/equities_ticks` — tick TAQ (future; from Databento/Polygon when upgraded)
+- `raw/equities_ticks` — tick TAQ (future; from Databento/Massive when upgraded)
   - Columns: `ts_ns`, `symbol`, `price`, `size`, `side`, `venue`, `seq`, metadata.
 - `raw/options_nbbo` — OPRA or vendor equivalent
   - Columns: `ts_ns`, `underlier`, `expiry`, `strike`, `cp_flag`, `bid`, `ask`, `bid_size`, `ask_size`, `nbbo_mid`, `exchs_bitmap`, metadata.
@@ -229,8 +229,8 @@ All raw tables are **append‑only**; curated tables are recomputed deterministi
 
 We operate a **free→prosumer** vendor stack:
 
-- Equities minute & EOD: Alpaca now; Databento/Polygon later.
-- Options chains & IV: Finnhub now (exploratory); OPRA via Databento/Polygon/Cboe later.
+- Equities minute & EOD: Alpaca now; Databento/Massive later.
+- Options chains & IV: Finnhub now (exploratory); OPRA via Databento/Massive/Cboe later.
 - Corporate actions & listings: Alpha Vantage (LISTING_STATUS, splits/divs), FMP (delistings), SEC/EDGAR for authoritative dates.
 - Macro & rates: FRED/ALFRED + Treasury data.
 
@@ -298,7 +298,7 @@ The edge scheduler uses **per‑vendor executors** so slow vendors cannot block 
 - Work units are produced by `scripts/scheduler/producers.py`, with functions like:
   - `alpaca_bars_units()`
   - `alpaca_minute_units()`
-  - `polygon_bars_units()`
+  - `massive_bars_units()`
   - `finnhub_options_units()`
   - `finnhub_daily_units()`
   - `fred_treasury_units()`
@@ -403,7 +403,7 @@ The exact vendor limits and endpoint URLs are maintained in `configs/endpoints.y
 Each entry in the capabilities registry has the form:
 
 - `dataset` — logical dataset name (`equities_bars`, `options_nbbo`, `macros_fred`, `corp_actions`, `fundamentals`)
-- `vendor` — `alpaca`, `polygon`, `finnhub`, `fred`, `alfred`, `alpha_vantage`, `fmp`, etc.
+- `vendor` — `alpaca`, `massive`, `finnhub`, `fred`, `alfred`, `alpha_vantage`, `fmp`, etc.
 - `endpoint` — path or function name for the vendor API
 - `hard_rpm` — hard requests‑per‑minute limit used for budgeting
 - `soft_daily_cap` — approximate daily request ceiling
@@ -418,7 +418,7 @@ Indicative examples (actual numbers live in configs):
   - `finnhub` → `/stock/candle`, backup EOD/minute with smaller caps.
 - `options_chain` / `options_nbbo`:
   - `finnhub` → options chain endpoints, free exploratory data.
-  - `databento` / `polygon` → SIP/OPRA feed when upgraded, with higher limits and better quality.
+  - `databento` / `massive` → SIP/OPRA feed when upgraded, with higher limits and better quality.
 - `corp_actions`:
   - `alpha_vantage` → `LISTING_STATUS`, splits/dividends functions.
   - `fmp` → delistings and company metadata.
@@ -939,7 +939,7 @@ We standardize on interactive CLI wizards as the primary UX for all operational 
 Responsibilities:
 - Detect environment (Pi vs Mac) and locate external SSD
 - Prompt for storage root (default: `/mnt/.../data_layer`)
-- Collect API keys (Alpaca, Finnhub, Alpha Vantage, FRED, FMP, Polygon)
+- Collect API keys (Alpaca, Finnhub, Alpha Vantage, FRED, FMP, Massive)
 - Generate/patch `.env` with `EDGE_NODE_ID`, `TRADEML_ENV=local`, conservative `NODE_MAX_INFLIGHT_*` defaults
 - Initialize SQLite control DB (`data_layer/control/node.sqlite`) with `backfill_queue` + `partition_status` tables
 - Initialize stage config (`data_layer/control/stage.yml`) with Stage 0
