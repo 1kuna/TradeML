@@ -1,20 +1,28 @@
 """
-Polygon.io connector (free-tier friendly, 5 req/min suggested).
+Massive.com connector (formerly Polygon.io) - free-tier friendly, 5 req/min limit.
 
 Implements a small subset of endpoints used as supplemental sources:
  - Aggregates (day/minute) for equities bars
  - Reference splits and dividends
  - Reference tickers (active)
  - Market status (now)
+ - Options contracts and aggregates
+
+Free tier limits (as of 2025):
+ - 5 requests per minute
+ - 2 years historical data for minute-level granularity
+ - End-of-day equities, forex, and crypto included
 
 All methods are best-effort and return empty DataFrames on errors. Use
 BudgetManager to govern daily request counts under the 'polygon' vendor.
+
+See: https://massive.com/docs/rest/stocks
 """
 
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, Optional, Tuple
 
 import pandas as pd
@@ -24,13 +32,34 @@ from .base import BaseConnector, ConnectorError
 
 
 class PolygonConnector(BaseConnector):
-    API_URL = "https://api.polygon.io"
+    """Connector for Massive.com (formerly Polygon.io) market data API."""
 
-    def __init__(self, api_key: Optional[str] = None, rate_limit_per_sec: float = 0.08):
+    # Massive.com is the new default; legacy api.polygon.io still works during transition
+    DEFAULT_API_URL = "https://api.massive.com"
+    LEGACY_API_URL = "https://api.polygon.io"
+
+    # Free tier historical data limit
+    FREE_TIER_HISTORY_DAYS = 730  # ~2 years
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        rate_limit_per_sec: float = 0.08,
+        api_url: Optional[str] = None,
+    ):
         api_key = api_key or os.getenv("POLYGON_API_KEY")
         if not api_key:
-            raise ConnectorError("Polygon API key not found. Set POLYGON_API_KEY in .env")
-        super().__init__(source_name="polygon", api_key=api_key, base_url=self.API_URL, rate_limit_per_sec=rate_limit_per_sec)
+            raise ConnectorError("Polygon/Massive API key not found. Set POLYGON_API_KEY in .env")
+
+        # Allow URL override via env var for transition period
+        self.api_url = api_url or os.getenv("POLYGON_API_URL", self.DEFAULT_API_URL)
+
+        super().__init__(
+            source_name="polygon",
+            api_key=api_key,
+            base_url=self.api_url,
+            rate_limit_per_sec=rate_limit_per_sec,
+        )
 
     def _auth_params(self) -> Dict[str, str]:
         return {"apiKey": self.api_key}
@@ -45,10 +74,22 @@ class PolygonConnector(BaseConnector):
     def fetch_aggregates(self, symbol: str, start_date: date, end_date: date, timespan: str = "day") -> pd.DataFrame:
         """Fetch aggregates for a symbol between dates (inclusive). timespan in {'day','minute'}.
 
+        Free tier limits:
+          - 2 years of historical minute data
+          - EOD data may have longer history
+
         Returns columns: date, symbol, open, high, low, close, volume
         """
         ts = "day" if timespan not in ("minute", "day") else timespan
-        url = f"{self.API_URL}/v2/aggs/ticker/{symbol}/range/1/{ts}/{start_date.isoformat()}/{end_date.isoformat()}"
+
+        # Clamp to free tier history limit for minute data
+        if ts == "minute":
+            earliest = date.today() - timedelta(days=self.FREE_TIER_HISTORY_DAYS)
+            if start_date < earliest:
+                logger.debug(f"Clamping start_date from {start_date} to {earliest} (free tier limit)")
+                start_date = earliest
+
+        url = f"{self.api_url}/v2/aggs/ticker/{symbol}/range/1/{ts}/{start_date.isoformat()}/{end_date.isoformat()}"
         try:
             r = self._get(url, params=self._auth_params())
             data = r.json()
@@ -76,7 +117,7 @@ class PolygonConnector(BaseConnector):
 
     # -------- Reference: splits & dividends --------
     def fetch_splits(self, symbol: str) -> pd.DataFrame:
-        url = f"{self.API_URL}/v3/reference/splits"
+        url = f"{self.api_url}/v3/reference/splits"
         try:
             r = self._get(url, params={**self._auth_params(), "ticker": symbol, "limit": 1000})
             data = r.json()
@@ -101,7 +142,7 @@ class PolygonConnector(BaseConnector):
             return pd.DataFrame()
 
     def fetch_dividends(self, symbol: str) -> pd.DataFrame:
-        url = f"{self.API_URL}/v3/reference/dividends"
+        url = f"{self.api_url}/v3/reference/dividends"
         try:
             r = self._get(url, params={**self._auth_params(), "ticker": symbol, "limit": 1000})
             data = r.json()
@@ -130,7 +171,7 @@ class PolygonConnector(BaseConnector):
 
     # -------- Reference: tickers & market status --------
     def list_active_tickers(self, cursor: Optional[str] = None, limit: int = 1000) -> Tuple[pd.DataFrame, Optional[str]]:
-        url = f"{self.API_URL}/v3/reference/tickers"
+        url = f"{self.api_url}/v3/reference/tickers"
         try:
             params = {**self._auth_params(), "market": "stocks", "active": "true", "limit": limit}
             if cursor:
@@ -158,7 +199,7 @@ class PolygonConnector(BaseConnector):
             return pd.DataFrame(), None
 
     def market_status_now(self) -> Optional[Dict]:
-        url = f"{self.API_URL}/v1/marketstatus/now"
+        url = f"{self.api_url}/v1/marketstatus/now"
         try:
             r = self._get(url, params=self._auth_params())
             return r.json()
@@ -178,7 +219,7 @@ class PolygonConnector(BaseConnector):
           - cursor: Pagination cursor
         Returns: (DataFrame, next_cursor)
         """
-        url = f"{self.API_URL}/v3/reference/options/contracts"
+        url = f"{self.api_url}/v3/reference/options/contracts"
         params: Dict[str, object] = {**self._auth_params(), "underlying_ticker": underlying_ticker, "limit": limit}
         if as_of is not None:
             params["as_of"] = as_of.isoformat()
@@ -211,19 +252,16 @@ class PolygonConnector(BaseConnector):
         """
         GET /v3/aggs/ticker/{option_ticker}/range/{multiplier}/{timespan}/{from}/{to}
 
-        Free plan allows ~2 years back — clamp start_date accordingly.
+        Free tier allows ~2 years back — clamp start_date accordingly.
         Returns columns: date, option_ticker, open, high, low, close, volume
         """
-        # Clamp to ~2 years back
-        from datetime import timedelta as _TD
-        try:
-            earliest = date.today() - _TD(days=730)
-        except Exception:
-            earliest = date.today()
+        # Clamp to free tier history limit
+        earliest = date.today() - timedelta(days=self.FREE_TIER_HISTORY_DAYS)
         if start_date < earliest:
+            logger.debug(f"Clamping option start_date from {start_date} to {earliest} (free tier limit)")
             start_date = earliest
         tspan = timespan if timespan in ("minute", "hour", "day", "week", "month") else "day"
-        url = f"{self.API_URL}/v3/aggs/ticker/{option_ticker}/range/{multiplier}/{tspan}/{start_date.isoformat()}/{end_date.isoformat()}"
+        url = f"{self.api_url}/v3/aggs/ticker/{option_ticker}/range/{multiplier}/{tspan}/{start_date.isoformat()}/{end_date.isoformat()}"
         try:
             r = self._get(url, params=self._auth_params())
             data = r.json()

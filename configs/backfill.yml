@@ -11,7 +11,7 @@ policy:
     av:      { requests: 25 }      # Alpha Vantage: 25/day
     fred:    { requests: 10000 }   # lower daily cap; rpm limited in connector
     fmp:     { requests: 250 }     # FMP free tier: 250/day
-    polygon: { requests: 7000 }    # Polygon free: 5 rpm (~7200/day) → cap at 7000
+    polygon: { requests: 7000 }    # Massive.com (Polygon) free: 5 rpm (~7200/day) → cap at 7000
 
   # Per-vendor rate limits for unified data-node queue (§1.1 of node spec)
   # hard_rpm: requests-per-minute ceiling (token bucket)
