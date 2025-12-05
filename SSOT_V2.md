@@ -253,22 +253,40 @@ QC thresholds and expectations (rows per day, half‑days allowed, etc.) are con
 
 ### 2.4 Backfill subsystem
 
-Backfill runs continuously via two sweeps:
+On the Pi, all ingest work flows through a **unified ingest queue** (`backfill_queue`) that handles forward ingest, gap‑filling, bootstrap, and QC probes in a single priority‑ordered system.
 
-1. **Forward sweep**: ingest today’s deltas using the edge scheduler.
-2. **Backward sweep**: continuously backfills older history until GREEN thresholds are met.
+**Task kinds** (`kind` field):
+- `BOOTSTRAP` — initial historical data fetch for new symbols or expanded windows
+- `GAP` — fill RED/AMBER partitions detected by audit
+- `FORWARD` — collect today's deltas (live/continuous ingest)
+- `QC_PROBE` — weekly cross‑vendor spot‑checks
 
-Core control flow:
+**Priority order** (lower = more important):
+- `0` — `BOOTSTRAP` inside current stage window
+- `1` — `GAP` inside current stage window
+- `2` — `QC_PROBE` (weekly cross‑vendor checks)
+- `3` — `BOOTSTRAP` outside stage window (ancient history)
+- `5` — `FORWARD` (live ingest)
 
-1. `audit_scan()` compares expected vs actual partitions, updates `partition_status`, and populates `backfill_queue` with RED/AMBER gaps, prioritized by reference tables first (corp_actions, delistings), then equities EOD, minute, options, macro.
-2. `backfill_run()` consumes `backfill_queue` tasks in priority order, enforcing per‑vendor budgets (token buckets) and chunk sizes. Completed tasks update raw tables and `partition_status`.
+Tasks are processed FIFO within each priority lane, ordered by `(priority, created_at)`.
+
+**Core control flow:**
+
+1. `audit_scan()` compares expected vs actual partitions, updates `partition_status`, and upserts `GAP` tasks into `backfill_queue` for RED/AMBER partitions within the current stage window.
+2. Queue worker leases tasks in priority order, enforcing per‑vendor budgets (token buckets + daily caps with 85/90/100% slices by kind). Completed tasks update raw tables and `partition_status`.
 3. `curate_incremental()` detects changed raw partitions and rebuilds only affected curated partitions plus dependent derived artifacts.
 4. `qc.refresh()` recomputes GREEN/AMBER/RED and coverage metrics.
 
-Idempotency rules:
+**Budget slices by kind:**
+- 0–85% of daily cap: `BOOTSTRAP` + `GAP` can spend freely
+- 85–90%: only `QC_PROBE` + `FORWARD`
+- 90–100%: only `FORWARD` (guaranteed allocation for live ingest)
+
+**Idempotency rules:**
 
 - Partitions are written to `.tmp` paths, verified, then moved into place.
-- Leases (S3 or DB) prevent parallel workers from duplicating work.
+- Leases with TTL prevent parallel workers from duplicating work; expired leases revert to PENDING.
+- Task deduplication via `UNIQUE(dataset, symbol, start_date, end_date, kind)` constraint.
 - Backfill windows use closed intervals `[t0, t1)` to keep replays deterministic.
 
 ### 2.5 Per‑vendor edge scheduler
@@ -339,21 +357,29 @@ Tracks completeness and QC for each logical partition.
 
 **backfill_queue**
 
-Represents tasks to backfill missing or low‑quality partitions.
+Represents tasks in the unified ingest queue. On the Pi, this is stored in SQLite (`data_layer/control/node.sqlite`); optionally mirrored to Postgres for workstation visibility.
 
-- `id` (UUID, primary key)
-- `dataset` (text) — logical dataset name, e.g., `equities_eod`, `options_nbbo`, `fundamentals`
+- `id` (INTEGER, primary key, autoincrement)
+- `dataset` (text) — logical dataset name, e.g., `equities_eod`, `equities_minute`, `options_chains`, `macros_fred`
 - `symbol` (text, nullable)
-- `start_date` (date, nullable)
-- `end_date` (date, nullable)
-- `priority` (integer) — smaller numbers processed first; reference tables use highest priority
-- `status` (enum: `PENDING`, `RUNNING`, `FAILED`, `DONE`)
-- `attempts` (integer)
+- `start_date` (date)
+- `end_date` (date)
+- `kind` (text) — task type: `BOOTSTRAP`, `GAP`, `FORWARD`, or `QC_PROBE`
+- `priority` (integer) — smaller numbers processed first (see §2.4 for priority semantics)
+- `status` (enum: `PENDING`, `LEASED`, `DONE`, `FAILED`)
+- `attempts` (integer, default 0)
+- `lease_owner` (text, nullable) — node ID holding the current lease
+- `lease_expires_at` (timestamptz, nullable) — when the lease expires; expired leases revert to PENDING
+- `next_not_before` (timestamptz, nullable) — used for exponential backoff after failures
 - `last_error` (text, nullable)
-- `owner_node` (text, nullable) — node that holds the current lease
-- `next_not_before` (timestamptz, nullable) — used for exponential backoff
 - `created_at` (timestamptz)
 - `updated_at` (timestamptz)
+
+**Constraints:**
+- `UNIQUE(dataset, symbol, start_date, end_date, kind)` — prevents duplicate tasks for the same work unit
+
+**Index:**
+- `idx_backfill_queue_status ON (status, priority, created_at)` — efficient lease_next_task queries
 
 **pipeline_runs** (optional but recommended)
 
@@ -654,25 +680,46 @@ The Markdown report renders a human‑friendly view over the same JSON, and must
 
 ## 5. Orchestration & Node Loop SSOT
 
-### 5.1 Nightly DAG
+### 5.1 Unified Pi Data‑Node Service
 
-The canonical nightly sequence (implemented in node loop and/or scheduler):
+The Pi runs a **unified data‑node service** (`python -m data_node`) that handles all data collection, audit, backfill, curation, and QC. Training, evaluation, and promotion remain on the workstation.
 
-1. `ingest.forward()` — run edge scheduler to collect today’s deltas for all enabled datasets.
-2. `audit.scan()` — recompute partition_status and identify gaps.
-3. `backfill.run()` — fill RED/AMBER gaps under budgets.
-4. `curate.incremental()` — rebuild curated partitions affected by new raw data.
-5. `qc.refresh()` — recompute GREEN/AMBER/RED and coverage.
-6. `train_if_ready('equities_xs')` — only if GREEN thresholds are satisfied.
-7. `train_if_ready('options_vol')` and `train_if_ready('intraday_xs')` (where enabled).
-8. `evaluate.cpcv_and_shadow()` — recompute CPCV metrics and update challenger stats.
-9. `promote_if_beat_champion()` — apply promotion rules.
-10. `report.emit_daily()` — render MD + JSON blotters and coverage/drift plots.
+**Four concurrent loops:**
 
-### 5.2 Pi node & launchers
+1. **ForwardIngestLoop** (every 15 min):
+   - Check bookmarks/manifests to see if today's data is incomplete
+   - Enqueue `FORWARD` tasks into `backfill_queue` (priority=5)
 
-- `scripts/node.py` runs the loop continuously on the Pi; configured via `.env`.
-- Windows launcher (`scripts/windows/training_run.bat`) allows one‑click training loops.
+2. **PlannerLoop**:
+   - **Light run (every 4h):** `audit_scan()` on active datasets; upsert `GAP` tasks for RED/AMBER partitions
+   - **Heavy run (02:00 local):** full audit, stage gating (Stage 0→1 promotion), purge old FAILED tasks
+
+3. **QueueWorkerLoop** (continuous):
+   - Lease next task by `(priority, created_at)` respecting vendor budgets
+   - Call dataset fetcher → write raw parquet → update partition_status
+   - Mark task DONE or FAILED with backoff
+
+4. **MaintenanceLoop** (02:00 local):
+   - `curate_incremental()` for all raw partitions touched since last maintenance
+   - Structural QC (`qc.refresh`) for those partitions
+   - Weekly: enqueue `QC_PROBE` tasks for cross‑vendor spot‑checks
+   - Export curated tables + QC ledger to `exports/nightly/YYYY-MM-DD/`
+
+### 5.2 Workstation Nightly DAG
+
+Training and model governance run on the workstation, consuming Pi exports:
+
+1. Pull `exports/nightly/YYYY-MM-DD/` from Pi (or shared storage)
+2. `train_if_ready('equities_xs')` — only if GREEN thresholds are satisfied
+3. `train_if_ready('options_vol')` and `train_if_ready('intraday_xs')` (where enabled)
+4. `evaluate.cpcv_and_shadow()` — recompute CPCV metrics and update challenger stats
+5. `promote_if_beat_champion()` — apply promotion rules
+6. `report.emit_daily()` — render MD + JSON blotters and coverage/drift plots
+
+### 5.3 Launchers
+
+- **Pi**: `python -m data_node` or `scripts/pi_data_node_wizard.py` for guided setup
+- **Workstation**: `ops/dags/nightly.py` with training/eval/promote enabled; `scripts/windows/training_run.bat` for one‑click runs
 
 All production automation should be expressed via these APIs/CLIs, not bespoke scripts.
 
@@ -887,15 +934,36 @@ Once these conditions are validated, this SSOT v2 becomes the reference for any 
 
 We standardize on interactive CLI wizards as the primary UX for all operational flows. Each wizard must be single-command start (`python <wizard>.py`), fully guided, resume-safe, and loud on unexpected failures.
 
-**Edge (Pi) data collection wizard**
-- Responsibilities: create/activate venv, install ingest deps, select storage root (external SSD by default), generate/patch `.env`, initialize control tables (partition_status/manifests) on SSD, start edge scheduler/node loop, and stream logs to durable files with clear `tail -f` instructions.
-- Storage: Parquet + zstd on the SSD; control data (bookmarks/manifests/partition_status/logs) co-located on the SSD so unplug/reattach works without cloud deps. Future addition: optional replication to remote/object storage for multi-node sync.
-- Resume: wizard reads SSD state (paths, node_id, manifests/bookmarks) and continues from last offsets automatically.
-- UX: prints actionable next steps (e.g., how to view logs); fails loudly on schema/gating issues (rate-limit backoff handled silently).
+**Edge (Pi) data‑node wizard** (`scripts/pi_data_node_wizard.py`)
+
+Responsibilities:
+- Detect environment (Pi vs Mac) and locate external SSD
+- Prompt for storage root (default: `/mnt/.../data_layer`)
+- Collect API keys (Alpaca, Finnhub, Alpha Vantage, FRED, FMP, Polygon)
+- Generate/patch `.env` with `EDGE_NODE_ID`, `TRADEML_ENV=local`, conservative `NODE_MAX_INFLIGHT_*` defaults
+- Initialize SQLite control DB (`data_layer/control/node.sqlite`) with `backfill_queue` + `partition_status` tables
+- Initialize stage config (`data_layer/control/stage.yml`) with Stage 0
+- Seed `BOOTSTRAP` tasks for Stage 0 universe (100 symbols × 5y EOD + 1y minute)
+- Configure maintenance time (default: 02:00 local)
+- Optionally start `python -m data_node` with Rich dashboard
+
+Storage:
+- SQLite `node.sqlite` on SSD for queue and partition_status mirror
+- Parquet + zstd for raw/curated data
+- All control data (queue, manifests, partition_status, logs) co‑located on SSD for portability
+
+Stage‑gated expansion:
+- **Stage 0** (initial): 100 symbols, 5y EOD, 1y minute
+- **Stage 1** (target): 500 symbols, 15y EOD, 5y minute
+- Auto‑promote from Stage 0→1 when GREEN coverage ≥0.98 on equities EOD/minute
+
+Resume: wizard reads SSD state (`stage.yml`, queue, manifests/bookmarks) and continues from last offsets automatically.
+
+UX: prints actionable next steps; fails loudly on schema/gating issues (rate‑limit backoff handled silently by the queue worker).
 
 **Workstation wizards (train/eval/inference/paper trade)**
 - Single entrypoints for training, evaluation, shadow/paper trading, and inference serving; reuse the same patterns: venv/bootstrap, env/config selection, artifact discovery (champion/challenger), GREEN gating checks, CPCV/DSR/PBO runs, and promotion decisions.
-- Data access: must work offline from the SSD copy (Parquet + zstd). Future addition: optional remote/object-store sync for multi-node/cloud use.
+- Data access: must work offline from the SSD copy (Parquet + zstd) or Pi exports. Future addition: optional remote/object-store sync for multi-node/cloud use.
 - Output: consistent log capture to file from start of run; expose links for MLflow UI, reports, or any web dashboards started by the wizard.
 
 **Wizard invariants**

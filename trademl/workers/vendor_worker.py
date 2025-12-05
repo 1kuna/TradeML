@@ -114,7 +114,7 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     logger.add(log_dir / f"{vendor}.log", rotation="10 MB", retention=5)
 
-    from scripts.edge_collector import EdgeCollector
+    from legacy.scripts.edge_collector import EdgeCollector
     edge = EdgeCollector(args.config)
 
     # Respect per-process vendor concurrency cap via existing env hook

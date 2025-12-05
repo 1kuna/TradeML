@@ -18,8 +18,9 @@ from .finnhub_connector import FinnhubConnector
 from .fmp_connector import FMPConnector
 from .polygon_connector import PolygonConnector
 # Expose EdgeCollector for tests/mocks while keeping lazy import in run_edge_scheduler
+# NOTE: EdgeCollector is legacy - new code should use data_node instead
 try:
-    from scripts.edge_collector import EdgeCollector  # type: ignore
+    from legacy.scripts.edge_collector import EdgeCollector  # type: ignore
 except Exception:
     EdgeCollector = None  # type: ignore
 
@@ -51,10 +52,10 @@ def run_edge_scheduler(
         return {"status": "error", "reason": "config_not_found"}
 
     try:
-        # Import EdgeCollector from scripts
-        scripts_path = str(Path(__file__).parent.parent.parent / "scripts")
-        if scripts_path not in sys.path:
-            sys.path.insert(0, scripts_path)
+        # Import EdgeCollector from legacy/scripts
+        legacy_path = str(Path(__file__).parent.parent.parent / "legacy" / "scripts")
+        if legacy_path not in sys.path:
+            sys.path.insert(0, legacy_path)
 
         from edge_collector import EdgeCollector as _EdgeCollector  # type: ignore
 

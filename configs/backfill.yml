@@ -3,6 +3,8 @@ scheduler:
 
 policy:
   max_concurrency: 3
+
+  # Legacy daily budget caps (used by existing backfill code)
   daily_api_budget:
     alpaca:  { requests: 250000 }  # near-theoretical; rpm limited in connector
     finnhub: { requests: 86400 }   # 60 rpm * 60 * 24
@@ -10,6 +12,29 @@ policy:
     fred:    { requests: 10000 }   # lower daily cap; rpm limited in connector
     fmp:     { requests: 250 }     # FMP free tier: 250/day
     polygon: { requests: 7000 }    # Polygon free: 5 rpm (~7200/day) → cap at 7000
+
+  # Per-vendor rate limits for unified data-node queue (§1.1 of node spec)
+  # hard_rpm: requests-per-minute ceiling (token bucket)
+  # soft_daily_cap: daily request budget for 85/90/100% slices
+  rate_limits:
+    alpaca:
+      hard_rpm: 150          # ~75% of 200/min guideline
+      soft_daily_cap: 10000
+    finnhub:
+      hard_rpm: 50           # below 60/min limit
+      soft_daily_cap: 10000
+    av:
+      hard_rpm: 4            # below 5/min
+      soft_daily_cap: 400    # below 500/day
+    fred:
+      hard_rpm: 80           # below 120/min
+      soft_daily_cap: 5000
+    fmp:
+      hard_rpm: 3            # conservative for 250/day cap
+      soft_daily_cap: 200    # below 250/day
+    polygon:
+      hard_rpm: 4            # below 5/min
+      soft_daily_cap: 300
 
   priorities:
     - { table: corp_actions,     weight: 100 }
@@ -27,7 +52,7 @@ targets:
   macro_treasury:  { earliest: '2000-01-01', chunk_days: 365, expect_rows: 5 }
   macro_vintages:  { series: ['DGS10','CPIAUCSL'] }
   fundamentals:     { earliest: '2000-01-01', chunk_days: 1 }
-  options_chain_hist:{ earliest: '2015-01-01', chunk_days: 1 }
+  options_chain_hist: { earliest: '2015-01-01', chunk_days: 1 }
   equities_eod_fn:  { earliest: '2000-01-01', chunk_days: 30 }
 
 qc_thresholds:
