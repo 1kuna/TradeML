@@ -542,16 +542,18 @@ def seed_bootstrap_tasks(data_root: Path, dry_run: bool = False) -> int:
         raise
 
 
-def offer_start_service(dry_run: bool = False) -> None:
+def offer_start_service(data_root: Path, dry_run: bool = False) -> None:
     """Offer to start the data_node service."""
     print_header("Start Service")
+
+    log_path = data_root.parent / "logs" / "data_node.log"
 
     if dry_run:
         print_info("Would offer to start data_node service")
         return
 
     if not prompt_yes_no("Start the data_node service now?", default=True):
-        print_info("You can start it later with: python -m data_node")
+        print_info("You can start it later with: ./scripts/run_data_node.sh")
         return
 
     print_info("Starting data_node...")
@@ -566,11 +568,11 @@ def offer_start_service(dry_run: bool = False) -> None:
             start_new_session=True,
         )
         print_success("data_node service started in background")
-        print_info("Check logs in: logs/data_node.log")
+        print_info(f"Check logs: tail -f {log_path}")
 
     except Exception as e:
         print_error(f"Failed to start service: {e}")
-        print_info("Start manually with: python -m data_node")
+        print_info("Start manually with: ./scripts/run_data_node.sh")
 
 
 def run_wizard(resume: bool = False, dry_run: bool = False) -> None:
@@ -681,13 +683,16 @@ def run_wizard(resume: bool = False, dry_run: bool = False) -> None:
         print_success(f"State saved to {STATE_FILE}")
 
     # Step 11: Offer to start service
-    offer_start_service(dry_run)
+    offer_start_service(data_root, dry_run)
+
+    # Compute log path for instructions
+    log_path = data_root.parent / "logs" / "data_node.log"
 
     print_header("Setup Complete!")
     print_info("Next steps:")
-    print_info("  1. Monitor progress: python -m data_node --status")
-    print_info("  2. View logs: tail -f logs/data_node.log")
-    print_info("  3. Check queue: python -c 'from data_node.db import get_db; print(get_db().get_queue_stats())'")
+    print_info("  1. Monitor progress: ./scripts/run_data_node.sh --status")
+    print_info(f"  2. View logs: tail -f {log_path}")
+    print_info("  3. Start service: ./scripts/run_data_node.sh")
 
 
 def main():
