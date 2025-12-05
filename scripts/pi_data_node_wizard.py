@@ -52,10 +52,10 @@ VENDOR_KEYS = {
         "required": False,
         "description": "Options chains and news",
     },
-    "polygon": {
-        "env_vars": ["POLYGON_API_KEY"],
+    "massive": {
+        "env_vars": ["MASSIVE_API_KEY"],
         "required": False,
-        "description": "Cross-vendor QC verification",
+        "description": "Cross-vendor QC verification (Polygon.io rebrand)",
     },
     "fred": {
         "env_vars": ["FRED_API_KEY"],
@@ -78,7 +78,7 @@ VENDOR_KEYS = {
 DEFAULT_INFLIGHT = {
     "alpaca": 2,
     "finnhub": 1,
-    "polygon": 1,
+    "massive": 1,
     "fred": 1,
     "av": 1,
     "fmp": 1,
@@ -110,6 +110,38 @@ def print_warning(text: str) -> None:
 def print_error(text: str) -> None:
     """Print an error message."""
     print(f"  ✗  {text}")
+
+
+def check_dependencies() -> bool:
+    """Check if required dependencies are installed.
+
+    Returns True if all dependencies are available, False otherwise.
+    Prints helpful instructions if dependencies are missing.
+    """
+    missing = []
+
+    try:
+        import loguru  # noqa: F401
+    except ImportError:
+        missing.append("loguru")
+
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        missing.append("pyyaml")
+
+    try:
+        import dotenv  # noqa: F401
+    except ImportError:
+        missing.append("python-dotenv")
+
+    if missing:
+        print_error(f"Missing dependencies: {', '.join(missing)}")
+        print_info("Install with: pip install " + " ".join(missing))
+        print_info("Or use the bootstrap script: ./scripts/bootstrap_data_node.sh")
+        return False
+
+    return True
 
 
 def prompt_yes_no(question: str, default: bool = True) -> bool:
@@ -238,9 +270,98 @@ def detect_environment() -> dict:
 
 
 def collect_api_keys(state: WizardState, dry_run: bool = False) -> dict:
-    """Collect API keys from user."""
+    """Collect API keys with improved UX.
+
+    If existing keys are found (from .env or state), shows a summary and
+    offers to edit specific keys. Otherwise falls back to vendor-by-vendor
+    collection.
+    """
     print_header("API Key Configuration")
 
+    # Gather existing keys from .env and state
+    existing_keys = {}
+
+    # Check .env file
+    if DEFAULT_ENV_PATH.exists():
+        for line in DEFAULT_ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if value and any(key in cfg["env_vars"] for cfg in VENDOR_KEYS.values()):
+                    existing_keys[key] = value
+
+    # Check state file
+    for vendor, config in VENDOR_KEYS.items():
+        for env_var in config["env_vars"]:
+            state_val = state.get(f"key_{env_var}")
+            if state_val and env_var not in existing_keys:
+                existing_keys[env_var] = state_val
+
+    # Also check environment variables
+    for vendor, config in VENDOR_KEYS.items():
+        for env_var in config["env_vars"]:
+            env_val = os.environ.get(env_var)
+            if env_val and env_var not in existing_keys:
+                existing_keys[env_var] = env_val
+
+    # Show summary of existing keys
+    if existing_keys:
+        print_success(f"Found {len(existing_keys)} API key(s) configured:")
+        for key, value in existing_keys.items():
+            masked = value[:4] + "..." + value[-4:] if len(value) > 12 else "***"
+            print(f"    - {key}: {masked}")
+
+        # Ask if user wants to edit any
+        if not prompt_yes_no("\n  Edit any API keys?", default=False):
+            return existing_keys
+
+        # Edit loop
+        keys = dict(existing_keys)
+        while True:
+            # Build numbered list of all possible keys
+            all_env_vars = []
+            for vendor, config in VENDOR_KEYS.items():
+                for env_var in config["env_vars"]:
+                    all_env_vars.append((env_var, vendor, config))
+
+            print("\n  Which key to edit?")
+            for i, (env_var, vendor, config) in enumerate(all_env_vars, 1):
+                status = "[set]" if env_var in keys else "[   ]"
+                print(f"    {i}) {status} {env_var} ({vendor})")
+            print(f"    0) Done editing")
+
+            choice = input("\n  Enter number: ").strip()
+            if choice == "0" or choice == "":
+                break
+
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(all_env_vars):
+                    env_var, vendor, config = all_env_vars[idx]
+                    current = keys.get(env_var)
+                    if current:
+                        masked = current[:4] + "..." + current[-4:] if len(current) > 12 else "***"
+                        print(f"  Current value: {masked}")
+                    value = input(f"  Enter {env_var} (or blank to remove): ").strip()
+                    if value:
+                        keys[env_var] = value
+                        if not dry_run:
+                            state.set(f"key_{env_var}", value)
+                        print_success(f"{env_var} updated")
+                    elif env_var in keys:
+                        del keys[env_var]
+                        print_info(f"{env_var} removed")
+                else:
+                    print_warning("Invalid selection")
+            except ValueError:
+                print_warning("Please enter a number")
+
+        return keys
+
+    # No existing keys - fall through to vendor-by-vendor collection
+    print_info("No existing API keys found. Let's configure them.")
     keys = {}
 
     for vendor, config in VENDOR_KEYS.items():
@@ -248,15 +369,6 @@ def collect_api_keys(state: WizardState, dry_run: bool = False) -> dict:
         print(f"\n  {vendor.upper()} ({req}): {config['description']}")
 
         for env_var in config["env_vars"]:
-            # Check existing value
-            existing = os.environ.get(env_var) or state.get(f"key_{env_var}")
-
-            if existing:
-                masked = existing[:4] + "..." + existing[-4:] if len(existing) > 12 else "***"
-                if prompt_yes_no(f"Use existing {env_var}? ({masked})", default=True):
-                    keys[env_var] = existing
-                    continue
-
             if config["required"]:
                 value = prompt_string(f"Enter {env_var}")
             else:
@@ -467,6 +579,11 @@ def run_wizard(resume: bool = False, dry_run: bool = False) -> None:
 
     if dry_run:
         print_warning("DRY RUN MODE - No changes will be made")
+
+    # Check dependencies before proceeding
+    if not check_dependencies():
+        print_error("Please install missing dependencies and re-run the wizard.")
+        sys.exit(1)
 
     # Load state
     state = WizardState(STATE_FILE)
