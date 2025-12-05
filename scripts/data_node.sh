@@ -171,13 +171,70 @@ get_pid() {
     fi
 }
 
+# Get ALL running data_node PIDs (not just from PID file)
+get_all_pids() {
+    pgrep -f "python.*-m data_node" 2>/dev/null || true
+}
+
 is_running() {
+    # First check PID file
     local pid
     pid=$(get_pid)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         return 0
     fi
+
+    # Also check for any data_node processes (catches orphans)
+    local all_pids
+    all_pids=$(get_all_pids)
+    if [ -n "$all_pids" ]; then
+        return 0
+    fi
+
     return 1
+}
+
+# Kill ALL data_node processes
+kill_all() {
+    local all_pids
+    all_pids=$(get_all_pids)
+
+    if [ -z "$all_pids" ]; then
+        return 0
+    fi
+
+    local count
+    count=$(echo "$all_pids" | wc -l | tr -d ' ')
+
+    if [ "$count" -gt 1 ]; then
+        warn "Found $count data_node processes running - killing all"
+    fi
+
+    # Send SIGTERM first
+    for pid in $all_pids; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    # Wait up to 5 seconds
+    local waited=0
+    while [ $waited -lt 5 ]; do
+        all_pids=$(get_all_pids)
+        if [ -z "$all_pids" ]; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    # Force kill any remaining
+    all_pids=$(get_all_pids)
+    if [ -n "$all_pids" ]; then
+        warn "Processes still running, sending SIGKILL..."
+        for pid in $all_pids; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+        sleep 1
+    fi
 }
 
 do_setup() {
@@ -202,8 +259,16 @@ do_start() {
         fi
     done
 
-    if is_running; then
-        warn "Data node is already running (PID: $(get_pid))"
+    # Check for any existing processes
+    local all_pids
+    all_pids=$(get_all_pids)
+    if [ -n "$all_pids" ]; then
+        local count
+        count=$(echo "$all_pids" | wc -l | tr -d ' ')
+        warn "Data node already running ($count process(es))"
+        echo "  PIDs: $(echo $all_pids | tr '\n' ' ')"
+        echo ""
+        echo "  Use 'stop' first, or 'restart' to replace"
         return 1
     fi
 
@@ -233,32 +298,30 @@ do_start() {
 }
 
 do_stop() {
-    if ! is_running; then
+    local all_pids
+    all_pids=$(get_all_pids)
+
+    if [ -z "$all_pids" ]; then
         warn "Data node is not running"
         rm -f "$PID_FILE"
         return 0
     fi
 
-    local pid
-    pid=$(get_pid)
-    info "Stopping data node (PID: $pid)..."
+    local count
+    count=$(echo "$all_pids" | wc -l | tr -d ' ')
+    info "Stopping data node ($count process(es))..."
 
-    kill -TERM "$pid" 2>/dev/null || true
-
-    local count=0
-    while [ $count -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
-        sleep 1
-        count=$((count + 1))
-    done
-
-    if kill -0 "$pid" 2>/dev/null; then
-        warn "Process still running, sending SIGKILL..."
-        kill -KILL "$pid" 2>/dev/null || true
-        sleep 1
-    fi
-
+    kill_all
     rm -f "$PID_FILE"
-    info "Data node stopped"
+
+    # Verify all stopped
+    all_pids=$(get_all_pids)
+    if [ -z "$all_pids" ]; then
+        info "Data node stopped"
+    else
+        error "Failed to stop all processes: $all_pids"
+        return 1
+    fi
 }
 
 do_restart() {
