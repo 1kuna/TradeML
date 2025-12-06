@@ -67,13 +67,13 @@ for _vendor, _config in _ENTITLEMENTS.get("vendors", {}).items():
         DATASET_VENDORS.setdefault(_dataset, []).append(_vendor)
 
 # Vendor priority (lower = preferred)
+# FMP removed - free tier has severe endpoint restrictions
 VENDOR_PRIORITY = {
     "alpaca": 1,
     "massive": 2,
     "finnhub": 3,
     "fred": 1,
     "av": 2,
-    "fmp": 3,
 }
 
 # Inverse mapping: vendor → datasets it can handle
@@ -111,9 +111,13 @@ def is_vendor_entitled(vendor: str, dataset: str) -> bool:
 
 def _ensure_date(val) -> date:
     """Convert val to date if it's a string, or return as-is if already a date."""
+    if val is None:
+        raise ValueError("Date value cannot be None")
     if isinstance(val, date):
         return val
-    return date.fromisoformat(val)
+    if isinstance(val, str):
+        return date.fromisoformat(val)
+    raise TypeError(f"Expected date or str, got {type(val).__name__}")
 
 
 def get_vendors_for_dataset(dataset: str) -> list[str]:

@@ -69,19 +69,20 @@ class MassiveConnector(BaseConnector):
         """Fetch aggregates for a symbol between dates (inclusive). timespan in {'day','minute'}.
 
         Free tier limits:
-          - 2 years of historical minute data
-          - EOD data may have longer history
+          - 2 years of historical data for ALL timespans (day and minute)
 
         Returns columns: date, symbol, open, high, low, close, volume
         """
         ts = "day" if timespan not in ("minute", "day") else timespan
 
-        # Clamp to free tier history limit for minute data
-        if ts == "minute":
-            earliest = date.today() - timedelta(days=self.FREE_TIER_HISTORY_DAYS)
-            if start_date < earliest:
-                logger.debug(f"Clamping start_date from {start_date} to {earliest} (free tier limit)")
-                start_date = earliest
+        # Clamp to free tier history limit for ALL timespans (not just minute)
+        earliest = date.today() - timedelta(days=self.FREE_TIER_HISTORY_DAYS)
+        if end_date < earliest:
+            logger.debug(f"Date range {start_date}->{end_date} entirely before free tier limit ({earliest}), skipping")
+            return pd.DataFrame()
+        if start_date < earliest:
+            logger.debug(f"Clamping start_date from {start_date} to {earliest} (free tier limit)")
+            start_date = earliest
 
         url = f"{self.API_URL}/v2/aggs/ticker/{symbol}/range/1/{ts}/{start_date.isoformat()}/{end_date.isoformat()}"
         try:

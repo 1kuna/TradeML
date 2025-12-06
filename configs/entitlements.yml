@@ -55,13 +55,5 @@ vendors:
     excluded: []
     notes: "25 requests/day HARD limit. Use sparingly. Premium: 75-1200 req/min."
 
-  fmp:
-    rpm: 4  # ~250/day = ~4/min spread evenly
-    daily_cap: 250
-    bandwidth_mb_30d: 500  # 500 MB per trailing 30 days
-    datasets:
-      - fundamentals      # income, balance, cash - US, ~5 years
-      - symbols_bulk      # exchange symbol master
-      - equities_eod      # gap-fill only, EOD
-    excluded: []
-    notes: "250 calls/day, 500MB/30 days bandwidth. ~5 years of annual statements."
+  # FMP removed - free tier has severe endpoint restrictions (only ~80 tickers allowed)
+  # Re-enable when/if upgrading to paid plan
