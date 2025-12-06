@@ -5,36 +5,36 @@ policy:
   max_concurrency: 3
 
   # Legacy daily budget caps (used by existing backfill code)
+  # Verified free tier limits as of Dec 2025
   daily_api_budget:
-    alpaca:  { requests: 250000 }  # near-theoretical; rpm limited in connector
+    alpaca:  { requests: 288000 }  # 200 rpm * 60 * 24
     finnhub: { requests: 86400 }   # 60 rpm * 60 * 24
-    av:      { requests: 25 }      # Alpha Vantage: 25/day
-    fred:    { requests: 10000 }   # lower daily cap; rpm limited in connector
-    fmp:     { requests: 250 }     # FMP free tier: 250/day
-    massive: { requests: 7000 }    # Massive.com free: 5 rpm (~7200/day) → cap at 7000
+    av:      { requests: 25 }      # Alpha Vantage: 25/day HARD CAP
+    fred:    { requests: 172800 }  # 120 rpm * 60 * 24
+    massive: { requests: 7200 }    # 5 rpm * 60 * 24
+    # FMP removed - free tier has severe endpoint restrictions
 
   # Per-vendor rate limits for unified data-node queue (§1.1 of node spec)
   # hard_rpm: requests-per-minute ceiling (token bucket)
   # soft_daily_cap: daily request budget for 85/90/100% slices
+  # Verified free tier limits as of Dec 2025
   rate_limits:
     alpaca:
-      hard_rpm: 150          # ~75% of 200/min guideline
-      soft_daily_cap: 10000
+      hard_rpm: 200          # Free tier: 200 req/min
+      soft_daily_cap: 288000 # 200 * 60 * 24 theoretical max
     finnhub:
-      hard_rpm: 50           # below 60/min limit
-      soft_daily_cap: 10000
+      hard_rpm: 60           # Free tier: 60 req/min
+      soft_daily_cap: 86400  # 60 * 60 * 24 theoretical max
     av:
-      hard_rpm: 4            # below 5/min
-      soft_daily_cap: 400    # below 500/day
+      hard_rpm: 5            # Free tier: 5 req/min
+      soft_daily_cap: 25     # HARD CAP: 25 requests/day
     fred:
-      hard_rpm: 80           # below 120/min
-      soft_daily_cap: 5000
-    fmp:
-      hard_rpm: 3            # conservative for 250/day cap
-      soft_daily_cap: 200    # below 250/day
+      hard_rpm: 120          # ~120 req/min (from support emails)
+      soft_daily_cap: 172800 # 120 * 60 * 24 theoretical max
     massive:
-      hard_rpm: 4            # below 5/min
-      soft_daily_cap: 300
+      hard_rpm: 5            # Free tier: 5 req/min
+      soft_daily_cap: 7200   # 5 * 60 * 24 theoretical max
+    # FMP removed - free tier has severe endpoint restrictions (~80 tickers only)
 
   priorities:
     - { table: corp_actions,     weight: 100 }

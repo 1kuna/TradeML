@@ -190,6 +190,23 @@ class BudgetManager:
         except Exception as e:
             logger.warning(f"Failed to save budget state: {e}")
 
+    def reset(self) -> None:
+        """Reset all budgets to defaults by deleting state file and reloading."""
+        with self._lock:
+            # Delete persisted state
+            if self.state_path.exists():
+                self.state_path.unlink()
+                logger.info(f"Deleted budget state file: {self.state_path}")
+
+            # Reload config (which will set defaults if no config)
+            self._budgets.clear()
+            self._load_config()
+            logger.info("Budget state reset to defaults")
+
+            # Log new values
+            for vendor, budget in self._budgets.items():
+                logger.info(f"  {vendor}: {budget.hard_rpm} rpm, {budget.soft_daily_cap:,}/day")
+
     def _refill_tokens(self, vendor: str) -> None:
         """Refill tokens based on elapsed time (token bucket algorithm)."""
         budget = self._budgets.get(vendor)

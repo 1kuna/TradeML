@@ -384,6 +384,11 @@ def main():
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--reset-budgets",
+        action="store_true",
+        help="Reset budget state to defaults and exit",
+    )
 
     args = parser.parse_args()
 
@@ -395,6 +400,14 @@ def main():
         configure_logging(log_file=False, verbose=args.verbose)
         success = selfcheck()
         sys.exit(0 if success else 1)
+
+    if args.reset_budgets:
+        configure_logging(log_file=False, verbose=args.verbose)
+        logger.info("Resetting budget state to defaults...")
+        budgets = get_budget_manager()
+        budgets.reset()
+        logger.info("Budget reset complete")
+        return
 
     run_node(with_ui=not args.no_ui, verbose=args.verbose)
 
