@@ -113,14 +113,22 @@ class BudgetManager:
             logger.debug(f"Loaded budget for {vendor}: rpm={rpm}, daily={limits.get('soft_daily_cap')}")
 
     def _set_defaults(self) -> None:
-        """Set default budget values per spec §1.1."""
+        """Set default budget values based on verified free tier limits (Dec 2025).
+
+        Daily caps = rpm * 60 * 24 (theoretical max), except AV which has hard 25/day.
+        """
         defaults = {
-            "alpaca": VendorBudget(hard_rpm=150, soft_daily_cap=10_000, tokens=150.0),
-            "finnhub": VendorBudget(hard_rpm=50, soft_daily_cap=10_000, tokens=50.0),
-            "av": VendorBudget(hard_rpm=4, soft_daily_cap=400, tokens=4.0),
-            "fred": VendorBudget(hard_rpm=80, soft_daily_cap=5_000, tokens=80.0),
-            "fmp": VendorBudget(hard_rpm=3, soft_daily_cap=200, tokens=3.0),
-            "massive": VendorBudget(hard_rpm=4, soft_daily_cap=300, tokens=4.0),
+            # Alpaca: 200 rpm free tier → 288,000/day theoretical
+            "alpaca": VendorBudget(hard_rpm=200, soft_daily_cap=288_000, tokens=200.0),
+            # Finnhub: 60 rpm free tier → 86,400/day theoretical
+            "finnhub": VendorBudget(hard_rpm=60, soft_daily_cap=86_400, tokens=60.0),
+            # Alpha Vantage: 5 rpm, 25/day HARD CAP
+            "av": VendorBudget(hard_rpm=5, soft_daily_cap=25, tokens=5.0),
+            # FRED: ~120 rpm → 172,800/day theoretical
+            "fred": VendorBudget(hard_rpm=120, soft_daily_cap=172_800, tokens=120.0),
+            # Massive: 5 rpm free tier → 7,200/day theoretical
+            "massive": VendorBudget(hard_rpm=5, soft_daily_cap=7_200, tokens=5.0),
+            # FMP removed - free tier too limited
         }
         self._budgets = defaults
 
