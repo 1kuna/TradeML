@@ -28,12 +28,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from loguru import logger
 
 
-def scan_raw_partitions(data_root: str, vendor: str, table: str) -> list[tuple[date, Path]]:
+def scan_raw_partitions(data_root: str, vendor: str, table: str) -> list[tuple[date, list[Path]]]:
     """
     Scan raw partition directories for a vendor/table combination.
 
     Returns:
-        List of (date, parquet_path) tuples
+        List of (date, [parquet_paths]) tuples - ALL parquet files per date
     """
     base_path = Path(data_root) / "data_layer" / "raw" / vendor / table
 
@@ -56,15 +56,15 @@ def scan_raw_partitions(data_root: str, vendor: str, table: str) -> list[tuple[d
             logger.warning(f"Invalid date format in directory: {date_dir.name}")
             continue
 
-        # Find parquet file(s) in the directory
+        # Find ALL parquet files in the directory (not just the first!)
         parquet_files = list(date_dir.glob("*.parquet"))
         if not parquet_files:
             # Check for nested partition structure
             parquet_files = list(date_dir.glob("**/*.parquet"))
 
         if parquet_files:
-            # Use the first parquet file found
-            partitions.append((dt, parquet_files[0]))
+            # Return ALL parquet files for this date
+            partitions.append((dt, parquet_files))
 
     return partitions
 
@@ -221,60 +221,62 @@ def backfill_partition_status(
                     logger.info(f"    No partitions found")
                     continue
 
-                logger.info(f"    Found {len(partitions)} date partitions")
+                total_files = sum(len(files) for _, files in partitions)
+                logger.info(f"    Found {len(partitions)} date partitions ({total_files} parquet files)")
 
-                for partition_date, parquet_path in partitions:
-                    stats["files_scanned"] += 1
+                for partition_date, parquet_files in partitions:
+                    for parquet_path in parquet_files:
+                        stats["files_scanned"] += 1
 
-                    try:
-                        rows_by_symbol = count_rows_by_symbol(parquet_path, dataset)
+                        try:
+                            rows_by_symbol = count_rows_by_symbol(parquet_path, dataset)
 
-                        for symbol, date_counts in rows_by_symbol.items():
-                            for dt, row_count in date_counts.items():
-                                # Use partition date if no date in data
-                                actual_date = dt if dt else partition_date
+                            for symbol, date_counts in rows_by_symbol.items():
+                                for dt, row_count in date_counts.items():
+                                    # Use partition date if no date in data
+                                    actual_date = dt if dt else partition_date
 
-                                # Calculate status based on row count
-                                status = calculate_partition_status(
-                                    row_count=row_count,
-                                    expected_rows=expected_per_day,
-                                    qc_code="OK",
-                                    thresholds=thresholds,
-                                )
-
-                                qc_code = "OK" if status == PartitionStatus.GREEN else "ROW_COUNT_MISMATCH"
-
-                                stats["partitions_found"] += 1
-
-                                if dry_run:
-                                    # Just log what would be done
-                                    if stats["partitions_found"] <= 20:
-                                        logger.info(
-                                            f"      [DRY RUN] Would create: "
-                                            f"{dataset}/{symbol}/{actual_date} "
-                                            f"rows={row_count} status={status.value}"
-                                        )
-                                    elif stats["partitions_found"] == 21:
-                                        logger.info("      ... (truncated)")
-                                else:
-                                    # Actually insert
-                                    db.upsert_partition_status(
-                                        source_name=vendor,
-                                        table_name=dataset,
-                                        symbol=symbol,
-                                        dt=actual_date.isoformat() if hasattr(actual_date, 'isoformat') else str(actual_date),
-                                        status=status,
-                                        qc_score=1.0 if status == PartitionStatus.GREEN else 0.5,
+                                    # Calculate status based on row count
+                                    status = calculate_partition_status(
                                         row_count=row_count,
                                         expected_rows=expected_per_day,
-                                        qc_code=qc_code,
+                                        qc_code="OK",
+                                        thresholds=thresholds,
                                     )
-                                    stats["partitions_created"] += 1
 
-                    except Exception as e:
-                        logger.error(f"    Error processing {parquet_path}: {e}")
-                        stats["errors"] += 1
-                        continue
+                                    qc_code = "OK" if status == PartitionStatus.GREEN else "ROW_COUNT_MISMATCH"
+
+                                    stats["partitions_found"] += 1
+
+                                    if dry_run:
+                                        # Just log what would be done
+                                        if stats["partitions_found"] <= 20:
+                                            logger.info(
+                                                f"      [DRY RUN] Would create: "
+                                                f"{dataset}/{symbol}/{actual_date} "
+                                                f"rows={row_count} status={status.value}"
+                                            )
+                                        elif stats["partitions_found"] == 21:
+                                            logger.info("      ... (truncated)")
+                                    else:
+                                        # Actually insert
+                                        db.upsert_partition_status(
+                                            source_name=vendor,
+                                            table_name=dataset,
+                                            symbol=symbol,
+                                            dt=actual_date.isoformat() if hasattr(actual_date, 'isoformat') else str(actual_date),
+                                            status=status,
+                                            qc_score=1.0 if status == PartitionStatus.GREEN else 0.5,
+                                            row_count=row_count,
+                                            expected_rows=expected_per_day,
+                                            qc_code=qc_code,
+                                        )
+                                        stats["partitions_created"] += 1
+
+                        except Exception as e:
+                            logger.error(f"    Error processing {parquet_path}: {e}")
+                            stats["errors"] += 1
+                            continue
 
     return stats
 
