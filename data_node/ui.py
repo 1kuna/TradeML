@@ -124,11 +124,10 @@ class NodeStatus:
                     setattr(self.vendors[name], key, value)
 
     def add_log_line(self, line: str) -> None:
-        """Add a log line directly to buffer (for dashboard thread only)."""
-        # Note: This bypasses the queue and writes directly to log_lines
-        # Only safe to call from the dashboard thread
+        """Add a log line directly to buffer (thread-safe)."""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_lines.append(f"{timestamp} {line}")
+        with self._lock:
+            self.log_lines.append(f"{timestamp} {line}")
 
     def queue_log_line(self, line: str) -> None:
         """Thread-safe: queue a log line for dashboard consumption.
@@ -142,7 +141,7 @@ class NodeStatus:
             pass  # Drop if queue full - prevents blocking workers
 
     def drain_log_queue(self) -> None:
-        """Drain log queue into log_lines (dashboard thread only).
+        """Drain log queue into log_lines (thread-safe).
 
         Call this from the dashboard render loop to safely transfer
         queued log lines into the deque that Rich displays.
@@ -151,7 +150,8 @@ class NodeStatus:
             try:
                 line = self._log_queue.get_nowait()
                 timestamp = datetime.now().strftime("%H:%M:%S")
-                self.log_lines.append(f"{timestamp} {line}")
+                with self._lock:
+                    self.log_lines.append(f"{timestamp} {line}")
             except Empty:
                 break
 
