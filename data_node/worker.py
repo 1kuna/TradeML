@@ -517,6 +517,7 @@ class VendorWorker:
 
         self._running = False
         self._tasks_processed = 0
+        self._tasks_failed = 0
 
     def run(self) -> None:
         """Main worker loop."""
@@ -673,6 +674,7 @@ class VendorWorker:
                 error=result.error or "Rate limited",
                 backoff_until=backoff_until,
             )
+            self._tasks_failed += 1
             logger.warning(f"Task {task.id} rate limited, retry after {backoff_until}")
 
         else:  # ERROR, NOT_ENTITLED, NOT_SUPPORTED
@@ -685,6 +687,7 @@ class VendorWorker:
                 error=result.error or "Unknown error",
                 backoff_until=backoff_until,
             )
+            self._tasks_failed += 1
             logger.warning(f"Task {task.id} error, retry after {backoff_until}: {result.error}")
 
     def stop(self) -> None:
@@ -700,6 +703,11 @@ class VendorWorker:
     def tasks_processed(self) -> int:
         """Get count of tasks processed by this worker."""
         return self._tasks_processed
+
+    @property
+    def tasks_failed(self) -> int:
+        """Get count of tasks that failed for this worker."""
+        return self._tasks_failed
 
 
 class QueueWorkerPool:
@@ -795,11 +803,16 @@ class QueueWorkerPool:
         return self._running
 
     def get_stats(self) -> dict[str, int]:
-        """Get per-vendor task counts."""
-        stats: dict[str, int] = {}
+        """Get aggregate task counts across all workers."""
+        total_processed = 0
+        total_failed = 0
         for worker in self._workers:
-            stats[worker.vendor] = stats.get(worker.vendor, 0) + worker.tasks_processed
-        return stats
+            total_processed += worker.tasks_processed
+            total_failed += worker.tasks_failed
+        return {
+            "processed": total_processed,
+            "failed": total_failed,
+        }
 
     def get_active_counts(self) -> dict[str, int]:
         """Get count of currently active workers per vendor."""

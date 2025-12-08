@@ -357,7 +357,13 @@ def run_node(
                     logger.warning(f"Failed to get coverage: {e}")
 
             # Update loop status
-            status.update_loop("Workers", running=worker_pool.is_running)
+            worker_stats = worker_pool.get_stats()
+            status.update_loop(
+                "Workers",
+                running=worker_pool.is_running,
+                tasks_completed=worker_stats["processed"],
+                tasks_failed=worker_stats["failed"],
+            )
             status.update_loop("Planner", running=planner_loop.is_running)
             status.update_loop("Maintenance", running=maintenance_loop.is_running)
 
