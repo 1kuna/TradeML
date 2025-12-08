@@ -374,7 +374,7 @@ def clear_stale_tasks(dry_run: bool = False) -> int:
     # Find PENDING tasks where partition is now GREEN
     query = """
         SELECT t.id, t.dataset, t.symbol, t.start_date
-        FROM task_queue t
+        FROM backfill_queue t
         JOIN partition_status p
             ON t.dataset = p.table_name
             AND t.symbol = p.symbol
@@ -406,7 +406,7 @@ def clear_stale_tasks(dry_run: bool = False) -> int:
         batch = task_ids[i:i+500]
         placeholders = ",".join("?" * len(batch))
         conn.execute(f"""
-            UPDATE task_queue
+            UPDATE backfill_queue
             SET status = 'DONE', completed_at = datetime('now')
             WHERE id IN ({placeholders})
         """, batch)
