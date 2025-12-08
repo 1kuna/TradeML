@@ -253,8 +253,8 @@ class BudgetManager:
         with self._lock:
             budget = self._budgets.get(vendor)
             if budget is None:
-                logger.warning(f"Unknown vendor: {vendor}, allowing by default")
-                return True
+                logger.debug(f"Rejecting unknown vendor: {vendor}")
+                return False
 
             self._check_daily_reset(vendor)
             self._refill_tokens(vendor)

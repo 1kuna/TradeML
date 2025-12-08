@@ -178,7 +178,8 @@ def _fetch_equities_eod(task: Task, vendor: str) -> FetchResult:
         elif vendor == "finnhub":
             return _fetch_finnhub_candles(task)
         elif vendor == "fmp":
-            return _fetch_fmp_eod(task)
+            # FMP free tier too limited - reject
+            return FetchResult(status=FetchStatus.NOT_SUPPORTED, error="FMP free tier unsupported")
         else:
             return FetchResult(status=FetchStatus.NOT_SUPPORTED, error=f"Vendor {vendor} not supported for equities_eod")
     except ImportError as e:
@@ -244,7 +245,8 @@ def _fetch_fundamentals(task: Task, vendor: str) -> FetchResult:
     """Fetch fundamentals data."""
     try:
         if vendor == "fmp":
-            return _fetch_fmp_fundamentals(task)
+            # FMP free tier too limited - reject
+            return FetchResult(status=FetchStatus.NOT_SUPPORTED, error="FMP free tier unsupported")
         elif vendor == "finnhub":
             return _fetch_finnhub_fundamentals(task)
         else:

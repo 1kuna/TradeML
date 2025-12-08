@@ -32,12 +32,12 @@ from .fetchers import (
 
 
 # Default concurrency limits per vendor
+# Note: FMP removed - free tier too limited
 DEFAULT_MAX_INFLIGHT = {
     "alpaca": 2,
     "finnhub": 2,
     "fred": 1,
     "av": 1,
-    "fmp": 1,
     "massive": 1,
 }
 
@@ -421,13 +421,13 @@ def run_worker(
 # =============================================================================
 
 # Default thread counts per vendor (sized for latency resilience)
+# Note: FMP removed - free tier too limited
 DEFAULT_THREAD_COUNTS = {
-    "alpaca": 4,    # 150 rpm - high rate, needs headroom for latency
-    "finnhub": 2,   # 50 rpm
-    "fred": 2,      # 80 rpm
-    "av": 1,        # 4 rpm - so slow 1 is plenty
-    "fmp": 1,       # 3 rpm
-    "massive": 1,   # 4 rpm
+    "alpaca": 4,    # 200 rpm - high rate, needs headroom for latency
+    "finnhub": 2,   # 60 rpm
+    "fred": 2,      # 120 rpm
+    "av": 1,        # 5 rpm, 25/day - so slow 1 is plenty
+    "massive": 1,   # 5 rpm
 }
 
 

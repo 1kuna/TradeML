@@ -19,6 +19,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from queue import Queue, Empty, Full
 from typing import Optional
 
 from loguru import logger
@@ -86,10 +87,14 @@ class NodeStatus:
     # Vendor statuses
     vendors: dict[str, VendorStatus] = field(default_factory=dict)
 
-    # Log lines (circular buffer)
+    # Log lines (circular buffer) - only touched by dashboard thread
     log_lines: deque = field(default_factory=lambda: deque(maxlen=20))
 
-    # Thread lock
+    # Thread-safe log queue for worker threads to submit logs
+    # Dashboard thread drains this into log_lines
+    _log_queue: Queue = field(default_factory=lambda: Queue(maxsize=100))
+
+    # Thread lock for other state
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def update_queue_stats(self, stats: dict) -> None:
@@ -119,10 +124,36 @@ class NodeStatus:
                     setattr(self.vendors[name], key, value)
 
     def add_log_line(self, line: str) -> None:
-        """Add a log line to the buffer."""
-        with self._lock:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            self.log_lines.append(f"{timestamp} {line}")
+        """Add a log line directly to buffer (for dashboard thread only)."""
+        # Note: This bypasses the queue and writes directly to log_lines
+        # Only safe to call from the dashboard thread
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_lines.append(f"{timestamp} {line}")
+
+    def queue_log_line(self, line: str) -> None:
+        """Thread-safe: queue a log line for dashboard consumption.
+
+        Worker threads should call this instead of add_log_line().
+        The dashboard thread will drain the queue into log_lines.
+        """
+        try:
+            self._log_queue.put_nowait(line)
+        except Full:
+            pass  # Drop if queue full - prevents blocking workers
+
+    def drain_log_queue(self) -> None:
+        """Drain log queue into log_lines (dashboard thread only).
+
+        Call this from the dashboard render loop to safely transfer
+        queued log lines into the deque that Rich displays.
+        """
+        while True:
+            try:
+                line = self._log_queue.get_nowait()
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                self.log_lines.append(f"{timestamp} {line}")
+            except Empty:
+                break
 
     def get_snapshot(self) -> dict:
         """Get a thread-safe snapshot of the status."""
@@ -335,23 +366,30 @@ class Dashboard:
         with Live(layout, console=self._console, refresh_per_second=2, screen=True) as live:
             while self._running:
                 try:
+                    # Drain log queue in dashboard thread (thread-safe)
+                    self.status.drain_log_queue()
                     self._update_layout(layout)
                     time.sleep(0.5)
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
+                    # Use direct add since we're in dashboard thread
                     self.status.add_log_line(f"Dashboard error: {e}")
                     time.sleep(1)
 
 
 class LogHandler:
-    """Loguru handler that sends logs to NodeStatus."""
+    """Loguru handler that sends logs to NodeStatus.
+
+    Uses queue_log_line() for thread-safe log submission.
+    Worker threads can safely log without blocking or corrupting Rich display.
+    """
 
     def __init__(self, status: NodeStatus):
         self.status = status
 
     def write(self, message):
-        """Write a log message."""
+        """Write a log message (thread-safe via queue)."""
         # Strip ANSI codes and newlines
         text = message.strip()
         if text:
@@ -359,7 +397,8 @@ class LogHandler:
             parts = text.split(" | ")
             if len(parts) >= 3:
                 text = " | ".join(parts[-2:])
-            self.status.add_log_line(text[:100])
+            # Use thread-safe queue instead of direct add
+            self.status.queue_log_line(text[:100])
 
 
 def setup_log_handler(status: NodeStatus) -> int:
