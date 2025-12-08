@@ -407,7 +407,7 @@ def clear_stale_tasks(dry_run: bool = False) -> int:
         placeholders = ",".join("?" * len(batch))
         conn.execute(f"""
             UPDATE backfill_queue
-            SET status = 'DONE', completed_at = datetime('now')
+            SET status = 'DONE'
             WHERE id IN ({placeholders})
         """, batch)
 
