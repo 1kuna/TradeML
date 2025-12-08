@@ -189,17 +189,124 @@ def _fetch_equities_eod(task: Task, vendor: str) -> FetchResult:
 
 
 def _fetch_equities_minute(task: Task, vendor: str) -> FetchResult:
-    """Fetch minute equities bars."""
-    try:
-        if vendor == "alpaca":
-            return _fetch_alpaca_bars(task, timeframe="1Min")
-        elif vendor == "massive":
-            return _fetch_massive_bars(task, timeframe="minute")
-        else:
-            return FetchResult(status=FetchStatus.NOT_SUPPORTED, error=f"Vendor {vendor} not supported for equities_minute")
-    except ImportError as e:
-        logger.warning(f"Connector not available for {vendor}: {e}")
-        return FetchResult(status=FetchStatus.ERROR, error=str(e), vendor_used=vendor)
+    """Fetch minute equities bars.
+
+    For multi-day tasks, chunks into single-day fetches to:
+    - Provide per-day progress visibility
+    - Avoid loading years of data into memory
+    - Enable graceful recovery if a fetch fails partway
+    """
+    from datetime import timedelta
+
+    start_date = _ensure_date(task.start_date)
+    end_date = _ensure_date(task.end_date)
+
+    # For single-day tasks, fetch directly
+    if start_date == end_date:
+        try:
+            if vendor == "alpaca":
+                return _fetch_alpaca_bars(task, timeframe="1Min")
+            elif vendor == "massive":
+                return _fetch_massive_bars(task, timeframe="minute")
+            else:
+                return FetchResult(status=FetchStatus.NOT_SUPPORTED, error=f"Vendor {vendor} not supported for equities_minute")
+        except ImportError as e:
+            logger.warning(f"Connector not available for {vendor}: {e}")
+            return FetchResult(status=FetchStatus.ERROR, error=str(e), vendor_used=vendor)
+
+    # Multi-day task: chunk into single-day fetches
+    logger.info(f"Chunking multi-day minute task: {task.symbol} from {start_date} to {end_date}")
+
+    total_rows = 0
+    rows_by_date: dict[date, int] = {}
+    days_processed = 0
+    days_total = (end_date - start_date).days + 1
+
+    current_date = start_date
+    while current_date <= end_date:
+        # Create a single-day task copy
+        single_day_task = Task(
+            id=task.id,
+            dataset=task.dataset,
+            symbol=task.symbol,
+            start_date=current_date.isoformat(),
+            end_date=current_date.isoformat(),
+            kind=task.kind,
+            priority=task.priority,
+            status=task.status,
+            attempts=task.attempts,
+            lease_owner=task.lease_owner,
+            lease_expires_at=task.lease_expires_at,
+            next_not_before=task.next_not_before,
+            last_error=task.last_error,
+            created_at=task.created_at,
+            updated_at=task.updated_at,
+        )
+
+        try:
+            if vendor == "alpaca":
+                result = _fetch_alpaca_bars(single_day_task, timeframe="1Min")
+            elif vendor == "massive":
+                result = _fetch_massive_bars(single_day_task, timeframe="minute")
+            else:
+                return FetchResult(status=FetchStatus.NOT_SUPPORTED, error=f"Vendor {vendor} not supported for equities_minute")
+
+            # Accumulate results
+            if result.status == FetchStatus.SUCCESS:
+                day_rows = result.rows
+                total_rows += day_rows
+                rows_by_date[current_date] = day_rows
+            elif result.status == FetchStatus.EMPTY:
+                # Weekend/holiday - record 0 rows
+                rows_by_date[current_date] = 0
+            elif result.status in (FetchStatus.RATE_LIMITED, FetchStatus.ERROR):
+                # Return partial progress - the remaining days will be re-fetched via GAP audit
+                logger.warning(f"Chunk fetch failed at {current_date}: {result.error}")
+                if rows_by_date:
+                    return FetchResult(
+                        status=FetchStatus.SUCCESS,  # Partial success
+                        rows=total_rows,
+                        rows_by_date=rows_by_date,
+                        qc_code="PARTIAL",
+                        vendor_used=vendor,
+                        error=f"Partial fetch, failed at {current_date}: {result.error}",
+                    )
+                return result
+            else:
+                # NOT_ENTITLED, NOT_SUPPORTED - propagate immediately
+                return result
+
+        except ImportError as e:
+            logger.warning(f"Connector not available for {vendor}: {e}")
+            return FetchResult(status=FetchStatus.ERROR, error=str(e), vendor_used=vendor)
+        except Exception as e:
+            logger.exception(f"Error fetching {current_date}: {e}")
+            if rows_by_date:
+                return FetchResult(
+                    status=FetchStatus.SUCCESS,
+                    rows=total_rows,
+                    rows_by_date=rows_by_date,
+                    qc_code="PARTIAL",
+                    vendor_used=vendor,
+                    error=f"Partial fetch, failed at {current_date}: {e}",
+                )
+            return FetchResult(status=FetchStatus.ERROR, error=str(e), vendor_used=vendor)
+
+        days_processed += 1
+        if days_processed % 30 == 0:
+            logger.info(f"Progress: {task.symbol} {days_processed}/{days_total} days, {total_rows} rows")
+
+        current_date += timedelta(days=1)
+
+    logger.info(f"Completed multi-day fetch: {task.symbol} {days_total} days, {total_rows} total rows")
+
+    return FetchResult(
+        status=FetchStatus.SUCCESS,
+        rows=total_rows,
+        rows_by_date=rows_by_date,
+        qc_code="OK",
+        vendor_used=vendor,
+    )
 
 
 def _fetch_options_chains(task: Task, vendor: str) -> FetchResult:
