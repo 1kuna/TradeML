@@ -37,6 +37,7 @@ class FetchResult:
     """Result of a fetch operation."""
     status: FetchStatus
     rows: int = 0
+    rows_by_date: Optional[dict[date, int]] = None  # Per-day row counts for multi-day tasks
     partition_status: Optional[PartitionStatus] = None
     qc_code: Optional[str] = None
     error: Optional[str] = None
@@ -283,10 +284,12 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
             return FetchResult(
                 status=FetchStatus.EMPTY,
                 rows=0,
-                partition_status=PartitionStatus.GREEN,
                 qc_code="NO_SESSION",
                 vendor_used="alpaca",
             )
+
+        # Compute per-day row counts for QC validation
+        rows_by_date = _compute_rows_by_date(df)
 
         # Write to raw partition
         table_name = "equities_bars" if timeframe == "1Day" else "equities_bars_minute"
@@ -297,7 +300,7 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
         return FetchResult(
             status=FetchStatus.SUCCESS,
             rows=len(df),
-            partition_status=PartitionStatus.GREEN,
+            rows_by_date=rows_by_date,
             qc_code="OK",
             vendor_used="alpaca",
         )
@@ -411,10 +414,12 @@ def _fetch_massive_bars(task: Task, timeframe: str) -> FetchResult:
             return FetchResult(
                 status=FetchStatus.EMPTY,
                 rows=0,
-                partition_status=PartitionStatus.GREEN,
                 qc_code="NO_SESSION",
                 vendor_used="massive",
             )
+
+        # Compute per-day row counts for QC validation
+        rows_by_date = _compute_rows_by_date(df)
 
         table_name = "equities_bars" if timeframe == "day" else "equities_bars_minute"
         raw_path = _get_raw_path("massive", table_name, task.start_date)
@@ -423,7 +428,7 @@ def _fetch_massive_bars(task: Task, timeframe: str) -> FetchResult:
         return FetchResult(
             status=FetchStatus.SUCCESS,
             rows=len(df),
-            partition_status=PartitionStatus.GREEN,
+            rows_by_date=rows_by_date,
             qc_code="OK",
             vendor_used="massive",
         )
@@ -456,10 +461,12 @@ def _fetch_finnhub_candles(task: Task) -> FetchResult:
             return FetchResult(
                 status=FetchStatus.EMPTY,
                 rows=0,
-                partition_status=PartitionStatus.GREEN,
                 qc_code="NO_SESSION",
                 vendor_used="finnhub",
             )
+
+        # Compute per-day row counts for QC validation
+        rows_by_date = _compute_rows_by_date(df)
 
         raw_path = _get_raw_path("finnhub", "equities_bars", task.start_date)
         connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
@@ -467,7 +474,7 @@ def _fetch_finnhub_candles(task: Task) -> FetchResult:
         return FetchResult(
             status=FetchStatus.SUCCESS,
             rows=len(df),
-            partition_status=PartitionStatus.GREEN,
+            rows_by_date=rows_by_date,
             qc_code="OK",
             vendor_used="finnhub",
         )
@@ -715,6 +722,58 @@ def _fetch_fmp_fundamentals(task: Task) -> FetchResult:
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
+def _compute_rows_by_date(df) -> dict[date, int]:
+    """Compute per-day row counts from a DataFrame.
+
+    Expects the DataFrame to have a 'date' column with date objects.
+    Returns dict mapping date -> row_count for that day.
+    """
+    if df is None or df.empty:
+        return {}
+
+    # Handle different date column formats
+    if "date" in df.columns:
+        date_col = df["date"]
+    elif "timestamp" in df.columns:
+        date_col = df["timestamp"].dt.date
+    else:
+        # Try to find any date-like column
+        for col in df.columns:
+            if "date" in col.lower() or "time" in col.lower():
+                try:
+                    import pandas as pd
+                    if hasattr(df[col], "dt"):
+                        date_col = df[col].dt.date
+                        break
+                    elif df[col].dtype == object:
+                        date_col = pd.to_datetime(df[col]).dt.date
+                        break
+                except Exception:
+                    continue
+        else:
+            # No date column found
+            return {}
+
+    # Group by date and count
+    counts = date_col.value_counts().to_dict()
+
+    # Ensure keys are date objects
+    result = {}
+    for dt, count in counts.items():
+        if isinstance(dt, date):
+            result[dt] = int(count)
+        elif hasattr(dt, "date"):
+            result[dt.date()] = int(count)
+        else:
+            # Try to convert string
+            try:
+                result[date.fromisoformat(str(dt)[:10])] = int(count)
+            except (ValueError, TypeError):
+                pass
+
+    return result
+
 
 def _get_raw_path(
     vendor: str,

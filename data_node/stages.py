@@ -5,6 +5,7 @@ Implements:
 - Stage configuration (universe size, history depth)
 - Stage 0→1 promotion based on GREEN coverage threshold
 - Bootstrap task seeding for new stages
+- Dataset expectations loading (expect_rows, qc_thresholds)
 
 See updated_node_spec.md §4 for stage semantics.
 """
@@ -14,6 +15,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +23,89 @@ import yaml
 from loguru import logger
 
 from .db import NodeDB, TaskKind, get_db
+
+
+# =============================================================================
+# Backfill Config Loading (expect_rows, qc_thresholds)
+# =============================================================================
+
+def _get_backfill_config_path() -> Path:
+    """Get path to backfill.yml config file."""
+    return Path(__file__).parent.parent / "configs" / "backfill.yml"
+
+
+@lru_cache(maxsize=1)
+def _load_backfill_config() -> dict:
+    """Load backfill.yml configuration (cached)."""
+    config_path = _get_backfill_config_path()
+    if not config_path.exists():
+        logger.warning(f"Backfill config not found at {config_path}")
+        return {}
+
+    with open(config_path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def load_dataset_expectations() -> dict[str, dict]:
+    """Load expect_rows and qc_thresholds from backfill.yml.
+
+    Returns:
+        Dict with 'targets' and 'thresholds' keys:
+        - targets: {dataset: {expect_rows, chunk_days, ...}}
+        - thresholds: {rows_low_ratio, rows_high_ratio, allow_halfdays, ...}
+    """
+    config = _load_backfill_config()
+
+    targets = config.get("targets", {})
+    thresholds = config.get("qc_thresholds", {})
+
+    return {
+        "targets": targets,
+        "thresholds": thresholds,
+    }
+
+
+def get_expected_rows(dataset: str, num_days: int = 1) -> int:
+    """Get expected row count for a dataset.
+
+    For multi-day tasks, multiplies per-day expectation by num_days.
+    Returns 0 if no expectation defined (no validation).
+
+    Args:
+        dataset: Dataset name (equities_eod, equities_minute, etc.)
+        num_days: Number of days covered by the task
+
+    Returns:
+        Expected row count (0 means no validation)
+    """
+    expectations = load_dataset_expectations()
+    target = expectations["targets"].get(dataset, {})
+    per_day = target.get("expect_rows", 0)
+    return per_day * num_days
+
+
+def get_qc_thresholds() -> dict:
+    """Get QC threshold configuration.
+
+    Returns:
+        Dict with rows_low_ratio, rows_high_ratio, allow_halfdays, etc.
+        Uses defaults if not configured.
+    """
+    expectations = load_dataset_expectations()
+    thresholds = expectations.get("thresholds", {})
+
+    # Apply defaults
+    return {
+        "rows_low_ratio": thresholds.get("rows_low_ratio", 0.90),
+        "rows_high_ratio": thresholds.get("rows_high_ratio", 1.20),
+        "allow_halfdays": thresholds.get("allow_halfdays", True),
+        "green_min_ratio": thresholds.get("green_min_ratio", 0.98),
+    }
+
+
+def clear_config_cache() -> None:
+    """Clear cached config (for testing or config reload)."""
+    _load_backfill_config.cache_clear()
 
 
 @dataclass

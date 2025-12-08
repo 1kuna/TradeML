@@ -793,6 +793,94 @@ class NodeDB:
 
         return [self._row_to_partition(row) for row in rows]
 
+    def get_partitions_by_status(
+        self,
+        table_name: str,
+        status: PartitionStatus,
+        limit: int = 1000,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> list[PartitionRecord]:
+        """
+        Get partitions with a given status for QC review.
+
+        Used by maintenance QC to find partitions that need row-count validation.
+
+        Args:
+            table_name: Table name to query
+            status: Status to filter by (GREEN, AMBER, RED)
+            limit: Maximum number of records to return
+            start_date: Optional start date filter
+            end_date: Optional end date filter
+
+        Returns:
+            List of PartitionRecord objects
+        """
+        conn = self._get_connection()
+
+        # Build query dynamically
+        conditions = ["table_name = ?", "status = ?"]
+        params: list = [table_name, status.value]
+
+        if start_date:
+            conditions.append("dt >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("dt <= ?")
+            params.append(end_date)
+
+        where_clause = " AND ".join(conditions)
+        params.append(limit)
+
+        rows = conn.execute(f"""
+            SELECT * FROM partition_status
+            WHERE {where_clause}
+            ORDER BY dt DESC
+            LIMIT ?
+        """, params).fetchall()
+
+        return [self._row_to_partition(row) for row in rows]
+
+    def count_partitions_by_status(
+        self,
+        table_name: str,
+        status: PartitionStatus,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> int:
+        """
+        Count partitions with a given status.
+
+        Args:
+            table_name: Table name to query
+            status: Status to filter by
+            start_date: Optional start date filter
+            end_date: Optional end date filter
+
+        Returns:
+            Count of matching partitions
+        """
+        conn = self._get_connection()
+
+        conditions = ["table_name = ?", "status = ?"]
+        params: list = [table_name, status.value]
+
+        if start_date:
+            conditions.append("dt >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("dt <= ?")
+            params.append(end_date)
+
+        where_clause = " AND ".join(conditions)
+
+        row = conn.execute(f"""
+            SELECT COUNT(*) as cnt FROM partition_status
+            WHERE {where_clause}
+        """, params).fetchone()
+
+        return row['cnt'] if row else 0
+
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------

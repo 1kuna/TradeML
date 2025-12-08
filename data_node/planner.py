@@ -282,6 +282,129 @@ def prune_old_failed_tasks(days: int = 30, db: Optional[NodeDB] = None) -> int:
     return deleted
 
 
+def audit_amber_partitions(
+    datasets: Optional[list[str]] = None,
+    db: Optional[NodeDB] = None,
+    limit_per_table: int = 1000,
+) -> int:
+    """
+    Find AMBER partitions and create GAP tasks to refetch them.
+
+    AMBER partitions are those that failed row-count validation during QC
+    (e.g., incomplete data due to API limits). This function creates GAP
+    tasks so the worker pool can refetch them.
+
+    Args:
+        datasets: List of datasets to audit (default: equities_eod, equities_minute)
+        db: Database instance
+        limit_per_table: Maximum partitions to process per table
+
+    Returns:
+        Number of GAP tasks created
+    """
+    if db is None:
+        db = get_db()
+
+    if datasets is None:
+        datasets = ["equities_eod", "equities_minute"]
+
+    created = 0
+
+    for table in datasets:
+        # Get AMBER partitions
+        amber_partitions = db.get_partitions_by_status(
+            table_name=table,
+            status=PartitionStatus.AMBER,
+            limit=limit_per_table,
+        )
+
+        if not amber_partitions:
+            logger.debug(f"No AMBER partitions found for {table}")
+            continue
+
+        logger.info(f"Found {len(amber_partitions)} AMBER partitions in {table}")
+
+        for p in amber_partitions:
+            # Create GAP task for this partition
+            task_id = db.enqueue_task(
+                dataset=table,
+                symbol=p.symbol,
+                start_date=p.dt,
+                end_date=p.dt,
+                kind=TaskKind.GAP,
+                priority=PRIORITY_GAP,
+            )
+
+            if task_id:
+                created += 1
+                logger.debug(f"Created GAP task for AMBER partition: {table}/{p.symbol}/{p.dt}")
+
+    if created > 0:
+        logger.info(f"Created {created} GAP tasks for AMBER partitions")
+
+    return created
+
+
+def audit_red_partitions(
+    datasets: Optional[list[str]] = None,
+    db: Optional[NodeDB] = None,
+    limit_per_table: int = 500,
+) -> int:
+    """
+    Find RED partitions and create high-priority GAP tasks.
+
+    RED partitions are those with complete data loss (0 rows).
+    These get higher priority than AMBER.
+
+    Args:
+        datasets: List of datasets to audit (default: equities_eod, equities_minute)
+        db: Database instance
+        limit_per_table: Maximum partitions to process per table
+
+    Returns:
+        Number of GAP tasks created
+    """
+    if db is None:
+        db = get_db()
+
+    if datasets is None:
+        datasets = ["equities_eod", "equities_minute"]
+
+    created = 0
+
+    for table in datasets:
+        # Get RED partitions
+        red_partitions = db.get_partitions_by_status(
+            table_name=table,
+            status=PartitionStatus.RED,
+            limit=limit_per_table,
+        )
+
+        if not red_partitions:
+            continue
+
+        logger.info(f"Found {len(red_partitions)} RED partitions in {table}")
+
+        for p in red_partitions:
+            # Create high-priority GAP task
+            task_id = db.enqueue_task(
+                dataset=table,
+                symbol=p.symbol,
+                start_date=p.dt,
+                end_date=p.dt,
+                kind=TaskKind.GAP,
+                priority=PRIORITY_BOOTSTRAP,  # Highest priority for complete failures
+            )
+
+            if task_id:
+                created += 1
+
+    if created > 0:
+        logger.info(f"Created {created} high-priority GAP tasks for RED partitions")
+
+    return created
+
+
 class PlannerLoop:
     """
     Background loop that runs gap audits and schedules tasks.
@@ -347,6 +470,7 @@ class PlannerLoop:
 
         Includes:
         - Full gap audit for all datasets
+        - AMBER/RED partition re-queueing
         - Stage promotion check
         - Failed task pruning
 
@@ -357,6 +481,8 @@ class PlannerLoop:
 
         results = {
             "gaps_created": 0,
+            "amber_requeued": 0,
+            "red_requeued": 0,
             "promoted": False,
             "pruned": 0,
         }
@@ -364,6 +490,12 @@ class PlannerLoop:
         # Full gap audit
         gaps = audit_for_gaps(self.datasets, self.db)
         results["gaps_created"] = upsert_gap_tasks(gaps, self.db)
+
+        # Re-queue AMBER partitions (row-count mismatches from QC)
+        results["amber_requeued"] = audit_amber_partitions(self.datasets, self.db)
+
+        # Re-queue RED partitions (complete failures)
+        results["red_requeued"] = audit_red_partitions(self.datasets, self.db)
 
         # Check stage promotion
         results["promoted"] = check_promotion(self.db)
@@ -373,6 +505,8 @@ class PlannerLoop:
 
         logger.info(
             f"Heavy audit complete: {results['gaps_created']} gaps, "
+            f"{results['amber_requeued']} AMBER re-queued, "
+            f"{results['red_requeued']} RED re-queued, "
             f"promoted={results['promoted']}, pruned={results['pruned']}"
         )
 

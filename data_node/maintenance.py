@@ -74,7 +74,7 @@ def run_structural_qc(db: Optional[NodeDB] = None) -> dict:
     Run structural QC checks on partition_status.
 
     Checks:
-    - Row count vs expected
+    - Row count vs expected (validates GREEN partitions have correct row counts)
     - Calendar continuity (no unexpected gaps)
     - Basic outlier detection
 
@@ -84,6 +84,10 @@ def run_structural_qc(db: Optional[NodeDB] = None) -> dict:
     Returns:
         Dict with QC results
     """
+    from .db import PartitionStatus
+    from .qc import calculate_partition_status
+    from .stages import get_expected_rows, get_qc_thresholds
+
     if db is None:
         db = get_db()
 
@@ -92,6 +96,9 @@ def run_structural_qc(db: Optional[NodeDB] = None) -> dict:
     results = {
         "checked": 0,
         "issues": 0,
+        "row_count_mismatches": 0,
+        "updated_to_amber": 0,
+        "updated_to_red": 0,
         "details": [],
     }
 
@@ -102,6 +109,7 @@ def run_structural_qc(db: Optional[NodeDB] = None) -> dict:
     # Check equities_eod and equities_minute
     for table in ["equities_eod", "equities_minute"]:
         try:
+            # 1. Check overall coverage
             coverage = db.get_green_coverage(
                 table_name=table,
                 start_date=week_ago,
@@ -120,10 +128,170 @@ def run_structural_qc(db: Optional[NodeDB] = None) -> dict:
                 })
                 logger.warning(f"Low coverage for {table}: {coverage:.2%}")
 
+            # 2. Validate row counts for GREEN partitions
+            row_count_issues = _validate_partition_row_counts(db, table, results)
+            if row_count_issues > 0:
+                logger.warning(f"Found {row_count_issues} row-count mismatches in {table}")
+
         except Exception as e:
             logger.warning(f"QC check failed for {table}: {e}")
 
     logger.info(f"Structural QC complete: {results['checked']} checked, {results['issues']} issues")
+    return results
+
+
+def _validate_partition_row_counts(
+    db: NodeDB,
+    table_name: str,
+    results: dict,
+    batch_size: int = 10000,
+) -> int:
+    """Validate row counts for GREEN partitions in a table.
+
+    Checks each GREEN partition's row_count against expected_rows.
+    Updates partitions that fail validation to AMBER or RED.
+
+    Args:
+        db: Database instance
+        table_name: Table to validate
+        results: Results dict to update
+        batch_size: How many partitions to check per batch
+
+    Returns:
+        Number of mismatches found
+    """
+    from .db import PartitionStatus
+    from .qc import calculate_partition_status
+    from .stages import get_expected_rows, get_qc_thresholds
+
+    thresholds = get_qc_thresholds()
+    expected_per_day = get_expected_rows(table_name, num_days=1)
+
+    if expected_per_day == 0:
+        # No expectation defined for this table
+        logger.debug(f"No expect_rows defined for {table_name}, skipping row-count validation")
+        return 0
+
+    # Get GREEN partitions to validate
+    partitions = db.get_partitions_by_status(
+        table_name=table_name,
+        status=PartitionStatus.GREEN,
+        limit=batch_size,
+    )
+
+    mismatches = 0
+
+    for p in partitions:
+        # Skip partitions with NO_SESSION (holidays/weekends)
+        if p.qc_code == "NO_SESSION":
+            continue
+
+        # Skip if no expected_rows set (legacy data)
+        if p.expected_rows == 0:
+            continue
+
+        # Validate row count
+        new_status = calculate_partition_status(
+            row_count=p.row_count,
+            expected_rows=p.expected_rows,
+            qc_code=p.qc_code,
+            thresholds=thresholds,
+        )
+
+        if new_status != PartitionStatus.GREEN:
+            mismatches += 1
+            results["issues"] += 1
+            results["row_count_mismatches"] += 1
+
+            # Determine QC code
+            if p.row_count < p.expected_rows:
+                qc_code = "ROW_COUNT_LOW"
+            else:
+                qc_code = "ROW_COUNT_HIGH"
+
+            # Update partition status
+            db.upsert_partition_status(
+                source_name=p.source_name,
+                table_name=table_name,
+                symbol=p.symbol,
+                dt=p.dt,
+                status=new_status,
+                qc_score=0.5,
+                row_count=p.row_count,
+                expected_rows=p.expected_rows,
+                qc_code=qc_code,
+                notes=f"QC: expected {p.expected_rows}, got {p.row_count}",
+            )
+
+            if new_status == PartitionStatus.AMBER:
+                results["updated_to_amber"] += 1
+            else:
+                results["updated_to_red"] += 1
+
+            logger.warning(
+                f"Row mismatch: {table_name}/{p.symbol}/{p.dt} - "
+                f"expected {p.expected_rows}, got {p.row_count} -> {new_status.value}"
+            )
+
+    return mismatches
+
+
+def audit_existing_partitions(db: Optional[NodeDB] = None) -> dict:
+    """Re-evaluate all GREEN partitions with row-count validation.
+
+    One-time migration function to catch existing bad data after deploying
+    the QC fix. Runs through all GREEN partitions and validates row counts.
+
+    Args:
+        db: Database instance
+
+    Returns:
+        Dict with audit results
+    """
+    if db is None:
+        db = get_db()
+
+    logger.info("Auditing existing partitions for row-count issues...")
+
+    results = {
+        "tables_checked": 0,
+        "partitions_checked": 0,
+        "issues_found": 0,
+        "updated_to_amber": 0,
+        "updated_to_red": 0,
+        "by_table": {},
+    }
+
+    for table in ["equities_eod", "equities_minute"]:
+        table_results = {
+            "checked": 0,
+            "issues": 0,
+            "row_count_mismatches": 0,
+            "updated_to_amber": 0,
+            "updated_to_red": 0,
+            "details": [],
+        }
+
+        logger.info(f"Auditing {table}...")
+        mismatches = _validate_partition_row_counts(db, table, table_results, batch_size=50000)
+
+        results["tables_checked"] += 1
+        results["partitions_checked"] += table_results.get("checked", 0)
+        results["issues_found"] += mismatches
+        results["updated_to_amber"] += table_results["updated_to_amber"]
+        results["updated_to_red"] += table_results["updated_to_red"]
+        results["by_table"][table] = {
+            "mismatches": mismatches,
+            "updated_to_amber": table_results["updated_to_amber"],
+            "updated_to_red": table_results["updated_to_red"],
+        }
+
+        logger.info(f"  {table}: {mismatches} issues found")
+
+    logger.info(
+        f"Audit complete: {results['issues_found']} issues found, "
+        f"{results['updated_to_amber']} marked AMBER, {results['updated_to_red']} marked RED"
+    )
     return results
 
 

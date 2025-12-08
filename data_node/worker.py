@@ -29,6 +29,8 @@ from .fetchers import (
     get_vendors_for_dataset,
     VENDOR_PRIORITY,
 )
+from .qc import validate_partition_row_count
+from .stages import get_expected_rows, get_qc_thresholds
 
 
 # Default concurrency limits per vendor
@@ -178,6 +180,7 @@ class QueueWorker:
         Handle the result of a fetch operation.
 
         Updates partition_status and marks task done/failed.
+        For multi-day tasks, creates per-day partition entries with proper validation.
 
         Args:
             task: The task that was processed
@@ -186,19 +189,53 @@ class QueueWorker:
         now = datetime.utcnow()
 
         if result.status == FetchStatus.SUCCESS:
-            # Update partition status to GREEN
-            if result.partition_status:
+            # Get expected rows per day from config
+            expected_per_day = get_expected_rows(task.dataset, num_days=1)
+            thresholds = get_qc_thresholds()
+
+            # Process per-day entries if available
+            if result.rows_by_date:
+                for dt, row_count in result.rows_by_date.items():
+                    # Calculate status for this day
+                    status, qc_code = validate_partition_row_count(
+                        row_count=row_count,
+                        expected_rows=expected_per_day,
+                        qc_code=result.qc_code,
+                        thresholds=thresholds,
+                    )
+
+                    self.db.upsert_partition_status(
+                        source_name=result.vendor_used or "unknown",
+                        table_name=task.dataset,
+                        symbol=task.symbol,
+                        dt=dt.isoformat() if hasattr(dt, 'isoformat') else str(dt),
+                        status=status,
+                        qc_score=1.0 if status == PartitionStatus.GREEN else 0.5,
+                        row_count=row_count,
+                        expected_rows=expected_per_day,
+                        qc_code=qc_code,
+                    )
+            else:
+                # Fallback: single entry for single-day tasks or legacy fetchers
+                status, qc_code = validate_partition_row_count(
+                    row_count=result.rows,
+                    expected_rows=expected_per_day,
+                    qc_code=result.qc_code,
+                    thresholds=thresholds,
+                )
+
                 self.db.upsert_partition_status(
                     source_name=result.vendor_used or "unknown",
                     table_name=task.dataset,
                     symbol=task.symbol,
                     dt=task.start_date,
-                    status=result.partition_status,
-                    qc_score=1.0,
+                    status=status,
+                    qc_score=1.0 if status == PartitionStatus.GREEN else 0.5,
                     row_count=result.rows,
-                    expected_rows=result.rows,
-                    qc_code=result.qc_code,
+                    expected_rows=expected_per_day,
+                    qc_code=qc_code,
                 )
+
             self.db.mark_task_done(task.id)
             logger.info(f"Task {task.id} completed: {result.rows} rows from {result.vendor_used}")
 
@@ -551,29 +588,67 @@ class VendorWorker:
         return True
 
     def _handle_result(self, task: Task, result) -> None:
-        """Handle the result of a fetch operation."""
+        """Handle the result of a fetch operation.
+
+        For multi-day tasks, creates per-day partition entries with proper validation.
+        """
         from .fetchers import FetchStatus
 
         now = datetime.utcnow()
 
         if result.status == FetchStatus.SUCCESS:
-            if result.partition_status:
+            # Get expected rows per day from config
+            expected_per_day = get_expected_rows(task.dataset, num_days=1)
+            thresholds = get_qc_thresholds()
+
+            # Process per-day entries if available
+            if result.rows_by_date:
+                for dt, row_count in result.rows_by_date.items():
+                    # Calculate status for this day
+                    status, qc_code = validate_partition_row_count(
+                        row_count=row_count,
+                        expected_rows=expected_per_day,
+                        qc_code=result.qc_code,
+                        thresholds=thresholds,
+                    )
+
+                    self.db.upsert_partition_status(
+                        source_name=result.vendor_used or self.vendor,
+                        table_name=task.dataset,
+                        symbol=task.symbol,
+                        dt=dt.isoformat() if hasattr(dt, 'isoformat') else str(dt),
+                        status=status,
+                        qc_score=1.0 if status == PartitionStatus.GREEN else 0.5,
+                        row_count=row_count,
+                        expected_rows=expected_per_day,
+                        qc_code=qc_code,
+                    )
+            else:
+                # Fallback: single entry for single-day tasks or legacy fetchers
+                status, qc_code = validate_partition_row_count(
+                    row_count=result.rows,
+                    expected_rows=expected_per_day,
+                    qc_code=result.qc_code,
+                    thresholds=thresholds,
+                )
+
                 self.db.upsert_partition_status(
                     source_name=result.vendor_used or self.vendor,
                     table_name=task.dataset,
                     symbol=task.symbol,
                     dt=task.start_date,
-                    status=result.partition_status,
-                    qc_score=1.0,
+                    status=status,
+                    qc_score=1.0 if status == PartitionStatus.GREEN else 0.5,
                     row_count=result.rows,
-                    expected_rows=result.rows,
-                    qc_code=result.qc_code,
+                    expected_rows=expected_per_day,
+                    qc_code=qc_code,
                 )
+
             self.db.mark_task_done(task.id)
             logger.info(f"Task {task.id} completed: {result.rows} rows from {self.vendor}")
 
         elif result.status == FetchStatus.EMPTY:
-            from .db import PartitionStatus
+            # Empty result (weekend/holiday) - mark as GREEN with NO_SESSION
             self.db.upsert_partition_status(
                 source_name=result.vendor_used or self.vendor,
                 table_name=task.dataset,
