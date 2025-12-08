@@ -39,6 +39,9 @@ class MassiveConnector(BaseConnector):
     # Free tier historical data limit
     FREE_TIER_HISTORY_DAYS = 730  # ~2 years
 
+    # Free tier doesn't include same-day data (T+1 delay)
+    FREE_TIER_DELAY_DAYS = 1
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -75,6 +78,7 @@ class MassiveConnector(BaseConnector):
         Free tier limits:
           - 2 years of historical data for ALL timespans (day and minute)
           - API returns max 50000 results per request
+          - No same-day data (T+1 delay)
 
         For minute data with large date ranges, automatically chunks requests
         to avoid hitting the 5000 default limit.
@@ -91,6 +95,15 @@ class MassiveConnector(BaseConnector):
         if start_date < earliest:
             logger.debug(f"Clamping start_date from {start_date} to {earliest} (free tier limit)")
             start_date = earliest
+
+        # Clamp end_date to exclude recent days (free tier has T+1 delay)
+        latest = date.today() - timedelta(days=self.FREE_TIER_DELAY_DAYS)
+        if start_date > latest:
+            logger.debug(f"Date range {start_date}->{end_date} too recent for free tier (latest={latest}), skipping")
+            return pd.DataFrame()
+        if end_date > latest:
+            logger.debug(f"Clamping end_date from {end_date} to {latest} (free tier delay)")
+            end_date = latest
 
         # For minute data with large ranges, chunk the requests
         if ts == "minute":
@@ -295,7 +308,7 @@ class MassiveConnector(BaseConnector):
         """
         GET /v3/aggs/ticker/{option_ticker}/range/{multiplier}/{timespan}/{from}/{to}
 
-        Free tier allows ~2 years back — clamp start_date accordingly.
+        Free tier allows ~2 years back and has T+1 delay — clamp dates accordingly.
         Returns columns: date, option_ticker, open, high, low, close, volume
         """
         # Clamp to free tier history limit
@@ -303,6 +316,15 @@ class MassiveConnector(BaseConnector):
         if start_date < earliest:
             logger.debug(f"Clamping option start_date from {start_date} to {earliest} (free tier limit)")
             start_date = earliest
+
+        # Clamp end_date to exclude recent days (free tier has T+1 delay)
+        latest = date.today() - timedelta(days=self.FREE_TIER_DELAY_DAYS)
+        if start_date > latest:
+            logger.debug(f"Option date range {start_date}->{end_date} too recent for free tier, skipping")
+            return pd.DataFrame()
+        if end_date > latest:
+            logger.debug(f"Clamping option end_date from {end_date} to {latest} (free tier delay)")
+            end_date = latest
         tspan = timespan if timespan in ("minute", "hour", "day", "week", "month") else "day"
         url = f"{self.API_URL}/v3/aggs/ticker/{option_ticker}/range/{multiplier}/{tspan}/{start_date.isoformat()}/{end_date.isoformat()}"
         try:
