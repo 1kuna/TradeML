@@ -42,7 +42,7 @@ from .budgets import get_budget_manager, BudgetManager
 from .worker import QueueWorkerLoop, QueueWorkerPool
 from .planner import PlannerLoop
 from .maintenance import MaintenanceLoop
-from .stages import get_stage_info, get_current_universe
+from .stages import get_stage_info, get_current_universe, get_date_range
 from .ui import NodeStatus, Dashboard, setup_log_handler, print_simple_status
 
 
@@ -180,7 +180,6 @@ def show_status() -> None:
         status.update_queue_stats(stats)
 
         # Get coverage
-        from .stages import get_date_range
         start, end = get_date_range("equities_eod")
         coverage = db.get_green_coverage(
             table_name="equities_eod",
@@ -188,8 +187,8 @@ def show_status() -> None:
             end_date=end,
         )
         status.green_coverage = coverage
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to get coverage: {e}")
 
     # Get budget status
     try:
@@ -301,14 +300,18 @@ def run_node(
     # Main loop - update status periodically
     logger.info("Data node running. Press Ctrl-C to stop.")
 
+    # Track when we last updated coverage (expensive query)
+    last_coverage_update = 0
+    coverage_update_interval = 60  # seconds
+
     try:
         while not shutdown_requested:
             # Update queue stats
             try:
                 stats = db.get_queue_stats()
                 status.update_queue_stats(stats)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to get queue stats: {e}")
 
             # Update budget status
             try:
@@ -320,8 +323,23 @@ def run_node(
                         tokens_rpm=budget_status["tokens_rpm"],
                         hard_rpm=budget_status["hard_rpm"],
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to get budget status: {e}")
+
+            # Update coverage (every 60 seconds - expensive query)
+            now = time.time()
+            if now - last_coverage_update >= coverage_update_interval:
+                try:
+                    start, end = get_date_range("equities_eod")
+                    coverage = db.get_green_coverage(
+                        table_name="equities_eod",
+                        start_date=start,
+                        end_date=end,
+                    )
+                    status.green_coverage = coverage
+                    last_coverage_update = now
+                except Exception as e:
+                    logger.warning(f"Failed to get coverage: {e}")
 
             # Update loop status
             status.update_loop("Workers", running=worker_pool.is_running)
