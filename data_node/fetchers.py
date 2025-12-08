@@ -423,77 +423,21 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
 
 
 def _fetch_alpaca_options(task: Task) -> FetchResult:
-    """Fetch options data from Alpaca."""
-    from data_layer.connectors.alpaca_connector import AlpacaConnector
-
-    connector = AlpacaConnector()
-
-    try:
-        if not task.symbol:
-            return FetchResult(status=FetchStatus.ERROR, error="No underlier specified")
-
-        df = connector.fetch_option_chain_snapshot_df(task.symbol)
-
-        if df is None or df.empty:
-            return FetchResult(
-                status=FetchStatus.EMPTY,
-                rows=0,
-                partition_status=PartitionStatus.GREEN,
-                qc_code="NO_SESSION",
-                vendor_used="alpaca",
-            )
-
-        raw_path = _get_raw_path("alpaca", "options_chains", task.start_date, underlier=task.symbol)
-        connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
-
-        return FetchResult(
-            status=FetchStatus.SUCCESS,
-            rows=len(df),
-            partition_status=PartitionStatus.GREEN,
-            qc_code="OK",
-            vendor_used="alpaca",
-        )
-
-    except Exception as e:
-        return _handle_exception(e, "alpaca")
+    """Fetch options data from Alpaca (not supported - requires SDK)."""
+    return FetchResult(
+        status=FetchStatus.NOT_SUPPORTED,
+        error="Alpaca options requires SDK (removed - REST only)",
+        vendor_used="alpaca",
+    )
 
 
 def _fetch_alpaca_corp_actions(task: Task) -> FetchResult:
-    """Fetch corporate actions from Alpaca."""
-    from data_layer.connectors.alpaca_connector import AlpacaConnector
-
-    connector = AlpacaConnector()
-
-    try:
-        symbols = [task.symbol] if task.symbol else None
-        df = connector.fetch_corporate_actions(
-            start=_ensure_date(task.start_date),
-            end=_ensure_date(task.end_date),
-            symbols=symbols,
-        )
-
-        if df is None or df.empty:
-            return FetchResult(
-                status=FetchStatus.EMPTY,
-                rows=0,
-                partition_status=PartitionStatus.GREEN,
-                qc_code="NO_ACTIONS",
-                vendor_used="alpaca",
-            )
-
-        raw_path = _get_raw_path("alpaca", "corp_actions", task.start_date)
-        connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
-
-        return FetchResult(
-            status=FetchStatus.SUCCESS,
-            rows=len(df),
-            partition_status=PartitionStatus.GREEN,
-            qc_code="OK",
-            vendor_used="alpaca",
-        )
-
-    except Exception as e:
-        return _handle_exception(e, "alpaca")
+    """Fetch corporate actions from Alpaca (not supported - requires SDK)."""
+    return FetchResult(
+        status=FetchStatus.NOT_SUPPORTED,
+        error="Alpaca corporate actions requires SDK (removed - REST only)",
+        vendor_used="alpaca",
+    )
 
 
 # -----------------------------------------------------------------------------
