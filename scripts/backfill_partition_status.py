@@ -200,6 +200,8 @@ def backfill_partition_status(
         "partitions_created": 0,
         "partitions_skipped": 0,
         "errors": 0,
+        "corrupted_files": [],
+        "malformed_dirs": [],
     }
 
     # Known vendors that write data
@@ -274,11 +276,84 @@ def backfill_partition_status(
                                         stats["partitions_created"] += 1
 
                         except Exception as e:
-                            logger.error(f"    Error processing {parquet_path}: {e}")
+                            error_msg = str(e)
                             stats["errors"] += 1
+
+                            # Track corrupted parquet files
+                            if "PAR1" in error_msg or "out of specification" in error_msg:
+                                stats["corrupted_files"].append(parquet_path)
+                                # Check for malformed nested date directories
+                                path_str = str(parquet_path)
+                                if path_str.count("/date=") > 1:
+                                    # Find the first date= dir that contains another date= dir
+                                    parts = path_str.split("/date=")
+                                    if len(parts) > 2:
+                                        malformed = path_str.split("/date=")[0] + "/date=" + parts[1].split("/")[0]
+                                        if malformed not in stats["malformed_dirs"]:
+                                            stats["malformed_dirs"].append(malformed)
+                            else:
+                                logger.error(f"    Error processing {parquet_path}: {e}")
                             continue
 
     return stats
+
+
+def cleanup_corrupted_files(stats: dict, dry_run: bool = False) -> dict:
+    """
+    Clean up corrupted parquet files and malformed directories found during scan.
+
+    Args:
+        stats: Stats dict from backfill_partition_status containing corrupted_files and malformed_dirs
+        dry_run: If True, only preview what would be deleted
+
+    Returns:
+        Dict with cleanup results
+    """
+    import shutil
+
+    results = {
+        "files_deleted": 0,
+        "dirs_deleted": 0,
+        "bytes_freed": 0,
+    }
+
+    # Delete malformed directories first (they contain the corrupted files)
+    for dir_path in stats.get("malformed_dirs", []):
+        dir_path = Path(dir_path)
+        if dir_path.exists():
+            if dry_run:
+                # Calculate size
+                size = sum(f.stat().st_size for f in dir_path.rglob("*") if f.is_file())
+                logger.info(f"  [DRY RUN] Would delete malformed dir: {dir_path} ({size / 1024 / 1024:.1f} MB)")
+                results["bytes_freed"] += size
+            else:
+                try:
+                    size = sum(f.stat().st_size for f in dir_path.rglob("*") if f.is_file())
+                    shutil.rmtree(dir_path)
+                    results["dirs_deleted"] += 1
+                    results["bytes_freed"] += size
+                    logger.info(f"  Deleted malformed dir: {dir_path}")
+                except Exception as e:
+                    logger.error(f"  Failed to delete {dir_path}: {e}")
+
+    # Delete individual corrupted files (if not already deleted with their parent dir)
+    for file_path in stats.get("corrupted_files", []):
+        file_path = Path(file_path)
+        if file_path.exists():
+            if dry_run:
+                size = file_path.stat().st_size
+                logger.info(f"  [DRY RUN] Would delete corrupted file: {file_path} ({size / 1024:.1f} KB)")
+                results["bytes_freed"] += size
+            else:
+                try:
+                    size = file_path.stat().st_size
+                    file_path.unlink()
+                    results["files_deleted"] += 1
+                    results["bytes_freed"] += size
+                except Exception as e:
+                    logger.error(f"  Failed to delete {file_path}: {e}")
+
+    return results
 
 
 def clear_stale_tasks(dry_run: bool = False) -> int:
@@ -363,6 +438,11 @@ def main():
         help="Also clear redundant PENDING tasks after backfilling",
     )
     parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Delete corrupted parquet files and malformed directories found during scan",
+    )
+    parser.add_argument(
         "--data-root",
         default=os.environ.get("DATA_ROOT", "."),
         help="Path to DATA_ROOT (default: from env or current dir)",
@@ -397,6 +477,27 @@ def main():
     logger.info(f"  Partitions found: {stats['partitions_found']}")
     logger.info(f"  Partitions created: {stats['partitions_created']}")
     logger.info(f"  Errors: {stats['errors']}")
+    logger.info(f"  Corrupted files: {len(stats['corrupted_files'])}")
+    logger.info(f"  Malformed dirs: {len(stats['malformed_dirs'])}")
+
+    # Clean up corrupted files if requested
+    if args.cleanup and (stats['corrupted_files'] or stats['malformed_dirs']):
+        logger.info("")
+        logger.info("Cleaning up corrupted files and malformed directories...")
+        cleanup_results = cleanup_corrupted_files(stats, dry_run=args.dry_run)
+        if args.dry_run:
+            logger.info(f"  [DRY RUN] Would free: {cleanup_results['bytes_freed'] / 1024 / 1024:.1f} MB")
+        else:
+            logger.info(f"  Directories deleted: {cleanup_results['dirs_deleted']}")
+            logger.info(f"  Files deleted: {cleanup_results['files_deleted']}")
+            logger.info(f"  Space freed: {cleanup_results['bytes_freed'] / 1024 / 1024:.1f} MB")
+    elif stats['corrupted_files'] or stats['malformed_dirs']:
+        logger.info("")
+        logger.info("Found corrupted data. Run with --cleanup to remove:")
+        for d in stats['malformed_dirs'][:5]:
+            logger.info(f"  {d}")
+        if len(stats['malformed_dirs']) > 5:
+            logger.info(f"  ... and {len(stats['malformed_dirs']) - 5} more directories")
 
     # Optionally clear redundant tasks
     if args.clear_tasks:
