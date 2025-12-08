@@ -64,12 +64,20 @@ class MassiveConnector(BaseConnector):
     def _transform(self, raw_data, **kwargs) -> pd.DataFrame:  # unused abstract
         return pd.DataFrame()
 
+    # API result limits
+    API_LIMIT = 50000  # Max results per request (Polygon allows up to 50k)
+    MINUTE_CHUNK_DAYS = 10  # Days per chunk for minute data (~3900 bars, safe under 5000)
+
     # -------- Aggregates --------
     def fetch_aggregates(self, symbol: str, start_date: date, end_date: date, timespan: str = "day") -> pd.DataFrame:
         """Fetch aggregates for a symbol between dates (inclusive). timespan in {'day','minute'}.
 
         Free tier limits:
           - 2 years of historical data for ALL timespans (day and minute)
+          - API returns max 50000 results per request
+
+        For minute data with large date ranges, automatically chunks requests
+        to avoid hitting the 5000 default limit.
 
         Returns columns: date, symbol, open, high, low, close, volume
         """
@@ -84,9 +92,18 @@ class MassiveConnector(BaseConnector):
             logger.debug(f"Clamping start_date from {start_date} to {earliest} (free tier limit)")
             start_date = earliest
 
+        # For minute data with large ranges, chunk the requests
+        if ts == "minute":
+            return self._fetch_aggregates_chunked(symbol, start_date, end_date, ts)
+
+        # For daily data, single request is usually sufficient
+        return self._fetch_aggregates_single(symbol, start_date, end_date, ts)
+
+    def _fetch_aggregates_single(self, symbol: str, start_date: date, end_date: date, ts: str) -> pd.DataFrame:
+        """Fetch aggregates in a single request."""
         url = f"{self.API_URL}/v2/aggs/ticker/{symbol}/range/1/{ts}/{start_date.isoformat()}/{end_date.isoformat()}"
         try:
-            r = self._get(url, params=self._auth_params())
+            r = self._get(url, params={**self._auth_params(), "limit": self.API_LIMIT})
             data = r.json()
             results = data.get("results", []) if isinstance(data, dict) else []
             if not results:
@@ -107,8 +124,39 @@ class MassiveConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=url)
         except Exception as e:
-            logger.warning(f"Massive aggregates fetch failed for {symbol} {start_date}->{end_date} {timespan}: {e}")
+            logger.warning(f"Massive aggregates fetch failed for {symbol} {start_date}->{end_date} {ts}: {e}")
             return pd.DataFrame()
+
+    def _fetch_aggregates_chunked(self, symbol: str, start_date: date, end_date: date, ts: str) -> pd.DataFrame:
+        """Fetch minute aggregates in chunks to avoid API limit.
+
+        Chunks by MINUTE_CHUNK_DAYS to stay under API result limits.
+        """
+        total_days = (end_date - start_date).days + 1
+        num_chunks = (total_days + self.MINUTE_CHUNK_DAYS - 1) // self.MINUTE_CHUNK_DAYS
+
+        if num_chunks > 1:
+            logger.info(f"Chunking {symbol} minute data: {total_days} days → {num_chunks} requests")
+
+        all_dfs = []
+        chunk_start = start_date
+
+        while chunk_start <= end_date:
+            chunk_end = min(chunk_start + timedelta(days=self.MINUTE_CHUNK_DAYS - 1), end_date)
+
+            df = self._fetch_aggregates_single(symbol, chunk_start, chunk_end, ts)
+            if df is not None and not df.empty:
+                all_dfs.append(df)
+
+            chunk_start = chunk_end + timedelta(days=1)
+
+        if not all_dfs:
+            return pd.DataFrame()
+
+        combined = pd.concat(all_dfs, ignore_index=True)
+        # Remove duplicate rows (in case of overlapping chunks)
+        combined = combined.drop_duplicates(subset=["date", "symbol", "open", "high", "low", "close"])
+        return combined
 
     # -------- Reference: splits & dividends --------
     def fetch_splits(self, symbol: str) -> pd.DataFrame:
