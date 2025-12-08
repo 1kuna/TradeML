@@ -81,6 +81,10 @@ class NodeStatus:
     universe_size: int = 0
     green_coverage: float = 0.0
 
+    # Partition stats (actual completed data)
+    partitions_green: int = 0
+    partitions_total: int = 0
+
     # Loop statuses
     loops: dict[str, LoopStatus] = field(default_factory=dict)
 
@@ -170,6 +174,8 @@ class NodeStatus:
                 "current_stage": self.current_stage,
                 "universe_size": self.universe_size,
                 "green_coverage": self.green_coverage,
+                "partitions_green": self.partitions_green,
+                "partitions_total": self.partitions_total,
                 "loops": {k: v.__dict__.copy() for k, v in self.loops.items()},
                 "vendors": {k: v.__dict__.copy() for k, v in self.vendors.items()},
                 "log_lines": list(self.log_lines),
@@ -185,8 +191,9 @@ def make_header_panel(status: NodeStatus) -> Panel:
         f"[bold cyan]ENV[/] {snapshot['env']}  "
         f"[bold cyan]STAGE[/] {snapshot['current_stage']}",
         f"[bold cyan]ROOT[/] {snapshot['data_root']}",
+        f"[bold cyan]PARTITIONS[/] "
+        f"[green]{snapshot['partitions_green']:,}[/] GREEN / {snapshot['partitions_total']:,} total  "
         f"[bold cyan]QUEUE[/] "
-        f"[green]{snapshot['queue_done']}[/] done  "
         f"[yellow]{snapshot['queue_pending']}[/] pending  "
         f"[blue]{snapshot['queue_leased']}[/] active  "
         f"[red]{snapshot['queue_failed']}[/] failed",
@@ -423,10 +430,13 @@ def print_simple_status(status: NodeStatus) -> None:
     print(f"Universe: {snapshot['universe_size']} symbols")
     print(f"Coverage: {snapshot['green_coverage']:.1%}")
 
+    print("\n--- Partitions ---")
+    print(f"GREEN: {snapshot['partitions_green']:,}")
+    print(f"Total: {snapshot['partitions_total']:,}")
+
     print("\n--- Queue ---")
     print(f"Pending: {snapshot['queue_pending']}")
     print(f"Active: {snapshot['queue_leased']}")
-    print(f"Done: {snapshot['queue_done']}")
     print(f"Failed: {snapshot['queue_failed']}")
 
     print("\n--- Loops ---")

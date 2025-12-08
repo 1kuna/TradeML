@@ -173,7 +173,7 @@ def show_status() -> None:
     except Exception:
         pass
 
-    # Get queue stats
+    # Get queue stats and partition counts
     try:
         db = get_db()
         stats = db.get_queue_stats()
@@ -187,8 +187,15 @@ def show_status() -> None:
             end_date=end,
         )
         status.green_coverage = coverage
+
+        # Get partition counts
+        conn = db._get_connection()
+        row = conn.execute("SELECT COUNT(*) FROM partition_status").fetchone()
+        status.partitions_total = row[0] if row else 0
+        row = conn.execute("SELECT COUNT(*) FROM partition_status WHERE status='GREEN'").fetchone()
+        status.partitions_green = row[0] if row else 0
     except Exception as e:
-        logger.warning(f"Failed to get coverage: {e}")
+        logger.warning(f"Failed to get stats: {e}")
 
     # Get budget status
     try:
@@ -326,7 +333,7 @@ def run_node(
             except Exception as e:
                 logger.warning(f"Failed to get budget status: {e}")
 
-            # Update coverage (every 60 seconds - expensive query)
+            # Update coverage and partition counts (every 60 seconds - expensive queries)
             now = time.time()
             if now - last_coverage_update >= coverage_update_interval:
                 try:
@@ -337,6 +344,14 @@ def run_node(
                         end_date=end,
                     )
                     status.green_coverage = coverage
+
+                    # Get partition counts
+                    conn = db._get_connection()
+                    row = conn.execute("SELECT COUNT(*) FROM partition_status").fetchone()
+                    status.partitions_total = row[0] if row else 0
+                    row = conn.execute("SELECT COUNT(*) FROM partition_status WHERE status='GREEN'").fetchone()
+                    status.partitions_green = row[0] if row else 0
+
                     last_coverage_update = now
                 except Exception as e:
                     logger.warning(f"Failed to get coverage: {e}")
