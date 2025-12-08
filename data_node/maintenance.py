@@ -459,6 +459,7 @@ class MaintenanceLoop:
         # Tracking
         self._last_run_date: Optional[date] = None
         self._last_run_results: Optional[dict] = None
+        self._last_tick: Optional[datetime] = None
 
         # Loop control
         self._running = False
@@ -542,6 +543,7 @@ class MaintenanceLoop:
         Returns:
             Maintenance results if run, None otherwise
         """
+        self._last_tick = datetime.now()
         if self.should_run():
             return self.run()
         return None
@@ -593,6 +595,11 @@ class MaintenanceLoop:
     def is_running(self) -> bool:
         """Check if the loop is running."""
         return self._running
+
+    @property
+    def last_tick(self) -> Optional[datetime]:
+        """Get the timestamp of the last tick."""
+        return self._last_tick
 
     def get_status(self) -> dict:
         """Get maintenance status for display."""

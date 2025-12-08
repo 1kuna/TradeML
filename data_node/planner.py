@@ -443,6 +443,7 @@ class PlannerLoop:
         self._last_forward_check: Optional[datetime] = None
         self._last_light_audit: Optional[datetime] = None
         self._last_heavy_audit_date: Optional[date] = None
+        self._last_tick: Optional[datetime] = None
 
         # Loop control
         self._running = False
@@ -583,6 +584,7 @@ class PlannerLoop:
         if self.should_run_forward():
             actions["forward_tasks"] = self.run_forward_check()
 
+        self._last_tick = datetime.now()
         return actions
 
     def start(self, threaded: bool = True) -> None:
@@ -638,6 +640,11 @@ class PlannerLoop:
     def is_running(self) -> bool:
         """Check if the loop is running."""
         return self._running
+
+    @property
+    def last_tick(self) -> Optional[datetime]:
+        """Get the timestamp of the last tick."""
+        return self._last_tick
 
     def get_status(self) -> dict:
         """Get planner status for display."""

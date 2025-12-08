@@ -364,8 +364,16 @@ def run_node(
                 tasks_completed=worker_stats["processed"],
                 tasks_failed=worker_stats["failed"],
             )
-            status.update_loop("Planner", running=planner_loop.is_running)
-            status.update_loop("Maintenance", running=maintenance_loop.is_running)
+            status.update_loop(
+                "Planner",
+                running=planner_loop.is_running,
+                last_run=planner_loop.last_tick,
+            )
+            status.update_loop(
+                "Maintenance",
+                running=maintenance_loop.is_running,
+                last_run=maintenance_loop.last_tick,
+            )
 
             time.sleep(1)
 
