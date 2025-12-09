@@ -98,7 +98,7 @@ class AlpacaConnector(BaseConnector):
             "timeframe": timeframe,
             "start": f"{start_date.isoformat()}T00:00:00Z",
             "end": f"{end_date.isoformat()}T23:59:59Z",
-            "feed": "iex",
+            "feed": "sip",
             "symbols": ",".join(symbols),
             "limit": 10000,
         }

@@ -36,11 +36,11 @@ from .stages import get_expected_rows, get_qc_thresholds
 # Default concurrency limits per vendor
 # Note: FMP removed - free tier too limited
 DEFAULT_MAX_INFLIGHT = {
-    "alpaca": 2,
+    "alpaca": 8,   # Increased for higher throughput (200 rpm limit)
     "finnhub": 2,
     "fred": 1,
     "av": 1,
-    "massive": 1,
+    "massive": 2,
 }
 
 # Default lease TTL in seconds
@@ -161,8 +161,8 @@ class QueueWorker:
             self._inflight[vendor] = self._inflight.get(vendor, 0) + 1
 
         try:
-            # Spend budget token
-            self.budgets.spend(vendor)
+            # Budget is tracked per HTTP request in base.py._get()
+            # (not per task, since multi-day tasks make many API calls)
 
             # Execute fetch
             result = fetch_task(task, vendor)
@@ -565,8 +565,8 @@ class VendorWorker:
         if task is None:
             return False
 
-        # Spend budget token
-        self.budgets.spend(self.vendor)
+        # Budget is tracked per HTTP request in base.py._get()
+        # (not per task, since multi-day tasks make many API calls)
 
         # Execute fetch
         from .fetchers import fetch_task, FetchResult, FetchStatus

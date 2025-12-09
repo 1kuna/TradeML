@@ -150,6 +150,15 @@ class BaseConnector(ABC):
                 response = self.session.get(url, params=params, headers=headers, timeout=30)
                 logger.debug(f"HTTP GET retry status: {response.status_code} for {url}")
             response.raise_for_status()
+
+            # Track budget per HTTP request (not per task)
+            # This gives accurate API call counts in the dashboard
+            try:
+                from data_node.budgets import get_budget_manager
+                get_budget_manager().spend(self.source_name)
+            except Exception:
+                pass  # Budget tracking optional - don't fail requests
+
             return response
         except requests.exceptions.RequestException as e:
             if isinstance(getattr(e, "reason", None), NameResolutionError) or "Failed to resolve" in str(e):
