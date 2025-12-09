@@ -151,9 +151,7 @@ class NodeDB:
             db_path = Path(data_root) / "data_layer" / "control" / "node.sqlite"
 
         self.db_path = Path(db_path)
-        # Semaphore allows N concurrent lease attempts (vs mutex which serializes all)
-        # Race protection is handled by UPDATE WHERE + rowcount check
-        self._lease_semaphore = threading.Semaphore(4)
+        self._lock = threading.Lock()
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get thread-local connection with proper settings."""
@@ -330,7 +328,7 @@ class NodeDB:
         now_str = now.isoformat()
         lease_expires_str = lease_expires.isoformat()
 
-        with self._lease_semaphore:
+        with self._lock:
             with self.transaction() as conn:
                 # Find next eligible task
                 # Treat expired leases as PENDING
@@ -412,7 +410,7 @@ class NodeDB:
         # Build dataset IN clause
         placeholders = ",".join("?" * len(datasets))
 
-        with self._lease_semaphore:
+        with self._lock:
             with self.transaction() as conn:
                 # Find next eligible task for this vendor's datasets
                 row = conn.execute(f"""

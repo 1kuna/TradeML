@@ -90,8 +90,6 @@ class RequestPacer:
         if not self.enabled:
             return
         lk = self._lock_for(vendor)
-
-        # Calculate sleep time and schedule next slot inside lock (fast)
         with lk:
             st = self._state_for(vendor, rps)
             now = time.time()
@@ -100,15 +98,9 @@ class RequestPacer:
                 # Apply small positive jitter to avoid lockstep
                 jmin, jmax = self.jitter_ms_range
                 jitter = random.uniform(jmin / 1000.0, jmax / 1000.0)
-                sleep_time = wait_for + jitter
-            else:
-                sleep_time = 0
-            # Schedule next slot BEFORE releasing lock
-            # This ensures proper spacing even with concurrent threads
+                time.sleep(wait_for + jitter)
+                now = time.time()
+            # Schedule next slot
             base = max(now, st.next_allowed_ts)
             st.next_allowed_ts = base + st.interval_s
-
-        # Sleep OUTSIDE lock - allows other threads to schedule their slots
-        if sleep_time > 0:
-            time.sleep(sleep_time)
 
