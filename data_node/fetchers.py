@@ -478,9 +478,39 @@ def _fetch_massive_bars(task: Task, timeframe: str) -> FetchResult:
     from data_layer.connectors.massive_connector import MassiveConnector
 
     connector = MassiveConnector()
+    start_date = _ensure_date(task.start_date)
+    end_date = _ensure_date(task.end_date)
 
     # Track fetch params for lineage
     fetch_params = {"timespan": timeframe}
+
+    # Respect Massive free-tier history (2y) and T+1 delay by refusing tasks outside the window.
+    earliest = date.today() - timedelta(days=connector.FREE_TIER_HISTORY_DAYS)
+    latest = date.today() - timedelta(days=connector.FREE_TIER_DELAY_DAYS)
+
+    if end_date < earliest or start_date < earliest:
+        # Too old for Massive free tier — let the worker switch vendors (e.g., Alpaca).
+        return FetchResult(
+            status=FetchStatus.NOT_ENTITLED,
+            error=(
+                f"massive free tier is limited to {connector.FREE_TIER_HISTORY_DAYS} days; "
+                f"requested {start_date}..{end_date}"
+            ),
+            vendor_used="massive",
+            fetch_params={**fetch_params, "blocked_reason": "history_limit"},
+        )
+
+    if start_date > latest:
+        # Too recent for Massive (T+1 delay); avoid AMBER empties.
+        return FetchResult(
+            status=FetchStatus.NOT_ENTITLED,
+            error=(
+                f"massive free tier has T+1 delay (latest {latest}); "
+                f"requested {start_date}..{end_date}"
+            ),
+            vendor_used="massive",
+            fetch_params={**fetch_params, "blocked_reason": "t_plus_one_limit"},
+        )
 
     try:
         if not task.symbol:
@@ -488,8 +518,8 @@ def _fetch_massive_bars(task: Task, timeframe: str) -> FetchResult:
 
         df = connector.fetch_aggregates(
             symbol=task.symbol,
-            start_date=_ensure_date(task.start_date),
-            end_date=_ensure_date(task.end_date),
+            start_date=start_date,
+            end_date=end_date,
             timespan=timeframe,
         )
 
