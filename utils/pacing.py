@@ -89,8 +89,10 @@ class RequestPacer:
     def acquire(self, vendor: str, rps: float) -> None:
         if not self.enabled:
             return
+        t_start = time.time()
         lk = self._lock_for(vendor)
         with lk:
+            t_lock_acquired = time.time()
             st = self._state_for(vendor, rps)
             now = time.time()
             wait_for = st.next_allowed_ts - now
@@ -98,9 +100,21 @@ class RequestPacer:
                 # Apply small positive jitter to avoid lockstep
                 jmin, jmax = self.jitter_ms_range
                 jitter = random.uniform(jmin / 1000.0, jmax / 1000.0)
-                time.sleep(wait_for + jitter)
+                actual_sleep = wait_for + jitter
+                time.sleep(actual_sleep)
                 now = time.time()
+            else:
+                actual_sleep = 0
             # Schedule next slot
             base = max(now, st.next_allowed_ts)
             st.next_allowed_ts = base + st.interval_s
+
+        # Log timing if significant wait occurred
+        total_ms = (time.time() - t_start) * 1000
+        lock_wait_ms = (t_lock_acquired - t_start) * 1000
+        if total_ms > 100:  # Only log if pacing took >100ms
+            import logging
+            logging.getLogger(__name__).info(
+                f"[PACING] {vendor}: total={total_ms:.0f}ms (lock_wait={lock_wait_ms:.0f}ms, sleep={actual_sleep*1000:.0f}ms)"
+            )
 

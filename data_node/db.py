@@ -410,9 +410,16 @@ class NodeDB:
         # Build dataset IN clause
         placeholders = ",".join("?" * len(datasets))
 
+        import time as _time
+        t_start = _time.time()
+
         with self._lock:
+            t_lock_acquired = _time.time()
+            lock_wait_ms = (t_lock_acquired - t_start) * 1000
+
             with self.transaction() as conn:
                 # Find next eligible task for this vendor's datasets
+                t_query_start = _time.time()
                 row = conn.execute(f"""
                     SELECT *
                     FROM backfill_queue
@@ -422,13 +429,19 @@ class NodeDB:
                     ORDER BY priority ASC, created_at ASC
                     LIMIT 1
                 """, (*datasets, now_str, now_str)).fetchone()
+                t_query_end = _time.time()
+                query_ms = (t_query_end - t_query_start) * 1000
 
                 if row is None:
+                    total_ms = (_time.time() - t_start) * 1000
+                    if lock_wait_ms > 20:  # Log if lock wait was significant
+                        logger.info(f"[DB-LEASE] {vendor}: no task, total={total_ms:.0f}ms (lock_wait={lock_wait_ms:.0f}ms, query={query_ms:.0f}ms)")
                     return None
 
                 task_id = row['id']
 
                 # Attempt to lease it
+                t_update_start = _time.time()
                 cursor = conn.execute("""
                     UPDATE backfill_queue
                     SET status = 'LEASED',
@@ -438,6 +451,8 @@ class NodeDB:
                     WHERE id = ?
                       AND (status = 'PENDING' OR (status = 'LEASED' AND lease_expires_at < ?))
                 """, (node_id, lease_expires_str, now_str, task_id, now_str))
+                t_update_end = _time.time()
+                update_ms = (t_update_end - t_update_start) * 1000
 
                 if cursor.rowcount == 0:
                     # Race condition - someone else got it
@@ -453,7 +468,8 @@ class NodeDB:
                     return None
 
                 task = self._row_to_task(row)
-                logger.debug(f"Leased task {task.id} for {vendor}: {task.kind.value} {task.dataset}/{task.symbol}")
+                total_ms = (_time.time() - t_start) * 1000
+                logger.info(f"[DB-LEASE] {vendor}: task={task.id}, total={total_ms:.0f}ms (lock_wait={lock_wait_ms:.0f}ms, query={query_ms:.0f}ms, update={update_ms:.0f}ms)")
                 return task
 
     def mark_task_done(self, task_id: int) -> bool:

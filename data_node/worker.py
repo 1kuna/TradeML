@@ -551,6 +551,9 @@ class VendorWorker:
         Returns:
             True if a task was processed, False if none available
         """
+        import time as _time
+        t_start = _time.time()
+
         # Check budget before leasing
         # Use GAP as default kind since we don't know the task kind yet
         if not self.budgets.can_spend(self.vendor, TaskKind.GAP):
@@ -558,14 +561,19 @@ class VendorWorker:
             return False
 
         # Lease next task for this vendor
+        t_lease_start = _time.time()
         task = self.db.lease_next_task_for_vendor(
             vendor=self.vendor,
             datasets=self.datasets,
             node_id=self.node_id,
             lease_ttl_seconds=DEFAULT_LEASE_TTL,
         )
+        t_lease_end = _time.time()
+        lease_ms = (t_lease_end - t_lease_start) * 1000
 
         if task is None:
+            if lease_ms > 50:  # Only log if lease took unusually long
+                logger.info(f"[TIMING] {self.vendor}-{self.worker_id}: lease (no task) took {lease_ms:.0f}ms")
             return False
 
         # Budget is tracked per HTTP request in base.py._get()
@@ -574,6 +582,7 @@ class VendorWorker:
         # Execute fetch
         from .fetchers import fetch_task, FetchResult, FetchStatus
 
+        t_fetch_start = _time.time()
         try:
             result = fetch_task(task, self.vendor)
             result.vendor_used = self.vendor
@@ -584,10 +593,19 @@ class VendorWorker:
                 error=str(e),
                 vendor_used=self.vendor,
             )
+        t_fetch_end = _time.time()
+        fetch_ms = (t_fetch_end - t_fetch_start) * 1000
 
         # Handle result
+        t_handle_start = _time.time()
         self._handle_result(task, result)
+        t_handle_end = _time.time()
+        handle_ms = (t_handle_end - t_handle_start) * 1000
+
         self._tasks_processed += 1
+
+        total_ms = (_time.time() - t_start) * 1000
+        logger.info(f"[TIMING] {self.vendor}-{self.worker_id}: task={task.id} total={total_ms:.0f}ms (lease={lease_ms:.0f}ms, fetch={fetch_ms:.0f}ms, handle={handle_ms:.0f}ms)")
 
         return True
 
