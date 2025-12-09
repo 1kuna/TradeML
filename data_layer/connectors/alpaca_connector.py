@@ -93,10 +93,14 @@ class AlpacaConnector(BaseConnector):
                 f"Valid: {list(VALID_TIMEFRAMES)}"
             )
 
-        # Default to IEX feed on free tier; allow override via env
-        feed = os.getenv("ALPACA_FEED", "iex").lower()
+        # Default to SIP for fuller historical coverage.
+        feed_env = os.getenv("ALPACA_FEED")
+        feed = (feed_env or "sip").lower()
         if feed not in ("iex", "sip"):
-            feed = "iex"
+            feed = "sip"
+
+        allow_iex_fallback = os.getenv("ALPACA_ALLOW_IEX_FALLBACK", "0") not in ("0", "false", "False")
+        today = date.today()
 
         url = f"{self.base_url}/v2/stocks/bars"
         params = {
@@ -115,6 +119,8 @@ class AlpacaConnector(BaseConnector):
         bucket: Dict[str, List[Dict[str, Any]]] = {s: [] for s in symbols}
         page_token: Optional[str] = None
 
+        attempted_fallback = False
+
         while True:
             p = dict(params)
             if page_token:
@@ -122,6 +128,9 @@ class AlpacaConnector(BaseConnector):
 
             try:
                 resp = self._get(url, params=p, headers=headers)
+            except requests.exceptions.HTTPError as rexc:
+                # If fallback is ever enabled, it would go here. By default we hard-fail to avoid IEX.
+                raise ConnectorError(f"Failed to fetch data from Alpaca: {rexc}")
             except requests.exceptions.RequestException as rexc:
                 raise ConnectorError(f"Failed to fetch data from Alpaca: {rexc}")
 
