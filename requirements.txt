@@ -42,7 +42,8 @@ mlxtend>=0.23.0  # For combinatorial CV utilities
 
 # ===== Options Pricing & Greeks =====
 py_vollib>=1.0.1  # Black-Scholes IV and Greeks
-QuantLib-Python>=1.31; platform_system != "Windows"  # SVI fitting, term structure
+# QuantLib-Python - optional, no ARM wheels available. Install manually on x86:
+# pip install QuantLib-Python>=1.31
 
 # ===== Execution Simulation =====
 # Custom implementation of Almgren-Chriss, Avellaneda-Stoikov

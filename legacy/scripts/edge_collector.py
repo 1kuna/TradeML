@@ -15,6 +15,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, date
 from typing import Optional, List, Dict
 import threading
+import time
 
 import yaml
 import pandas as pd
@@ -28,11 +29,21 @@ from data_layer.storage.s3_client import get_s3_client
 from data_layer.storage.lease_manager import LeaseManager
 from data_layer.storage.bookmarks import BookmarkManager
 from data_layer.connectors.alpaca_connector import AlpacaConnector
+from data_layer.connectors.polygon_connector import PolygonConnector
+from data_layer.connectors.finnhub_connector import FinnhubConnector
+from data_layer.connectors.fred_connector import FREDConnector
+from data_layer.connectors.alpha_vantage_connector import AlphaVantageConnector
+from data_layer.connectors.fmp_connector import FMPConnector
 from utils.concurrency import max_inflight_for, worker_count
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ops.ssot.budget import BudgetManager
 from utils.s3_writer import S3Writer
 from utils.bad_symbols import BadSymbolCache
+
+
+def _is_name_resolution_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return ("name resolution" in m) or ("failed to resolve" in m) or ("temporary failure in name resolution" in m)
 
 
 class EdgeCollector:
@@ -43,9 +54,11 @@ class EdgeCollector:
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
 
-        # Storage backend
+        # Storage backend and data root
         self.storage_backend = os.getenv("STORAGE_BACKEND", "local")
-        logger.info(f"Storage backend: {self.storage_backend}")
+        self.parquet_compression = os.getenv("PARQUET_COMPRESSION", "zstd")
+        self.data_root = Path(os.getenv("DATA_ROOT", Path(__file__).resolve().parents[1] / "data"))
+        logger.info(f"Storage backend: {self.storage_backend} (data_root={self.data_root})")
 
         if self.storage_backend == "s3":
             self.s3 = get_s3_client()
@@ -75,6 +88,11 @@ class EdgeCollector:
             self.s3_writer = None
             # Local bad-symbol cache
             self.bad_symbols = BadSymbolCache(None)
+            # Local bookmarks on SSD
+            self.bookmarks = BookmarkManager(
+                s3_client=None,
+                local_path=os.getenv("BOOKMARKS_PATH", str(self.data_root / "data_layer" / "manifests" / "bookmarks.json")),
+            )
 
         # In-memory cache (session) in addition to persisted bad-symbols
         self._vendor_bad_symbols = {
@@ -111,7 +129,40 @@ class EdgeCollector:
             )
             logger.info("Initialized Alpaca connector")
 
-        # Add other connectors as needed...
+        if os.getenv("POLYGON_API_KEY"):
+            try:
+                connectors["polygon"] = PolygonConnector(api_key=os.getenv("POLYGON_API_KEY"))
+                logger.info("Initialized Polygon connector")
+            except Exception as e:
+                logger.warning(f"Polygon connector init failed: {e}")
+
+        if os.getenv("FINNHUB_API_KEY"):
+            try:
+                connectors["finnhub"] = FinnhubConnector(api_key=os.getenv("FINNHUB_API_KEY"))
+                logger.info("Initialized Finnhub connector")
+            except Exception as e:
+                logger.warning(f"Finnhub connector init failed: {e}")
+
+        if os.getenv("FRED_API_KEY"):
+            try:
+                connectors["fred"] = FREDConnector(api_key=os.getenv("FRED_API_KEY"))
+                logger.info("Initialized FRED connector")
+            except Exception as e:
+                logger.warning(f"FRED connector init failed: {e}")
+
+        if os.getenv("ALPHA_VANTAGE_API_KEY"):
+            try:
+                connectors["av"] = AlphaVantageConnector(api_key=os.getenv("ALPHA_VANTAGE_API_KEY"))
+                logger.info("Initialized Alpha Vantage connector")
+            except Exception as e:
+                logger.warning(f"Alpha Vantage connector init failed: {e}")
+
+        if os.getenv("FMP_API_KEY"):
+            try:
+                connectors["fmp"] = FMPConnector(api_key=os.getenv("FMP_API_KEY"))
+                logger.info("Initialized FMP connector")
+            except Exception as e:
+                logger.warning(f"FMP connector init failed: {e}")
 
         return connectors
 
@@ -180,10 +231,13 @@ class EdgeCollector:
         """Upload dataframe to S3 with partitioning."""
         if not self.s3:
             # Local storage fallback (source-first layout for consistency)
-            local_dir = Path(f"data_layer/raw/{source}/{table}/date={date}")
+            local_dir = self.data_root / "data_layer" / "raw" / source / table / f"date={date}"
             local_dir.mkdir(parents=True, exist_ok=True)
             local_file = local_dir / "data.parquet"
-            df.to_parquet(local_file, index=False)
+            try:
+                df.to_parquet(local_file, index=False, compression=self.parquet_compression)
+            except Exception:
+                df.to_parquet(local_file, index=False)
             logger.info(f"Saved locally: {local_file}")
             return
 
@@ -198,25 +252,25 @@ class EdgeCollector:
             if fut is not None:
                 fut.result()
                 return
-            import io
-            buffer = io.BytesIO()
+        import io
+        buffer = io.BytesIO()
+        try:
+            df.to_parquet(buffer, index=False, compression=self.parquet_compression)
+        except Exception:
             df.to_parquet(buffer, index=False)
-            data = buffer.getvalue()
-            temp_key = f"{key}.tmp"
-            self.s3.put_object(temp_key, data)
-            if self.s3.object_exists(key):
-                logger.debug(f"Object already exists, skipping: {key}")
-                self.s3.delete_object(temp_key)
-                return
-            self.s3.put_object(key, data)
+        data = buffer.getvalue()
+        temp_key = f"{key}.tmp"
+        self.s3.put_object(temp_key, data)
+        if self.s3.object_exists(key):
+            logger.debug(f"Object already exists, skipping: {key}")
             self.s3.delete_object(temp_key)
-            logger.info(f"Uploaded to S3: {key} ({len(df)} rows, {len(data)} bytes)")
+            return
+        self.s3.put_object(key, data)
+        self.s3.delete_object(temp_key)
+        logger.info(f"Uploaded to S3: {key} ({len(df)} rows, {len(data)} bytes)")
 
     def _write_manifest(self, source: str, table: str, date: str, row_count: int):
         """Write manifest log for audit trail."""
-        if not self.s3:
-            return  # Skip in local mode
-
         manifest_key = f"manifests/{date}/manifest-{source}-{table}.jsonl"
         manifest_entry = {
             "source": source,
@@ -226,12 +280,21 @@ class EdgeCollector:
             "timestamp": datetime.utcnow().isoformat(),
         }
 
+        if not self.s3:
+            # Local append on SSD
+            out_path = self.data_root / "data_layer" / manifest_key
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with out_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(manifest_entry) + "\n")
+            logger.debug(f"Updated manifest (local): {out_path}")
+            return
+
         # Append to manifest (read, append, write)
         import json
         try:
             existing_data, etag = self.s3.get_object(manifest_key)
             lines = existing_data.decode('utf-8').strip().split('\n')
-        except:
+        except Exception:
             lines = []
 
         lines.append(json.dumps(manifest_entry))
@@ -299,6 +362,7 @@ class EdgeCollector:
             return connector.fetch_bars(symbols=chunk, start_date=ds, end_date=ds, timeframe=timeframe)
 
         results = []
+        first_error: Optional[Exception] = None
         with ThreadPoolExecutor(max_workers=inflight) as ex:
             futs = [ex.submit(_fetch_chunk, ch) for ch in chunks]
             try:
@@ -311,12 +375,16 @@ class EdgeCollector:
                             results.append(dfp)
                     except Exception as e:
                         logger.warning(f"Alpaca chunk fetch failed: {e}")
+                        if first_error is None:
+                            first_error = e
             except KeyboardInterrupt:
                 for f in futs:
                     f.cancel()
                 raise
 
         if not results:
+            if first_error:
+                raise first_error
             return pd.DataFrame()
         return pd.concat(results, ignore_index=True)
 
@@ -483,6 +551,20 @@ class EdgeCollector:
 
         return connectors
 
+    def reset_connector_session(self, vendor: str):
+        """Force a connector to rebuild its HTTP session after network failures."""
+        conn = self.connectors.get(vendor)
+        if not conn:
+            return
+        reset_fn = getattr(conn, "reset_session", None)
+        if not callable(reset_fn):
+            return
+        try:
+            reset_fn()
+            logger.warning(f"{vendor}: connector HTTP session reset (network recovery)")
+        except Exception as e:
+            logger.warning(f"{vendor}: failed to reset HTTP session: {e}")
+
     def _should_fetch_eod_for_day(self, vendor: str, day: date) -> bool:
         """Gate EOD/day timeframe fetches for 'today' unless past cutoff or explicitly allowed.
 
@@ -552,6 +634,12 @@ class EdgeCollector:
         - Use a single global threadpool of size NODE_WORKERS
         - Start with one inflight per vendor; when a vendor pauses (rate limit/no work), slots go to others
         """
+        max_stuck_seconds = 1800
+        try:
+            max_stuck_seconds = max(300, int(os.getenv("EDGE_MAX_STUCK_SECONDS", "1800")))
+        except Exception:
+            max_stuck_seconds = 1800
+        last_progress_ts = time.time()
         # Prepare budget manager
         budget = self._init_budget()
 
@@ -703,11 +791,20 @@ class EdgeCollector:
         def fred_units():
             if "fred" not in self.connectors:
                 return
+            # Cap the number of fred units per edge run to prevent long blocking cycles
+            try:
+                max_units = max(1, int(os.getenv("NODE_FRED_UNITS_PER_RUN", "90")))
+            except Exception:
+                max_units = 90
+            emitted = 0
             # Iterate from bookmark → gated end_day (yesterday before cutoff, else today)
             last_ts = self.bookmarks.get_last_timestamp("fred", "macro_treasury") if self.bookmarks else None
             start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=7))
             d = start_date
             while d <= today and not self.shutdown_requested:
+                if emitted >= max_units:
+                    logger.info(f"fred: reached per-run cap ({max_units} units); will resume next cycle")
+                    break
                 if not self._should_fetch_eod_for_day("fred", d):
                     d += timedelta(days=1)
                     continue
@@ -717,6 +814,7 @@ class EdgeCollector:
                     "tokens": 1,
                     "run": lambda day=d: self._run_fred_treasury_day(day, budget),
                 }
+                emitted += 1
                 d += timedelta(days=1)
 
         try:
@@ -752,7 +850,8 @@ class EdgeCollector:
 
             def vendor_cap(vendor: str) -> int:
                 # Constrain polygon to 1 to avoid parallel long units under strict RPM
-                default_caps = {"alpaca": 2, "polygon": 1, "finnhub": 2, "fred": 2}
+                # Constrain fred to 1 to avoid FD exhaustion on long backfills.
+                default_caps = {"alpaca": 2, "polygon": 1, "finnhub": 2, "fred": 1}
                 return max(1, max_inflight_for(vendor, default=default_caps.get(vendor, 1)))
 
             def can_run(vendor: str, tokens: int) -> bool:
@@ -776,6 +875,9 @@ class EdgeCollector:
             # Seed up to max_workers with RR across tasks, honoring vendor caps
             import random, time as _t
             while len(active) < max_workers and not self.shutdown_requested:
+                if (time.time() - last_progress_ts) >= max_stuck_seconds:
+                    logger.warning(f"Edge run stuck with no progress for {max_stuck_seconds}s; pausing remaining work for next cycle")
+                    break
                 progressed = False
                 for _ in range(len(task_order)):
                     t = next(rr)
@@ -835,7 +937,7 @@ class EdgeCollector:
             except Exception:
                 max_wait_val = 60
             max_wait = None if max_wait_val <= 0 else max_wait_val
-            break_on_timeout = os.getenv("EDGE_SCHEDULER_BREAK_ON_TIMEOUT", "true").lower() in ("1","true","yes","on")
+            break_on_timeout = os.getenv("EDGE_SCHEDULER_BREAK_ON_TIMEOUT", "false").lower() in ("1","true","yes","on")
 
             while active and not self.shutdown_requested:
                     # As futures complete, schedule replacements (with timeout to avoid deadlock)
@@ -855,6 +957,9 @@ class EdgeCollector:
                                     )
                                 except Exception:
                                     logger.warning(f"No unit finished within {max_wait}s; (active={len(active)})")
+                            if (time.time() - last_progress_ts) >= max_stuck_seconds:
+                                logger.warning(f"Edge run stuck with no completed units for {max_stuck_seconds}s; deferring remaining work")
+                                break
                             if break_on_timeout:
                                 break
                             else:
@@ -870,6 +975,7 @@ class EdgeCollector:
                     except Exception:
                         pass
                     v = unit["vendor"]
+                    last_progress_ts = time.time()
                     status, rows, msg = ("error", 0, "")
                     try:
                         res = done.result()
@@ -931,6 +1037,9 @@ class EdgeCollector:
                         for tn, it in list(producers.items()):
                             if not it:
                                 continue
+                            if (time.time() - last_progress_ts) >= max_stuck_seconds:
+                                logger.warning(f"Edge run stuck with no progress for {max_stuck_seconds}s; deferring remaining units")
+                                break
                             try:
                                 nxt = next(it)
                             except StopIteration:
@@ -978,7 +1087,13 @@ class EdgeCollector:
         if not connector:
             return ("empty", 0, "no connector")
         logger.debug(f"_run_alpaca_day start: {day} symbols={len(symbols)}")
-        df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1, timeframe="1Day")
+        try:
+            df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1, timeframe="1Day")
+        except Exception as e:
+            emsg = str(e)
+            if _is_name_resolution_error(emsg):
+                return ("ratelimited", 0, emsg)
+            return ("error", 0, emsg)
         if df.empty:
             return ("empty", 0, "no data")
         fut = self._upload_to_s3(df, "alpaca", "equities_bars", day.isoformat(), async_write=True)
@@ -998,7 +1113,13 @@ class EdgeCollector:
         if not connector:
             return ("empty", 0, "no connector")
         logger.debug(f"_run_alpaca_minute_day start: {day} symbols={len(symbols)}")
-        df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1, timeframe="1Min")
+        try:
+            df = self._alpaca_fetch_day_parallel(connector, symbols, day.isoformat(), inflight_override=1, timeframe="1Min")
+        except Exception as e:
+            emsg = str(e)
+            if _is_name_resolution_error(emsg):
+                return ("ratelimited", 0, emsg)
+            return ("error", 0, emsg)
         if df.empty:
             return ("empty", 0, "no data")
         fut = self._upload_to_s3(df, "alpaca", "equities_bars_minute", day.isoformat(), async_write=True)
@@ -1293,6 +1414,8 @@ class EdgeCollector:
             out.mkdir(parents=True, exist_ok=True)
             df_total.to_parquet(out / "data.parquet", index=False)
         if self.bookmarks:
+            self.bookmarks.set("finnhub", "equities_eod_fn", day.isoformat(), int(len(df_total)))
+            # Maintain legacy bookmark key for backward compatibility until old readers migrate
             self.bookmarks.set("finnhub", "equities_bars", day.isoformat(), int(len(df_total)))
         return ("ok", int(len(df_total)), "")
 
@@ -1387,6 +1510,47 @@ class EdgeCollector:
                 df.to_parquet(out / "data.parquet", index=False)
         if rows_written == 0:
             return ("empty", 0, "no data")
+        return ("ok", rows_written, "")
+
+    def _run_fmp_delistings(self, budget: Optional[BudgetManager] = None):
+        """Fetch FMP delisted companies list for reference/delistings table."""
+        conn = self.connectors.get("fmp")
+        if not conn:
+            return ("empty", 0, "no connector")
+
+        try:
+            df = conn.fetch_delisted_companies()
+        except Exception as e:
+            emsg = str(e)
+            if "429" in emsg or "rate" in emsg.lower():
+                return ("ratelimited", 0, emsg)
+            logger.warning(f"FMP delistings fetch failed: {e}")
+            return ("error", 0, emsg)
+
+        if df.empty:
+            return ("empty", 0, "no data")
+
+        rows_written = len(df)
+
+        # Write to reference/delistings location
+        if self.s3:
+            key = "reference/delistings_fmp.parquet"
+            try:
+                self._upload_parquet_key(df, key, async_write=False)
+            except Exception as e:
+                return ("error", rows_written, str(e))
+        else:
+            out = Path("data_layer/reference")
+            out.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(out / "delistings_fmp.parquet", index=False)
+
+        # Update bookmark to prevent duplicate fetches today
+        today = date.today()
+        bookmark_key = f"fmp-delistings-{today.isoformat()}"
+        if self.bookmarks:
+            self.bookmarks.update_bookmark("fmp", bookmark_key, {"fetched_at": today.isoformat()})
+
+        logger.info(f"FMP delistings: wrote {rows_written} records")
         return ("ok", rows_written, "")
 
     def run(self, scheduler_mode: Optional[str] = None):

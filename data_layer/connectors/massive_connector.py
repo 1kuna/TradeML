@@ -1,20 +1,28 @@
 """
-Polygon.io connector (free-tier friendly, 5 req/min suggested).
+Massive.com connector - free-tier friendly, 5 req/min limit.
 
 Implements a small subset of endpoints used as supplemental sources:
  - Aggregates (day/minute) for equities bars
  - Reference splits and dividends
  - Reference tickers (active)
  - Market status (now)
+ - Options contracts and aggregates
+
+Free tier limits (as of 2025):
+ - 5 requests per minute
+ - 2 years historical data for minute-level granularity
+ - End-of-day equities, forex, and crypto included
 
 All methods are best-effort and return empty DataFrames on errors. Use
-BudgetManager to govern daily request counts under the 'polygon' vendor.
+BudgetManager to govern daily request counts under the 'massive' vendor.
+
+See: https://massive.com/docs/rest/stocks
 """
 
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, Optional, Tuple
 
 import pandas as pd
@@ -23,14 +31,32 @@ from loguru import logger
 from .base import BaseConnector, ConnectorError
 
 
-class PolygonConnector(BaseConnector):
-    API_URL = "https://api.polygon.io"
+class MassiveConnector(BaseConnector):
+    """Connector for Massive.com market data API."""
 
-    def __init__(self, api_key: Optional[str] = None, rate_limit_per_sec: float = 0.08):
-        api_key = api_key or os.getenv("POLYGON_API_KEY")
+    API_URL = "https://api.massive.com"
+
+    # Free tier historical data limit
+    FREE_TIER_HISTORY_DAYS = 730  # ~2 years
+
+    # Free tier doesn't include same-day data (T+1 delay)
+    FREE_TIER_DELAY_DAYS = 1
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        rate_limit_per_sec: float = 0.08,
+    ):
+        api_key = api_key or os.getenv("MASSIVE_API_KEY")
         if not api_key:
-            raise ConnectorError("Polygon API key not found. Set POLYGON_API_KEY in .env")
-        super().__init__(source_name="polygon", api_key=api_key, base_url=self.API_URL, rate_limit_per_sec=rate_limit_per_sec)
+            raise ConnectorError("Massive API key not found. Set MASSIVE_API_KEY in .env")
+
+        super().__init__(
+            source_name="massive",
+            api_key=api_key,
+            base_url=self.API_URL,
+            rate_limit_per_sec=rate_limit_per_sec,
+        )
 
     def _auth_params(self) -> Dict[str, str]:
         return {"apiKey": self.api_key}
@@ -41,23 +67,63 @@ class PolygonConnector(BaseConnector):
     def _transform(self, raw_data, **kwargs) -> pd.DataFrame:  # unused abstract
         return pd.DataFrame()
 
+    # API result limits
+    API_LIMIT = 50000  # Max results per request (Polygon allows up to 50k)
+    MINUTE_CHUNK_DAYS = 10  # Days per chunk for minute data (~3900 bars, safe under 5000)
+
     # -------- Aggregates --------
     def fetch_aggregates(self, symbol: str, start_date: date, end_date: date, timespan: str = "day") -> pd.DataFrame:
         """Fetch aggregates for a symbol between dates (inclusive). timespan in {'day','minute'}.
 
+        Free tier limits:
+          - 2 years of historical data for ALL timespans (day and minute)
+          - API returns max 50000 results per request
+          - No same-day data (T+1 delay)
+
+        For minute data with large date ranges, automatically chunks requests
+        to avoid hitting the 5000 default limit.
+
         Returns columns: date, symbol, open, high, low, close, volume
         """
         ts = "day" if timespan not in ("minute", "day") else timespan
+
+        # Clamp to free tier history limit for ALL timespans (not just minute)
+        earliest = date.today() - timedelta(days=self.FREE_TIER_HISTORY_DAYS)
+        if end_date < earliest:
+            logger.debug(f"Date range {start_date}->{end_date} entirely before free tier limit ({earliest}), skipping")
+            return pd.DataFrame()
+        if start_date < earliest:
+            logger.debug(f"Clamping start_date from {start_date} to {earliest} (free tier limit)")
+            start_date = earliest
+
+        # Clamp end_date to exclude recent days (free tier has T+1 delay)
+        latest = date.today() - timedelta(days=self.FREE_TIER_DELAY_DAYS)
+        if start_date > latest:
+            logger.debug(f"Date range {start_date}->{end_date} too recent for free tier (latest={latest}), skipping")
+            return pd.DataFrame()
+        if end_date > latest:
+            logger.debug(f"Clamping end_date from {end_date} to {latest} (free tier delay)")
+            end_date = latest
+
+        # For minute data with large ranges, chunk the requests
+        if ts == "minute":
+            return self._fetch_aggregates_chunked(symbol, start_date, end_date, ts)
+
+        # For daily data, single request is usually sufficient
+        return self._fetch_aggregates_single(symbol, start_date, end_date, ts)
+
+    def _fetch_aggregates_single(self, symbol: str, start_date: date, end_date: date, ts: str) -> pd.DataFrame:
+        """Fetch aggregates in a single request."""
         url = f"{self.API_URL}/v2/aggs/ticker/{symbol}/range/1/{ts}/{start_date.isoformat()}/{end_date.isoformat()}"
         try:
-            r = self._get(url, params=self._auth_params())
+            r = self._get(url, params={**self._auth_params(), "limit": self.API_LIMIT})
             data = r.json()
             results = data.get("results", []) if isinstance(data, dict) else []
             if not results:
                 return pd.DataFrame()
             rows = []
             for it in results:
-                # Polygon uses epoch millis in 't'
+                # Massive uses epoch millis in 't'
                 dt = pd.to_datetime(int(it.get("t", 0)), unit="ms").date()
                 rows.append({
                     "date": dt,
@@ -71,8 +137,39 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=url)
         except Exception as e:
-            logger.warning(f"Polygon aggregates fetch failed for {symbol} {start_date}->{end_date} {timespan}: {e}")
+            logger.warning(f"Massive aggregates fetch failed for {symbol} {start_date}->{end_date} {ts}: {e}")
             return pd.DataFrame()
+
+    def _fetch_aggregates_chunked(self, symbol: str, start_date: date, end_date: date, ts: str) -> pd.DataFrame:
+        """Fetch minute aggregates in chunks to avoid API limit.
+
+        Chunks by MINUTE_CHUNK_DAYS to stay under API result limits.
+        """
+        total_days = (end_date - start_date).days + 1
+        num_chunks = (total_days + self.MINUTE_CHUNK_DAYS - 1) // self.MINUTE_CHUNK_DAYS
+
+        if num_chunks > 1:
+            logger.info(f"Chunking {symbol} minute data: {total_days} days → {num_chunks} requests")
+
+        all_dfs = []
+        chunk_start = start_date
+
+        while chunk_start <= end_date:
+            chunk_end = min(chunk_start + timedelta(days=self.MINUTE_CHUNK_DAYS - 1), end_date)
+
+            df = self._fetch_aggregates_single(symbol, chunk_start, chunk_end, ts)
+            if df is not None and not df.empty:
+                all_dfs.append(df)
+
+            chunk_start = chunk_end + timedelta(days=1)
+
+        if not all_dfs:
+            return pd.DataFrame()
+
+        combined = pd.concat(all_dfs, ignore_index=True)
+        # Remove duplicate rows (in case of overlapping chunks)
+        combined = combined.drop_duplicates(subset=["date", "symbol", "open", "high", "low", "close"])
+        return combined
 
     # -------- Reference: splits & dividends --------
     def fetch_splits(self, symbol: str) -> pd.DataFrame:
@@ -97,7 +194,7 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=f"{url}?ticker={symbol}")
         except Exception as e:
-            logger.warning(f"Polygon splits fetch failed for {symbol}: {e}")
+            logger.warning(f"Massive splits fetch failed for {symbol}: {e}")
             return pd.DataFrame()
 
     def fetch_dividends(self, symbol: str) -> pd.DataFrame:
@@ -125,7 +222,7 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=f"{url}?ticker={symbol}")
         except Exception as e:
-            logger.warning(f"Polygon dividends fetch failed for {symbol}: {e}")
+            logger.warning(f"Massive dividends fetch failed for {symbol}: {e}")
             return pd.DataFrame()
 
     # -------- Reference: tickers & market status --------
@@ -154,7 +251,7 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=url), next_cursor
         except Exception as e:
-            logger.warning(f"Polygon tickers fetch failed: {e}")
+            logger.warning(f"Massive tickers fetch failed: {e}")
             return pd.DataFrame(), None
 
     def market_status_now(self) -> Optional[Dict]:
@@ -163,7 +260,7 @@ class PolygonConnector(BaseConnector):
             r = self._get(url, params=self._auth_params())
             return r.json()
         except Exception as e:
-            logger.warning(f"Polygon market status failed: {e}")
+            logger.warning(f"Massive market status failed: {e}")
             return None
 
     # -------- Options (v3 reference + v3 aggregates custom-bars) --------
@@ -204,24 +301,30 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=url), next_cursor
         except Exception as e:
-            logger.warning(f"Polygon options contracts fetch failed for {underlying_ticker}: {e}")
+            logger.warning(f"Massive options contracts fetch failed for {underlying_ticker}: {e}")
             return pd.DataFrame(), None
 
     def fetch_option_aggregates(self, option_ticker: str, start_date: date, end_date: date, multiplier: int = 1, timespan: str = "day") -> pd.DataFrame:
         """
         GET /v3/aggs/ticker/{option_ticker}/range/{multiplier}/{timespan}/{from}/{to}
 
-        Free plan allows ~2 years back — clamp start_date accordingly.
+        Free tier allows ~2 years back and has T+1 delay — clamp dates accordingly.
         Returns columns: date, option_ticker, open, high, low, close, volume
         """
-        # Clamp to ~2 years back
-        from datetime import timedelta as _TD
-        try:
-            earliest = date.today() - _TD(days=730)
-        except Exception:
-            earliest = date.today()
+        # Clamp to free tier history limit
+        earliest = date.today() - timedelta(days=self.FREE_TIER_HISTORY_DAYS)
         if start_date < earliest:
+            logger.debug(f"Clamping option start_date from {start_date} to {earliest} (free tier limit)")
             start_date = earliest
+
+        # Clamp end_date to exclude recent days (free tier has T+1 delay)
+        latest = date.today() - timedelta(days=self.FREE_TIER_DELAY_DAYS)
+        if start_date > latest:
+            logger.debug(f"Option date range {start_date}->{end_date} too recent for free tier, skipping")
+            return pd.DataFrame()
+        if end_date > latest:
+            logger.debug(f"Clamping option end_date from {end_date} to {latest} (free tier delay)")
+            end_date = latest
         tspan = timespan if timespan in ("minute", "hour", "day", "week", "month") else "day"
         url = f"{self.API_URL}/v3/aggs/ticker/{option_ticker}/range/{multiplier}/{tspan}/{start_date.isoformat()}/{end_date.isoformat()}"
         try:
@@ -245,5 +348,5 @@ class PolygonConnector(BaseConnector):
             df = pd.DataFrame(rows)
             return self._add_metadata(df, source_uri=url)
         except Exception as e:
-            logger.warning(f"Polygon option aggregates failed for {option_ticker}: {e}")
+            logger.warning(f"Massive option aggregates failed for {option_ticker}: {e}")
             return pd.DataFrame()

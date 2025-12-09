@@ -9,6 +9,7 @@ All data connectors must inherit from BaseConnector and implement:
 import hashlib
 import os
 import time
+import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -134,8 +135,17 @@ class BaseConnector(ABC):
         try:
             response = self.session.get(url, params=params, headers=headers, timeout=30)
             logger.debug(f"HTTP GET status: {response.status_code} for {url}")
+
+            # Track budget per HTTP request BEFORE checking status
+            # This counts ALL API calls (success, 429, 5xx) for accurate rate limiting
+            try:
+                from data_node.budgets import get_budget_manager
+                get_budget_manager().spend(self.source_name)
+            except Exception:
+                pass  # Budget tracking optional - don't fail requests
+
+            # Handle rate limiting (429)
             if response.status_code == 429:
-                # Respect Retry-After if provided; otherwise exponential backoff with jitter
                 retry_after = response.headers.get("Retry-After")
                 if retry_after:
                     try:
@@ -146,9 +156,29 @@ class BaseConnector(ABC):
                     sleep_s = min(60, (self._min_request_interval or 1.0) * (2 + random.random()))
                 logger.warning(f"429 rate limited for {url}; sleeping {sleep_s:.2f}s")
                 time.sleep(sleep_s)
-                # One more attempt (let session retry strategy handle further if needed)
                 response = self.session.get(url, params=params, headers=headers, timeout=30)
                 logger.debug(f"HTTP GET retry status: {response.status_code} for {url}")
+                # Count retry attempt in budget too
+                try:
+                    from data_node.budgets import get_budget_manager
+                    get_budget_manager().spend(self.source_name)
+                except Exception:
+                    pass
+
+            # Handle server errors (5xx) with retry
+            if response.status_code >= 500:
+                sleep_s = min(30, 2 * (1 + random.random()))  # 2-4s with jitter
+                logger.warning(f"{response.status_code} server error for {url}; sleeping {sleep_s:.2f}s and retrying")
+                time.sleep(sleep_s)
+                response = self.session.get(url, params=params, headers=headers, timeout=30)
+                logger.debug(f"HTTP GET retry status: {response.status_code} for {url}")
+                # Count retry attempt in budget too
+                try:
+                    from data_node.budgets import get_budget_manager
+                    get_budget_manager().spend(self.source_name)
+                except Exception:
+                    pass
+
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
@@ -297,25 +327,55 @@ class BaseConnector(ABC):
         # Local filesystem write
         path = Path(path)
 
-        # Create directory if needed
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Convert to PyArrow table
-        table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
-
         if partition_cols:
-            # Write partitioned dataset
-            pq.write_to_dataset(
-                table,
-                root_path=str(path),
-                partition_cols=partition_cols,
-                existing_data_behavior="overwrite_or_ignore",
-            )
-            logger.info(f"Wrote partitioned Parquet to {path}")
-        else:
-            # Write single file
-            pq.write_table(table, str(path), compression="snappy")
-            logger.info(f"Wrote Parquet to {path}")
+            part_cols = [c for c in partition_cols if c in df.columns]
+            if not part_cols:
+                logger.warning("Partition columns not found in DataFrame; writing unpartitioned")
+                partition_cols = None
+            else:
+                for _, sub in df.groupby(part_cols, dropna=False, as_index=False):
+                    # Build partition directory path
+                    part_path = Path(path)
+                    for c in part_cols:
+                        v = sub.iloc[0][c]
+                        if hasattr(v, "isoformat"):
+                            v = v.isoformat()
+                        part_path = part_path / f"{c}={v}"
+
+                    part_path.mkdir(parents=True, exist_ok=True)
+                    tmp_file = part_path / f".tmp-{uuid.uuid4().hex}.parquet"
+                    final_file = part_path / "data.parquet"
+
+                    table = pa.Table.from_pandas(sub, schema=schema, preserve_index=False)
+                    try:
+                        pq.write_table(table, str(tmp_file), compression="snappy")
+                        os.replace(tmp_file, final_file)  # Atomic on same filesystem
+                    finally:
+                        if tmp_file.exists():
+                            try:
+                                tmp_file.unlink()
+                            except Exception:
+                                pass
+                logger.info(f"Wrote partitioned Parquet to {path}")
+                return
+
+        # Fallback: single file
+        target_dir = path.parent if path.suffix else path
+        target_dir.mkdir(parents=True, exist_ok=True)
+        tmp_file = target_dir / f".tmp-{uuid.uuid4().hex}{''.join(path.suffixes) if path.suffixes else '.parquet'}"
+        final_file = path if path.suffix else target_dir / "data.parquet"
+
+        table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+        try:
+            pq.write_table(table, str(tmp_file), compression="snappy")
+            os.replace(tmp_file, final_file)
+        finally:
+            if tmp_file.exists():
+                try:
+                    tmp_file.unlink()
+                except Exception:
+                    pass
+        logger.info(f"Wrote Parquet to {final_file}")
 
     def _write_parquet_s3(
         self,

@@ -1,0 +1,33 @@
+# TradeML - Pi Data Node Requirements
+# Lightweight dependencies for Raspberry Pi data collection
+# For full training/ML features, use requirements.txt on x86 machine
+
+# ===== Data Processing & Storage =====
+pandas>=2.1.0
+polars>=0.19.0
+pyarrow>=14.0.0
+numpy>=1.24.0
+
+# Database & Storage
+sqlalchemy>=2.0.0
+boto3>=1.28.0  # S3/MinIO client
+
+# ===== Data Sources =====
+alpaca-py>=0.13.0
+requests>=2.31.0
+aiohttp>=3.9.0
+
+# ===== Market Calendars =====
+exchange-calendars>=4.2.0
+pandas-market-calendars>=4.3.0
+
+# ===== Configuration & Utilities =====
+pydantic>=2.4.0
+python-dotenv>=1.0.0
+pyyaml>=6.0
+click>=8.1.0
+rich>=13.6.0
+tqdm>=4.66.0
+
+# ===== Logging =====
+loguru>=0.7.2

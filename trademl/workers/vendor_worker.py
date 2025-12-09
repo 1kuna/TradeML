@@ -4,7 +4,7 @@ from __future__ import annotations
 Process-per-vendor worker entrypoint.
 
 Env (or CLI overrides):
-  - VENDOR: one of alpaca|polygon|finnhub|fred (required)
+  - VENDOR: one of alpaca|massive|finnhub|fred (required)
   - CONCURRENCY: integer inflight cap for this vendor (optional)
   - RPM_LIMIT: requests per minute for this vendor (optional)
   - BUDGET: integer token budget per day (0 or empty = unlimited) (optional)
@@ -30,7 +30,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 def _normalize_vendor(v: str) -> str:
     m = (v or "").strip().lower()
-    if m not in ("alpaca", "polygon", "finnhub", "fred"):
+    if m not in ("alpaca", "massive", "finnhub", "fred"):
         raise ValueError(f"Unsupported vendor: {v}")
     return m
 
@@ -45,7 +45,7 @@ def _tasks_for_vendor_all(edge, vendor: str) -> List[str]:
             "alpaca_options_chain",
             "alpaca_corporate_actions",
         ],
-        "polygon": ["polygon_bars"],
+        "massive": ["massive_bars"],
         "finnhub": ["finnhub_options"],
         "fred": ["fred_treasury"],
     }
@@ -114,7 +114,7 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     logger.add(log_dir / f"{vendor}.log", rotation="10 MB", retention=5)
 
-    from scripts.edge_collector import EdgeCollector
+    from legacy.scripts.edge_collector import EdgeCollector
     edge = EdgeCollector(args.config)
 
     # Respect per-process vendor concurrency cap via existing env hook

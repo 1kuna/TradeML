@@ -85,7 +85,7 @@ All raw files carry metadata: `ingested_at`, `source_uri`, `vendor_ts`, `api_ver
 
 **Prosumer/Enterprise upgrades:**
 - **Databento**: historical SIP TAQ and **OPRA** options NBBO as flat binary/Parquet; pay‑as‑you‑go; excellent for research reproducibility.
-- **Polygon**: consolidated equities minute/EOD, options chains, some tick coverage; friendly APIs.
+- **Massive (Polygon.io)**: consolidated equities minute/EOD, options chains, some tick coverage; friendly APIs.
 - **Tiingo / Intrinio / Quandl (Nasdaq Data Link)**: alternative EOD and fundamentals.
 
 **Notes:** always record exchange timestamps; keep splits/divs separate; never rely on vendor pre‑adjusted OHLCV without logging the algorithm.
@@ -125,7 +125,7 @@ All raw files carry metadata: `ingested_at`, `source_uri`, `vendor_ts`, `api_ver
 
 **Prosumer/Enterprise:**
 - **Databento — OPRA** consolidated NBBO trades/quotes (research‑grade).  
-- **Polygon Options** NBBO snapshots, OI/volume; good API ergonomics.  
+- **Massive Options** NBBO snapshots, OI/volume; good API ergonomics.  
 - **Cboe DataShop** official EOD files and Greeks snapshots for benchmarking.
 
 **Policy:** compute **IV/Greeks yourselves** from NBBO mids; fit daily **SVI/SSVI** surfaces with no‑arbitrage constraints and persist QC flags.
@@ -190,7 +190,7 @@ All raw files carry metadata: `ingested_at`, `source_uri`, `vendor_ts`, `api_ver
 - Paths: chain by underlier/date; IV/Greeks; subject to rate limits.  
 - Output: per‑contract fields; store raw and compute IV ourselves for consistency.
 
-**Databento/Polygon/Cboe (upgrade)**  
+**Databento/Massive/Cboe (upgrade)**  
 - Ensure ability to drop‑in replace the free sources with identical curated schemas; keep vendor‑specific quirks confined to `connectors/`.
 
 ---

@@ -186,7 +186,7 @@ qc_thresholds:
   rows_high_ratio: 1.20
   allow_halfdays:  true
 
-Note: Remove legacy IEX free‑tier plans; use Alpaca for minute/EOD dev; upgrade to Databento/Polygon for consolidated TAQ/OPRA when research requires. Keep curated schemas unchanged.
+Note: Remove legacy IEX free‑tier plans; use Alpaca for minute/EOD dev; upgrade to Databento/Massive for consolidated TAQ/OPRA when research requires. Keep curated schemas unchanged.
 
 ⸻
 
@@ -292,8 +292,8 @@ The trainer refuses to run if thresholds are not met.
 ⸻
 
 11) Data Sourcing Policy (free → prosumer)
-	•	Equities minute/EOD: Alpaca for dev; Databento/Polygon for consolidated TAQ (upgrade when needed). Avoid vendor pre‑adjusted OHLCV unless we log the algorithm; apply our own corporate‑action logic.
-	•	Options: Finnhub chains for exploration; OPRA NBBO via Databento or Cboe/Polygon for research‑grade IV/Greeks; compute IV from NBBO mids; fit daily SVI/SSVI with no‑arb checks.
+	•	Equities minute/EOD: Alpaca for dev; Databento/Massive for consolidated TAQ (upgrade when needed). Avoid vendor pre‑adjusted OHLCV unless we log the algorithm; apply our own corporate‑action logic.
+	•	Options: Finnhub chains for exploration; OPRA NBBO via Databento or Cboe/Massive for research‑grade IV/Greeks; compute IV from NBBO mids; fit daily SVI/SSVI with no‑arb checks.
 	•	Corporate actions & listings: Alpha Vantage LISTING_STATUS, splits/divs; reconcile with SEC EDGAR.
 	•	Delistings & index membership: persist as reference; ensure universes include delisted names.
 	•	Macro: FRED + ALFRED vintages (revision‑aware labels/features).
@@ -383,7 +383,7 @@ def promote_if_beat_champion(model_name: str) -> None: ...
 
 16) Rollout Order (do these next)
 	1.	Create partition_status, backfill_queue; ship ata-audit and ata-backfill CLIs.
-	2.	Remove legacy IEX free‑tier dependencies from default plans; pin Alpaca for dev minute/EOD; stage Databento/Polygon connectors.
+	2.	Remove legacy IEX free‑tier dependencies from default plans; pin Alpaca for dev minute/EOD; stage Databento/Massive connectors.
 	3.	Encode regime windows + time‑decay in training/*.yml; add per‑model GREEN thresholds.
 	4.	Implement the router (availability + regime rules). Add CPCV‑consistent stacking once at least two signals are GREEN.
 
@@ -392,7 +392,7 @@ def promote_if_beat_champion(model_name: str) -> None: ...
 17) Appendix: Acceptance Tests (end‑to‑end)
 	•	Data ops → model ops: delete a week of minute bars for 50 symbols → audit marks RED → backfill fills → curate rebuilds → GREEN ≥ threshold → train_if_ready(intraday_xs) unblocks.
 	•	Regime mask sanity: flipping to include pre‑2012 in fitting should degrade OOS CPCV metrics (expected).
-	•	Vendor swap: switch minute from Alpaca→Polygon under stable curated schema; OOS metrics remain comparable; coverage improves.
+	•	Vendor swap: switch minute from Alpaca→Massive under stable curated schema; OOS metrics remain comparable; coverage improves.
 	•	Promotion gate: challenger beats champion net with better DSR/PBO → auto‑promotion and new shadow cycle starts.
 
 ⸻

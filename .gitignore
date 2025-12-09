@@ -86,6 +86,7 @@ notebooks/.ipynb_checkpoints/
 # ===== IDE & Editors =====
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~

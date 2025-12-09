@@ -67,7 +67,7 @@
 
 ### 2.2 Options (free‑first; accurate path later)
 - **Free/exploratory:** Finnhub options chains/IV/greeks (rate‑limited). Option Strategist weekly IV/HV snapshots for reality checks.
-- **Upgrade path:** Polygon Options or Databento OPRA (consolidated NBBO trades/quotes). Cboe DataShop EOD/Greeks snapshots for benchmarks.
+- **Upgrade path:** Massive Options or Databento OPRA (consolidated NBBO trades/quotes). Cboe DataShop EOD/Greeks snapshots for benchmarks.
 
 ### 2.3 Point‑in‑Time Discipline
 - Store **raw OHLCV** and **event feeds** separately; apply proportional adjustments yourselves; every artifact carries `ingested_at` and `source_uri`.
@@ -357,7 +357,7 @@ Human‑readable blotter + machine‑readable JSON in `/reports/`.
 • Vol targeting + fractional Kelly; AC simulator; drift dashboards; champion‑challenger & shadow trading.
 
 **Phase 5 (Week 12+): Scale & Refine**  
-• Upgrade data (Polygon/Databento) as needed; test shallow sequence models **only if** GBDT beats baselines net.
+• Upgrade data (Massive/Databento) as needed; test shallow sequence models **only if** GBDT beats baselines net.
 
 ---
 

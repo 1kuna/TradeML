@@ -1,0 +1,59 @@
+# Vendor Entitlements - What each free tier can ACTUALLY access
+# This is the source of truth for task routing
+# Verified as of Dec 5, 2025
+
+vendors:
+  alpaca:
+    rpm: 200
+    daily_cap: null  # no daily limit
+    datasets:
+      - equities_eod      # IEX only, 15-min delayed via REST
+      - equities_minute   # IEX only
+      - options_bars      # indicative feed only
+      - corp_actions
+    excluded: []
+    notes: "IEX exchange only on free tier. REST is 15-min delayed, WebSocket is real-time (30 symbols max)."
+
+  finnhub:
+    rpm: 60
+    daily_cap: null
+    datasets:
+      - options_chains    # US only
+      - fundamentals_snapshot
+      - news
+    excluded:
+      - equities_eod      # 403 on free tier for US stocks
+    notes: "Free tier is US-only, 50 WebSocket symbols. Stock candles require paid plan."
+
+  massive:
+    rpm: 5
+    daily_cap: null
+    datasets:
+      - equities_eod      # EOD only, 2 years max
+      - equities_minute   # 2 years back
+      - corp_actions
+      - reference_data
+    excluded: []
+    notes: "2 years historical max. 100% US market coverage. EOD data."
+
+  fred:
+    rpm: 120
+    daily_cap: null
+    datasets:
+      - macros_fred
+      - treasuries
+    excluded: []
+    notes: "Approximate rate limit (~120/min from support emails). Free API, contact Fed for higher throughput."
+
+  av:  # alpha_vantage
+    rpm: 5
+    daily_cap: 25  # HARD CAP - 25 requests per day
+    datasets:
+      - corp_actions      # splits, dividends - full history
+      - delistings
+      - options_chain_hist
+    excluded: []
+    notes: "25 requests/day HARD limit. Use sparingly. Premium: 75-1200 req/min."
+
+  # FMP removed - free tier has severe endpoint restrictions (only ~80 tickers allowed)
+  # Re-enable when/if upgrading to paid plan
