@@ -30,7 +30,7 @@ from .fetchers import (
     VENDOR_PRIORITY,
 )
 from .qc import validate_partition_row_count
-from .stages import get_expected_rows, get_qc_thresholds, load_stage_config
+from .stages import get_expected_rows, get_qc_thresholds
 
 
 def _is_trading_day(dt_value) -> bool:
@@ -80,50 +80,35 @@ DEFAULT_LEASE_TTL = 300  # 5 minutes
 BACKOFF_BASE_SECONDS = 60
 BACKOFF_MAX_SECONDS = 3600  # 1 hour
 
+def _massive_in_window(task: Task) -> bool:
+    """Check if task is within Massive free-tier window (2y history, T+1 delay)."""
+    try:
+        start_date = date.fromisoformat(task.start_date) if isinstance(task.start_date, str) else task.start_date
+        end_date = date.fromisoformat(task.end_date) if isinstance(task.end_date, str) else task.end_date
+    except Exception as exc:
+        logger.debug(f"Massive window check failed for task {task.id}: bad dates {task.start_date}->{task.end_date} ({exc})")
+        return False
+
+    earliest = date.today() - timedelta(days=730)  # 2y history
+    latest = date.today() - timedelta(days=1)      # T+1 delay
+
+    if end_date < earliest or start_date < earliest:
+        logger.debug(f"Massive window miss (too old) task {task.id}: {start_date}->{end_date}, earliest {earliest}")
+        return False
+    if start_date > latest:
+        logger.debug(f"Massive window miss (too recent) task {task.id}: {start_date}->{end_date}, latest {latest}")
+        return False
+    return True
+
+
 def _vendor_supports_task(task: Task, vendor: str) -> bool:
     """
     Check if a vendor can service the task based on temporal limits.
 
-    Currently enforces:
-    - Massive free-tier limits (2y history, T+1 delay) for equities
-    - Stage-based exclusion when stage requires >2y history (Stage 0/1)
+    Currently enforces Massive free-tier window (2y history, T+1 delay) for equities.
     """
     if vendor == "massive" and task.dataset in ("equities_eod", "equities_minute"):
-        # If current stage demands >2y history, skip Massive entirely
-        try:
-            cfg = load_stage_config()
-            stage_def = cfg.stages.get(cfg.current_stage)
-            if stage_def and stage_def.equities_eod_years > 2:
-                logger.debug(
-                    f"Skipping Massive for task {task.id}: stage requires {stage_def.equities_eod_years}y history (>2y)"
-                )
-                return False
-        except Exception as exc:
-            logger.debug(f"Stage config check failed, defaulting to allow Massive: {exc}")
-
-        try:
-            # Normalize dates (handles str or date)
-            start_date = date.fromisoformat(task.start_date) if isinstance(task.start_date, str) else task.start_date
-            end_date = date.fromisoformat(task.end_date) if isinstance(task.end_date, str) else task.end_date
-        except Exception as exc:
-            logger.debug(f"Skipping Massive for task {task.id}: invalid dates {task.start_date}->{task.end_date} ({exc})")
-            return False
-
-        earliest = date.today() - timedelta(days=730)  # 2y history
-        latest = date.today() - timedelta(days=1)      # T+1 delay
-
-        if end_date < earliest or start_date < earliest:
-            logger.debug(
-                f"Skipping Massive for task {task.id}: range {start_date}->{end_date} before free-tier window (earliest {earliest})"
-            )
-            return False
-
-        if start_date > latest:
-            logger.debug(
-                f"Skipping Massive for task {task.id}: range {start_date}->{end_date} too recent (latest {latest})"
-            )
-            return False
-
+        return _massive_in_window(task)
     return True
 
 
