@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from loguru import logger
@@ -86,22 +86,31 @@ def _vendor_supports_task(task: Task, vendor: str) -> bool:
 
     Currently enforces Massive free-tier limits (2y history, T+1 delay) for equities.
     """
-    try:
-        from datetime import date as dt_date, timedelta as dt_timedelta
-
-        if vendor == "massive" and task.dataset in ("equities_eod", "equities_minute"):
-            start_date = dt_date.fromisoformat(task.start_date) if isinstance(task.start_date, str) else task.start_date
-            end_date = dt_date.fromisoformat(task.end_date) if isinstance(task.end_date, str) else task.end_date
-
-            earliest = dt_date.today() - dt_timedelta(days=730)  # 2y history
-            latest = dt_date.today() - dt_timedelta(days=1)      # T+1 delay
-
-            # Too old or too recent for Massive
-            if end_date < earliest or start_date < earliest or start_date > latest:
-                return False
-    except Exception:
-        # If parsing fails, be permissive to avoid false negatives
+    if vendor != "massive" or task.dataset not in ("equities_eod", "equities_minute"):
         return True
+
+    try:
+        # Normalize dates (handles str or date)
+        start_date = date.fromisoformat(task.start_date) if isinstance(task.start_date, str) else task.start_date
+        end_date = date.fromisoformat(task.end_date) if isinstance(task.end_date, str) else task.end_date
+    except Exception as exc:
+        logger.debug(f"Skipping Massive for task {task.id}: invalid dates {task.start_date}->{task.end_date} ({exc})")
+        return False
+
+    earliest = date.today() - timedelta(days=730)  # 2y history
+    latest = date.today() - timedelta(days=1)      # T+1 delay
+
+    if end_date < earliest or start_date < earliest:
+        logger.debug(
+            f"Skipping Massive for task {task.id}: range {start_date}->{end_date} before free-tier window (earliest {earliest})"
+        )
+        return False
+
+    if start_date > latest:
+        logger.debug(
+            f"Skipping Massive for task {task.id}: range {start_date}->{end_date} too recent (latest {latest})"
+        )
+        return False
 
     return True
 
