@@ -188,6 +188,20 @@ class QueueWorker:
             logger.warning(f"No vendors configured for dataset: {task.dataset}")
             return None
 
+        # If current stage requires >2y history, strip Massive from equities datasets up front
+        if task.dataset in ("equities_eod", "equities_minute"):
+            try:
+                cfg = load_stage_config()
+                stage_def = cfg.stages.get(cfg.current_stage)
+                if stage_def and stage_def.equities_eod_years > 2:
+                    if "massive" in vendors:
+                        vendors = [v for v in vendors if v != "massive"]
+                        logger.info(
+                            f"Stage requires {stage_def.equities_eod_years}y history; removing Massive for task {task.id}"
+                        )
+            except Exception as exc:
+                logger.debug(f"Stage config check failed, keeping vendor list intact: {exc}")
+
         eligible = []
         now = datetime.now(timezone.utc)
 
