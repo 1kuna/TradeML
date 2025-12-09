@@ -30,7 +30,7 @@ from .fetchers import (
     VENDOR_PRIORITY,
 )
 from .qc import validate_partition_row_count
-from .stages import get_expected_rows, get_qc_thresholds
+from .stages import get_expected_rows, get_qc_thresholds, load_stage_config
 
 
 def _is_trading_day(dt_value) -> bool:
@@ -84,33 +84,45 @@ def _vendor_supports_task(task: Task, vendor: str) -> bool:
     """
     Check if a vendor can service the task based on temporal limits.
 
-    Currently enforces Massive free-tier limits (2y history, T+1 delay) for equities.
+    Currently enforces:
+    - Massive free-tier limits (2y history, T+1 delay) for equities
+    - Stage-based exclusion when stage requires >2y history (Stage 0/1)
     """
-    if vendor != "massive" or task.dataset not in ("equities_eod", "equities_minute"):
-        return True
+    if vendor == "massive" and task.dataset in ("equities_eod", "equities_minute"):
+        # If current stage demands >2y history, skip Massive entirely
+        try:
+            cfg = load_stage_config()
+            stage_def = cfg.stages.get(cfg.current_stage)
+            if stage_def and stage_def.equities_eod_years > 2:
+                logger.debug(
+                    f"Skipping Massive for task {task.id}: stage requires {stage_def.equities_eod_years}y history (>2y)"
+                )
+                return False
+        except Exception as exc:
+            logger.debug(f"Stage config check failed, defaulting to allow Massive: {exc}")
 
-    try:
-        # Normalize dates (handles str or date)
-        start_date = date.fromisoformat(task.start_date) if isinstance(task.start_date, str) else task.start_date
-        end_date = date.fromisoformat(task.end_date) if isinstance(task.end_date, str) else task.end_date
-    except Exception as exc:
-        logger.debug(f"Skipping Massive for task {task.id}: invalid dates {task.start_date}->{task.end_date} ({exc})")
-        return False
+        try:
+            # Normalize dates (handles str or date)
+            start_date = date.fromisoformat(task.start_date) if isinstance(task.start_date, str) else task.start_date
+            end_date = date.fromisoformat(task.end_date) if isinstance(task.end_date, str) else task.end_date
+        except Exception as exc:
+            logger.debug(f"Skipping Massive for task {task.id}: invalid dates {task.start_date}->{task.end_date} ({exc})")
+            return False
 
-    earliest = date.today() - timedelta(days=730)  # 2y history
-    latest = date.today() - timedelta(days=1)      # T+1 delay
+        earliest = date.today() - timedelta(days=730)  # 2y history
+        latest = date.today() - timedelta(days=1)      # T+1 delay
 
-    if end_date < earliest or start_date < earliest:
-        logger.debug(
-            f"Skipping Massive for task {task.id}: range {start_date}->{end_date} before free-tier window (earliest {earliest})"
-        )
-        return False
+        if end_date < earliest or start_date < earliest:
+            logger.debug(
+                f"Skipping Massive for task {task.id}: range {start_date}->{end_date} before free-tier window (earliest {earliest})"
+            )
+            return False
 
-    if start_date > latest:
-        logger.debug(
-            f"Skipping Massive for task {task.id}: range {start_date}->{end_date} too recent (latest {latest})"
-        )
-        return False
+        if start_date > latest:
+            logger.debug(
+                f"Skipping Massive for task {task.id}: range {start_date}->{end_date} too recent (latest {latest})"
+            )
+            return False
 
     return True
 
