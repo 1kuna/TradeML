@@ -80,6 +80,31 @@ DEFAULT_LEASE_TTL = 300  # 5 minutes
 BACKOFF_BASE_SECONDS = 60
 BACKOFF_MAX_SECONDS = 3600  # 1 hour
 
+def _vendor_supports_task(task: Task, vendor: str) -> bool:
+    """
+    Check if a vendor can service the task based on temporal limits.
+
+    Currently enforces Massive free-tier limits (2y history, T+1 delay) for equities.
+    """
+    try:
+        from datetime import date as dt_date, timedelta as dt_timedelta
+
+        if vendor == "massive" and task.dataset in ("equities_eod", "equities_minute"):
+            start_date = dt_date.fromisoformat(task.start_date) if isinstance(task.start_date, str) else task.start_date
+            end_date = dt_date.fromisoformat(task.end_date) if isinstance(task.end_date, str) else task.end_date
+
+            earliest = dt_date.today() - dt_timedelta(days=730)  # 2y history
+            latest = dt_date.today() - dt_timedelta(days=1)      # T+1 delay
+
+            # Too old or too recent for Massive
+            if end_date < earliest or start_date < earliest or start_date > latest:
+                return False
+    except Exception:
+        # If parsing fails, be permissive to avoid false negatives
+        return True
+
+    return True
+
 
 class QueueWorker:
     """
@@ -146,6 +171,11 @@ class QueueWorker:
         now = datetime.now(timezone.utc)
 
         for vendor in vendors:
+            # Skip vendors that cannot service this task (e.g., Massive history window)
+            if not _vendor_supports_task(task, vendor):
+                logger.debug(f"Vendor {vendor} not eligible for task window {task.start_date}->{task.end_date}")
+                continue
+
             # Check ineligibility cache
             cache_key = (task.dataset, vendor)
             if cache_key in self._vendor_ineligible:
