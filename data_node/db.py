@@ -87,6 +87,16 @@ PRIORITY_MAP = {
     (TaskKind.FORWARD, False): 5,
 }
 
+# Max days per task to prevent head-of-line blocking
+# Minute data: smaller chunks (more data per day)
+# EOD data: larger chunks (less data per day)
+MAX_TASK_DAYS = {
+    "equities_minute": 7,    # ~2,730 bars per task (7 × 390)
+    "equities_eod": 30,      # 30 bars per task
+    "fundamentals": 90,      # Quarterly data, larger chunks OK
+    "default": 14,           # Reasonable default for unknown datasets
+}
+
 
 @dataclass
 class Task:
@@ -268,11 +278,13 @@ class NodeDB:
         end_date: str,
         kind: TaskKind,
         priority: int,
+        chunk: bool = True,
     ) -> Optional[int]:
         """
         Enqueue a task into the backfill_queue.
 
         Uses INSERT OR IGNORE to avoid duplicates (thanks to UNIQUE constraint).
+        Automatically chunks large date ranges to prevent head-of-line blocking.
 
         Args:
             dataset: Logical dataset name (equities_eod, equities_minute, etc.)
@@ -281,10 +293,60 @@ class NodeDB:
             end_date: End date (YYYY-MM-DD)
             kind: Task kind (BOOTSTRAP, GAP, FORWARD, QC_PROBE)
             priority: Priority (lower = more important)
+            chunk: If True, automatically chunk large date ranges (default True)
 
         Returns:
-            Task ID if inserted, None if already exists
+            Task ID of first chunk if inserted, None if already exists
         """
+        # Parse dates
+        start_dt = date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
+        end_dt = date.fromisoformat(end_date) if isinstance(end_date, str) else end_date
+
+        # Get max days for this dataset
+        max_days = MAX_TASK_DAYS.get(dataset, MAX_TASK_DAYS["default"])
+
+        # Calculate date range
+        total_days = (end_dt - start_dt).days + 1
+
+        # If small enough or chunking disabled, insert directly
+        if not chunk or total_days <= max_days:
+            return self._enqueue_single_task(dataset, symbol, start_date, end_date, kind, priority)
+
+        # Chunk the date range
+        first_task_id = None
+        chunk_start = start_dt
+        chunk_num = 0
+
+        while chunk_start <= end_dt:
+            chunk_end = min(chunk_start + timedelta(days=max_days - 1), end_dt)
+
+            task_id = self._enqueue_single_task(
+                dataset, symbol,
+                chunk_start.isoformat(), chunk_end.isoformat(),
+                kind, priority + chunk_num,  # Slightly lower priority for later chunks
+            )
+
+            if first_task_id is None and task_id is not None:
+                first_task_id = task_id
+
+            chunk_start = chunk_end + timedelta(days=1)
+            chunk_num += 1
+
+        if chunk_num > 1:
+            logger.info(f"Chunked {dataset}/{symbol} [{start_date}..{end_date}] into {chunk_num} tasks (max {max_days} days each)")
+
+        return first_task_id
+
+    def _enqueue_single_task(
+        self,
+        dataset: str,
+        symbol: Optional[str],
+        start_date: str,
+        end_date: str,
+        kind: TaskKind,
+        priority: int,
+    ) -> Optional[int]:
+        """Enqueue a single task without chunking."""
         now = datetime.now(timezone.utc).isoformat()
 
         with self.transaction() as conn:

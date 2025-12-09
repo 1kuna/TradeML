@@ -134,8 +134,17 @@ class BaseConnector(ABC):
         try:
             response = self.session.get(url, params=params, headers=headers, timeout=30)
             logger.debug(f"HTTP GET status: {response.status_code} for {url}")
+
+            # Track budget per HTTP request BEFORE checking status
+            # This counts ALL API calls (success, 429, 5xx) for accurate rate limiting
+            try:
+                from data_node.budgets import get_budget_manager
+                get_budget_manager().spend(self.source_name)
+            except Exception:
+                pass  # Budget tracking optional - don't fail requests
+
+            # Handle rate limiting (429)
             if response.status_code == 429:
-                # Respect Retry-After if provided; otherwise exponential backoff with jitter
                 retry_after = response.headers.get("Retry-After")
                 if retry_after:
                     try:
@@ -146,19 +155,30 @@ class BaseConnector(ABC):
                     sleep_s = min(60, (self._min_request_interval or 1.0) * (2 + random.random()))
                 logger.warning(f"429 rate limited for {url}; sleeping {sleep_s:.2f}s")
                 time.sleep(sleep_s)
-                # One more attempt (let session retry strategy handle further if needed)
                 response = self.session.get(url, params=params, headers=headers, timeout=30)
                 logger.debug(f"HTTP GET retry status: {response.status_code} for {url}")
+                # Count retry attempt in budget too
+                try:
+                    from data_node.budgets import get_budget_manager
+                    get_budget_manager().spend(self.source_name)
+                except Exception:
+                    pass
+
+            # Handle server errors (5xx) with retry
+            if response.status_code >= 500:
+                sleep_s = min(30, 2 * (1 + random.random()))  # 2-4s with jitter
+                logger.warning(f"{response.status_code} server error for {url}; sleeping {sleep_s:.2f}s and retrying")
+                time.sleep(sleep_s)
+                response = self.session.get(url, params=params, headers=headers, timeout=30)
+                logger.debug(f"HTTP GET retry status: {response.status_code} for {url}")
+                # Count retry attempt in budget too
+                try:
+                    from data_node.budgets import get_budget_manager
+                    get_budget_manager().spend(self.source_name)
+                except Exception:
+                    pass
+
             response.raise_for_status()
-
-            # Track budget per HTTP request (not per task)
-            # This gives accurate API call counts in the dashboard
-            try:
-                from data_node.budgets import get_budget_manager
-                get_budget_manager().spend(self.source_name)
-            except Exception:
-                pass  # Budget tracking optional - don't fail requests
-
             return response
         except requests.exceptions.RequestException as e:
             if isinstance(getattr(e, "reason", None), NameResolutionError) or "Failed to resolve" in str(e):

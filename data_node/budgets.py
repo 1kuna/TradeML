@@ -71,6 +71,8 @@ class BudgetManager:
         """
         self._lock = threading.RLock()  # Reentrant lock for try_spend()
         self._budgets: dict[str, VendorBudget] = {}
+        self._last_save_time: float = 0.0  # For debounced saves
+        self._save_interval: float = 1.0   # Save at most once per second
 
         # Resolve paths
         if config_path is None:
@@ -133,9 +135,22 @@ class BudgetManager:
         self._budgets = defaults
 
     def _load_state(self) -> None:
-        """Load persisted state from JSON file."""
+        """Load persisted state from JSON file.
+
+        Implements crash recovery with safeguards:
+        - Missing file: Warn and start fresh (expected on first run)
+        - Corrupted file: Backup and start fresh
+        - Stale token state: Reset to prevent post-restart burst
+        """
         if not self.state_path.exists():
-            logger.debug("No budget state file found, starting fresh")
+            # Check if we expect a state file (data_layer/control exists)
+            if self.state_path.parent.exists():
+                logger.warning(
+                    f"Budget state file missing: {self.state_path} - starting fresh. "
+                    "This is normal on first run, but may indicate data loss if unexpected."
+                )
+            else:
+                logger.debug("No budget state file found (first run), starting fresh")
             return
 
         try:
@@ -143,6 +158,7 @@ class BudgetManager:
                 state = json.load(f)
 
             now = datetime.now(timezone.utc)
+            now_ts = time.time()
 
             for vendor, data in state.items():
                 if vendor not in self._budgets:
@@ -160,11 +176,34 @@ class BudgetManager:
                     self._budgets[vendor].spent_today = data.get("spent_today", 0)
                     self._budgets[vendor].last_reset = last_reset
 
-                # Restore token bucket state
-                self._budgets[vendor].tokens = data.get("tokens", self._budgets[vendor].hard_rpm)
-                self._budgets[vendor].last_token_update = data.get("last_token_update", time.time())
+                # Restore token bucket state with anti-burst protection
+                saved_tokens = data.get("tokens", self._budgets[vendor].hard_rpm)
+                saved_update_time = data.get("last_token_update", now_ts)
 
-            logger.debug(f"Loaded budget state from {self.state_path}")
+                # If the saved timestamp is stale (>60s old), reset to prevent burst
+                # This handles crashes where tokens weren't updated
+                if now_ts - saved_update_time > 60:
+                    # Start with 1 token to allow immediate progress, but prevent burst
+                    self._budgets[vendor].tokens = min(1.0, self._budgets[vendor].hard_rpm)
+                    self._budgets[vendor].last_token_update = now_ts
+                    logger.info(f"Budget for {vendor}: reset tokens to 1 (stale timestamp, anti-burst)")
+                else:
+                    self._budgets[vendor].tokens = saved_tokens
+                    self._budgets[vendor].last_token_update = saved_update_time
+
+            logger.info(f"Loaded budget state from {self.state_path}")
+        except json.JSONDecodeError as e:
+            # Corrupted file - backup and start fresh
+            backup_path = self.state_path.with_suffix(".json.bak")
+            try:
+                import shutil
+                shutil.copy2(self.state_path, backup_path)
+                logger.error(
+                    f"Budget state file corrupted: {e}. "
+                    f"Backed up to {backup_path} and starting fresh."
+                )
+            except Exception:
+                logger.error(f"Budget state file corrupted: {e}. Starting fresh.")
         except Exception as e:
             logger.warning(f"Failed to load budget state: {e}, starting fresh")
 
@@ -306,9 +345,12 @@ class BudgetManager:
             # Increment daily spent
             budget.spent_today += tokens
 
-            # Persist periodically (every 10 calls)
-            if budget.spent_today % 10 == 0:
+            # Persist with debounce (at most once per second to limit I/O)
+            # This reduces max data loss from 9 calls to ~3 calls (at 3 rps)
+            now = time.time()
+            if now - self._last_save_time >= self._save_interval:
                 self._save_state()
+                self._last_save_time = now
 
             return True
 

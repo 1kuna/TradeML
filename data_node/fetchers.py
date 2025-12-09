@@ -25,6 +25,7 @@ from .db import Task, TaskKind, PartitionStatus
 class FetchStatus(str, Enum):
     """Result status from a fetch operation."""
     SUCCESS = "success"         # Data fetched and written
+    PARTIAL = "partial"         # Some days fetched, but fetch failed partway through
     EMPTY = "empty"             # No data (weekend/holiday/no session)
     RATE_LIMITED = "rate_limited"  # 429 or similar
     ERROR = "error"             # Transient error (5xx, network)
@@ -43,6 +44,8 @@ class FetchResult:
     error: Optional[str] = None
     vendor_used: Optional[str] = None
     fetch_params: Optional[dict] = None  # API params used (for selective re-fetch)
+    failed_at_date: Optional[str] = None  # For PARTIAL: date where fetch failed
+    original_end_date: Optional[str] = None  # For PARTIAL: original task end date
 
 
 # ---------------------------------------------------------------------------
@@ -261,16 +264,18 @@ def _fetch_equities_minute(task: Task, vendor: str) -> FetchResult:
                 # Weekend/holiday - record 0 rows
                 rows_by_date[current_date] = 0
             elif result.status in (FetchStatus.RATE_LIMITED, FetchStatus.ERROR):
-                # Return partial progress - the remaining days will be re-fetched via GAP audit
+                # Return partial progress - worker will create follow-up task for remaining days
                 logger.warning(f"Chunk fetch failed at {current_date}: {result.error}")
                 if rows_by_date:
                     return FetchResult(
-                        status=FetchStatus.SUCCESS,  # Partial success
+                        status=FetchStatus.PARTIAL,
                         rows=total_rows,
                         rows_by_date=rows_by_date,
                         qc_code="PARTIAL",
                         vendor_used=vendor,
                         error=f"Partial fetch, failed at {current_date}: {result.error}",
+                        failed_at_date=current_date.isoformat(),  # Track where we failed
+                        original_end_date=end_date.isoformat(),    # Track original end date
                     )
                 return result
             else:
@@ -284,12 +289,14 @@ def _fetch_equities_minute(task: Task, vendor: str) -> FetchResult:
             logger.exception(f"Error fetching {current_date}: {e}")
             if rows_by_date:
                 return FetchResult(
-                    status=FetchStatus.SUCCESS,
+                    status=FetchStatus.PARTIAL,
                     rows=total_rows,
                     rows_by_date=rows_by_date,
                     qc_code="PARTIAL",
                     vendor_used=vendor,
                     error=f"Partial fetch, failed at {current_date}: {e}",
+                    failed_at_date=current_date.isoformat(),
+                    original_end_date=end_date.isoformat(),
                 )
             return FetchResult(status=FetchStatus.ERROR, error=str(e), vendor_used=vendor)
 
@@ -416,7 +423,8 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
         table_name = "equities_bars" if timeframe == "1Day" else "equities_bars_minute"
         raw_path = _get_raw_path("alpaca", table_name, task.start_date)
 
-        connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
+        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
+        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -493,7 +501,8 @@ def _fetch_massive_bars(task: Task, timeframe: str) -> FetchResult:
 
         table_name = "equities_bars" if timeframe == "day" else "equities_bars_minute"
         raw_path = _get_raw_path("massive", table_name, task.start_date)
-        connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
+        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
+        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -546,7 +555,8 @@ def _fetch_finnhub_candles(task: Task) -> FetchResult:
         rows_by_date = _compute_rows_by_date(df)
 
         raw_path = _get_raw_path("finnhub", "equities_bars", task.start_date)
-        connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
+        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
+        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -592,7 +602,8 @@ def _fetch_finnhub_options(task: Task) -> FetchResult:
             )
 
         raw_path = _get_raw_path("finnhub", "options_chains", task.start_date, underlier=task.symbol)
-        connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
+        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
+        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -633,12 +644,13 @@ def _fetch_finnhub_fundamentals(task: Task) -> FetchResult:
                 fetch_params=fetch_params,
             )
 
-        # For now, just return success - actual storage TBD
+        # TODO: Implement fundamentals storage - for now return EMPTY to avoid phantom GREEN partitions
+        # Data was fetched but not persisted, so don't claim SUCCESS
+        logger.warning(f"Finnhub fundamentals fetch for {task.symbol}: storage not implemented, returning EMPTY")
         return FetchResult(
-            status=FetchStatus.SUCCESS,
-            rows=1,
-            partition_status=PartitionStatus.GREEN,
-            qc_code="OK",
+            status=FetchStatus.EMPTY,
+            rows=0,
+            qc_code="STORAGE_NOT_IMPLEMENTED",
             vendor_used="finnhub",
             fetch_params=fetch_params,
         )
@@ -679,7 +691,8 @@ def _fetch_fred_treasury(task: Task) -> FetchResult:
             )
 
         raw_path = _get_raw_path("fred", "macro_treasury", task.start_date)
-        connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
+        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
+        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -726,7 +739,8 @@ def _fetch_av_corp_actions(task: Task) -> FetchResult:
             )
 
         raw_path = _get_raw_path("av", "corp_actions", task.start_date)
-        connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
+        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
+        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -773,7 +787,8 @@ def _fetch_fmp_eod(task: Task) -> FetchResult:
             )
 
         raw_path = _get_raw_path("fmp", "equities_bars", task.start_date)
-        connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
+        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
+        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -813,7 +828,8 @@ def _fetch_fmp_fundamentals(task: Task) -> FetchResult:
             )
 
         raw_path = _get_raw_path("fmp", "fundamentals", task.start_date)
-        connector.write_parquet(df, str(raw_path.parent), partition_cols=["date"])
+        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
+        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
 
         return FetchResult(
             status=FetchStatus.SUCCESS,

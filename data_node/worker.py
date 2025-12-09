@@ -33,6 +33,23 @@ from .qc import validate_partition_row_count
 from .stages import get_expected_rows, get_qc_thresholds
 
 
+def _is_trading_day(dt_value) -> bool:
+    """Best-effort trading day check using XNYS calendar; fallback to weekday."""
+    try:
+        from datetime import date as dt_date
+        from data_layer.reference.calendars import get_calendar
+
+        dt_obj = dt_date.fromisoformat(dt_value) if isinstance(dt_value, str) else dt_value
+        cal = get_calendar("XNYS")
+        return bool(cal.is_trading_day(dt_obj))
+    except Exception:
+        # Fallback: weekday (Mon-Fri) treated as trading
+        try:
+            return dt_value.weekday() < 5
+        except Exception:
+            return True
+
+
 # Default concurrency limits per vendor
 # Note: FMP removed - free tier too limited
 DEFAULT_MAX_INFLIGHT = {
@@ -196,6 +213,22 @@ class QueueWorker:
             # Process per-day entries if available
             if result.rows_by_date:
                 for dt, row_count in result.rows_by_date.items():
+                    # Non-trading day with zero rows → NO_SESSION GREEN
+                    if row_count == 0 and not _is_trading_day(dt):
+                        self.db.upsert_partition_status(
+                            source_name=result.vendor_used or "unknown",
+                            table_name=task.dataset,
+                            symbol=task.symbol,
+                            dt=dt.isoformat() if hasattr(dt, 'isoformat') else str(dt),
+                            status=PartitionStatus.GREEN,
+                            qc_score=1.0,
+                            row_count=0,
+                            expected_rows=0,
+                            qc_code="NO_SESSION",
+                            fetch_params=result.fetch_params,
+                        )
+                        continue
+
                     # Calculate status for this day
                     status, qc_code = validate_partition_row_count(
                         row_count=row_count,
@@ -218,6 +251,23 @@ class QueueWorker:
                     )
             else:
                 # Fallback: single entry for single-day tasks or legacy fetchers
+                if result.rows == 0 and not _is_trading_day(task.start_date):
+                    self.db.upsert_partition_status(
+                        source_name=result.vendor_used or "unknown",
+                        table_name=task.dataset,
+                        symbol=task.symbol,
+                        dt=task.start_date,
+                        status=PartitionStatus.GREEN,
+                        qc_score=1.0,
+                        row_count=0,
+                        expected_rows=0,
+                        qc_code="NO_SESSION",
+                        fetch_params=result.fetch_params,
+                    )
+                    self.db.mark_task_done(task.id)
+                    logger.debug(f"Task {task.id} empty/non-trading single day")
+                    return
+
                 status, qc_code = validate_partition_row_count(
                     row_count=result.rows,
                     expected_rows=expected_per_day,
@@ -242,21 +292,122 @@ class QueueWorker:
             logger.info(f"Task {task.id} completed: {result.rows} rows from {result.vendor_used}")
 
         elif result.status == FetchStatus.EMPTY:
-            # Empty result (weekend/holiday) - mark as GREEN with NO_SESSION
-            self.db.upsert_partition_status(
-                source_name=result.vendor_used or "unknown",
-                table_name=task.dataset,
-                symbol=task.symbol,
-                dt=task.start_date,
-                status=PartitionStatus.GREEN,
-                qc_score=1.0,
-                row_count=0,
-                expected_rows=0,
-                qc_code=result.qc_code or "NO_SESSION",
-                fetch_params=result.fetch_params,
-            )
+            if result.qc_code == "STORAGE_NOT_IMPLEMENTED":
+                # Data was fetched but not persisted; surface as AMBER gap
+                self.db.upsert_partition_status(
+                    source_name=result.vendor_used or "unknown",
+                    table_name=task.dataset,
+                    symbol=task.symbol,
+                    dt=task.start_date,
+                    status=PartitionStatus.AMBER,
+                    qc_score=0.5,
+                    row_count=0,
+                    expected_rows=0,
+                    qc_code=result.qc_code,
+                    fetch_params=result.fetch_params,
+                )
+                logger.warning(f"Task {task.id} empty due to missing storage {task.start_date}: {result.qc_code}")
+            else:
+                # Check if this is a trading day - empty on trading day is suspicious
+                from data_layer.reference.calendars import get_calendar
+                try:
+                    from datetime import date as dt_date
+                    task_date = dt_date.fromisoformat(task.start_date) if isinstance(task.start_date, str) else task.start_date
+                    is_trading = get_calendar("XNYS").is_trading_day(task_date)
+                except Exception:
+                    is_trading = True  # Assume trading day if calendar fails
+
+                if is_trading and result.qc_code != "NO_SESSION":
+                    # Empty on a trading day - mark AMBER for re-check, not GREEN
+                    expected_rows = get_expected_rows(task.dataset, num_days=1)
+                    self.db.upsert_partition_status(
+                        source_name=result.vendor_used or "unknown",
+                        table_name=task.dataset,
+                        symbol=task.symbol,
+                        dt=task.start_date,
+                        status=PartitionStatus.AMBER,
+                        qc_score=0.5,
+                        row_count=0,
+                        expected_rows=expected_rows,
+                        qc_code=result.qc_code or "EMPTY_ON_TRADING_DAY",
+                        fetch_params=result.fetch_params,
+                    )
+                    logger.warning(f"Task {task.id} empty on trading day {task.start_date}: {result.qc_code}")
+                else:
+                    # Non-trading day (weekend/holiday) - empty is expected, mark GREEN
+                    self.db.upsert_partition_status(
+                        source_name=result.vendor_used or "unknown",
+                        table_name=task.dataset,
+                        symbol=task.symbol,
+                        dt=task.start_date,
+                        status=PartitionStatus.GREEN,
+                        qc_score=1.0,
+                        row_count=0,
+                        expected_rows=0,
+                        qc_code=result.qc_code or "NO_SESSION",
+                        fetch_params=result.fetch_params,
+                    )
+                    logger.debug(f"Task {task.id} empty/no-session: {result.qc_code}")
+
             self.db.mark_task_done(task.id)
-            logger.debug(f"Task {task.id} empty/no-session: {result.qc_code}")
+
+        elif result.status == FetchStatus.PARTIAL:
+            # Partial success - some days fetched, but failed partway through
+            expected_per_day = get_expected_rows(task.dataset, num_days=1)
+            thresholds = get_qc_thresholds()
+
+            if result.rows_by_date:
+                for dt, row_count in result.rows_by_date.items():
+                    if row_count == 0 and not _is_trading_day(dt):
+                        self.db.upsert_partition_status(
+                            source_name=result.vendor_used or "unknown",
+                            table_name=task.dataset,
+                            symbol=task.symbol,
+                            dt=dt.isoformat() if hasattr(dt, 'isoformat') else str(dt),
+                            status=PartitionStatus.GREEN,
+                            qc_score=1.0,
+                            row_count=0,
+                            expected_rows=0,
+                            qc_code="NO_SESSION",
+                            fetch_params=result.fetch_params,
+                        )
+                        continue
+
+                    status, qc_code = validate_partition_row_count(
+                        row_count=row_count,
+                        expected_rows=expected_per_day,
+                        qc_code=result.qc_code,
+                        thresholds=thresholds,
+                    )
+
+                    self.db.upsert_partition_status(
+                        source_name=result.vendor_used or "unknown",
+                        table_name=task.dataset,
+                        symbol=task.symbol,
+                        dt=dt.isoformat() if hasattr(dt, 'isoformat') else str(dt),
+                        status=status,
+                        qc_score=1.0 if status == PartitionStatus.GREEN else 0.5,
+                        row_count=row_count,
+                        expected_rows=expected_per_day,
+                        qc_code=qc_code,
+                        fetch_params=result.fetch_params,
+                    )
+
+            # Create follow-up task for the remaining range
+            if result.failed_at_date and result.original_end_date:
+                new_task_id = self.db.enqueue_task(
+                    dataset=task.dataset,
+                    symbol=task.symbol,
+                    start_date=result.failed_at_date,
+                    end_date=result.original_end_date,
+                    kind=task.kind,  # Preserve original kind
+                    priority=task.priority + 1,  # Slightly lower priority
+                )
+                if new_task_id:
+                    logger.info(f"Created follow-up task {new_task_id} for {task.symbol} {result.failed_at_date} to {result.original_end_date}")
+
+            self.db.mark_task_done(task.id)
+            logger.info(f"Task {task.id} partial: {result.rows} rows from {result.vendor_used}, failed at {result.failed_at_date}")
 
         elif result.status == FetchStatus.RATE_LIMITED:
             # Rate limited - retry with backoff
@@ -625,8 +776,48 @@ class VendorWorker:
 
             # Process per-day entries if available
             if result.rows_by_date:
+                # Get trading calendar to check for weekends/holidays
+                from data_layer.reference.calendars import get_calendar
+                try:
+                    cal = get_calendar("XNYS")
+                except Exception:
+                    cal = None
+
                 for dt, row_count in result.rows_by_date.items():
-                    # Calculate status for this day
+                    # Convert to date if needed for calendar check
+                    from datetime import date as dt_date
+                    if isinstance(dt, str):
+                        check_date = dt_date.fromisoformat(dt)
+                    elif hasattr(dt, 'date'):
+                        check_date = dt.date()
+                    else:
+                        check_date = dt
+
+                    # Check if this is a trading day
+                    is_trading = True  # Default to trading (safer)
+                    if cal is not None:
+                        try:
+                            is_trading = cal.is_trading_day(check_date)
+                        except Exception:
+                            pass
+
+                    # For non-trading days with 0 rows, skip validation - mark GREEN
+                    if not is_trading and row_count == 0:
+                        self.db.upsert_partition_status(
+                            source_name=result.vendor_used or self.vendor,
+                            table_name=task.dataset,
+                            symbol=task.symbol,
+                            dt=dt.isoformat() if hasattr(dt, 'isoformat') else str(dt),
+                            status=PartitionStatus.GREEN,
+                            qc_score=1.0,
+                            row_count=0,
+                            expected_rows=0,
+                            qc_code="NO_SESSION",
+                            fetch_params=result.fetch_params,
+                        )
+                        continue
+
+                    # Calculate status for this trading day
                     status, qc_code = validate_partition_row_count(
                         row_count=row_count,
                         expected_rows=expected_per_day,
@@ -648,6 +839,23 @@ class VendorWorker:
                     )
             else:
                 # Fallback: single entry for single-day tasks or legacy fetchers
+                if result.rows == 0 and not _is_trading_day(task.start_date):
+                    self.db.upsert_partition_status(
+                        source_name=result.vendor_used or self.vendor,
+                        table_name=task.dataset,
+                        symbol=task.symbol,
+                        dt=task.start_date,
+                        status=PartitionStatus.GREEN,
+                        qc_score=1.0,
+                        row_count=0,
+                        expected_rows=0,
+                        qc_code="NO_SESSION",
+                        fetch_params=result.fetch_params,
+                    )
+                    self.db.mark_task_done(task.id)
+                    logger.debug(f"Task {task.id} empty/non-trading single day")
+                    return
+
                 status, qc_code = validate_partition_row_count(
                     row_count=result.rows,
                     expected_rows=expected_per_day,
@@ -672,21 +880,135 @@ class VendorWorker:
             logger.info(f"Task {task.id} completed: {result.rows} rows from {self.vendor}")
 
         elif result.status == FetchStatus.EMPTY:
-            # Empty result (weekend/holiday) - mark as GREEN with NO_SESSION
-            self.db.upsert_partition_status(
-                source_name=result.vendor_used or self.vendor,
-                table_name=task.dataset,
-                symbol=task.symbol,
-                dt=task.start_date,
-                status=PartitionStatus.GREEN,
-                qc_score=1.0,
-                row_count=0,
-                expected_rows=0,
-                qc_code=result.qc_code or "NO_SESSION",
-                fetch_params=result.fetch_params,
-            )
+            if result.qc_code == "STORAGE_NOT_IMPLEMENTED":
+                self.db.upsert_partition_status(
+                    source_name=result.vendor_used or self.vendor,
+                    table_name=task.dataset,
+                    symbol=task.symbol,
+                    dt=task.start_date,
+                    status=PartitionStatus.AMBER,
+                    qc_score=0.5,
+                    row_count=0,
+                    expected_rows=0,
+                    qc_code=result.qc_code,
+                    fetch_params=result.fetch_params,
+                )
+                logger.warning(f"Task {task.id} empty due to missing storage {task.start_date}: {result.qc_code}")
+            else:
+                is_trading = _is_trading_day(task.start_date)
+                if is_trading and result.qc_code != "NO_SESSION":
+                    expected_rows = get_expected_rows(task.dataset, num_days=1)
+                    self.db.upsert_partition_status(
+                        source_name=result.vendor_used or self.vendor,
+                        table_name=task.dataset,
+                        symbol=task.symbol,
+                        dt=task.start_date,
+                        status=PartitionStatus.AMBER,
+                        qc_score=0.5,
+                        row_count=0,
+                        expected_rows=expected_rows,
+                        qc_code=result.qc_code or "EMPTY_ON_TRADING_DAY",
+                        fetch_params=result.fetch_params,
+                    )
+                    logger.warning(f"Task {task.id} empty on trading day {task.start_date}: {result.qc_code}")
+                else:
+                    self.db.upsert_partition_status(
+                        source_name=result.vendor_used or self.vendor,
+                        table_name=task.dataset,
+                        symbol=task.symbol,
+                        dt=task.start_date,
+                        status=PartitionStatus.GREEN,
+                        qc_score=1.0,
+                        row_count=0,
+                        expected_rows=0,
+                        qc_code=result.qc_code or "NO_SESSION",
+                        fetch_params=result.fetch_params,
+                    )
+                    logger.debug(f"Task {task.id} empty/no-session: {result.qc_code}")
+
             self.db.mark_task_done(task.id)
-            logger.debug(f"Task {task.id} empty/no-session: {result.qc_code}")
+
+        elif result.status == FetchStatus.PARTIAL:
+            # Partial success - some days fetched, but failed partway through
+            # 1) Process the successfully fetched days
+            expected_per_day = get_expected_rows(task.dataset, num_days=1)
+            thresholds = get_qc_thresholds()
+
+            if result.rows_by_date:
+                # Get trading calendar
+                from data_layer.reference.calendars import get_calendar
+                try:
+                    cal = get_calendar("XNYS")
+                except Exception:
+                    cal = None
+
+                for dt, row_count in result.rows_by_date.items():
+                    from datetime import date as dt_date
+                    if isinstance(dt, str):
+                        check_date = dt_date.fromisoformat(dt)
+                    elif hasattr(dt, 'date'):
+                        check_date = dt.date()
+                    else:
+                        check_date = dt
+
+                    is_trading = True
+                    if cal is not None:
+                        try:
+                            is_trading = cal.is_trading_day(check_date)
+                        except Exception:
+                            pass
+
+                    if not is_trading and row_count == 0:
+                        self.db.upsert_partition_status(
+                            source_name=result.vendor_used or self.vendor,
+                            table_name=task.dataset,
+                            symbol=task.symbol,
+                            dt=dt.isoformat() if hasattr(dt, 'isoformat') else str(dt),
+                            status=PartitionStatus.GREEN,
+                            qc_score=1.0,
+                            row_count=0,
+                            expected_rows=0,
+                            qc_code="NO_SESSION",
+                            fetch_params=result.fetch_params,
+                        )
+                        continue
+
+                    status, qc_code = validate_partition_row_count(
+                        row_count=row_count,
+                        expected_rows=expected_per_day,
+                        qc_code=result.qc_code,
+                        thresholds=thresholds,
+                    )
+
+                    self.db.upsert_partition_status(
+                        source_name=result.vendor_used or self.vendor,
+                        table_name=task.dataset,
+                        symbol=task.symbol,
+                        dt=dt.isoformat() if hasattr(dt, 'isoformat') else str(dt),
+                        status=status,
+                        qc_score=1.0 if status == PartitionStatus.GREEN else 0.5,
+                        row_count=row_count,
+                        expected_rows=expected_per_day,
+                        qc_code=qc_code,
+                        fetch_params=result.fetch_params,
+                    )
+
+            # 2) Create follow-up task for the remaining days
+            if result.failed_at_date and result.original_end_date:
+                new_task_id = self.db.enqueue_task(
+                    dataset=task.dataset,
+                    symbol=task.symbol,
+                    start_date=result.failed_at_date,
+                    end_date=result.original_end_date,
+                    kind=task.kind,  # Preserve original kind
+                    priority=task.priority + 1,  # Slightly lower priority
+                )
+                if new_task_id:
+                    logger.info(f"Created follow-up task {new_task_id} for {task.symbol} {result.failed_at_date} to {result.original_end_date}")
+
+            # 3) Mark original task as done (the partial data is saved)
+            self.db.mark_task_done(task.id)
+            logger.info(f"Task {task.id} partial: {result.rows} rows from {self.vendor}, failed at {result.failed_at_date}")
 
         elif result.status == FetchStatus.RATE_LIMITED:
             backoff = timedelta(seconds=BACKOFF_BASE_SECONDS * (2 ** task.attempts))
