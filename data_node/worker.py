@@ -463,7 +463,7 @@ def run_worker(
 # Default thread counts per vendor (sized for latency resilience)
 # Note: FMP removed - free tier too limited
 DEFAULT_THREAD_COUNTS = {
-    "alpaca": 10,   # 200 rpm - 10 threads for aggressive throughput
+    "alpaca": 3,    # 3.25 rps × ~0.5s latency = 2-3 threads saturates API
     "finnhub": 2,   # 60 rpm
     "fred": 2,      # 120 rpm
     "av": 1,        # 5 rpm, 25/day - so slow 1 is plenty
