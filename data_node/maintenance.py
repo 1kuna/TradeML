@@ -26,6 +26,32 @@ from loguru import logger
 
 from .db import NodeDB, get_db
 
+
+def _map_dataset_to_table(table_name: str) -> str:
+    """Map logical dataset names to raw table directories used by fetchers."""
+    mapping = {
+        "equities_eod": "equities_bars",
+        "equities_minute": "equities_bars_minute",
+        "options_chains": "options_chains",
+        "macros_fred": "macro_treasury",
+        "corp_actions": "corp_actions",
+        "fundamentals": "fundamentals",
+    }
+    return mapping.get(table_name, table_name)
+
+
+def _resolve_raw_partition_path(source_name: str, table_name: str, dt: str, symbol: Optional[str]) -> Optional[Path]:
+    """
+    Best-effort reconstruction of the raw parquet path for a partition.
+
+    Uses the same convention as fetchers: data_layer/raw/<vendor>/<table>/date=<dt>/data.parquet
+    """
+    data_root = os.environ.get("DATA_ROOT", ".")
+    resolved_table = _map_dataset_to_table(table_name)
+    if dt is None:
+        return None
+    return Path(data_root) / "data_layer" / "raw" / source_name / resolved_table / f"date={dt}" / "data.parquet"
+
 # Try to import existing curate module
 try:
     from ops.ssot.curate import curate_incremental, IncrementalCurator
@@ -182,6 +208,26 @@ def _validate_partition_row_counts(
     mismatches = 0
 
     for p in partitions:
+        # Check backing parquet file exists (guards crash between upsert and write)
+        partition_path = _resolve_raw_partition_path(p.source_name, table_name, p.dt, p.symbol)
+        if partition_path is not None and not partition_path.exists():
+            results["issues"] += 1
+            results["updated_to_red"] += 1
+            db.upsert_partition_status(
+                source_name=p.source_name,
+                table_name=table_name,
+                symbol=p.symbol,
+                dt=p.dt,
+                status=PartitionStatus.RED,
+                qc_score=0.0,
+                row_count=0,
+                expected_rows=p.expected_rows,
+                qc_code="MISSING_FILE",
+                notes="QC: missing parquet file",
+            )
+            logger.warning(f"Missing parquet file for {table_name}/{p.symbol}/{p.dt}: {partition_path}")
+            continue
+
         # Skip partitions with NO_SESSION (holidays/weekends)
         if p.qc_code == "NO_SESSION":
             continue

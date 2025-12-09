@@ -286,6 +286,15 @@ def get_current_universe() -> list[str]:
     return all_symbols[:stage_def.universe_size]
 
 
+def _years_ago(from_date: date, years: int) -> date:
+    """Subtract whole years while handling leap days."""
+    try:
+        return from_date.replace(year=from_date.year - years)
+    except ValueError:
+        # Handle Feb 29 → Feb 28 on non-leap years
+        return from_date.replace(month=2, day=28, year=from_date.year - years)
+
+
 def get_date_range(dataset: str) -> tuple[date, date]:
     """
     Get the date range for a dataset based on current stage.
@@ -312,7 +321,7 @@ def get_date_range(dataset: str) -> tuple[date, date]:
         # Default to EOD range for other datasets
         years = stage_def.equities_eod_years
 
-    start_date = today - timedelta(days=years * 365)
+    start_date = _years_ago(today, years)
     return (start_date, today)
 
 
@@ -355,8 +364,8 @@ def get_extended_date_range(
         new_years = new_def.equities_eod_years
 
     # Extension is from new_start to old_start
-    new_start = today - timedelta(days=new_years * 365)
-    old_start = today - timedelta(days=old_years * 365)
+    new_start = _years_ago(today, new_years)
+    old_start = _years_ago(today, old_years)
 
     return (new_start, old_start - timedelta(days=1))
 

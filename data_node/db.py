@@ -14,7 +14,7 @@ import json
 import os
 import sqlite3
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -279,6 +279,7 @@ class NodeDB:
         kind: TaskKind,
         priority: int,
         chunk: bool = True,
+        allow_overlap: bool = False,
     ) -> Optional[int]:
         """
         Enqueue a task into the backfill_queue.
@@ -302,6 +303,16 @@ class NodeDB:
         start_dt = date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
         end_dt = date.fromisoformat(end_date) if isinstance(end_date, str) else end_date
 
+        # Skip if overlapping pending/leased task already exists (used by gap audit)
+        if not allow_overlap and self.task_exists_overlapping(
+            dataset=dataset,
+            symbol=symbol,
+            start_date=start_dt,
+            end_date=end_dt,
+        ):
+            logger.debug(f"Skipped enqueue (overlap pending/leased) for {dataset}/{symbol} [{start_dt}..{end_dt}]")
+            return None
+
         # Get max days for this dataset
         max_days = MAX_TASK_DAYS.get(dataset, MAX_TASK_DAYS["default"])
 
@@ -321,9 +332,12 @@ class NodeDB:
             chunk_end = min(chunk_start + timedelta(days=max_days - 1), end_dt)
 
             task_id = self._enqueue_single_task(
-                dataset, symbol,
-                chunk_start.isoformat(), chunk_end.isoformat(),
-                kind, priority + chunk_num,  # Slightly lower priority for later chunks
+                dataset,
+                symbol,
+                chunk_start.isoformat(),
+                chunk_end.isoformat(),
+                kind,
+                priority + chunk_num,  # Slightly lower priority for later chunks
             )
 
             if first_task_id is None and task_id is not None:
@@ -361,6 +375,58 @@ class NodeDB:
                 logger.debug(f"Enqueued task {task_id}: {kind.value} {dataset}/{symbol} [{start_date}..{end_date}]")
                 return task_id
             return None
+
+    def task_exists_overlapping(
+        self,
+        dataset: str,
+        symbol: Optional[str],
+        start_date,
+        end_date,
+        statuses: tuple[str, ...] = ("PENDING", "LEASED"),
+    ) -> bool:
+        """
+        Check if there is any pending/leased task that overlaps the given date range,
+        regardless of kind.
+        """
+        # Normalize dates to ISO strings for lexicographic comparison in SQLite
+        if hasattr(start_date, "isoformat"):
+            start_date = start_date.isoformat()
+        if hasattr(end_date, "isoformat"):
+            end_date = end_date.isoformat()
+
+        placeholders = ",".join("?" * len(statuses))
+        params: list = [dataset, start_date, end_date, start_date, end_date] + list(statuses)
+
+        with self.transaction() as conn:
+            row = conn.execute(
+                f"""
+                SELECT 1
+                FROM backfill_queue
+                WHERE dataset = ?
+                  AND symbol IS ?
+                  AND NOT (end_date < ? OR start_date > ?)
+                  AND status IN ({placeholders})
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            return row is not None
+
+    def release_task(self, task_id: int) -> None:
+        """Release a leased task back to PENDING."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE backfill_queue
+                SET status = 'PENDING',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, task_id),
+            )
 
     def lease_next_task(
         self,
@@ -534,7 +600,7 @@ class NodeDB:
                 logger.info(f"[DB-LEASE] {vendor}: task={task.id}, total={total_ms:.0f}ms (lock_wait={lock_wait_ms:.0f}ms, query={query_ms:.0f}ms, update={update_ms:.0f}ms)")
                 return task
 
-    def mark_task_done(self, task_id: int) -> bool:
+    def mark_task_done(self, task_id: int, conn: Optional[sqlite3.Connection] = None) -> bool:
         """
         Mark a task as DONE.
 
@@ -546,8 +612,13 @@ class NodeDB:
         """
         now = datetime.now(timezone.utc).isoformat()
 
-        with self.transaction() as conn:
-            cursor = conn.execute("""
+        if conn is None:
+            context = self.transaction()
+        else:
+            context = nullcontext(conn)
+
+        with context as _conn:
+            cursor = _conn.execute("""
                 UPDATE backfill_queue
                 SET status = 'DONE',
                     lease_owner = NULL,
@@ -681,6 +752,7 @@ class NodeDB:
         qc_code: Optional[str] = None,
         notes: Optional[str] = None,
         fetch_params: Optional[dict] = None,
+        conn: Optional[sqlite3.Connection] = None,
     ) -> None:
         """
         Upsert a partition status record.
@@ -694,16 +766,22 @@ class NodeDB:
         now = datetime.now(timezone.utc).isoformat()
         fetch_params_json = json.dumps(fetch_params) if fetch_params else None
 
-        with self.transaction() as conn:
+        # Allow caller to supply an open transaction to keep task updates atomic
+        if conn is None:
+            context = self.transaction()
+        else:
+            context = nullcontext(conn)
+
+        with context as _conn:
             # Check if exists
-            existing = conn.execute("""
+            existing = _conn.execute("""
                 SELECT first_observed_at FROM partition_status
                 WHERE source_name = ? AND table_name = ? AND symbol IS ? AND dt = ?
             """, (source_name, table_name, symbol, dt)).fetchone()
 
             if existing:
                 # Update
-                conn.execute("""
+                _conn.execute("""
                     UPDATE partition_status
                     SET status = ?, qc_score = ?, row_count = ?, expected_rows = ?,
                         qc_code = ?, last_observed_at = ?, notes = ?, fetch_params = ?
@@ -714,7 +792,7 @@ class NodeDB:
                 ))
             else:
                 # Insert
-                conn.execute("""
+                _conn.execute("""
                     INSERT INTO partition_status
                     (source_name, table_name, symbol, dt, status, qc_score, row_count,
                      expected_rows, qc_code, first_observed_at, last_observed_at, notes, fetch_params)

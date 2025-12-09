@@ -9,6 +9,7 @@ All data connectors must inherit from BaseConnector and implement:
 import hashlib
 import os
 import time
+import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -326,25 +327,55 @@ class BaseConnector(ABC):
         # Local filesystem write
         path = Path(path)
 
-        # Create directory if needed
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Convert to PyArrow table
-        table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
-
         if partition_cols:
-            # Write partitioned dataset
-            pq.write_to_dataset(
-                table,
-                root_path=str(path),
-                partition_cols=partition_cols,
-                existing_data_behavior="overwrite_or_ignore",
-            )
-            logger.info(f"Wrote partitioned Parquet to {path}")
-        else:
-            # Write single file
-            pq.write_table(table, str(path), compression="snappy")
-            logger.info(f"Wrote Parquet to {path}")
+            part_cols = [c for c in partition_cols if c in df.columns]
+            if not part_cols:
+                logger.warning("Partition columns not found in DataFrame; writing unpartitioned")
+                partition_cols = None
+            else:
+                for _, sub in df.groupby(part_cols, dropna=False, as_index=False):
+                    # Build partition directory path
+                    part_path = Path(path)
+                    for c in part_cols:
+                        v = sub.iloc[0][c]
+                        if hasattr(v, "isoformat"):
+                            v = v.isoformat()
+                        part_path = part_path / f"{c}={v}"
+
+                    part_path.mkdir(parents=True, exist_ok=True)
+                    tmp_file = part_path / f".tmp-{uuid.uuid4().hex}.parquet"
+                    final_file = part_path / "data.parquet"
+
+                    table = pa.Table.from_pandas(sub, schema=schema, preserve_index=False)
+                    try:
+                        pq.write_table(table, str(tmp_file), compression="snappy")
+                        os.replace(tmp_file, final_file)  # Atomic on same filesystem
+                    finally:
+                        if tmp_file.exists():
+                            try:
+                                tmp_file.unlink()
+                            except Exception:
+                                pass
+                logger.info(f"Wrote partitioned Parquet to {path}")
+                return
+
+        # Fallback: single file
+        target_dir = path.parent if path.suffix else path
+        target_dir.mkdir(parents=True, exist_ok=True)
+        tmp_file = target_dir / f".tmp-{uuid.uuid4().hex}{''.join(path.suffixes) if path.suffixes else '.parquet'}"
+        final_file = path if path.suffix else target_dir / "data.parquet"
+
+        table = pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+        try:
+            pq.write_table(table, str(tmp_file), compression="snappy")
+            os.replace(tmp_file, final_file)
+        finally:
+            if tmp_file.exists():
+                try:
+                    tmp_file.unlink()
+                except Exception:
+                    pass
+        logger.info(f"Wrote Parquet to {final_file}")
 
     def _write_parquet_s3(
         self,
