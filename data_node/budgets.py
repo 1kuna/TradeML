@@ -26,6 +26,12 @@ from loguru import logger
 from .db import TaskKind
 
 
+VENDOR_ALIASES = {
+    # Normalize connector source names to budget keys
+    "alpha_vantage": "av",
+}
+
+
 @dataclass
 class VendorBudget:
     """Budget state for a single vendor."""
@@ -87,6 +93,10 @@ class BudgetManager:
         # Load config and state
         self._load_config()
         self._load_state()
+
+    def _normalize_vendor(self, vendor: str) -> str:
+        """Map aliases (e.g., connector source names) to canonical budget keys."""
+        return VENDOR_ALIASES.get(vendor, vendor)
 
     def _load_config(self) -> None:
         """Load rate limits from config file."""
@@ -160,7 +170,8 @@ class BudgetManager:
             now = datetime.now(timezone.utc)
             now_ts = time.time()
 
-            for vendor, data in state.items():
+            for vendor_key, data in state.items():
+                vendor = self._normalize_vendor(vendor_key)
                 if vendor not in self._budgets:
                     continue
 
@@ -289,6 +300,7 @@ class BudgetManager:
         Returns:
             True if spending is allowed
         """
+        vendor = self._normalize_vendor(vendor)
         with self._lock:
             budget = self._budgets.get(vendor)
             if budget is None:
@@ -331,6 +343,7 @@ class BudgetManager:
         Returns:
             True if recorded, False if vendor unknown
         """
+        vendor = self._normalize_vendor(vendor)
         with self._lock:
             budget = self._budgets.get(vendor)
             if budget is None:
@@ -368,6 +381,7 @@ class BudgetManager:
         Returns:
             True if spending was allowed and recorded
         """
+        vendor = self._normalize_vendor(vendor)
         with self._lock:
             if not self.can_spend(vendor, kind, tokens):
                 return False
@@ -380,6 +394,7 @@ class BudgetManager:
         Returns:
             Dict with spent_today, soft_daily_cap, remaining, pct_used, tokens_rpm
         """
+        vendor = self._normalize_vendor(vendor)
         with self._lock:
             budget = self._budgets.get(vendor)
             if budget is None:
