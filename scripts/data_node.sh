@@ -59,6 +59,61 @@ error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 header() { echo -e "${BLUE}$*${NC}"; }
 
 # =============================================================================
+# Preflight Checks
+# =============================================================================
+
+check_data_root_mount() {
+    local path="$DATA_ROOT"
+
+    if [ -z "$path" ]; then
+        error "DATA_ROOT is not set"
+        return 1
+    fi
+
+    if [ ! -d "$path" ]; then
+        error "DATA_ROOT not found: $path (mount may be missing)"
+        return 1
+    fi
+
+    # When using external mounts, ensure we are actually on the mounted volume
+    if command -v df >/dev/null 2>&1; then
+        local df_line device mountpoint
+        df_line=$(df -P "$path" 2>/dev/null | awk 'NR==2 {print $1 " " $6}')
+        device=$(echo "$df_line" | awk '{print $1}')
+        mountpoint=$(echo "$df_line" | awk '{print $2}')
+
+        if [[ "$path" == /mnt/* || "$path" == /media/* ]]; then
+            if [ -z "$mountpoint" ] || [ "$mountpoint" != "$path" ]; then
+                error "DATA_ROOT=$path is not a mounted volume (currently on $mountpoint). Mount the SSD and retry."
+                return 1
+            fi
+        fi
+    fi
+
+    # Writeability check (avoids silently writing to the wrong disk)
+    local probe="$path/.trademl_write_test"
+    if ! (touch "$probe" 2>/dev/null && rm -f "$probe"); then
+        error "DATA_ROOT not writable: $path"
+        return 1
+    fi
+
+    return 0
+}
+
+check_sqlite_cli() {
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        error "sqlite3 CLI not found. Install with: sudo apt-get update && sudo apt-get install -y sqlite3"
+        return 1
+    fi
+    return 0
+}
+
+preflight_checks() {
+    check_data_root_mount || exit 1
+    check_sqlite_cli || exit 1
+}
+
+# =============================================================================
 # Bootstrap Functions
 # =============================================================================
 
@@ -249,6 +304,7 @@ do_setup() {
 }
 
 do_start() {
+    preflight_checks
     ensure_venv
 
     local background=false
@@ -331,6 +387,7 @@ do_restart() {
 }
 
 do_status() {
+    preflight_checks
     ensure_venv
 
     header "============================================================"
@@ -367,6 +424,7 @@ do_logs() {
 }
 
 do_selfcheck() {
+    preflight_checks
     ensure_venv
     "$VENV/bin/python" -m data_node --selfcheck
 }
