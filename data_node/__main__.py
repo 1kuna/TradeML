@@ -42,7 +42,7 @@ from .budgets import get_budget_manager, BudgetManager
 from .worker import QueueWorkerLoop, QueueWorkerPool
 from .planner import PlannerLoop
 from .maintenance import MaintenanceLoop
-from .stages import get_stage_info, get_current_universe, get_date_range
+from .stages import get_stage_info
 from .ui import NodeStatus, Dashboard, setup_log_handler, print_simple_status
 
 
@@ -179,21 +179,18 @@ def show_status() -> None:
         stats = db.get_queue_stats()
         status.update_queue_stats(stats)
 
-        # Get coverage
-        start, end = get_date_range("equities_eod")
-        coverage = db.get_green_coverage(
-            table_name="equities_eod",
-            start_date=start,
-            end_date=end,
-        )
-        status.green_coverage = coverage
-
-        # Get partition counts
+        # Get partition counts (coverage is derived from these)
         conn = db._get_connection()
         row = conn.execute("SELECT COUNT(*) FROM partition_status").fetchone()
         status.partitions_total = row[0] if row else 0
         row = conn.execute("SELECT COUNT(*) FROM partition_status WHERE status='GREEN'").fetchone()
         status.partitions_green = row[0] if row else 0
+
+        # Coverage = GREEN / total (all tables)
+        if status.partitions_total > 0:
+            status.green_coverage = status.partitions_green / status.partitions_total
+        else:
+            status.green_coverage = 0.0
     except Exception as e:
         logger.warning(f"Failed to get stats: {e}")
 
@@ -337,20 +334,18 @@ def run_node(
             now = time.time()
             if now - last_coverage_update >= coverage_update_interval:
                 try:
-                    start, end = get_date_range("equities_eod")
-                    coverage = db.get_green_coverage(
-                        table_name="equities_eod",
-                        start_date=start,
-                        end_date=end,
-                    )
-                    status.green_coverage = coverage
-
-                    # Get partition counts
+                    # Get partition counts (coverage is derived from these)
                     conn = db._get_connection()
                     row = conn.execute("SELECT COUNT(*) FROM partition_status").fetchone()
                     status.partitions_total = row[0] if row else 0
                     row = conn.execute("SELECT COUNT(*) FROM partition_status WHERE status='GREEN'").fetchone()
                     status.partitions_green = row[0] if row else 0
+
+                    # Coverage = GREEN / total (all tables)
+                    if status.partitions_total > 0:
+                        status.green_coverage = status.partitions_green / status.partitions_total
+                    else:
+                        status.green_coverage = 0.0
 
                     last_coverage_update = now
                 except Exception as e:
