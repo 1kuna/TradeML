@@ -65,6 +65,7 @@ class AlpacaConnector(BaseConnector):
         )
 
         self.secret_key = secret_key
+        self.last_feed: Optional[str] = None  # Track feed used for fetch_params lineage
         logger.info("Alpaca connector initialized (REST only)")
 
     def _fetch_raw(
@@ -98,6 +99,7 @@ class AlpacaConnector(BaseConnector):
         feed = (feed_env or "sip").lower()
         if feed not in ("iex", "sip"):
             feed = "sip"
+        self.last_feed = feed  # Track for fetch_params lineage
 
         allow_iex_fallback = os.getenv("ALPACA_ALLOW_IEX_FALLBACK", "0") not in ("0", "false", "False")
         today = date.today()

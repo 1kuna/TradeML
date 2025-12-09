@@ -308,9 +308,12 @@ def _fetch_equities_minute(task: Task, vendor: str) -> FetchResult:
 
     logger.info(f"Completed multi-day fetch: {task.symbol} {days_total} days, {total_rows} total rows")
 
-    # Determine fetch_params based on vendor
+    # Determine fetch_params based on vendor (read actual feed from env for alpaca)
     if vendor == "alpaca":
-        fetch_params = {"feed": "sip", "timeframe": "1Min"}
+        alpaca_feed = (os.getenv("ALPACA_FEED") or "sip").lower()
+        if alpaca_feed not in ("iex", "sip"):
+            alpaca_feed = "sip"
+        fetch_params = {"feed": alpaca_feed, "timeframe": "1Min"}
     elif vendor == "massive":
         fetch_params = {"timespan": "minute"}
     else:
@@ -391,9 +394,6 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
 
     connector = AlpacaConnector()
 
-    # Track fetch params for lineage
-    fetch_params = {"feed": "sip", "timeframe": timeframe}
-
     try:
         symbols = [task.symbol] if task.symbol else []
         if not symbols:
@@ -405,6 +405,9 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
             end_date=_ensure_date(task.end_date),
             timeframe=timeframe,
         )
+
+        # Get actual feed used from connector for lineage tracking
+        fetch_params = {"feed": connector.last_feed or "sip", "timeframe": timeframe}
 
         if df is None or df.empty:
             # Check if this is a weekend/holiday
@@ -436,13 +439,16 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
         )
 
     except Exception as e:
+        # Get feed if available (may be None if error occurred before fetch)
+        actual_feed = getattr(connector, 'last_feed', None) or "sip"
+        err_fetch_params = {"feed": actual_feed, "timeframe": timeframe}
         error_str = str(e).lower()
         if "429" in error_str or "rate" in error_str:
-            return FetchResult(status=FetchStatus.RATE_LIMITED, error=str(e), vendor_used="alpaca", fetch_params=fetch_params)
+            return FetchResult(status=FetchStatus.RATE_LIMITED, error=str(e), vendor_used="alpaca", fetch_params=err_fetch_params)
         elif "401" in error_str or "403" in error_str or "not entitled" in error_str:
-            return FetchResult(status=FetchStatus.NOT_ENTITLED, error=str(e), vendor_used="alpaca", fetch_params=fetch_params)
+            return FetchResult(status=FetchStatus.NOT_ENTITLED, error=str(e), vendor_used="alpaca", fetch_params=err_fetch_params)
         else:
-            return FetchResult(status=FetchStatus.ERROR, error=str(e), vendor_used="alpaca", fetch_params=fetch_params)
+            return FetchResult(status=FetchStatus.ERROR, error=str(e), vendor_used="alpaca", fetch_params=err_fetch_params)
 
 
 def _fetch_alpaca_options(task: Task) -> FetchResult:
