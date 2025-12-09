@@ -77,6 +77,49 @@ def test_vendor_specific_leasing(node_db):
     assert leased.symbol == "NVDA"
 
 
+def test_massive_vendor_respects_history_window(node_db):
+    """Massive should never lease tasks outside its 2-year free-tier window."""
+    now = datetime(2025, 12, 9, tzinfo=timezone.utc)  # latest=2025-12-08, earliest=2023-12-10
+
+    # Older than 2y for Massive, but valid for other vendors
+    node_db.enqueue_task(
+        dataset="equities_eod",
+        symbol="OLD",
+        start_date="2023-12-01",
+        end_date="2023-12-01",
+        kind=TaskKind.BOOTSTRAP,
+        priority=0,
+    )
+    # In-window for Massive
+    node_db.enqueue_task(
+        dataset="equities_eod",
+        symbol="NEW",
+        start_date="2024-12-02",
+        end_date="2024-12-02",
+        kind=TaskKind.BOOTSTRAP,
+        priority=1,
+    )
+
+    leased_massive = node_db.lease_next_task_for_vendor(
+        vendor="massive",
+        datasets=["equities_eod"],
+        node_id="node-massive",
+        now=now,
+    )
+    assert leased_massive is not None
+    assert leased_massive.symbol == "NEW"
+
+    # The older task should remain available for another vendor
+    leased_alpaca = node_db.lease_next_task_for_vendor(
+        vendor="alpaca",
+        datasets=["equities_eod"],
+        node_id="node-alpaca",
+        now=now,
+    )
+    assert leased_alpaca is not None
+    assert leased_alpaca.symbol == "OLD"
+
+
 def test_partition_coverage_and_batch_queries(node_db):
     # Insert two GREEN, one RED to validate coverage math
     node_db.upsert_partition_status(

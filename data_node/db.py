@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Generator, Optional
 
 from loguru import logger
+from .vendor_limits import massive_window
 
 
 # Register SQLite adapters for date/datetime (Python 3.12+ compatible)
@@ -542,6 +543,20 @@ class NodeDB:
         # Build dataset IN clause
         placeholders = ",".join("?" * len(datasets))
 
+        # Vendor-specific eligibility filters (avoid leasing tasks Massive cannot serve)
+        extra_where = ""
+        extra_params: tuple[str, ...] = ()
+        if vendor == "massive":
+            earliest, latest = massive_window(now.date())
+            # Skip any tasks outside Massive free-tier window: older than 2y or newer than T+1
+            extra_where = " AND start_date >= ? AND end_date >= ? AND start_date <= ? AND end_date <= ?"
+            extra_params = (
+                earliest.isoformat(),
+                earliest.isoformat(),
+                latest.isoformat(),
+                latest.isoformat(),
+            )
+
         import time as _time
         t_start = _time.time()
 
@@ -558,9 +573,10 @@ class NodeDB:
                     WHERE dataset IN ({placeholders})
                       AND (status = 'PENDING' OR (status = 'LEASED' AND lease_expires_at < ?))
                       AND (next_not_before IS NULL OR next_not_before <= ?)
+                      {extra_where}
                     ORDER BY priority ASC, created_at ASC
                     LIMIT 1
-                """, (*datasets, now_str, now_str)).fetchone()
+                """, (*datasets, now_str, now_str, *extra_params)).fetchone()
                 t_query_end = _time.time()
                 query_ms = (t_query_end - t_query_start) * 1000
 

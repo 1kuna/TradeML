@@ -31,6 +31,7 @@ from .fetchers import (
 )
 from .qc import validate_partition_row_count
 from .stages import get_expected_rows, get_qc_thresholds
+from .vendor_limits import massive_in_window, massive_window
 
 
 def _is_trading_day(dt_value) -> bool:
@@ -89,8 +90,7 @@ def _massive_in_window(task: Task) -> bool:
         logger.info(f"Massive window check failed for task {task.id}: bad dates {task.start_date}->{task.end_date} ({exc})")
         return False
 
-    earliest = date.today() - timedelta(days=730)  # 2y history
-    latest = date.today() - timedelta(days=1)      # T+1 delay
+    earliest, latest = massive_window()
 
     if end_date < earliest or start_date < earliest:
         logger.info(f"Massive window miss (too old) task {task.id}: {start_date}->{end_date}, earliest {earliest}")
@@ -108,7 +108,7 @@ def _vendor_supports_task(task: Task, vendor: str) -> bool:
     Currently enforces Massive free-tier window (2y history, T+1 delay) for equities.
     """
     if vendor == "massive" and task.dataset in ("equities_eod", "equities_minute"):
-        return _massive_in_window(task)
+        return massive_in_window(task.start_date, task.end_date)
     return True
 
 
