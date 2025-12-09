@@ -174,18 +174,18 @@ def upsert_gap_tasks(
         db = get_db()
 
     created = 0
-        for dataset, symbol, dt, status in gaps:
-            task_id = db.enqueue_task(
-                dataset=dataset,
-                symbol=symbol,
-                start_date=dt,
-                end_date=dt,
-                kind=TaskKind.GAP,
-                priority=PRIORITY_GAP,
-                allow_overlap=False,  # Avoid duplicates when BOOTSTRAP/FORWARD already queued
-            )
-            if task_id:
-                created += 1
+    for dataset, symbol, dt, status in gaps:
+        task_id = db.enqueue_task(
+            dataset=dataset,
+            symbol=symbol,
+            start_date=dt,
+            end_date=dt,
+            kind=TaskKind.GAP,
+            priority=PRIORITY_GAP,
+            allow_overlap=False,  # Avoid duplicates when BOOTSTRAP/FORWARD already queued
+        )
+        if task_id:
+            created += 1
 
     return created
 
