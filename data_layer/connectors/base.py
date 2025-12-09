@@ -99,6 +99,23 @@ class BaseConnector(ABC):
 
     def _rate_limit(self):
         """Enforce rate limiting between requests (global pacer + local fallback)."""
+        # First enforce per-vendor RPM via budget manager (token bucket)
+        try:
+            from data_node.budgets import get_budget_manager
+            from data_node.db import TaskKind
+
+            bm = get_budget_manager()
+            # Block until a token is available for this vendor
+            while not bm.try_spend(self.source_name, TaskKind.FORWARD):
+                status = bm.get_budget_status(self.source_name)
+                hard_rpm = status.get("hard_rpm", 1) or 1
+                wait_step = max(0.2, 60.0 / max(hard_rpm, 1))
+                logger.debug(f"{self.source_name}: waiting for budget token ({status.get('tokens_rpm', 0):.2f} tokens)")
+                time.sleep(wait_step)
+        except Exception:
+            # Budget tracking optional - do not block fetch if budget manager unavailable
+            pass
+
         try:
             RequestPacer.instance().acquire(self.source_name, self.rate_limit_per_sec)
             # Update local timestamp for completeness
