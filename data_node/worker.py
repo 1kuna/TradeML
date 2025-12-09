@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from loguru import logger
@@ -143,7 +143,7 @@ class QueueWorker:
             return None
 
         eligible = []
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         for vendor in vendors:
             # Check ineligibility cache
@@ -216,7 +216,7 @@ class QueueWorker:
             task: The task that was processed
             result: Result from the fetch operation
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         if result.status == FetchStatus.SUCCESS:
             # Get expected rows per day from config
@@ -531,7 +531,7 @@ class QueueWorker:
             self.db.mark_task_failed(
                 task.id,
                 error="No vendor available (budget/inflight limits)",
-                backoff_until=datetime.utcnow() + timedelta(minutes=5),
+                backoff_until=datetime.now(timezone.utc) + timedelta(minutes=5),
                 max_attempts=task.attempts + 10,  # Don't count towards failure
             )
             return False
@@ -816,7 +816,7 @@ class VendorWorker:
         """
         from .fetchers import FetchStatus
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         if result.status == FetchStatus.SUCCESS:
             # Get expected rows per day from config

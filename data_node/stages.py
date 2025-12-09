@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -439,7 +439,7 @@ def check_promotion(db: Optional[NodeDB] = None) -> bool:
     logger.info(f"Promoting from Stage {current_stage} to Stage {next_stage}")
 
     config.current_stage = next_stage
-    config.promoted_at = datetime.utcnow()
+    config.promoted_at = datetime.now(timezone.utc)
     save_stage_config(config)
 
     # Seed bootstrap tasks for new stage

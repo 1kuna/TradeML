@@ -395,7 +395,7 @@ class NodeDB:
             end_date = end_date.isoformat()
 
         placeholders = ",".join("?" * len(statuses))
-        params: list = [dataset, start_date, end_date, start_date, end_date] + list(statuses)
+        params: list = [dataset, symbol, start_date, end_date] + list(statuses)
 
         with self.transaction() as conn:
             row = conn.execute(

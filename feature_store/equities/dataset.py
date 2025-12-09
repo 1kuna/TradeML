@@ -89,7 +89,7 @@ def _triple_barrier_labels(
 ) -> pd.DataFrame:
     df = panel.sort_values(["symbol", "date"]).copy()
     df["ret_1d"] = df.groupby("symbol")["close"].pct_change()
-    df["sigma"] = df.groupby("symbol")["ret_1d"].apply(lambda s: _rolling_sigma(s, vol_window))
+    df["sigma"] = df.groupby("symbol")["ret_1d"].transform(lambda s: _rolling_sigma(s, vol_window))
 
     rows: List[dict] = []
     for sym, g in df.groupby("symbol", sort=False):
@@ -188,4 +188,3 @@ def build_training_dataset(
     meta["horizon_days"] = df.get("horizon_days", horizon_days)
 
     return Dataset(X=X.reset_index(drop=True), y=y.reset_index(drop=True), meta=meta.reset_index(drop=True))
-
