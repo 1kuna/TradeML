@@ -17,7 +17,8 @@
       "Bash(PYTHONPATH=\"$PWD\" python -m pytest:*)",
       "Bash(PYTHONPATH=\"$PWD\" python:*)",
       "Bash(timeout 30 python -m pytest:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(grep:*)"
     ],
     "deny": [],
     "ask": []

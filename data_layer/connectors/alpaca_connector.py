@@ -93,12 +93,17 @@ class AlpacaConnector(BaseConnector):
                 f"Valid: {list(VALID_TIMEFRAMES)}"
             )
 
+        # Default to IEX feed on free tier; allow override via env
+        feed = os.getenv("ALPACA_FEED", "iex").lower()
+        if feed not in ("iex", "sip"):
+            feed = "iex"
+
         url = f"{self.base_url}/v2/stocks/bars"
         params = {
             "timeframe": timeframe,
             "start": f"{start_date.isoformat()}T00:00:00Z",
             "end": f"{end_date.isoformat()}T23:59:59Z",
-            "feed": "sip",
+            "feed": feed,
             "symbols": ",".join(symbols),
             "limit": 10000,
         }

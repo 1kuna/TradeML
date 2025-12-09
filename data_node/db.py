@@ -388,14 +388,18 @@ class NodeDB:
         Check if there is any pending/leased task that overlaps the given date range,
         regardless of kind.
         """
+        if not statuses:
+            return False
+
         # Normalize dates to ISO strings for lexicographic comparison in SQLite
         if hasattr(start_date, "isoformat"):
             start_date = start_date.isoformat()
         if hasattr(end_date, "isoformat"):
             end_date = end_date.isoformat()
 
-        placeholders = ",".join("?" * len(statuses))
-        params: list = [dataset, symbol, start_date, end_date] + list(statuses)
+        placeholders = ",".join(["?"] * len(statuses))
+        # Order of params matches SQL: dataset, symbol, start_date, end_date, statuses...
+        params: list = [dataset, symbol, start_date, end_date, *statuses]
 
         with self.transaction() as conn:
             row = conn.execute(

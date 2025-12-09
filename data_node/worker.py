@@ -366,6 +366,24 @@ class QueueWorker:
                         )
                     )
                     logger.warning(f"Task {task.id} empty on trading day {task.start_date}: {result.qc_code}")
+                elif is_trading:
+                    # Trading day with explicit no-session: treat as AMBER to avoid false GREENs
+                    expected_rows = get_expected_rows(task.dataset, num_days=1)
+                    updates.append(
+                        dict(
+                            source_name=result.vendor_used or "unknown",
+                            table_name=task.dataset,
+                            symbol=task.symbol,
+                            dt=task.start_date,
+                            status=PartitionStatus.AMBER,
+                            qc_score=0.5,
+                            row_count=0,
+                            expected_rows=expected_rows,
+                            qc_code=result.qc_code or "NO_SESSION",
+                            fetch_params=result.fetch_params,
+                        )
+                    )
+                    logger.warning(f"Task {task.id} empty on trading day {task.start_date} (NO_SESSION)")
                 else:
                     # Non-trading day (weekend/holiday) - empty is expected, mark GREEN
                     updates.append(
@@ -980,6 +998,23 @@ class VendorWorker:
                         )
                     )
                     logger.warning(f"Task {task.id} empty on trading day {task.start_date}: {result.qc_code}")
+                elif is_trading:
+                    expected_rows = get_expected_rows(task.dataset, num_days=1)
+                    updates.append(
+                        dict(
+                            source_name=result.vendor_used or self.vendor,
+                            table_name=task.dataset,
+                            symbol=task.symbol,
+                            dt=task.start_date,
+                            status=PartitionStatus.AMBER,
+                            qc_score=0.5,
+                            row_count=0,
+                            expected_rows=expected_rows,
+                            qc_code=result.qc_code or "NO_SESSION",
+                            fetch_params=result.fetch_params,
+                        )
+                    )
+                    logger.warning(f"Task {task.id} empty on trading day {task.start_date} (NO_SESSION)")
                 else:
                     updates.append(
                         dict(
