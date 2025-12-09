@@ -37,7 +37,7 @@ class AlpacaConnector(BaseConnector):
         self,
         api_key: Optional[str] = None,
         secret_key: Optional[str] = None,
-        rate_limit_per_sec: float = 2.83,  # ~170 rpm (85% of 200)
+        rate_limit_per_sec: float = 3.25,  # ~195 rpm (97.5% of 200, aggressive)
     ):
         """
         Initialize Alpaca connector.
