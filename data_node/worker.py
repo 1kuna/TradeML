@@ -86,17 +86,17 @@ def _massive_in_window(task: Task) -> bool:
         start_date = date.fromisoformat(task.start_date) if isinstance(task.start_date, str) else task.start_date
         end_date = date.fromisoformat(task.end_date) if isinstance(task.end_date, str) else task.end_date
     except Exception as exc:
-        logger.debug(f"Massive window check failed for task {task.id}: bad dates {task.start_date}->{task.end_date} ({exc})")
+        logger.info(f"Massive window check failed for task {task.id}: bad dates {task.start_date}->{task.end_date} ({exc})")
         return False
 
     earliest = date.today() - timedelta(days=730)  # 2y history
     latest = date.today() - timedelta(days=1)      # T+1 delay
 
     if end_date < earliest or start_date < earliest:
-        logger.debug(f"Massive window miss (too old) task {task.id}: {start_date}->{end_date}, earliest {earliest}")
+        logger.info(f"Massive window miss (too old) task {task.id}: {start_date}->{end_date}, earliest {earliest}")
         return False
     if start_date > latest:
-        logger.debug(f"Massive window miss (too recent) task {task.id}: {start_date}->{end_date}, latest {latest}")
+        logger.info(f"Massive window miss (too recent) task {task.id}: {start_date}->{end_date}, latest {latest}")
         return False
     return True
 
@@ -173,27 +173,14 @@ class QueueWorker:
             logger.warning(f"No vendors configured for dataset: {task.dataset}")
             return None
 
-        # If current stage requires >2y history, strip Massive from equities datasets up front
-        if task.dataset in ("equities_eod", "equities_minute"):
-            try:
-                cfg = load_stage_config()
-                stage_def = cfg.stages.get(cfg.current_stage)
-                if stage_def and stage_def.equities_eod_years > 2:
-                    if "massive" in vendors:
-                        vendors = [v for v in vendors if v != "massive"]
-                        logger.info(
-                            f"Stage requires {stage_def.equities_eod_years}y history; removing Massive for task {task.id}"
-                        )
-            except Exception as exc:
-                logger.debug(f"Stage config check failed, keeping vendor list intact: {exc}")
-
+        logger.debug(f"Task {task.id} vendors: {vendors} for dataset {task.dataset}")
         eligible = []
         now = datetime.now(timezone.utc)
 
         for vendor in vendors:
             # Skip vendors that cannot service this task (e.g., Massive history window)
             if not _vendor_supports_task(task, vendor):
-                logger.debug(f"Vendor {vendor} not eligible for task window {task.start_date}->{task.end_date}")
+                logger.info(f"Vendor {vendor} skipped for task {task.id} window {task.start_date}->{task.end_date}")
                 continue
 
             # Check ineligibility cache
