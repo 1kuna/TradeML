@@ -42,6 +42,7 @@ class FetchResult:
     qc_code: Optional[str] = None
     error: Optional[str] = None
     vendor_used: Optional[str] = None
+    fetch_params: Optional[dict] = None  # API params used (for selective re-fetch)
 
 
 # ---------------------------------------------------------------------------
@@ -300,12 +301,21 @@ def _fetch_equities_minute(task: Task, vendor: str) -> FetchResult:
 
     logger.info(f"Completed multi-day fetch: {task.symbol} {days_total} days, {total_rows} total rows")
 
+    # Determine fetch_params based on vendor
+    if vendor == "alpaca":
+        fetch_params = {"feed": "sip", "timeframe": "1Min"}
+    elif vendor == "massive":
+        fetch_params = {"timespan": "minute"}
+    else:
+        fetch_params = {}
+
     return FetchResult(
         status=FetchStatus.SUCCESS,
         rows=total_rows,
         rows_by_date=rows_by_date,
         qc_code="OK",
         vendor_used=vendor,
+        fetch_params=fetch_params,
     )
 
 
@@ -374,6 +384,9 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
 
     connector = AlpacaConnector()
 
+    # Track fetch params for lineage
+    fetch_params = {"feed": "sip", "timeframe": timeframe}
+
     try:
         symbols = [task.symbol] if task.symbol else []
         if not symbols:
@@ -393,6 +406,7 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
                 rows=0,
                 qc_code="NO_SESSION",
                 vendor_used="alpaca",
+                fetch_params=fetch_params,
             )
 
         # Compute per-day row counts for QC validation
@@ -410,16 +424,17 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
             rows_by_date=rows_by_date,
             qc_code="OK",
             vendor_used="alpaca",
+            fetch_params=fetch_params,
         )
 
     except Exception as e:
         error_str = str(e).lower()
         if "429" in error_str or "rate" in error_str:
-            return FetchResult(status=FetchStatus.RATE_LIMITED, error=str(e), vendor_used="alpaca")
+            return FetchResult(status=FetchStatus.RATE_LIMITED, error=str(e), vendor_used="alpaca", fetch_params=fetch_params)
         elif "401" in error_str or "403" in error_str or "not entitled" in error_str:
-            return FetchResult(status=FetchStatus.NOT_ENTITLED, error=str(e), vendor_used="alpaca")
+            return FetchResult(status=FetchStatus.NOT_ENTITLED, error=str(e), vendor_used="alpaca", fetch_params=fetch_params)
         else:
-            return FetchResult(status=FetchStatus.ERROR, error=str(e), vendor_used="alpaca")
+            return FetchResult(status=FetchStatus.ERROR, error=str(e), vendor_used="alpaca", fetch_params=fetch_params)
 
 
 def _fetch_alpaca_options(task: Task) -> FetchResult:
@@ -450,6 +465,9 @@ def _fetch_massive_bars(task: Task, timeframe: str) -> FetchResult:
 
     connector = MassiveConnector()
 
+    # Track fetch params for lineage
+    fetch_params = {"timespan": timeframe}
+
     try:
         if not task.symbol:
             return FetchResult(status=FetchStatus.ERROR, error="No symbol specified")
@@ -467,6 +485,7 @@ def _fetch_massive_bars(task: Task, timeframe: str) -> FetchResult:
                 rows=0,
                 qc_code="NO_SESSION",
                 vendor_used="massive",
+                fetch_params=fetch_params,
             )
 
         # Compute per-day row counts for QC validation
@@ -482,10 +501,13 @@ def _fetch_massive_bars(task: Task, timeframe: str) -> FetchResult:
             rows_by_date=rows_by_date,
             qc_code="OK",
             vendor_used="massive",
+            fetch_params=fetch_params,
         )
 
     except Exception as e:
-        return _handle_exception(e, "massive")
+        result = _handle_exception(e, "massive")
+        result.fetch_params = fetch_params
+        return result
 
 
 # -----------------------------------------------------------------------------
@@ -497,6 +519,9 @@ def _fetch_finnhub_candles(task: Task) -> FetchResult:
     from data_layer.connectors.finnhub_connector import FinnhubConnector
 
     connector = FinnhubConnector()
+
+    # Track fetch params for lineage
+    fetch_params = {"resolution": "D"}
 
     try:
         if not task.symbol:
@@ -514,6 +539,7 @@ def _fetch_finnhub_candles(task: Task) -> FetchResult:
                 rows=0,
                 qc_code="NO_SESSION",
                 vendor_used="finnhub",
+                fetch_params=fetch_params,
             )
 
         # Compute per-day row counts for QC validation
@@ -528,10 +554,13 @@ def _fetch_finnhub_candles(task: Task) -> FetchResult:
             rows_by_date=rows_by_date,
             qc_code="OK",
             vendor_used="finnhub",
+            fetch_params=fetch_params,
         )
 
     except Exception as e:
-        return _handle_exception(e, "finnhub")
+        result = _handle_exception(e, "finnhub")
+        result.fetch_params = fetch_params
+        return result
 
 
 def _fetch_finnhub_options(task: Task) -> FetchResult:
@@ -539,6 +568,9 @@ def _fetch_finnhub_options(task: Task) -> FetchResult:
     from data_layer.connectors.finnhub_connector import FinnhubConnector
 
     connector = FinnhubConnector()
+
+    # Track fetch params for lineage
+    fetch_params = {"endpoint": "option-chain"}
 
     try:
         if not task.symbol:
@@ -556,6 +588,7 @@ def _fetch_finnhub_options(task: Task) -> FetchResult:
                 partition_status=PartitionStatus.GREEN,
                 qc_code="NO_SESSION",
                 vendor_used="finnhub",
+                fetch_params=fetch_params,
             )
 
         raw_path = _get_raw_path("finnhub", "options_chains", task.start_date, underlier=task.symbol)
@@ -567,10 +600,13 @@ def _fetch_finnhub_options(task: Task) -> FetchResult:
             partition_status=PartitionStatus.GREEN,
             qc_code="OK",
             vendor_used="finnhub",
+            fetch_params=fetch_params,
         )
 
     except Exception as e:
-        return _handle_exception(e, "finnhub")
+        result = _handle_exception(e, "finnhub")
+        result.fetch_params = fetch_params
+        return result
 
 
 def _fetch_finnhub_fundamentals(task: Task) -> FetchResult:
@@ -578,6 +614,9 @@ def _fetch_finnhub_fundamentals(task: Task) -> FetchResult:
     from data_layer.connectors.finnhub_connector import FinnhubConnector
 
     connector = FinnhubConnector()
+
+    # Track fetch params for lineage
+    fetch_params = {"endpoint": "profile2"}
 
     try:
         if not task.symbol:
@@ -591,6 +630,7 @@ def _fetch_finnhub_fundamentals(task: Task) -> FetchResult:
                 rows=0,
                 qc_code="NO_DATA",
                 vendor_used="finnhub",
+                fetch_params=fetch_params,
             )
 
         # For now, just return success - actual storage TBD
@@ -600,10 +640,13 @@ def _fetch_finnhub_fundamentals(task: Task) -> FetchResult:
             partition_status=PartitionStatus.GREEN,
             qc_code="OK",
             vendor_used="finnhub",
+            fetch_params=fetch_params,
         )
 
     except Exception as e:
-        return _handle_exception(e, "finnhub")
+        result = _handle_exception(e, "finnhub")
+        result.fetch_params = fetch_params
+        return result
 
 
 # -----------------------------------------------------------------------------
@@ -612,9 +655,12 @@ def _fetch_finnhub_fundamentals(task: Task) -> FetchResult:
 
 def _fetch_fred_treasury(task: Task) -> FetchResult:
     """Fetch treasury curve from FRED."""
-    from data_layer.connectors.fred_connector import FredConnector
+    from data_layer.connectors.fred_connector import FREDConnector
 
-    connector = FredConnector()
+    connector = FREDConnector()
+
+    # Track fetch params for lineage (FRED is simple - no significant config params)
+    fetch_params = {"endpoint": "treasury_curve"}
 
     try:
         df = connector.fetch_treasury_curve(
@@ -629,6 +675,7 @@ def _fetch_fred_treasury(task: Task) -> FetchResult:
                 partition_status=PartitionStatus.GREEN,
                 qc_code="NO_SESSION",
                 vendor_used="fred",
+                fetch_params=fetch_params,
             )
 
         raw_path = _get_raw_path("fred", "macro_treasury", task.start_date)
@@ -640,10 +687,13 @@ def _fetch_fred_treasury(task: Task) -> FetchResult:
             partition_status=PartitionStatus.GREEN,
             qc_code="OK",
             vendor_used="fred",
+            fetch_params=fetch_params,
         )
 
     except Exception as e:
-        return _handle_exception(e, "fred")
+        result = _handle_exception(e, "fred")
+        result.fetch_params = fetch_params
+        return result
 
 
 # -----------------------------------------------------------------------------
@@ -655,6 +705,9 @@ def _fetch_av_corp_actions(task: Task) -> FetchResult:
     from data_layer.connectors.alpha_vantage_connector import AlphaVantageConnector
 
     connector = AlphaVantageConnector()
+
+    # Track fetch params for lineage
+    fetch_params = {"function": "CORPORATE_ACTIONS"}
 
     try:
         if not task.symbol:
@@ -669,6 +722,7 @@ def _fetch_av_corp_actions(task: Task) -> FetchResult:
                 partition_status=PartitionStatus.GREEN,
                 qc_code="NO_ACTIONS",
                 vendor_used="av",
+                fetch_params=fetch_params,
             )
 
         raw_path = _get_raw_path("av", "corp_actions", task.start_date)
@@ -680,10 +734,13 @@ def _fetch_av_corp_actions(task: Task) -> FetchResult:
             partition_status=PartitionStatus.GREEN,
             qc_code="OK",
             vendor_used="av",
+            fetch_params=fetch_params,
         )
 
     except Exception as e:
-        return _handle_exception(e, "av")
+        result = _handle_exception(e, "av")
+        result.fetch_params = fetch_params
+        return result
 
 
 # -----------------------------------------------------------------------------

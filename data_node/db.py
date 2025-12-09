@@ -10,6 +10,7 @@ See SSOT_V2.md §2.8 and updated_node_spec.md §2 for schema details.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -243,6 +244,15 @@ class NodeDB:
                 CREATE INDEX IF NOT EXISTS idx_partition_status_lookup
                 ON partition_status(table_name, status, dt)
             """)
+
+            # Migration: Add fetch_params column for tracking API parameters
+            # This enables selective re-fetch when config changes (e.g., IEX→SIP)
+            try:
+                conn.execute("ALTER TABLE partition_status ADD COLUMN fetch_params TEXT")
+                logger.info("Added fetch_params column to partition_status")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
 
             logger.info(f"Initialized control database at {self.db_path}")
 
@@ -592,13 +602,19 @@ class NodeDB:
         expected_rows: int,
         qc_code: Optional[str] = None,
         notes: Optional[str] = None,
+        fetch_params: Optional[dict] = None,
     ) -> None:
         """
         Upsert a partition status record.
 
         Preserves first_observed_at for existing records.
+
+        Args:
+            fetch_params: API parameters used for this fetch (e.g., {"feed": "sip", "timeframe": "1Min"}).
+                          Enables selective re-fetch when config changes.
         """
         now = datetime.now(timezone.utc).isoformat()
+        fetch_params_json = json.dumps(fetch_params) if fetch_params else None
 
         with self.transaction() as conn:
             # Check if exists
@@ -612,22 +628,22 @@ class NodeDB:
                 conn.execute("""
                     UPDATE partition_status
                     SET status = ?, qc_score = ?, row_count = ?, expected_rows = ?,
-                        qc_code = ?, last_observed_at = ?, notes = ?
+                        qc_code = ?, last_observed_at = ?, notes = ?, fetch_params = ?
                     WHERE source_name = ? AND table_name = ? AND symbol IS ? AND dt = ?
                 """, (
                     status.value, qc_score, row_count, expected_rows, qc_code, now, notes,
-                    source_name, table_name, symbol, dt
+                    fetch_params_json, source_name, table_name, symbol, dt
                 ))
             else:
                 # Insert
                 conn.execute("""
                     INSERT INTO partition_status
                     (source_name, table_name, symbol, dt, status, qc_score, row_count,
-                     expected_rows, qc_code, first_observed_at, last_observed_at, notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     expected_rows, qc_code, first_observed_at, last_observed_at, notes, fetch_params)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     source_name, table_name, symbol, dt, status.value, qc_score, row_count,
-                    expected_rows, qc_code, now, now, notes
+                    expected_rows, qc_code, now, now, notes, fetch_params_json
                 ))
 
     def get_green_coverage(

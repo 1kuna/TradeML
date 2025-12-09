@@ -214,6 +214,7 @@ class QueueWorker:
                         row_count=row_count,
                         expected_rows=expected_per_day,
                         qc_code=qc_code,
+                        fetch_params=result.fetch_params,
                     )
             else:
                 # Fallback: single entry for single-day tasks or legacy fetchers
@@ -234,6 +235,7 @@ class QueueWorker:
                     row_count=result.rows,
                     expected_rows=expected_per_day,
                     qc_code=qc_code,
+                    fetch_params=result.fetch_params,
                 )
 
             self.db.mark_task_done(task.id)
@@ -251,6 +253,7 @@ class QueueWorker:
                 row_count=0,
                 expected_rows=0,
                 qc_code=result.qc_code or "NO_SESSION",
+                fetch_params=result.fetch_params,
             )
             self.db.mark_task_done(task.id)
             logger.debug(f"Task {task.id} empty/no-session: {result.qc_code}")
@@ -623,6 +626,7 @@ class VendorWorker:
                         row_count=row_count,
                         expected_rows=expected_per_day,
                         qc_code=qc_code,
+                        fetch_params=result.fetch_params,
                     )
             else:
                 # Fallback: single entry for single-day tasks or legacy fetchers
@@ -643,6 +647,7 @@ class VendorWorker:
                     row_count=result.rows,
                     expected_rows=expected_per_day,
                     qc_code=qc_code,
+                    fetch_params=result.fetch_params,
                 )
 
             self.db.mark_task_done(task.id)
@@ -660,6 +665,7 @@ class VendorWorker:
                 row_count=0,
                 expected_rows=0,
                 qc_code=result.qc_code or "NO_SESSION",
+                fetch_params=result.fetch_params,
             )
             self.db.mark_task_done(task.id)
             logger.debug(f"Task {task.id} empty/no-session: {result.qc_code}")
