@@ -65,7 +65,7 @@ def _prepare(df: pd.DataFrame, cfg: IntradayFeatureConfig) -> pd.DataFrame:
         df = (
             df.set_index("timestamp")
             .groupby("symbol")
-            .resample(f"{cfg.resample_minutes}T")
+            .resample(f"{cfg.resample_minutes}min")
             .agg({
                 "open": "first",
                 "high": "max",

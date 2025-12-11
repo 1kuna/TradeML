@@ -19,8 +19,9 @@ Minimal API:
     run_intraday(cfg) -> Dict with status, weights, metrics
 """
 
+import os
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import json
@@ -55,6 +56,11 @@ class IntradayConfig:
     purge_days: int = 1
     # Model settings
     patch_config: Optional[PatchConfig] = None
+    # IO overrides
+    minute_data_dir: str = "data_layer/curated/equities_minute"
+    daily_data_dir: Optional[str] = None  # falls back to env CURATED_EQUITY_BARS_ADJ_DIR if not set
+    artifact_dir: str = "models/intraday_xs/artifacts"
+    report_dir: str = os.path.join("ops", "reports")
 
 
 def _list_dates_in_range(root: Path, start: date, end: date) -> List[date]:
@@ -69,8 +75,8 @@ def _list_dates_in_range(root: Path, start: date, end: date) -> List[date]:
     return sorted(dates)
 
 
-def _load_minute_day(ds: date) -> pd.DataFrame:
-    p = Path("data_layer/curated/equities_minute") / f"date={ds.isoformat()}" / "data.parquet"
+def _load_minute_day(ds: date, base_dir: Path) -> pd.DataFrame:
+    p = base_dir / f"date={ds.isoformat()}" / "data.parquet"
     if p.exists():
         try:
             return pd.read_parquet(p)
@@ -82,6 +88,7 @@ def _load_minute_day(ds: date) -> pd.DataFrame:
 def _build_feature_label_panel(
     cfg: IntradayConfig,
     dates: List[date],
+    minute_base: Path,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Build feature and label panels from minute data.
@@ -92,7 +99,7 @@ def _build_feature_label_panel(
     feature_rows = []
 
     for ds in dates:
-        df = _load_minute_day(ds)
+        df = _load_minute_day(ds, minute_base)
         if df.empty:
             continue
 
@@ -179,7 +186,13 @@ def run_intraday(cfg: IntradayConfig) -> Dict:
 
     logger.info(f"Running intraday_xs pipeline from {start} to {end}")
 
-    base = Path("data_layer/curated/equities_minute")
+    minute_base = Path(cfg.minute_data_dir)
+    daily_base = Path(cfg.daily_data_dir) if cfg.daily_data_dir else None
+
+    if daily_base:
+        os.environ["CURATED_EQUITY_BARS_ADJ_DIR"] = str(daily_base.resolve())
+
+    base = minute_base
     if not base.exists():
         logger.warning("No curated minute data; intraday_xs will skip")
         return {"status": "no_data"}
@@ -189,7 +202,7 @@ def run_intraday(cfg: IntradayConfig) -> Dict:
         return {"status": "no_data", "reason": "no_dates_in_range"}
 
     # Build feature and label panels
-    features_df, labels_df = _build_feature_label_panel(cfg, dates)
+    features_df, labels_df = _build_feature_label_panel(cfg, dates, minute_base)
 
     if features_df.empty:
         logger.warning("No features generated from minute data")
@@ -262,7 +275,7 @@ def run_intraday(cfg: IntradayConfig) -> Dict:
     last_positions = weights[weights["date"] == last_date][["symbol", "target_w"]]
 
     # Save artifacts
-    artifact_dir = Path("models/intraday_xs/artifacts")
+    artifact_dir = Path(cfg.artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     summary = {
@@ -286,7 +299,7 @@ def run_intraday(cfg: IntradayConfig) -> Dict:
         if isinstance(v, (int, float, np.floating, str)):
             metrics[f"model_{k}"] = v
 
-    emit_daily(last_date, last_positions, metrics)
+    emit_daily(last_date, last_positions, metrics, out_dir=cfg.report_dir)
 
     return {
         "status": "ok",
