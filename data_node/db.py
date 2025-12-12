@@ -720,6 +720,33 @@ class NodeDB:
 
             return True
 
+    def defer_task_until(self, task_id: int, backoff_until: datetime) -> bool:
+        """
+        Defer a task without consuming an attempt.
+
+        Sets next_not_before and clears the lease, leaving attempts unchanged.
+        """
+        now_str = datetime.now(timezone.utc).isoformat()
+        backoff_str = backoff_until.isoformat()
+
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE backfill_queue
+                SET status = 'PENDING',
+                    next_not_before = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (backoff_str, now_str, task_id),
+            )
+            if cursor.rowcount > 0:
+                logger.debug(f"Deferred task {task_id} until {backoff_str} (no attempt increment)")
+                return True
+            return False
+
     def get_queue_stats(self) -> dict:
         """Get queue statistics."""
         conn = self._get_connection()

@@ -823,6 +823,23 @@ class VendorWorker:
                 logger.info(f"[TIMING] {self.vendor}-{self.worker_id}: lease (no task) took {lease_ms:.0f}ms")
             return False
 
+        # Enforce freshness delay: skip tasks that include the last 2 days
+        try:
+            from datetime import date as dt_date, time as dt_time
+
+            end_dt = dt_date.fromisoformat(task.end_date) if isinstance(task.end_date, str) else task.end_date
+            latest_allowed = dt_date.today() - timedelta(days=2)
+            if end_dt > latest_allowed:
+                backoff_until = datetime.combine(end_dt + timedelta(days=2), dt_time(hour=6, tzinfo=timezone.utc))
+                self.db.defer_task_until(task.id, backoff_until)
+                logger.info(
+                    f"Deferring task {task.id} ({task.dataset} {task.symbol} {task.start_date}->{task.end_date}) "
+                    f"until {backoff_until.isoformat()} (enforce 2-day freshness gap)"
+                )
+                return False
+        except Exception as exc:
+            logger.warning(f"Freshness defer check failed for task {task.id}: {exc}")
+
         # Budget check using the actual task kind
         if not self.budgets.can_spend(self.vendor, task.kind):
             logger.debug(
