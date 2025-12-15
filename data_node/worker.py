@@ -775,27 +775,67 @@ class VendorWorker:
         self._tasks_processed = 0
         self._tasks_failed = 0
 
+        # Heartbeat tracking for watchdog
+        self._last_heartbeat: datetime = datetime.now(timezone.utc)
+        self._last_task_completed: datetime | None = None
+
+    @property
+    def seconds_since_heartbeat(self) -> float:
+        """Seconds since last heartbeat (loop iteration)."""
+        return (datetime.now(timezone.utc) - self._last_heartbeat).total_seconds()
+
+    @property
+    def seconds_since_task(self) -> float | None:
+        """Seconds since last completed task, or None if never completed."""
+        if self._last_task_completed is None:
+            return None
+        return (datetime.now(timezone.utc) - self._last_task_completed).total_seconds()
+
     def run(self) -> None:
         """Main worker loop."""
         self._running = True
         worker_name = f"{self.vendor}-{self.worker_id}"
         logger.info(f"VendorWorker {worker_name} starting (datasets: {self.datasets})")
 
-        while self._running:
-            try:
-                processed = self._process_one()
+        # Idle tracking for heartbeat logging
+        idle_iterations = 0
+        IDLE_LOG_THRESHOLD = 60  # Log heartbeat after 60 idle iterations (~5 min at 5s sleep)
 
-                if processed:
-                    time.sleep(self.poll_interval)
-                else:
-                    # No task available - wait longer
+        try:
+            while self._running:
+                # Update heartbeat timestamp every iteration
+                self._last_heartbeat = datetime.now(timezone.utc)
+
+                try:
+                    processed = self._process_one()
+
+                    if processed:
+                        idle_iterations = 0
+                        self._last_task_completed = datetime.now(timezone.utc)
+                        time.sleep(self.poll_interval)
+                    else:
+                        # No task available - wait longer
+                        idle_iterations += 1
+                        if idle_iterations % IDLE_LOG_THRESHOLD == 0:
+                            logger.info(
+                                f"[HEARTBEAT] {worker_name}: idle for {idle_iterations} iterations "
+                                f"(~{idle_iterations * self.idle_interval:.0f}s), still alive"
+                            )
+                        time.sleep(self.idle_interval)
+
+                except Exception as e:
+                    logger.exception(f"VendorWorker {worker_name} error: {e}")
                     time.sleep(self.idle_interval)
 
-            except Exception as e:
-                logger.exception(f"VendorWorker {worker_name} error: {e}")
-                time.sleep(self.idle_interval)
-
-        logger.info(f"VendorWorker {worker_name} stopped (processed {self._tasks_processed} tasks)")
+        except Exception as e:
+            logger.exception(f"VendorWorker {worker_name} FATAL error - thread dying: {e}")
+            raise
+        finally:
+            logger.info(
+                f"VendorWorker {worker_name} exiting "
+                f"(processed={self._tasks_processed}, failed={self._tasks_failed}, "
+                f"running={self._running})"
+            )
 
     def _process_one(self) -> bool:
         """
@@ -1280,7 +1320,7 @@ class QueueWorkerPool:
                 thread = threading.Thread(
                     target=worker.run,
                     name=f"worker-{vendor}-{i}",
-                    daemon=True,
+                    daemon=False,  # Non-daemon so workers log exit instead of dying silently
                 )
 
                 self._workers.append(worker)
@@ -1339,3 +1379,40 @@ class QueueWorkerPool:
             if worker.is_running:
                 active[worker.vendor] = active.get(worker.vendor, 0) + 1
         return active
+
+    def check_worker_health(self, stale_threshold_sec: float = 30.0) -> dict:
+        """
+        Check health of all workers.
+
+        Args:
+            stale_threshold_sec: Seconds without heartbeat to consider a worker stale
+
+        Returns dict with:
+            - alive_threads: count of threads that are alive
+            - dead_threads: count of threads that have died
+            - stale_workers: list of worker names with stale heartbeats or dead threads
+            - healthy: True if all workers are healthy
+        """
+        alive = 0
+        dead = 0
+        stale: list[str] = []
+
+        for thread, worker in zip(self._threads, self._workers):
+            worker_name = f"{worker.vendor}-{worker.worker_id}"
+            if not thread.is_alive():
+                dead += 1
+                stale.append(f"{worker_name} (thread dead)")
+            elif worker.seconds_since_heartbeat > stale_threshold_sec:
+                alive += 1
+                stale.append(
+                    f"{worker_name} (no heartbeat for {worker.seconds_since_heartbeat:.0f}s)"
+                )
+            else:
+                alive += 1
+
+        return {
+            "alive_threads": alive,
+            "dead_threads": dead,
+            "stale_workers": stale,
+            "healthy": dead == 0 and len(stale) == 0,
+        }

@@ -308,6 +308,11 @@ def run_node(
     last_coverage_update = 0
     coverage_update_interval = 60  # seconds
 
+    # Watchdog check interval
+    last_watchdog_check = 0
+    watchdog_interval = 30  # Check worker health every 30 seconds
+    watchdog_stale_threshold = 60.0  # Consider worker stale after 60s without heartbeat
+
     try:
         while not shutdown_requested:
             # Update queue stats
@@ -350,6 +355,28 @@ def run_node(
                     last_coverage_update = now
                 except Exception as e:
                     logger.warning(f"Failed to get coverage: {e}")
+
+            # Watchdog check - detect dead or stale workers
+            if now - last_watchdog_check >= watchdog_interval:
+                try:
+                    health = worker_pool.check_worker_health(
+                        stale_threshold_sec=watchdog_stale_threshold
+                    )
+
+                    if health["dead_threads"] > 0:
+                        logger.error(
+                            f"[WATCHDOG] {health['dead_threads']} worker threads have died! "
+                            f"Stale: {health['stale_workers']}"
+                        )
+                    elif health["stale_workers"]:
+                        logger.warning(
+                            f"[WATCHDOG] {len(health['stale_workers'])} workers appear stuck: "
+                            f"{health['stale_workers']}"
+                        )
+
+                    last_watchdog_check = now
+                except Exception as e:
+                    logger.warning(f"Failed to check worker health: {e}")
 
             # Update loop status
             worker_stats = worker_pool.get_stats()
