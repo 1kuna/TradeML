@@ -1,10 +1,29 @@
 from __future__ import annotations
 
 import os
+import sys
 import shutil
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_LEGACY_ROOT = _REPO_ROOT / "legacy"
+_cleaned_path = []
+for entry in sys.path:
+    if not entry:
+        _cleaned_path.append(entry)
+        continue
+    try:
+        if Path(entry).resolve() == _LEGACY_ROOT:
+            continue
+    except Exception:
+        pass
+    _cleaned_path.append(entry)
+sys.path[:] = _cleaned_path
+if str(_REPO_ROOT) in sys.path:
+    sys.path.remove(str(_REPO_ROOT))
+sys.path.insert(0, str(_REPO_ROOT))
 
 import numpy as np
 import pandas as pd
