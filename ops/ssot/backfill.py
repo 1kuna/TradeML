@@ -26,7 +26,7 @@ from data_layer.storage.s3_client import get_s3_client
 from data_layer.storage.lease_manager import LeaseManager
 from ops.ssot.budget import BudgetManager
 from data_layer.connectors.finnhub_connector import FinnhubConnector
-from data_layer.connectors.polygon_connector import PolygonConnector
+from data_layer.connectors.massive_connector import MassiveConnector
 from data_layer.connectors.fred_connector import FREDConnector
 from data_layer.connectors.fmp_connector import FMPConnector
 from data_layer.connectors.alpha_vantage_connector import AlphaVantageConnector
@@ -68,58 +68,83 @@ def _append_raw_partition(df: pd.DataFrame, source: str, table: str, ds: date):
     - For local: serialize within-process via partition lock.
     """
     backend = os.getenv("STORAGE_BACKEND", "local").lower()
-    part_key = f"raw/{source}/{table}/date={ds.isoformat()}"
-    subset_cols = [c for c in ["date", "symbol", "open", "high", "low", "close", "volume"] if c in df.columns]
-    if backend == "s3":
-        s3 = get_s3_client()
-        key = f"{part_key}/data.parquet"
-        import io
-        # Conditional upsert loop
-        attempts = 0
-        while attempts < 5:
-            attempts += 1
-            try:
+    base_key = f"raw/{source}/{table}/date={ds.isoformat()}"
+
+    def _iter_partitions(frame: pd.DataFrame):
+        if frame is None or frame.empty:
+            return []
+        if "underlier" in frame.columns:
+            part_col = "underlier"
+        elif "symbol" in frame.columns:
+            part_col = "symbol"
+        else:
+            return [(None, None, frame)]
+
+        parts = []
+        for key, sub in frame.groupby(part_col, dropna=False):
+            if key is None or (isinstance(key, float) and pd.isna(key)):
+                continue
+            parts.append((part_col, str(key), sub))
+        return parts
+
+    for part_col, part_val, part_df in _iter_partitions(df):
+        part_key = base_key
+        if part_col:
+            part_key = f"{base_key}/{part_col}={part_val}"
+        subset_cols = [
+            c for c in ["date", "symbol", "underlier", "open", "high", "low", "close", "volume"]
+            if c in part_df.columns
+        ]
+
+        if backend == "s3":
+            s3 = get_s3_client()
+            key = f"{part_key}/data.parquet"
+            import io
+            # Conditional upsert loop
+            attempts = 0
+            while attempts < 5:
+                attempts += 1
                 try:
-                    data, etag = s3.get_object(key)
-                    existing = pd.read_parquet(io.BytesIO(data))
-                    merged = pd.concat([existing, df], ignore_index=True)
-                    if subset_cols:
-                        merged = merged.drop_duplicates(subset=subset_cols)
-                    buf = io.BytesIO()
-                    merged.to_parquet(buf, index=False)
-                    s3.put_object(key, buf.getvalue(), if_match=etag)
-                    logger.info(f"Upserted {len(df)} rows (total {len(merged)}) to s3://{s3.bucket}/{key}")
-                    return
-                except Exception:
-                    # Assume not found or stale etag; attempt create-if-absent
-                    buf = io.BytesIO()
-                    df if subset_cols else df
-                    df.to_parquet(buf, index=False)
-                    s3.put_object(key, buf.getvalue(), if_none_match="*")
-                    logger.info(f"Created partition with {len(df)} rows at s3://{s3.bucket}/{key}")
-                    return
-            except Exception as e:
-                # Precondition failed or transient, retry
-                if attempts >= 5:
-                    logger.warning(f"S3 upsert failed after retries for {key}: {e}")
-                    raise
-        return
-    else:
+                    try:
+                        data, etag = s3.get_object(key)
+                        existing = pd.read_parquet(io.BytesIO(data))
+                        merged = pd.concat([existing, part_df], ignore_index=True)
+                        if subset_cols:
+                            merged = merged.drop_duplicates(subset=subset_cols)
+                        buf = io.BytesIO()
+                        merged.to_parquet(buf, index=False)
+                        s3.put_object(key, buf.getvalue(), if_match=etag)
+                        logger.info(f"Upserted {len(part_df)} rows (total {len(merged)}) to s3://{s3.bucket}/{key}")
+                        break
+                    except Exception:
+                        # Assume not found or stale etag; attempt create-if-absent
+                        buf = io.BytesIO()
+                        part_df.to_parquet(buf, index=False)
+                        s3.put_object(key, buf.getvalue(), if_none_match="*")
+                        logger.info(f"Created partition with {len(part_df)} rows at s3://{s3.bucket}/{key}")
+                        break
+                except Exception as e:
+                    # Precondition failed or transient, retry
+                    if attempts >= 5:
+                        logger.warning(f"S3 upsert failed after retries for {key}: {e}")
+                        raise
+            continue
+
         # Local source-first layout with in-process lock
         lock = partition_lock(part_key)
         with lock:
-            path = Path("data_layer/raw") / source / table / f"date={ds.isoformat()}"
+            path = Path("data_layer") / part_key
             path.mkdir(parents=True, exist_ok=True)
             out = path / "data.parquet"
             if out.exists():
                 existing = pd.read_parquet(out)
-                merged = pd.concat([existing, df], ignore_index=True)
+                merged = pd.concat([existing, part_df], ignore_index=True)
                 if subset_cols:
                     merged = merged.drop_duplicates(subset=subset_cols)
             else:
-                merged = df
+                merged = part_df
             merged.to_parquet(out, index=False)
-            logger.info(f"Upserted {len(df)} rows (total {len(merged)}) to {out}")
+            logger.info(f"Upserted {len(part_df)} rows (total {len(merged)}) to {out}")
 
 
 def _lease_manager_if_s3() -> Optional[LeaseManager]:
@@ -225,19 +250,19 @@ def _process_queue_equities_eod(rows: List[Tuple], connector: AlpacaConnector, b
                     return
                 df = connector.fetch_bars(symbols=[symbol], start_date=ds, end_date=ds, timeframe="1Day")
                 if df.empty:
-                    poly_ok = budget.try_consume("polygon", 1) if budget else True
-                    if poly_ok:
+                    massive_ok = budget.try_consume("massive", 1) if budget else True
+                    if massive_ok:
                         try:
-                            pconn = PolygonConnector(api_key=os.getenv("POLYGON_API_KEY"))
-                            pdf = pconn.fetch_aggregates(symbol, ds, ds, timespan="day")
+                            mconn = MassiveConnector(api_key=os.getenv("MASSIVE_API_KEY"))
+                            pdf = mconn.fetch_aggregates(symbol, ds, ds, timespan="day")
                         except Exception:
                             pdf = pd.DataFrame()
                         if not pdf.empty:
-                            _append_raw_partition(pdf, source="polygon", table="equities_bars", ds=ds)
+                            _append_raw_partition(pdf, source="massive", table="equities_bars", ds=ds)
                         else:
                             logger.warning(f"No data for {symbol} on {ds}")
                     else:
-                        logger.warning("Polygon budget exhausted; skipping EOD fallback")
+                        logger.warning("Massive budget exhausted; skipping EOD fallback")
                 else:
                     _append_raw_partition(df[df["symbol"] == symbol], source="alpaca", table="equities_bars", ds=ds)
                 _delete_queue_item(item_id)
@@ -278,19 +303,19 @@ def _process_queue_equities_minute(rows: List[Tuple], connector: AlpacaConnector
                     return
                 df = connector.fetch_bars(symbols=[symbol], start_date=ds, end_date=ds, timeframe="1Min")
                 if df.empty:
-                    poly_ok = budget.try_consume("polygon", 1) if budget else True
-                    if poly_ok:
+                    massive_ok = budget.try_consume("massive", 1) if budget else True
+                    if massive_ok:
                         try:
-                            pconn = PolygonConnector(api_key=os.getenv("POLYGON_API_KEY"))
-                            pdf = pconn.fetch_aggregates(symbol, ds, ds, timespan="minute")
+                            mconn = MassiveConnector(api_key=os.getenv("MASSIVE_API_KEY"))
+                            pdf = mconn.fetch_aggregates(symbol, ds, ds, timespan="minute")
                         except Exception:
                             pdf = pd.DataFrame()
                         if not pdf.empty:
-                            _append_raw_partition(pdf, source="polygon", table="equities_bars_minute", ds=ds)
+                            _append_raw_partition(pdf, source="massive", table="equities_bars_minute", ds=ds)
                         else:
                             logger.warning(f"No minute data for {symbol} on {ds}")
                     else:
-                        logger.warning("Polygon budget exhausted; skipping minute fallback")
+                        logger.warning("Massive budget exhausted; skipping minute fallback")
                 else:
                     _append_raw_partition(df[df["symbol"] == symbol], source="alpaca", table="equities_bars_minute", ds=ds)
                 _delete_queue_item(item_id)
@@ -316,7 +341,10 @@ def _backfill_window_equities_eod(connector: AlpacaConnector, universe: List[str
         objs = s3.list_objects(prefix="raw/alpaca/equities_bars/date=")
         have_dates = sorted({o["Key"].split("date=")[-1].split("/")[0] for o in objs if "/data.parquet" in o["Key"]})
     else:
-        have_dates = [p.parent.name.split("=")[-1] for p in Path("data_layer/raw/alpaca/equities_bars").glob("date=*/data.parquet")]
+        have_dates = sorted({
+            p.parent.parent.name.split("=")[-1]
+            for p in Path("data_layer/raw/alpaca/equities_bars").glob("date=*/symbol=*/data.parquet")
+        })
 
     have = {pd.to_datetime(ds).date() for ds in have_dates}
 

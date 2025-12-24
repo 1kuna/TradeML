@@ -11,7 +11,7 @@ providers:
         endpoint: alpaca.bars
         unique: false
         weight: 3
-        notes: Primary daily OHLCV when Polygon throttle hits.
+        notes: Primary daily OHLCV when Massive throttle hits.
       equities_minute:
         endpoint: alpaca.minute
         unique: true
@@ -31,17 +31,17 @@ providers:
         endpoint: alpaca.corporate_actions
         unique: false
         weight: 2
-  polygon:
+  massive:
     rpm: 5
-    daily_cap: 7000
+    daily_cap: 7200
     datasets:
       equities_eod:
-        endpoint: polygon.aggs.day
+        endpoint: massive.aggs.day
         unique: false
         weight: 4
         notes: High quality aggregates; use when budget available.
       options_contracts:
-        endpoint: polygon.options.contracts
+        endpoint: massive.options.contracts
         unique: true
         weight: 5
         notes: Contract master; only practical source on free tier.

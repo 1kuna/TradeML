@@ -29,7 +29,7 @@ from data_layer.storage.s3_client import get_s3_client
 from data_layer.storage.lease_manager import LeaseManager
 from data_layer.storage.bookmarks import BookmarkManager
 from data_layer.connectors.alpaca_connector import AlpacaConnector
-from data_layer.connectors.polygon_connector import PolygonConnector
+from data_layer.connectors.massive_connector import MassiveConnector
 from data_layer.connectors.finnhub_connector import FinnhubConnector
 from data_layer.connectors.fred_connector import FREDConnector
 from data_layer.connectors.alpha_vantage_connector import AlphaVantageConnector
@@ -96,7 +96,7 @@ class EdgeCollector:
 
         # In-memory cache (session) in addition to persisted bad-symbols
         self._vendor_bad_symbols = {
-            "polygon": set(),
+            "massive": set(),
             "alpaca": set(),
             "finnhub": set(),
             "fred": set(),
@@ -129,12 +129,12 @@ class EdgeCollector:
             )
             logger.info("Initialized Alpaca connector")
 
-        if os.getenv("POLYGON_API_KEY"):
+        if os.getenv("MASSIVE_API_KEY"):
             try:
-                connectors["polygon"] = PolygonConnector(api_key=os.getenv("POLYGON_API_KEY"))
-                logger.info("Initialized Polygon connector")
+                connectors["massive"] = MassiveConnector(api_key=os.getenv("MASSIVE_API_KEY"))
+                logger.info("Initialized Massive connector")
             except Exception as e:
-                logger.warning(f"Polygon connector init failed: {e}")
+                logger.warning(f"Massive connector init failed: {e}")
 
         if os.getenv("FINNHUB_API_KEY"):
             try:
@@ -504,14 +504,14 @@ class EdgeCollector:
             )
             logger.info("Initialized Alpaca connector")
 
-        # Polygon connector (optional)
+        # Massive connector (optional)
         try:
-            if os.getenv("POLYGON_API_KEY"):
-                from data_layer.connectors.polygon_connector import PolygonConnector
-                connectors["polygon"] = PolygonConnector(api_key=os.getenv("POLYGON_API_KEY"))
-                logger.info("Initialized Polygon connector")
+            if os.getenv("MASSIVE_API_KEY"):
+                from data_layer.connectors.massive_connector import MassiveConnector
+                connectors["massive"] = MassiveConnector(api_key=os.getenv("MASSIVE_API_KEY"))
+                logger.info("Initialized Massive connector")
         except Exception as e:
-            logger.warning(f"Polygon connector not available: {e}")
+            logger.warning(f"Massive connector not available: {e}")
 
         # Finnhub connector (optional)
         try:
@@ -607,7 +607,7 @@ class EdgeCollector:
         mapping = {
             "alpaca_bars": "edge-alpaca-equities_bars",
             "alpaca_minute": "edge-alpaca-equities_bars_minute",
-            "polygon_bars": "edge-polygon-equities_bars",
+            "massive_bars": "edge-massive-equities_bars",
             "finnhub_options": "edge-finnhub-options_chains",
             "fred_treasury": "edge-fred-macro_treasury",
         }
@@ -708,13 +708,13 @@ class EdgeCollector:
                 }
                 d += timedelta(days=1)
 
-        def polygon_units():
-            if "polygon" not in self.connectors:
+        def massive_units():
+            if "massive" not in self.connectors:
                 return
-            last_ts = self.bookmarks.get_last_timestamp("polygon", "equities_bars") if self.bookmarks else None
+            last_ts = self.bookmarks.get_last_timestamp("massive", "equities_bars") if self.bookmarks else None
             start_date = (datetime.fromisoformat(last_ts).date() + timedelta(days=1)) if last_ts else (today - timedelta(days=7))
             try:
-                if start_date == today and not self._should_fetch_eod_for_day("polygon", today):
+                if start_date == today and not self._should_fetch_eod_for_day("massive", today):
                     prev = today - timedelta(days=1)
                     if (not last_ts) or (datetime.fromisoformat(last_ts).date() < prev):
                         start_date = prev
@@ -722,26 +722,26 @@ class EdgeCollector:
                         return
             except Exception:
                 pass
-            # Keep polygon units under scheduler timeout given ~5 rpm free-tier
+            # Keep massive units under scheduler timeout given ~5 rpm free-tier
             # Default to small chunks; override via NODE_POLYGON_SYMBOLS_PER_UNIT
             BATCH = max(1, int(os.getenv("NODE_POLYGON_SYMBOLS_PER_UNIT", "3")))
             d = start_date
             while d <= today and not self.shutdown_requested:
-                if not self._should_fetch_eod_for_day("polygon", d):
+                if not self._should_fetch_eod_for_day("massive", d):
                     d += timedelta(days=1)
                     continue
                 # Skip persisted bad symbols
-                pg_bad = set([s.upper() for s in self._vendor_bad_symbols.get("polygon", set())]) | self.bad_symbols.vendor_set("polygon")
+                pg_bad = set([s.upper() for s in self._vendor_bad_symbols.get("massive", set())]) | self.bad_symbols.vendor_set("massive")
                 val_syms = [s for s in symbols if s.upper() not in pg_bad]
                 for i in range(0, len(symbols), BATCH):
                     chunk_all = symbols[i:i+BATCH]
                     chunk = [s for s in chunk_all if s.upper() not in pg_bad]
                     tokens = len(chunk)  # ~1 req per symbol-day
                     yield {
-                        "vendor": "polygon",
-                        "desc": f"polygon {d} [{i}:{i+len(chunk)}]",
+                        "vendor": "massive",
+                        "desc": f"massive {d} [{i}:{i+len(chunk)}]",
                         "tokens": tokens,
-                        "run": lambda day=d, syms=chunk: self._run_polygon_day(syms, day, budget),
+                        "run": lambda day=d, syms=chunk: self._run_massive_day(syms, day, budget),
                     }
                 d += timedelta(days=1)
 
@@ -824,8 +824,8 @@ class EdgeCollector:
                     producers[t] = alpaca_units()
                 elif t == "alpaca_minute":
                     producers[t] = alpaca_minute_units()
-                elif t == "polygon_bars":
-                    producers[t] = polygon_units()
+                elif t == "massive_bars":
+                    producers[t] = massive_units()
                 elif t == "finnhub_options":
                     producers[t] = finnhub_units()
                 elif t == "fred_treasury":
@@ -849,9 +849,9 @@ class EdgeCollector:
             submitted = 0
 
             def vendor_cap(vendor: str) -> int:
-                # Constrain polygon to 1 to avoid parallel long units under strict RPM
+                # Constrain massive to 1 to avoid parallel long units under strict RPM
                 # Constrain fred to 1 to avoid FD exhaustion on long backfills.
-                default_caps = {"alpaca": 2, "polygon": 1, "finnhub": 2, "fred": 1}
+                default_caps = {"alpaca": 2, "massive": 1, "finnhub": 2, "fred": 1}
                 return max(1, max_inflight_for(vendor, default=default_caps.get(vendor, 1)))
 
             def can_run(vendor: str, tokens: int) -> bool:
@@ -913,15 +913,15 @@ class EdgeCollector:
                             from time import time as _now
                             caps = {
                                 v: f"{vendor_inflight.get(v,0)}/{vendor_cap(v)}"
-                                for v in ("alpaca", "polygon", "finnhub", "fred")
+                                for v in ("alpaca", "massive", "finnhub", "fred")
                             }
                             freezes = {
                                 v: int(max(0, vendor_freeze.get(v, 0) - _now()))
-                                for v in ("alpaca", "polygon", "finnhub", "fred")
+                                for v in ("alpaca", "massive", "finnhub", "fred")
                             }
                             budgets = {
                                 v: (budget.remaining(v) if budget else None)
-                                for v in ("alpaca", "polygon", "finnhub", "fred")
+                                for v in ("alpaca", "massive", "finnhub", "fred")
                             }
                             logger.warning(
                                 f"No units scheduled: caps={caps}, freeze_s={freezes}, budget_remaining={budgets}"
@@ -1133,25 +1133,25 @@ class EdgeCollector:
             self.bookmarks.set("alpaca", "equities_bars_minute", day.isoformat(), len(df))
         return ("ok", int(len(df)), "")
 
-    def _run_polygon_day(self, symbols: List[str], day: date, budget: Optional[BudgetManager]):
+    def _run_massive_day(self, symbols: List[str], day: date, budget: Optional[BudgetManager]):
         try:
-            from data_layer.connectors.polygon_connector import PolygonConnector
+            from data_layer.connectors.massive_connector import MassiveConnector
         except Exception:
             return ("empty", 0, "no connector")
-        conn: Optional[PolygonConnector] = self.connectors.get("polygon")  # type: ignore
+        conn: Optional[MassiveConnector] = self.connectors.get("massive")  # type: ignore
         if not conn:
             return ("empty", 0, "no connector")
         rows = []
-        logger.debug(f"_run_polygon_day start: {day} symbols={len(symbols)}")
+        logger.debug(f"_run_massive_day start: {day} symbols={len(symbols)}")
         total = len(symbols)
         import time as _time
         for idx, sym in enumerate(symbols, start=1):
-            if sym in self._vendor_bad_symbols.get("polygon", set()):
+            if sym in self._vendor_bad_symbols.get("massive", set()):
                 continue
             try:
                 t0 = _time.time()
                 df = conn.fetch_aggregates(sym, day, day, timespan="day")
-                logger.debug(f"polygon fetch {day} [{idx}/{total}] {sym} took {(_time.time()-t0):.2f}s rows={0 if df is None else len(df)}")
+                logger.debug(f"massive fetch {day} [{idx}/{total}] {sym} took {(_time.time()-t0):.2f}s rows={0 if df is None else len(df)}")
             except Exception as e:
                 emsg = str(e)
                 if "429" in emsg or "rate" in emsg.lower():
@@ -1159,10 +1159,10 @@ class EdgeCollector:
                 # Likely invalid/unsupported ticker: suppress further attempts this run
                 if any(s in emsg.lower() for s in ["invalid", "not found", "ticker"]):
                     try:
-                        self._vendor_bad_symbols.setdefault("polygon", set()).add(sym)
+                        self._vendor_bad_symbols.setdefault("massive", set()).add(sym)
                         try:
                             # two-strike persist within 24h
-                            self.bad_symbols.strike("polygon", sym, reason="invalid symbol")
+                            self.bad_symbols.strike("massive", sym, reason="invalid symbol")
                         except Exception:
                             pass
                     except Exception:
@@ -1173,16 +1173,16 @@ class EdgeCollector:
         if not rows:
             return ("empty", 0, "no data")
         out = pd.concat(rows, ignore_index=True)
-        fut = self._upload_to_s3(out, "polygon", "equities_bars", day.isoformat(), async_write=True)
+        fut = self._upload_to_s3(out, "massive", "equities_bars", day.isoformat(), async_write=True)
         try:
             if fut is not None:
-                self._wait_future_with_logs(fut, desc=f"polygon {day} parquet upload")
+                self._wait_future_with_logs(fut, desc=f"massive {day} parquet upload")
         except Exception as e:
             return ("error", 0, str(e))
-        self._write_manifest("polygon", "equities_bars", day.isoformat(), len(out))
+        self._write_manifest("massive", "equities_bars", day.isoformat(), len(out))
         if self.bookmarks:
-            # bookmark advances per day for polygon bars
-            self.bookmarks.set("polygon", "equities_bars", day.isoformat(), len(out))
+            # bookmark advances per day for massive bars
+            self.bookmarks.set("massive", "equities_bars", day.isoformat(), len(out))
         return ("ok", int(len(out)), "")
 
     def _run_finnhub_options_underlier(self, symbol: str, day: date, budget: Optional[BudgetManager]):

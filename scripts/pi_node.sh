@@ -369,18 +369,18 @@ ensure_env() {
 
   # Concurrency defaults (increase workers and vendor inflight caps)
   set_env_kv ".env" "NODE_WORKERS" "${NODE_WORKERS:-6}" "always"
-  set_env_kv ".env" "NODE_MAX_INFLIGHT_POLYGON" "${NODE_MAX_INFLIGHT_POLYGON:-2}" "always"
+  set_env_kv ".env" "NODE_MAX_INFLIGHT_MASSIVE" "${NODE_MAX_INFLIGHT_MASSIVE:-2}" "always"
   set_env_kv ".env" "NODE_MAX_INFLIGHT_FINNHUB" "${NODE_MAX_INFLIGHT_FINNHUB:-2}" "always"
   set_env_kv ".env" "NODE_MAX_INFLIGHT_FRED" "${NODE_MAX_INFLIGHT_FRED:-2}" "always"
   # Sensible default rate-limit cooldowns (if not explicitly set)
   set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_ALPACA" "${NODE_VENDOR_FREEZE_SECONDS_ALPACA:-60}" "if-empty"
-  set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_POLYGON" "${NODE_VENDOR_FREEZE_SECONDS_POLYGON:-60}" "if-empty"
+  set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_MASSIVE" "${NODE_VENDOR_FREEZE_SECONDS_MASSIVE:-60}" "if-empty"
   set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_FINNHUB" "${NODE_VENDOR_FREEZE_SECONDS_FINNHUB:-60}" "if-empty"
   set_env_kv ".env" "NODE_VENDOR_FREEZE_SECONDS_FRED" "${NODE_VENDOR_FREEZE_SECONDS_FRED:-60}" "if-empty"
   # Backfill horizons (defaults guided by SSOT/Playbook)
   set_env_kv ".env" "ALPACA_DAY_START_DAYS" "${ALPACA_DAY_START_DAYS:-5475}" "if-empty"    # ~15y
   set_env_kv ".env" "ALPACA_MINUTE_START_DAYS" "${ALPACA_MINUTE_START_DAYS:-730}" "if-empty" # ~2y
-  set_env_kv ".env" "POLYGON_DAY_START_DAYS" "${POLYGON_DAY_START_DAYS:-3650}" "if-empty"   # ~10y
+  set_env_kv ".env" "MASSIVE_DAY_START_DAYS" "${MASSIVE_DAY_START_DAYS:-3650}" "if-empty"   # ~10y
   set_env_kv ".env" "FRED_TREASURY_START_DAYS" "${FRED_TREASURY_START_DAYS:-18250}" "if-empty" # ~50y
 }
 
@@ -449,7 +449,7 @@ stop_vendor() {
 
 stop_all_vendors() {
   # Stop known vendors first
-  local vendors=(polygon alpaca finnhub fred)
+  local vendors=(massive alpaca finnhub fred)
   local v
   for v in "${vendors[@]}"; do
     stop_vendor "$v"
@@ -523,7 +523,7 @@ case "$cmd" in
     }
 
     # Example defaults; tune via editing below or exporting env before calling
-    start_vendor polygon 1 5   1000
+    start_vendor massive 1 5   1000
     start_vendor alpaca  8 200 0
     start_vendor finnhub 4 60  0
     start_vendor fred    2 60  0

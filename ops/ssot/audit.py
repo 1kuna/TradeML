@@ -27,7 +27,7 @@ import yaml
 from loguru import logger
 
 from data_layer.storage.s3_client import get_s3_client
-from data_layer.connectors.polygon_connector import PolygonConnector
+from data_layer.connectors.massive_connector import MassiveConnector
 from data_layer.qc.partition_status import (
     update_partition_status,
     init_ledger,
@@ -131,7 +131,7 @@ def audit_scan(tables: List[str]) -> None:
     with cfg_path.open() as f:
         cfg = yaml.safe_load(f)
 
-    # Optional budget manager (for QC sampling via Polygon)
+    # Optional budget manager (for QC sampling via Massive)
     bm = None
     try:
         s3 = get_s3_client() if os.getenv("STORAGE_BACKEND", "local").lower() == "s3" else None
@@ -184,12 +184,14 @@ def audit_scan(tables: List[str]) -> None:
             objs = s3.list_objects(prefix=f"{raw_prefix}/date=")
             dates = sorted({k["Key"].split("date=")[-1].split("/")[0] for k in objs if "/data.parquet" in k["Key"]})
         else:
-            def _local_dates(prefix: str, sub: bool) -> set:
+            def _local_dates(prefix: str, sub: bool, symbol_partitions: bool) -> set:
                 root = Path("data_layer") / prefix
                 if not root.exists():
                     return set()
                 if sub:
-                    return {p.parent.name.split("=")[-1] for p in root.glob("date=*/underlier=*/data.parquet")}
+                    return {p.parent.parent.name.split("=")[-1] for p in root.glob("date=*/underlier=*/data.parquet")}
+                if symbol_partitions:
+                    return {p.parent.parent.name.split("=")[-1] for p in root.glob("date=*/symbol=*/data.parquet")}
                 return {p.parent.name.split("=")[-1] for p in root.glob("date=*/data.parquet")}
 
             # source-first primary
@@ -198,9 +200,9 @@ def audit_scan(tables: List[str]) -> None:
             src, tbl = raw_prefix.split("/")[1:3]
             alternate = f"raw/{tbl}/{src}"
             if table == "options_chains":
-                dates = sorted(_local_dates(primary, True) | _local_dates(alternate, True))
+                dates = sorted(_local_dates(primary, True, False) | _local_dates(alternate, True, False))
             else:
-                dates = sorted(_local_dates(primary, False) | _local_dates(alternate, False))
+                dates = sorted(_local_dates(primary, False, True) | _local_dates(alternate, False, True))
 
         if not dates:
             logger.warning(f"No raw date partitions found under {raw_prefix}")
@@ -242,8 +244,9 @@ def audit_scan(tables: List[str]) -> None:
                         frames = [pd.read_parquet(p) for p in parts if p.exists()]
                         df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
                     else:
-                        path = Path("data_layer") / raw_prefix / f"date={d.isoformat()}" / "data.parquet"
-                        df = pd.read_parquet(path) if path.exists() else pd.DataFrame()
+                        parts = list((Path("data_layer") / raw_prefix / f"date={d.isoformat()}").glob("symbol=*/data.parquet"))
+                        frames = [pd.read_parquet(p) for p in parts if p.exists()]
+                        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
                 if not df.empty and "symbol" in df.columns:
                     counts = df.groupby("symbol").size().to_dict()
@@ -261,17 +264,17 @@ def audit_scan(tables: List[str]) -> None:
                         else:
                             st = "GREEN" if rows >= expect_rows else ("AMBER" if rows > 0 else "RED")
                         status_map[sym] = (st, rows)
-                    # QC sampling vs Polygon for today only (limit calls)
-                    if table in ("equities_eod", "equities_minute") and d == date.today() and os.getenv("POLYGON_API_KEY"):
+                    # QC sampling vs Massive for today only (limit calls)
+                    if table in ("equities_eod", "equities_minute") and d == date.today() and os.getenv("MASSIVE_API_KEY"):
                         try:
-                            pconn = PolygonConnector(api_key=os.getenv("POLYGON_API_KEY"))
+                            mconn = MassiveConnector(api_key=os.getenv("MASSIVE_API_KEY"))
                             # Sample up to 5 symbols
                             sample_syms = [s for s in universe if s in counts][:5]
                             for i, sym in enumerate(sample_syms):
-                                if bm and not bm.try_consume("polygon", 1):
+                                if bm and not bm.try_consume("massive", 1):
                                     break
                                 if table == "equities_eod":
-                                    pdf = pconn.fetch_aggregates(sym, d, d, timespan="day")
+                                    pdf = mconn.fetch_aggregates(sym, d, d, timespan="day")
                                     if not pdf.empty and "close" in df.columns:
                                         a_row = df[df["symbol"] == sym]
                                         if not a_row.empty and "close" in a_row.columns:
@@ -279,13 +282,13 @@ def audit_scan(tables: List[str]) -> None:
                                             p_close = float(pdf.iloc[0]["close"])
                                             diff_bps = 10000.0 * (a_close - p_close) / p_close if p_close else 0.0
                                             if abs(diff_bps) >= 20:
-                                                qc_notes[sym] = f"poly_close_diff_bps={diff_bps:.1f}"
+                                                qc_notes[sym] = f"massive_close_diff_bps={diff_bps:.1f}"
                                 else:  # minute
-                                    pdf = pconn.fetch_aggregates(sym, d, d, timespan="minute")
+                                    pdf = mconn.fetch_aggregates(sym, d, d, timespan="minute")
                                     p_rows = len(pdf) if not pdf.empty else 0
                                     a_rows = int(counts.get(sym, 0))
                                     if abs(a_rows - p_rows) >= 10:
-                                        qc_notes[sym] = f"poly_min_rows={p_rows}"
+                                        qc_notes[sym] = f"massive_min_rows={p_rows}"
                         except Exception:
                             pass
                 elif not df.empty and table == "options_chains" and "underlier" in df.columns:
@@ -313,7 +316,7 @@ def audit_scan(tables: List[str]) -> None:
                             notes += ",halfday_tolerated"
                 elif status_str == "RED":
                     notes = "missing"
-                # Attach QC notes from polygon sampling if available
+                # Attach QC notes from Massive sampling if available
                 if sym in qc_notes:
                     notes = (notes + "," if notes else "") + qc_notes[sym]
 

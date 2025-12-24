@@ -96,7 +96,7 @@ def merge_env(template_lines: List[Line], env_lines: List[Line]) -> str:
     pinned_keys = [
         "ALPACA_API_KEY",
         "ALPACA_SECRET_KEY",
-        "POLYGON_API_KEY",
+        "MASSIVE_API_KEY",
         "FRED_API_KEY",
         "FINNHUB_API_KEY",
         "FMP_API_KEY",

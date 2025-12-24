@@ -9,7 +9,7 @@ set -euo pipefail
 #   bash scripts/tools/reset_bookmarks.sh --vendor alpaca --table equities_bars_minute
 #   bash scripts/tools/reset_bookmarks.sh --vendor alpaca            # remove all alpaca:* bookmarks
 #   bash scripts/tools/reset_bookmarks.sh --alpaca-all               # remove alpaca day+minute bookmarks
-#   bash scripts/tools/reset_bookmarks.sh --polygon-day              # remove polygon:equities_bars
+#   bash scripts/tools/reset_bookmarks.sh --massive-day              # remove massive:equities_bars
 #   bash scripts/tools/reset_bookmarks.sh --fred-treasury            # remove fred:macro_treasury
 #
 # Requires:
@@ -89,12 +89,12 @@ usage() {
   cat <<USAGE
 Usage:
   $0 --list
-  $0 --vendor <alpaca|polygon|finnhub|fred> [--table <table_name>]
+  $0 --vendor <alpaca|massive|finnhub|fred> [--table <table_name>]
   Shortcuts:
     --alpaca-all       # remove alpaca day+minute bookmarks
     --alpaca-minute    # remove alpaca:equities_bars_minute
     --alpaca-day       # remove alpaca:equities_bars
-    --polygon-day      # remove polygon:equities_bars
+    --massive-day      # remove massive:equities_bars
     --fred-treasury    # remove fred:macro_treasury
 USAGE
 }
@@ -110,7 +110,7 @@ while [[ $# -gt 0 ]]; do
     --alpaca-all) VENDOR="alpaca"; TABLE=""; shift ;;
     --alpaca-minute) VENDOR="alpaca"; TABLE="equities_bars_minute"; shift ;;
     --alpaca-day) VENDOR="alpaca"; TABLE="equities_bars"; shift ;;
-    --polygon-day) VENDOR="polygon"; TABLE="equities_bars"; shift ;;
+    --massive-day) VENDOR="massive"; TABLE="equities_bars"; shift ;;
     --fred-treasury) VENDOR="fred"; TABLE="macro_treasury"; shift ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -121,4 +121,3 @@ if [[ -n "$VENDOR" ]]; then
 else
   usage; exit 1
 fi
-

@@ -108,18 +108,18 @@ def alpaca_minute_units(edge, budget_mgr=None) -> Iterator[dict]:
         d += timedelta(days=1)
 
 
-def polygon_bars_units(edge, budget_mgr=None) -> Iterator[dict]:
-    if "polygon" not in edge.connectors:
+def massive_bars_units(edge, budget_mgr=None) -> Iterator[dict]:
+    if "massive" not in edge.connectors:
         return
     symbols = edge._symbols_universe()
     today = _today_date()
     # Default: 10 years of daily bars
-    default_days = _int_env("POLYGON_DAY_START_DAYS", 365 * 10)
-    start_date = _start_date(edge, "polygon", "equities_bars", default_days)
+    default_days = _int_env("MASSIVE_DAY_START_DAYS", 365 * 10)
+    start_date = _start_date(edge, "massive", "equities_bars", default_days)
     try:
-        if start_date == today and not edge._should_fetch_eod_for_day("polygon", today):
+        if start_date == today and not edge._should_fetch_eod_for_day("massive", today):
             prev = today - timedelta(days=1)
-            last_ts = edge.bookmarks.get_last_timestamp("polygon", "equities_bars") if edge.bookmarks else None
+            last_ts = edge.bookmarks.get_last_timestamp("massive", "equities_bars") if edge.bookmarks else None
             if (not last_ts) or (datetime.fromisoformat(last_ts).date() < prev):
                 start_date = prev
             else:
@@ -127,28 +127,28 @@ def polygon_bars_units(edge, budget_mgr=None) -> Iterator[dict]:
     except Exception:
         pass
     try:
-        BATCH = max(1, int(os.getenv("NODE_POLYGON_SYMBOLS_PER_UNIT", "3")))
+        BATCH = max(1, int(os.getenv("NODE_MASSIVE_SYMBOLS_PER_UNIT", "3")))
     except Exception:
         BATCH = 3
     from itertools import islice
-    pg_bad = set([s.upper() for s in edge._vendor_bad_symbols.get("polygon", set())]) | edge.bad_symbols.vendor_set("polygon")
+    massive_bad = set([s.upper() for s in edge._vendor_bad_symbols.get("massive", set())]) | edge.bad_symbols.vendor_set("massive")
     d = start_date
     while d <= today and not edge.shutdown_requested:
-        if not edge._should_fetch_eod_for_day("polygon", d):
+        if not edge._should_fetch_eod_for_day("massive", d):
             d += timedelta(days=1)
             continue
-        if not _provider_allowed("polygon", "equities_eod", d, symbols):
+        if not _provider_allowed("massive", "equities_eod", d, symbols):
             d += timedelta(days=1)
             continue
-        val_syms = [s for s in symbols if s.upper() not in pg_bad]
+        val_syms = [s for s in symbols if s.upper() not in massive_bad]
         for i in range(0, len(val_syms), BATCH):
             chunk = val_syms[i:i + BATCH]
             tokens = len(chunk)
             yield {
-                "vendor": "polygon",
-                "desc": f"polygon {d} [{i}:{i+len(chunk)}]",
+                "vendor": "massive",
+                "desc": f"massive {d} [{i}:{i+len(chunk)}]",
                 "tokens": tokens,
-                "run": (lambda day=d, syms=chunk: edge._run_polygon_day(syms, day, budget_mgr)),
+                "run": (lambda day=d, syms=chunk: edge._run_massive_day(syms, day, budget_mgr)),
             }
         d += timedelta(days=1)
 

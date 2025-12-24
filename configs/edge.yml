@@ -8,7 +8,7 @@ tasks:
   - alpaca_options_bars
   - alpaca_options_chain
   - alpaca_corporate_actions
-  - polygon_bars
+  - massive_bars
   - finnhub_options
   - fred_treasury
   - av_corp_actions
@@ -19,7 +19,7 @@ tasks:
 policy:
   daily_api_budget:
     alpaca:  { requests: 250000 }
-    polygon: { requests: 7000 }
+    massive: { requests: 7200 }
     finnhub: { requests: 86400 }
     fred:    { requests: 10000 }
     av:      { requests: 25 }

@@ -19,7 +19,7 @@ from utils.concurrency import max_inflight_for
 def _vendor_lease_name(vendor: str) -> str:
     mapping = {
         "alpaca": "edge-alpaca-collector",
-        "polygon": "edge-polygon-collector",
+        "massive": "edge-massive-collector",
         "finnhub": "edge-finnhub-collector",
         "fred": "edge-fred-collector",
         "av": "edge-av-collector",
@@ -37,7 +37,7 @@ def _vendor_freeze_seconds(vendor: str) -> int:
 
 
 def _vendor_cap(vendor: str) -> int:
-    defaults = {"alpaca": 2, "polygon": 1, "finnhub": 2, "fred": 2, "av": 1, "fmp": 1}
+    defaults = {"alpaca": 2, "massive": 1, "finnhub": 2, "fred": 2, "av": 1, "fmp": 1}
     return max(1, max_inflight_for(vendor, default=defaults.get(vendor, 1)))
 
 
@@ -53,7 +53,7 @@ def _vendor_ping_target(vendor: str) -> Optional[tuple[str, int]]:
     mapping = {
         "alpaca": ("data.alpaca.markets", 443),
         "fred": ("api.stlouisfed.org", 443),
-        "polygon": ("api.polygon.io", 443),
+        "massive": ("api.massive.com", 443),
         "finnhub": ("finnhub.io", 443),
         "av": ("www.alphavantage.co", 443),
         "fmp": ("financialmodelingprep.com", 443),
@@ -179,7 +179,7 @@ class VendorRunner:
             alpaca_options_bars_units,
             alpaca_options_chain_units,
             alpaca_corporate_actions_units,
-            polygon_bars_units,
+            massive_bars_units,
             finnhub_options_units,
             fred_treasury_units,
             finnhub_daily_units,
@@ -200,9 +200,9 @@ class VendorRunner:
                 prods.append(alpaca_options_chain_units(self.edge, self.budget))
             if "alpaca_corporate_actions" in self.tasks:
                 prods.append(alpaca_corporate_actions_units(self.edge, self.budget))
-        elif self.vendor == "polygon":
-            if "polygon_bars" in self.tasks:
-                prods.append(polygon_bars_units(self.edge, self.budget))
+        elif self.vendor == "massive":
+            if "massive_bars" in self.tasks:
+                prods.append(massive_bars_units(self.edge, self.budget))
         elif self.vendor == "finnhub":
             if "finnhub_options" in self.tasks:
                 prods.append(finnhub_options_units(self.edge, self.budget))
@@ -441,14 +441,14 @@ class VendorSupervisor:
         self.runners: List[VendorRunner] = []
 
     def _group_tasks_by_vendor(self, tasks: List[str]) -> Dict[str, List[str]]:
-        mapping: Dict[str, List[str]] = {"alpaca": [], "polygon": [], "finnhub": [], "fred": [], "av": [], "fmp": []}
+        mapping: Dict[str, List[str]] = {"alpaca": [], "massive": [], "finnhub": [], "fred": [], "av": [], "fmp": []}
         for t in tasks:
             if t in ("alpaca_bars", "alpaca_minute"):
                 mapping["alpaca"].append(t)
             elif t in ("alpaca_options_bars", "alpaca_options_chain", "alpaca_corporate_actions"):
                 mapping["alpaca"].append(t)
-            elif t == "polygon_bars":
-                mapping["polygon"].append(t)
+            elif t == "massive_bars":
+                mapping["massive"].append(t)
             elif t in ("finnhub_options", "finnhub_daily"):
                 mapping["finnhub"].append(t)
             elif t == "fred_treasury":

@@ -5,7 +5,7 @@ URL formats, auth, and transform outputs. Safe to run locally; does not write S3
 
 Tests (single symbol: AAPL, prev business day):
 - Alpaca: 1Day, 1Min, 5Min bars via connector
-- Polygon: day aggregates via connector
+- Massive: day aggregates via connector
 - Finnhub: options chain via connector
 - FRED: treasury curve for a single day via connector
 - FMP (stable): search-symbol, historical-price-eod, dividends, earnings, splits, calendars, delisted
@@ -55,14 +55,14 @@ def run():
     except Exception as e:
         results["alpaca"] = f"error: {e}"
 
-    # ---- Polygon (connector) ----
+    # ---- Massive (connector) ----
     try:
-        from data_layer.connectors.polygon_connector import PolygonConnector
-        pg = PolygonConnector()
-        pd1 = pg.fetch_aggregates(sym, pbd, pbd, timespan="day")
-        results["polygon_day"] = f"ok rows={len(pd1)} cols=[{head_cols(pd1)}]" if not pd1.empty else "empty"
+        from data_layer.connectors.massive_connector import MassiveConnector
+        ms = MassiveConnector()
+        md1 = ms.fetch_aggregates(sym, pbd, pbd, timespan="day")
+        results["massive_day"] = f"ok rows={len(md1)} cols=[{head_cols(md1)}]" if not md1.empty else "empty"
     except Exception as e:
-        results["polygon"] = f"error: {e}"
+        results["massive"] = f"error: {e}"
 
     # ---- Finnhub (connector) ----
     try:
