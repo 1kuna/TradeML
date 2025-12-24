@@ -41,6 +41,8 @@ except ImportError:
 FORWARD_CHECK_INTERVAL = 900  # 15 minutes
 LIGHT_AUDIT_INTERVAL = 4 * 3600  # 4 hours
 HEAVY_AUDIT_HOUR = 2  # 02:00 local time
+LIGHT_AUDIT_WINDOW_DAYS = 30
+HEAVY_AUDIT_WINDOW_DAYS = 180
 
 # Priority levels per spec
 PRIORITY_BOOTSTRAP = 0
@@ -86,6 +88,7 @@ def _is_trading_day(dt: date) -> bool:
 def audit_for_gaps(
     datasets: list[str],
     db: Optional[NodeDB] = None,
+    window_days: Optional[int] = None,
 ) -> Generator[tuple[str, str, date, PartitionStatus], None, None]:
     """
     Audit partition_status for gaps in data coverage.
@@ -111,6 +114,10 @@ def audit_for_gaps(
 
     for dataset in datasets:
         start_date, end_date = get_date_range(dataset)
+        if window_days:
+            window_start = end_date - timedelta(days=window_days)
+            if window_start > start_date:
+                start_date = window_start
         expected_days = _generate_trading_days(start_date, end_date)
 
         if not expected_days:
@@ -133,7 +140,13 @@ def audit_for_gaps(
         # Build lookup: (symbol, date) -> status
         status_lookup: dict[tuple[str, date], PartitionStatus] = {}
         for row in existing:
-            key = (row["symbol"], row["dt"])
+            dt_val = row["dt"]
+            if isinstance(dt_val, str):
+                try:
+                    dt_val = date.fromisoformat(dt_val)
+                except ValueError:
+                    continue
+            key = (row["symbol"], dt_val)
             status_lookup[key] = PartitionStatus(row["status"])
 
         # Find gaps
@@ -460,7 +473,7 @@ class PlannerLoop:
             Number of tasks created
         """
         logger.info("Running light audit...")
-        gaps = audit_for_gaps(self.datasets, self.db)
+        gaps = audit_for_gaps(self.datasets, self.db, window_days=LIGHT_AUDIT_WINDOW_DAYS)
         created = upsert_gap_tasks(gaps, self.db)
         logger.info(f"Light audit complete: {created} GAP tasks created")
         self._last_light_audit = datetime.now()
@@ -490,7 +503,7 @@ class PlannerLoop:
         }
 
         # Full gap audit
-        gaps = audit_for_gaps(self.datasets, self.db)
+        gaps = audit_for_gaps(self.datasets, self.db, window_days=HEAVY_AUDIT_WINDOW_DAYS)
         results["gaps_created"] = upsert_gap_tasks(gaps, self.db)
 
         # Re-queue AMBER partitions (row-count mismatches from QC)

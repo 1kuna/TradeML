@@ -30,6 +30,7 @@ from .fetchers import (
     VENDOR_PRIORITY,
 )
 from .qc import validate_partition_row_count
+from .qc_weekly import get_secondary_vendor, run_qc_probe
 from .stages import get_expected_rows, get_qc_thresholds
 from .vendor_limits import massive_in_window, massive_window
 
@@ -109,6 +110,140 @@ def _vendor_supports_task(task: Task, vendor: str) -> bool:
     """
     if vendor == "massive" and task.dataset in ("equities_eod", "equities_minute"):
         return massive_in_window(task.start_date, task.end_date)
+    return True
+
+
+def _process_qc_probe_task(
+    task: Task,
+    db: NodeDB,
+    budgets: BudgetManager,
+) -> bool:
+    """Process a QC_PROBE task end-to-end."""
+    # Find primary partition record
+    primary = db.get_latest_partition_status(
+        table_name=task.dataset,
+        symbol=task.symbol,
+        dt=task.start_date,
+        status=PartitionStatus.GREEN,
+    )
+    if not primary:
+        primary = db.get_latest_partition_status(
+            table_name=task.dataset,
+            symbol=task.symbol,
+            dt=task.start_date,
+            status=None,
+        )
+
+    if not primary:
+        db.upsert_qc_probe(
+            dataset=task.dataset,
+            symbol=task.symbol,
+            dt=task.start_date,
+            primary_vendor=None,
+            secondary_vendor=None,
+            status="SKIPPED",
+            qc_code="PRIMARY_NOT_FOUND",
+        )
+        db.mark_task_done(task.id)
+        return True
+
+    primary_vendor = primary.get("source_name")
+    secondary_vendor = get_secondary_vendor(task.dataset, primary_vendor)
+
+    if secondary_vendor is None:
+        db.upsert_qc_probe(
+            dataset=task.dataset,
+            symbol=task.symbol,
+            dt=task.start_date,
+            primary_vendor=primary_vendor,
+            secondary_vendor=None,
+            status="SKIPPED",
+            qc_code="NO_SECONDARY_VENDOR",
+        )
+        db.mark_task_done(task.id)
+        return True
+
+    if not budgets.can_spend(secondary_vendor, TaskKind.QC_PROBE):
+        backoff_until = budgets.next_daily_reset_time(secondary_vendor)
+        db.defer_task_until(task.id, backoff_until)
+        logger.info(
+            f"QC_PROBE deferred for {task.dataset}/{task.symbol} until {backoff_until.isoformat()} "
+            f"(daily cap for {secondary_vendor})"
+        )
+        return False
+
+    # Fetch secondary data
+    result = fetch_task(task, secondary_vendor)
+    result.vendor_used = secondary_vendor
+
+    if result.status in (FetchStatus.RATE_LIMITED, FetchStatus.ERROR):
+        backoff = timedelta(seconds=BACKOFF_BASE_SECONDS * (2 ** task.attempts))
+        backoff = min(backoff, timedelta(seconds=BACKOFF_MAX_SECONDS))
+        backoff_until = datetime.now(timezone.utc) + backoff
+        db.mark_task_failed(
+            task.id,
+            error=result.error or "QC probe fetch error",
+            backoff_until=backoff_until,
+        )
+        return True
+
+    if result.status in (FetchStatus.NOT_ENTITLED, FetchStatus.NOT_SUPPORTED):
+        db.upsert_qc_probe(
+            dataset=task.dataset,
+            symbol=task.symbol,
+            dt=task.start_date,
+            primary_vendor=primary_vendor,
+            secondary_vendor=secondary_vendor,
+            status="SKIPPED",
+            qc_code="SECONDARY_NOT_ENTITLED" if result.status == FetchStatus.NOT_ENTITLED else "SECONDARY_NOT_SUPPORTED",
+        )
+        db.mark_task_done(task.id)
+        return True
+
+    # Update partition_status for secondary vendor using normal handling
+    QueueWorker(db=db, budgets=budgets).handle_result(task, result)
+
+    # Run cross-vendor comparison
+    dt_value = task.start_date
+    if isinstance(dt_value, str):
+        dt_value = date.fromisoformat(dt_value)
+    elif isinstance(dt_value, datetime):
+        dt_value = dt_value.date()
+
+    probe_result = run_qc_probe(
+        dataset=task.dataset,
+        symbol=task.symbol or "",
+        dt=dt_value,
+        primary_vendor=primary_vendor,
+        db=db,
+    )
+
+    if probe_result.get("status") == "MISMATCH":
+        db.upsert_partition_status(
+            source_name=primary_vendor or "unknown",
+            table_name=task.dataset,
+            symbol=task.symbol,
+            dt=task.start_date,
+            status=PartitionStatus.AMBER,
+            qc_score=0.5,
+            row_count=primary.get("row_count", 0) or 0,
+            expected_rows=primary.get("expected_rows", 0) or 0,
+            qc_code=probe_result.get("qc_code"),
+            notes="QC probe mismatch",
+        )
+        db.enqueue_task(
+            dataset=task.dataset,
+            symbol=task.symbol,
+            start_date=task.start_date,
+            end_date=task.start_date,
+            kind=TaskKind.GAP,
+            priority=1,
+            allow_overlap=False,
+        )
+        logger.warning(
+            f"QC probe mismatch for {task.dataset}/{task.symbol}/{task.start_date}: {probe_result.get('qc_code')}"
+        )
+
     return True
 
 
@@ -577,18 +712,40 @@ class QueueWorker:
         if task is None:
             return False
 
+        if task.kind == TaskKind.QC_PROBE:
+            return _process_qc_probe_task(task, self.db, self.budgets)
+
         # Pick vendor
         vendor = self.pick_vendor(task)
 
         if vendor is None:
-            # No vendor available right now - set backoff and release
-            logger.debug(f"No vendor available for task {task.id}, backing off")
-            self.db.mark_task_failed(
-                task.id,
-                error="No vendor available (budget/inflight limits)",
-                backoff_until=datetime.now(timezone.utc) + timedelta(minutes=5),
-                max_attempts=task.attempts + 10,  # Don't count towards failure
-            )
+            # No vendor available right now - defer without incrementing attempts
+            now = datetime.now(timezone.utc)
+            vendors = get_vendors_for_dataset(task.dataset)
+            if not vendors:
+                logger.error(f"No vendors support dataset {task.dataset}; failing task {task.id}")
+                self.db.mark_task_failed(
+                    task.id,
+                    error=f"No vendors support dataset {task.dataset}",
+                    max_attempts=0,
+                )
+                return False
+
+            eligible_daily = [v for v in vendors if self.budgets.can_spend(v, task.kind)]
+            if not eligible_daily:
+                backoff_until = min(
+                    (self.budgets.next_daily_reset_time(v) for v in vendors),
+                    default=now + timedelta(hours=1),
+                )
+                logger.info(
+                    f"No daily budget remaining for task {task.id}; deferring until {backoff_until.isoformat()}"
+                )
+            else:
+                backoff_until = now + timedelta(minutes=5)
+                logger.debug(
+                    f"No vendor inflight capacity for task {task.id}; deferring until {backoff_until.isoformat()}"
+                )
+            self.db.defer_task_until(task.id, backoff_until)
             return False
 
         # Process
@@ -779,6 +936,10 @@ class VendorWorker:
         self._last_heartbeat: datetime = datetime.now(timezone.utc)
         self._last_task_completed: datetime | None = None
 
+        # Vendor ineligibility cache (dataset -> expire time)
+        self._dataset_ineligible: dict[str, datetime] = {}
+        self._ineligible_ttl = timedelta(hours=24)
+
     @property
     def seconds_since_heartbeat(self) -> float:
         """Seconds since last heartbeat (loop iteration)."""
@@ -863,6 +1024,19 @@ class VendorWorker:
                 logger.info(f"[TIMING] {self.vendor}-{self.worker_id}: lease (no task) took {lease_ms:.0f}ms")
             return False
 
+        if task.kind == TaskKind.QC_PROBE:
+            return _process_qc_probe_task(task, self.db, self.budgets)
+
+        # Skip datasets marked ineligible for this vendor
+        blocked_until = self._dataset_ineligible.get(task.dataset)
+        if blocked_until and datetime.now(timezone.utc) < blocked_until:
+            logger.info(
+                f"VendorWorker {self.vendor}-{self.worker_id}: dataset {task.dataset} ineligible until "
+                f"{blocked_until.isoformat()}, releasing task {task.id}"
+            )
+            self.db.release_task(task.id)
+            return False
+
         # Enforce freshness delay: skip tasks that include the last 2 days
         try:
             from datetime import date as dt_date, time as dt_time
@@ -885,7 +1059,11 @@ class VendorWorker:
             logger.debug(
                 f"VendorWorker {self.vendor}-{self.worker_id}: budget exhausted for {task.kind.value}, releasing task {task.id}"
             )
-            self.db.release_task(task.id)
+            backoff_until = self.budgets.next_daily_reset_time(self.vendor)
+            self.db.defer_task_until(task.id, backoff_until)
+            logger.info(
+                f"VendorWorker {self.vendor}-{self.worker_id}: deferred task {task.id} until {backoff_until.isoformat()}"
+            )
             return False
 
         # Budget is tracked per HTTP request in base.py._get()
@@ -1235,7 +1413,27 @@ class VendorWorker:
             self._tasks_failed += 1
             logger.warning(f"Task {task.id} rate limited, retry after {backoff_until}")
 
-        else:  # ERROR, NOT_ENTITLED, NOT_SUPPORTED
+        elif result.status == FetchStatus.NOT_ENTITLED:
+            self._dataset_ineligible[task.dataset] = now + self._ineligible_ttl
+            self.db.mark_task_failed(
+                task.id,
+                error=result.error or "Not entitled",
+                backoff_until=now + timedelta(seconds=10),
+                max_attempts=task.attempts + 5,
+            )
+            self._tasks_failed += 1
+            logger.warning(f"Task {task.id} not entitled for {self.vendor}: {result.error}")
+
+        elif result.status == FetchStatus.NOT_SUPPORTED:
+            self.db.mark_task_failed(
+                task.id,
+                error=result.error or "Not supported",
+                max_attempts=0,
+            )
+            self._tasks_failed += 1
+            logger.error(f"Task {task.id} not supported: {result.error}")
+
+        else:  # ERROR
             backoff = timedelta(seconds=BACKOFF_BASE_SECONDS * (2 ** task.attempts))
             backoff = min(backoff, timedelta(seconds=BACKOFF_MAX_SECONDS))
             backoff_until = now + backoff
@@ -1305,6 +1503,9 @@ class QueueWorkerPool:
         if self._running:
             logger.warning("QueueWorkerPool already running")
             return
+        if any(thread.is_alive() for thread in self._threads):
+            logger.warning("QueueWorkerPool has active threads; refusing to start new ones")
+            return
 
         self._running = True
 
@@ -1330,10 +1531,14 @@ class QueueWorkerPool:
         total = sum(self.thread_counts.values())
         logger.info(f"QueueWorkerPool started: {total} worker threads ({self.thread_counts})")
 
-    def stop(self) -> None:
-        """Stop all worker threads."""
+    def stop(self, timeout: float = 10.0) -> int:
+        """Stop all worker threads.
+
+        Returns:
+            Count of threads still running after timeout.
+        """
         if not self._running:
-            return
+            return 0
 
         self._running = False
 
@@ -1341,19 +1546,26 @@ class QueueWorkerPool:
         for worker in self._workers:
             worker.stop()
 
-        # Wait for threads to finish
+        # Wait for threads to finish, bounded by a total timeout.
+        deadline = time.time() + timeout
         for thread in self._threads:
-            thread.join(timeout=10)
+            remaining = max(0.0, deadline - time.time())
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
 
         # Count any that didn't finish
         still_running = sum(1 for t in self._threads if t.is_alive())
         if still_running:
             logger.warning(f"{still_running} worker threads still running after timeout")
 
-        self._workers.clear()
-        self._threads.clear()
-
-        logger.info("QueueWorkerPool stopped")
+        if still_running:
+            logger.warning("QueueWorkerPool stop incomplete; keeping worker references")
+        else:
+            self._workers.clear()
+            self._threads.clear()
+            logger.info("QueueWorkerPool stopped")
+        return still_running
 
     @property
     def is_running(self) -> bool:

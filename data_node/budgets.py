@@ -16,7 +16,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -271,6 +271,26 @@ class BudgetManager:
         budget.tokens = min(budget.hard_rpm, budget.tokens + refill)
         budget.last_token_update = now
 
+    def try_acquire_rpm_tokens(self, vendor: str, tokens: int = 1) -> bool:
+        """
+        Try to acquire RPM tokens for a vendor without touching daily spend.
+
+        Returns:
+            True if tokens were acquired, False otherwise
+        """
+        vendor = self._normalize_vendor(vendor)
+        with self._lock:
+            budget = self._budgets.get(vendor)
+            if budget is None:
+                return False
+
+            self._refill_tokens(vendor)
+            if budget.tokens < tokens:
+                return False
+
+            budget.tokens = max(0.0, budget.tokens - tokens)
+            return True
+
     def _check_daily_reset(self, vendor: str) -> None:
         """Reset daily counter if we've crossed into a new UTC day."""
         budget = self._budgets.get(vendor)
@@ -308,12 +328,6 @@ class BudgetManager:
                 return False
 
             self._check_daily_reset(vendor)
-            self._refill_tokens(vendor)
-
-            # Check token bucket (RPM)
-            if budget.tokens < tokens:
-                logger.debug(f"{vendor} RPM limit: {budget.tokens:.1f} tokens < {tokens}")
-                return False
 
             # Check daily slice based on kind
             if kind in (TaskKind.BOOTSTRAP, TaskKind.GAP):
@@ -350,10 +364,6 @@ class BudgetManager:
                 return False
 
             self._check_daily_reset(vendor)
-            self._refill_tokens(vendor)
-
-            # Deduct from token bucket
-            budget.tokens = max(0, budget.tokens - tokens)
 
             # Increment daily spent
             budget.spent_today += tokens
@@ -386,6 +396,16 @@ class BudgetManager:
             if not self.can_spend(vendor, kind, tokens):
                 return False
             return self.spend(vendor, tokens)
+
+    def next_daily_reset_time(self, vendor: str) -> datetime:
+        """Return the next UTC daily reset timestamp for a vendor."""
+        vendor = self._normalize_vendor(vendor)
+        with self._lock:
+            if vendor not in self._budgets:
+                return datetime.now(timezone.utc) + timedelta(days=1)
+            now = datetime.now(timezone.utc)
+            next_day = now.date() + timedelta(days=1)
+            return datetime.combine(next_day, datetime.min.time(), tzinfo=timezone.utc)
 
     def get_budget_status(self, vendor: str) -> dict:
         """

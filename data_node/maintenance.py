@@ -44,13 +44,23 @@ def _resolve_raw_partition_path(source_name: str, table_name: str, dt: str, symb
     """
     Best-effort reconstruction of the raw parquet path for a partition.
 
-    Uses the same convention as fetchers: data_layer/raw/<vendor>/<table>/date=<dt>/data.parquet
+    Uses the same convention as fetchers:
+      data_layer/raw/<vendor>/<table>/date=<dt>/symbol=<symbol>/data.parquet
+      (options chains use underlier=<symbol>)
     """
     data_root = os.environ.get("DATA_ROOT", ".")
     resolved_table = _map_dataset_to_table(table_name)
     if dt is None:
         return None
-    return Path(data_root) / "data_layer" / "raw" / source_name / resolved_table / f"date={dt}" / "data.parquet"
+    base = Path(data_root) / "data_layer" / "raw" / source_name / resolved_table / f"date={dt}"
+
+    if symbol:
+        if table_name == "options_chains":
+            base = base / f"underlier={symbol}"
+        else:
+            base = base / f"symbol={symbol}"
+
+    return base / "data.parquet"
 
 # Try to import existing curate module
 try:
@@ -121,6 +131,7 @@ def run_structural_qc(db: Optional[NodeDB] = None) -> dict:
 
     results = {
         "checked": 0,
+        "tables_checked": 0,
         "issues": 0,
         "row_count_mismatches": 0,
         "updated_to_amber": 0,
@@ -142,7 +153,7 @@ def run_structural_qc(db: Optional[NodeDB] = None) -> dict:
                 end_date=today,
             )
 
-            results["checked"] += 1
+            results["tables_checked"] += 1
 
             if coverage < 0.95:
                 results["issues"] += 1
@@ -155,14 +166,23 @@ def run_structural_qc(db: Optional[NodeDB] = None) -> dict:
                 logger.warning(f"Low coverage for {table}: {coverage:.2%}")
 
             # 2. Validate row counts for GREEN partitions
-            row_count_issues = _validate_partition_row_counts(db, table, results)
+            row_count_issues = _validate_partition_row_counts(
+                db,
+                table,
+                results,
+                start_date=week_ago.isoformat(),
+                end_date=today.isoformat(),
+            )
             if row_count_issues > 0:
                 logger.warning(f"Found {row_count_issues} row-count mismatches in {table}")
 
         except Exception as e:
             logger.warning(f"QC check failed for {table}: {e}")
 
-    logger.info(f"Structural QC complete: {results['checked']} checked, {results['issues']} issues")
+    logger.info(
+        f"Structural QC complete: {results['checked']} partitions checked across "
+        f"{results['tables_checked']} tables, {results['issues']} issues"
+    )
     return results
 
 
@@ -171,6 +191,8 @@ def _validate_partition_row_counts(
     table_name: str,
     results: dict,
     batch_size: int = 10000,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> int:
     """Validate row counts for GREEN partitions in a table.
 
@@ -203,11 +225,14 @@ def _validate_partition_row_counts(
         table_name=table_name,
         status=PartitionStatus.GREEN,
         limit=batch_size,
+        start_date=start_date,
+        end_date=end_date,
     )
 
     mismatches = 0
 
     for p in partitions:
+        results["checked"] = results.get("checked", 0) + 1
         # Check backing parquet file exists (guards crash between upsert and write)
         partition_path = _resolve_raw_partition_path(p.source_name, table_name, p.dt, p.symbol)
         if partition_path is not None and not partition_path.exists():
@@ -399,22 +424,35 @@ def run_export(asof: Optional[date] = None, db: Optional[NodeDB] = None) -> dict
 def _export_partition_status(db: NodeDB, export_dir: Path, results: dict) -> None:
     """Export partition_status table as parquet."""
     try:
-        import pandas as pd
+        import pyarrow as pa
+        import pyarrow.parquet as pq
 
         conn = db._get_connection()
-        rows = conn.execute("SELECT * FROM partition_status").fetchall()
+        output_path = export_dir / "partition_status.parquet"
+        cursor = conn.execute("SELECT * FROM partition_status")
 
-        if not rows:
+        batch = cursor.fetchmany(5000)
+        if not batch:
             logger.debug("No partition_status rows to export")
             return
 
-        df = pd.DataFrame([dict(row) for row in rows])
-        output_path = export_dir / "partition_status.parquet"
-        df.to_parquet(output_path, index=False)
+        first_table = pa.Table.from_pylist([dict(row) for row in batch])
+        writer = pq.ParquetWriter(output_path, first_table.schema, compression="snappy")
+        try:
+            writer.write_table(first_table)
+            while True:
+                batch = cursor.fetchmany(5000)
+                if not batch:
+                    break
+                table = pa.Table.from_pylist([dict(row) for row in batch], schema=first_table.schema)
+                writer.write_table(table)
+        finally:
+            writer.close()
+
         results["files"].append("partition_status.parquet")
 
     except ImportError:
-        logger.warning("pandas not available, skipping partition_status export")
+        logger.warning("pyarrow not available, skipping partition_status export")
     except Exception as e:
         logger.warning(f"Failed to export partition_status: {e}")
         results["errors"].append(f"partition_status: {e}")
@@ -463,8 +501,11 @@ def _write_manifest(export_dir: Path, asof: date, results: dict) -> None:
         filepath = export_dir / filename
         if filepath.exists() and filepath.is_file():
             try:
+                hasher = hashlib.sha256()
                 with open(filepath, "rb") as f:
-                    checksum = hashlib.sha256(f.read()).hexdigest()
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+                checksum = hasher.hexdigest()
                 manifest["checksums"][filename] = checksum
             except Exception as e:
                 logger.debug(f"Could not compute checksum for {filename}: {e}")

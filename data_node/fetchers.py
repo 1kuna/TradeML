@@ -422,12 +422,10 @@ def _fetch_alpaca_bars(task: Task, timeframe: str) -> FetchResult:
         # Compute per-day row counts for QC validation
         rows_by_date = _compute_rows_by_date(df)
 
-        # Write to raw partition
+        df = _ensure_partition_columns(df, task.dataset, task)
         table_name = "equities_bars" if timeframe == "1Day" else "equities_bars_minute"
-        raw_path = _get_raw_path("alpaca", table_name, task.start_date)
-
-        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
-        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
+        raw_root = _get_raw_table_root("alpaca", table_name)
+        connector.write_parquet(df, str(raw_root), partition_cols=_partition_cols_for_dataset(task.dataset))
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -535,10 +533,10 @@ def _fetch_massive_bars(task: Task, timeframe: str) -> FetchResult:
         # Compute per-day row counts for QC validation
         rows_by_date = _compute_rows_by_date(df)
 
+        df = _ensure_partition_columns(df, task.dataset, task)
         table_name = "equities_bars" if timeframe == "day" else "equities_bars_minute"
-        raw_path = _get_raw_path("massive", table_name, task.start_date)
-        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
-        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
+        raw_root = _get_raw_table_root("massive", table_name)
+        connector.write_parquet(df, str(raw_root), partition_cols=_partition_cols_for_dataset(task.dataset))
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -590,9 +588,9 @@ def _fetch_finnhub_candles(task: Task) -> FetchResult:
         # Compute per-day row counts for QC validation
         rows_by_date = _compute_rows_by_date(df)
 
-        raw_path = _get_raw_path("finnhub", "equities_bars", task.start_date)
-        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
-        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
+        df = _ensure_partition_columns(df, task.dataset, task)
+        raw_root = _get_raw_table_root("finnhub", "equities_bars")
+        connector.write_parquet(df, str(raw_root), partition_cols=_partition_cols_for_dataset(task.dataset))
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -637,9 +635,9 @@ def _fetch_finnhub_options(task: Task) -> FetchResult:
                 fetch_params=fetch_params,
             )
 
-        raw_path = _get_raw_path("finnhub", "options_chains", task.start_date, underlier=task.symbol)
-        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
-        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
+        df = _ensure_partition_columns(df, task.dataset, task)
+        raw_root = _get_raw_table_root("finnhub", "options_chains")
+        connector.write_parquet(df, str(raw_root), partition_cols=_partition_cols_for_dataset(task.dataset))
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -726,9 +724,9 @@ def _fetch_fred_treasury(task: Task) -> FetchResult:
                 fetch_params=fetch_params,
             )
 
-        raw_path = _get_raw_path("fred", "macro_treasury", task.start_date)
-        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
-        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
+        df = _ensure_partition_columns(df, task.dataset, task)
+        raw_root = _get_raw_table_root("fred", "macro_treasury")
+        connector.write_parquet(df, str(raw_root), partition_cols=_partition_cols_for_dataset(task.dataset))
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -774,9 +772,9 @@ def _fetch_av_corp_actions(task: Task) -> FetchResult:
                 fetch_params=fetch_params,
             )
 
-        raw_path = _get_raw_path("av", "corp_actions", task.start_date)
-        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
-        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
+        df = _ensure_partition_columns(df, task.dataset, task)
+        raw_root = _get_raw_table_root("av", "corp_actions")
+        connector.write_parquet(df, str(raw_root), partition_cols=_partition_cols_for_dataset(task.dataset))
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -822,9 +820,9 @@ def _fetch_fmp_eod(task: Task) -> FetchResult:
                 vendor_used="fmp",
             )
 
-        raw_path = _get_raw_path("fmp", "equities_bars", task.start_date)
-        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
-        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
+        df = _ensure_partition_columns(df, task.dataset, task)
+        raw_root = _get_raw_table_root("fmp", "equities_bars")
+        connector.write_parquet(df, str(raw_root), partition_cols=_partition_cols_for_dataset(task.dataset))
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -863,9 +861,9 @@ def _fetch_fmp_fundamentals(task: Task) -> FetchResult:
                 vendor_used="fmp",
             )
 
-        raw_path = _get_raw_path("fmp", "fundamentals", task.start_date)
-        # Use parent.parent (table dir) so partition_cols creates date=... without nesting
-        connector.write_parquet(df, str(raw_path.parent.parent), partition_cols=["date"])
+        df = _ensure_partition_columns(df, task.dataset, task)
+        raw_root = _get_raw_table_root("fmp", "fundamentals")
+        connector.write_parquet(df, str(raw_root), partition_cols=_partition_cols_for_dataset(task.dataset))
 
         return FetchResult(
             status=FetchStatus.SUCCESS,
@@ -935,20 +933,36 @@ def _compute_rows_by_date(df) -> dict[date, int]:
     return result
 
 
-def _get_raw_path(
-    vendor: str,
-    table: str,
-    dt: str,
-    underlier: Optional[str] = None,
-) -> Path:
-    """Get the raw partition path."""
+def _get_raw_table_root(vendor: str, table: str) -> Path:
+    """Get the raw table root path."""
     data_root = os.environ.get("DATA_ROOT", ".")
-    base = Path(data_root) / "data_layer" / "raw" / vendor / table / f"date={dt}"
+    return Path(data_root) / "data_layer" / "raw" / vendor / table
 
-    if underlier:
-        base = base / f"underlier={underlier}"
 
-    return base / "data.parquet"
+def _partition_cols_for_dataset(dataset: str) -> list[str]:
+    """Return partition columns for the dataset's raw layout."""
+    if dataset == "options_chains":
+        return ["date", "underlier"]
+    if dataset == "macros_fred":
+        return ["date"]
+    return ["date", "symbol"]
+
+
+def _ensure_partition_columns(df, dataset: str, task: Task):
+    """Ensure required partition columns exist before writing parquet."""
+    if df is None or df.empty:
+        return df
+
+    if "date" not in df.columns:
+        df["date"] = _ensure_date(task.start_date)
+
+    if dataset == "options_chains":
+        if "underlier" not in df.columns and task.symbol:
+            df["underlier"] = task.symbol
+    elif "symbol" not in df.columns and task.symbol:
+        df["symbol"] = task.symbol
+
+    return df
 
 
 def _handle_exception(e: Exception, vendor: str) -> FetchResult:

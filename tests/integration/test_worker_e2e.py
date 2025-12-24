@@ -29,6 +29,7 @@ class _FakeBudget:
 class _FakeAlpacaConnector:
     def __init__(self, *args, **kwargs):  # noqa: ARG002
         self.source_name = "alpaca"
+        self.last_feed = None
 
     def fetch_bars(self, symbols, start_date, end_date, timeframe):  # noqa: ARG002
         dates = pd.bdate_range(start=start_date, end=end_date).date
@@ -51,7 +52,7 @@ class _FakeAlpacaConnector:
 
     def write_parquet(self, df, path, partition_cols=None, schema=None):  # noqa: ARG002
         base = Path(path)
-        _write_partitioned(df, base, partition_cols or ["date"])
+        _write_partitioned(df, base, partition_cols or ["date", "symbol"])
 
 
 class _FakeFinnhubConnector:
@@ -75,7 +76,7 @@ class _FakeFinnhubConnector:
 
     def write_parquet(self, df, path, partition_cols=None, schema=None):  # noqa: ARG002
         base = Path(path)
-        _write_partitioned(df, base, partition_cols or ["date"])
+        _write_partitioned(df, base, partition_cols or ["date", "underlier"])
 
 
 class _FakeFREDConnector:

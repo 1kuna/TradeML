@@ -218,7 +218,8 @@ def lease_next_task(now):
 
 On completion:
 
-- **Success**: write raw parquet to `data_layer/raw/...` via existing connector code, update manifests, update `partition_status` to GREEN/AMBER, increment vendor budget counters, mark task DONE.
+- **Success**: write raw parquet to `data_layer/raw/<vendor>/<table>/date=YYYY-MM-DD/symbol=SYMBOL/data.parquet`
+  (options use `underlier=SYMBOL`; macro/series datasets remain date-only) via existing connector code, update manifests, update `partition_status` to GREEN/AMBER, increment vendor budget counters, mark task DONE.
 - **Holiday/weekend** (empty): mark partition GREEN with `qc_code='NO_SESSION'`, task DONE.
 - **429/5xx**: increment `attempts`, set `next_not_before` with exponential backoff, clear lease, leave `status='PENDING'`.
 - **Hard 4xx / entitlement**: mark vendor as ineligible for `(dataset,symbol)` in a local cache or capability override; after N attempts, mark task FAILED and surface in UI.
@@ -239,7 +240,7 @@ Vendor budgets:
 1. Use table‑specific expectations from `configs/backfill.yml` (row counts, earliest dates, etc.).
 2. For each `(dataset,symbol,dt)`:
    - Determine expected rows (0 for weekends/holidays).
-   - Compare to existing raw partitions; write `partition_status` as GREEN/AMBER/RED.
+   - Compare to existing raw partitions (date+symbol/underlier as above; macro/series date-only); write `partition_status` as GREEN/AMBER/RED.
 3. For RED/AMBER partitions within the **current stage window**, *upsert* a `GAP` task into `backfill_queue` with:
    - `kind='GAP'`
    - `start_date=end_date=dt` (or a small window)
@@ -459,7 +460,7 @@ Concretely:
 
 - [ ] For each dataset (`equities_eod`, `equities_minute`, `options`, `macros_fred`, corp actions, etc.), wrap existing connector code (under `data_layer/connectors/`) in pure functions `fetch_<dataset>(vendor, symbol, start_date, end_date, kind)` that:
   - Call the vendor API respecting budgets and retries (per playbook).  
-  - Write raw parquet + manifests exactly as existing code does.
+  - Write raw parquet + manifests exactly as existing code does (date+symbol/underlier partitioning; macro/series date-only).
 
 **Step 4 — Queue worker**
 
@@ -527,4 +528,3 @@ Concretely:
 ---
 
 This is enough detail for the agent to implement without improvising: queue semantics, budgets, QC cadence, stage gating, wizard, UI, and SSOT edits are all fixed.
-

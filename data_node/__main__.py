@@ -255,6 +255,9 @@ def run_node(
     # Create loops
     db = get_db()
     budgets = get_budget_manager()
+    shutdown_timeout = float(os.environ.get("DATA_NODE_SHUTDOWN_TIMEOUT_SEC", "30"))
+    if shutdown_timeout <= 0:
+        shutdown_timeout = 30.0
 
     # Use the multi-threaded worker pool for parallel vendor processing
     worker_pool = QueueWorkerPool(db=db, budgets=budgets)
@@ -272,7 +275,7 @@ def run_node(
         nonlocal shutdown_requested
         if shutdown_requested:
             logger.warning("Force shutdown requested")
-            sys.exit(1)
+            os._exit(1)
         logger.info("Shutdown requested, stopping loops...")
         shutdown_requested = True
 
@@ -404,11 +407,15 @@ def run_node(
 
     # Shutdown
     logger.info("Stopping loops...")
+    shutdown_started = time.time()
+    shutdown_deadline = shutdown_started + shutdown_timeout
+    logger.info(f"Shutdown timeout set to {shutdown_timeout:.0f}s")
 
     if dashboard:
         dashboard.stop()
 
-    worker_pool.stop()
+    worker_timeout = max(0.0, shutdown_deadline - time.time())
+    still_running = worker_pool.stop(timeout=worker_timeout)
     status.update_loop("Workers", running=False)
 
     planner_loop.stop()
@@ -423,6 +430,13 @@ def run_node(
         logger.info("Budget state saved")
     except Exception as e:
         logger.warning(f"Failed to save budget state: {e}")
+
+    if still_running:
+        elapsed = time.time() - shutdown_started
+        logger.error(
+            f"Force exiting after {elapsed:.1f}s: {still_running} worker threads still running"
+        )
+        os._exit(1)
 
     logger.info("Data node stopped")
 

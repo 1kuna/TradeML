@@ -14,7 +14,8 @@ This section is intentionally descriptive so a reader/LLM can see what exists to
 - The node loop runs the **edge collector** (`scripts/edge_collector.py`), which:
   - Initializes connectors (alpaca, massive, fred, etc.).
   - Schedules ingest tasks (per-vendor schedulers) for equities bars (day/minute), options bars, macro, etc.
-  - Writes raw parquet to `data_layer/raw/<vendor>/<table>/date=YYYY-MM-DD/data.parquet`.
+  - Writes raw parquet to `data_layer/raw/<vendor>/<table>/date=YYYY-MM-DD/symbol=SYMBOL/data.parquet`
+    (options use `underlier=SYMBOL`; macro/series datasets remain date-only).
   - Writes manifests to `data_layer/manifests/<vendor>/<table>/manifest-*.jsonl`.
   - Updates bookmarks to resume from the last collected date.
 - Ingest cadence is frequent (interval loop). Backfill logic is vendor-first and static (no cross-vendor queue).

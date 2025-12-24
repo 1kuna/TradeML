@@ -40,6 +40,7 @@ def test_worker_processes_equities_task_with_stubbed_alpaca(node_db, temp_data_r
     class FakeAlpacaConnector:
         def __init__(self, *args, **kwargs):  # noqa: ARG002
             self.source_name = "alpaca"
+            self.last_feed = None
 
         def fetch_bars(self, symbols, start_date, end_date, timeframe):  # noqa: ARG002
             dates = pd.bdate_range(start=start_date, end=end_date).date
@@ -65,8 +66,7 @@ def test_worker_processes_equities_task_with_stubbed_alpaca(node_db, temp_data_r
             if partition_cols:
                 _write_partitioned(df, base, partition_cols)
             else:
-                base.mkdir(parents=True, exist_ok=True)
-                df.to_parquet(base / "data.parquet", index=False)
+                _write_partitioned(df, base, ["date", "symbol"])
 
     monkeypatch.setenv("DATA_ROOT", str(temp_data_root))
     monkeypatch.setenv("REQUEST_PACING_ENABLED", "false")
@@ -94,7 +94,16 @@ def test_worker_processes_equities_task_with_stubbed_alpaca(node_db, temp_data_r
 
     # Parquet written under DATA_ROOT
     for dt in (start_date, end_date):
-        raw_path = temp_data_root / "data_layer" / "raw" / "alpaca" / "equities_bars" / f"date={dt.isoformat()}" / "data.parquet"
+        raw_path = (
+            temp_data_root
+            / "data_layer"
+            / "raw"
+            / "alpaca"
+            / "equities_bars"
+            / f"date={dt.isoformat()}"
+            / "symbol=AAPL"
+            / "data.parquet"
+        )
         assert raw_path.exists()
 
     # Partition status updated to GREEN
@@ -175,7 +184,7 @@ def test_options_and_macros_fetchers_with_stubs(node_db, temp_data_root, monkeyp
 
         def write_parquet(self, df, path, partition_cols=None, schema=None):  # noqa: ARG002
             base = Path(path)
-            _write_partitioned(df, base, partition_cols or ["date"])
+            _write_partitioned(df, base, partition_cols or ["date", "underlier"])
 
     class FakeFREDConnector:
         def __init__(self, *args, **kwargs):  # noqa: ARG002
@@ -236,7 +245,24 @@ def test_options_and_macros_fetchers_with_stubs(node_db, temp_data_root, monkeyp
     assert macro_records
 
     # Parquet outputs exist
-    opt_files = list((temp_data_root / "data_layer" / "raw" / "finnhub" / "options_chains").rglob("data.parquet"))
-    fred_path = temp_data_root / "data_layer" / "raw" / "fred" / "macro_treasury" / f"date={start_dt.isoformat()}" / "data.parquet"
-    assert opt_files
+    opt_path = (
+        temp_data_root
+        / "data_layer"
+        / "raw"
+        / "finnhub"
+        / "options_chains"
+        / f"date={start_dt.isoformat()}"
+        / "underlier=AAPL"
+        / "data.parquet"
+    )
+    fred_path = (
+        temp_data_root
+        / "data_layer"
+        / "raw"
+        / "fred"
+        / "macro_treasury"
+        / f"date={start_dt.isoformat()}"
+        / "data.parquet"
+    )
+    assert opt_path.exists()
     assert fred_path.exists()

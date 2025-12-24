@@ -12,7 +12,9 @@ See updated_node_spec.md §6 for QC semantics.
 from __future__ import annotations
 
 import random
+import os
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 from loguru import logger
@@ -26,6 +28,9 @@ QC_DAY_OF_WEEK = 6  # Sunday (0=Monday, 6=Sunday)
 
 # Priority for QC_PROBE tasks
 PRIORITY_QC_PROBE = 2
+
+# Datasets supported for QC probes (minute bars lack timestamp in raw schema)
+QC_PROBE_DATASETS = ["equities_eod"]
 
 
 def is_qc_day(dt: Optional[date] = None) -> bool:
@@ -73,7 +78,7 @@ def select_qc_samples(
         return []
 
     samples: list[tuple[str, str, date]] = []
-    datasets = ["equities_eod", "equities_minute"]
+    datasets = QC_PROBE_DATASETS
 
     # Calculate sample allocation per dataset
     samples_per_dataset = n_samples // len(datasets)
@@ -123,10 +128,10 @@ def select_qc_samples(
 
             # Bias toward recent dates (last 90 days)
             days_ago = (date.today() - dt).days
-            if days_ago < 90:
-                weight *= 2.0
-            elif days_ago < 30:
+            if days_ago < 30:
                 weight *= 3.0
+            elif days_ago < 90:
+                weight *= 2.0
 
             # Bias toward high-volume symbols (first 50 in universe)
             try:
@@ -374,18 +379,115 @@ def run_qc_probe(
         "qc_code": None,
     }
 
+    if dataset not in QC_PROBE_DATASETS:
+        result["qc_code"] = "DATASET_UNSUPPORTED"
+        logger.debug(f"QC probe skipped for unsupported dataset {dataset}")
+        db.upsert_qc_probe(dataset, symbol, dt.isoformat(), primary_vendor, secondary_vendor, "SKIPPED", result["qc_code"])
+        return result
+
     if secondary_vendor is None:
         result["qc_code"] = "NO_SECONDARY_VENDOR"
         logger.debug(f"No secondary vendor for {dataset}/{primary_vendor}")
+        db.upsert_qc_probe(dataset, symbol, dt.isoformat(), primary_vendor, secondary_vendor, "SKIPPED", result["qc_code"])
         return result
 
-    # Get primary data from partition_status or curated
-    # (In a full implementation, this would fetch the actual data)
-    # For now, we just verify the secondary vendor is accessible
-    result["status"] = "PENDING_FETCH"
-    result["qc_code"] = "AWAITING_SECONDARY_DATA"
+    # Load primary and secondary raw data
+    primary_df = _load_raw_partition(primary_vendor, dataset, symbol, dt)
+    secondary_df = _load_raw_partition(secondary_vendor, dataset, symbol, dt)
+
+    if primary_df is None or primary_df.empty:
+        result["qc_code"] = "PRIMARY_MISSING"
+        db.upsert_qc_probe(dataset, symbol, dt.isoformat(), primary_vendor, secondary_vendor, "SKIPPED", result["qc_code"])
+        return result
+
+    if secondary_df is None or secondary_df.empty:
+        result["qc_code"] = "SECONDARY_MISSING"
+        db.upsert_qc_probe(dataset, symbol, dt.isoformat(), primary_vendor, secondary_vendor, "SKIPPED", result["qc_code"])
+        return result
+
+    primary_data = _summarize_ohlcv(primary_df)
+    secondary_data = _summarize_ohlcv(secondary_df)
+
+    if primary_data is None or secondary_data is None:
+        result["qc_code"] = "QC_DATA_INVALID"
+        db.upsert_qc_probe(dataset, symbol, dt.isoformat(), primary_vendor, secondary_vendor, "SKIPPED", result["qc_code"])
+        return result
+
+    matches, qc_code = compare_ohlcv(primary_data, secondary_data)
+    result["status"] = "OK" if matches else "MISMATCH"
+    result["qc_code"] = qc_code
+
+    db.upsert_qc_probe(
+        dataset,
+        symbol,
+        dt.isoformat(),
+        primary_vendor,
+        secondary_vendor,
+        result["status"],
+        result["qc_code"],
+        details={
+            "primary": primary_data,
+            "secondary": secondary_data,
+        },
+    )
 
     return result
+
+
+def _raw_table_for_dataset(dataset: str) -> str:
+    mapping = {
+        "equities_eod": "equities_bars",
+        "equities_minute": "equities_bars_minute",
+    }
+    return mapping.get(dataset, dataset)
+
+
+def _raw_partition_path(
+    vendor: str,
+    dataset: str,
+    symbol: str,
+    dt: date,
+) -> Path:
+    data_root = Path(os.environ.get("DATA_ROOT", "."))
+    table = _raw_table_for_dataset(dataset)
+    base = data_root / "data_layer" / "raw" / vendor / table / f"date={dt.isoformat()}"
+    if symbol:
+        base = base / f"symbol={symbol}"
+    return base / "data.parquet"
+
+
+def _load_raw_partition(
+    vendor: str,
+    dataset: str,
+    symbol: str,
+    dt: date,
+):
+    path = _raw_partition_path(vendor, dataset, symbol, dt)
+    if not path.exists():
+        return None
+    try:
+        import pandas as pd
+        return pd.read_parquet(path)
+    except Exception as exc:
+        logger.warning(f"Failed to read raw partition {path}: {exc}")
+        return None
+
+
+def _summarize_ohlcv(df) -> Optional[dict]:
+    if df is None or df.empty:
+        return None
+
+    # Expect single-day data for QC probes.
+    if "open" not in df or "high" not in df or "low" not in df or "close" not in df:
+        return None
+
+    return {
+        "open": float(df["open"].iloc[0]),
+        "high": float(df["high"].max()),
+        "low": float(df["low"].min()),
+        "close": float(df["close"].iloc[-1]),
+        "volume": float(df["volume"].sum()) if "volume" in df else 0.0,
+    }
 
 
 def get_qc_stats(db: Optional[NodeDB] = None) -> dict:

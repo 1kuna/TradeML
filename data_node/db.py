@@ -256,6 +256,29 @@ class NodeDB:
                 ON partition_status(table_name, status, dt)
             """)
 
+            # qc_probes table (cross-vendor QC results)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS qc_probes (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dataset          TEXT NOT NULL,
+                    symbol           TEXT,
+                    dt               DATE NOT NULL,
+                    primary_vendor   TEXT,
+                    secondary_vendor TEXT,
+                    status           TEXT NOT NULL,
+                    qc_code          TEXT,
+                    details          TEXT,
+                    created_at       TIMESTAMP NOT NULL,
+                    updated_at       TIMESTAMP NOT NULL,
+                    UNIQUE(dataset, symbol, dt, primary_vendor, secondary_vendor)
+                )
+            """)
+
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_qc_probes_lookup
+                ON qc_probes(dataset, dt, status)
+            """)
+
             # Migration: Add fetch_params column for tracking API parameters
             # This enables selective re-fetch when config changes (e.g., IEX→SIP)
             try:
@@ -953,6 +976,91 @@ class NodeDB:
         """, params).fetchall()
 
         return [dict(row) for row in rows]
+
+    def get_latest_partition_status(
+        self,
+        table_name: str,
+        symbol: Optional[str],
+        dt: str,
+        status: Optional[PartitionStatus] = None,
+    ) -> Optional[dict]:
+        """
+        Get the latest partition_status record for a dataset/symbol/date.
+
+        Args:
+            table_name: Dataset name
+            symbol: Symbol or None
+            dt: Date (YYYY-MM-DD)
+            status: Optional status filter (GREEN/AMBER/RED)
+
+        Returns:
+            Dict row or None
+        """
+        conn = self._get_connection()
+
+        conditions = ["table_name = ?", "symbol IS ?", "dt = ?"]
+        params: list = [table_name, symbol, dt]
+        if status is not None:
+            conditions.append("status = ?")
+            params.append(status.value)
+
+        where_clause = " AND ".join(conditions)
+
+        row = conn.execute(f"""
+            SELECT * FROM partition_status
+            WHERE {where_clause}
+            ORDER BY last_observed_at DESC
+            LIMIT 1
+        """, params).fetchone()
+
+        return dict(row) if row else None
+
+    def upsert_qc_probe(
+        self,
+        dataset: str,
+        symbol: Optional[str],
+        dt: str,
+        primary_vendor: Optional[str],
+        secondary_vendor: Optional[str],
+        status: str,
+        qc_code: Optional[str] = None,
+        details: Optional[dict] = None,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        """Upsert a QC probe result."""
+        now = datetime.now(timezone.utc).isoformat()
+        details_json = json.dumps(details) if details else None
+
+        if conn is None:
+            context = self.transaction()
+        else:
+            context = nullcontext(conn)
+
+        with context as _conn:
+            _conn.execute(
+                """
+                INSERT INTO qc_probes
+                (dataset, symbol, dt, primary_vendor, secondary_vendor, status, qc_code, details, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dataset, symbol, dt, primary_vendor, secondary_vendor)
+                DO UPDATE SET status = excluded.status,
+                              qc_code = excluded.qc_code,
+                              details = excluded.details,
+                              updated_at = excluded.updated_at
+                """,
+                (
+                    dataset,
+                    symbol,
+                    dt,
+                    primary_vendor,
+                    secondary_vendor,
+                    status,
+                    qc_code,
+                    details_json,
+                    now,
+                    now,
+                ),
+            )
 
     def prune_failed_tasks(self, before: datetime) -> int:
         """

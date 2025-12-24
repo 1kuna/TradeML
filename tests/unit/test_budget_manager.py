@@ -32,19 +32,16 @@ def test_budget_daily_and_rpm_enforced(budget_manager):
     manager, _, _ = budget_manager
 
     budget = manager._budgets["alpaca"]
-    budget.tokens = 100  # bypass RPM for this check
 
     # Daily slice: BOOTSTRAP limited to 85% of cap (8.5 → floor at 8 tokens)
     assert manager.can_spend("alpaca", TaskKind.BOOTSTRAP, tokens=8)
     assert not manager.can_spend("alpaca", TaskKind.BOOTSTRAP, tokens=9)
 
-    # RPM bucket decrements on spend and blocks oversized bursts
-    budget.tokens = 5
-    assert manager.try_spend("alpaca", TaskKind.BOOTSTRAP, tokens=2)
-    status = manager.get_budget_status("alpaca")
-    assert status["spent_today"] == 2
-    assert status["tokens_rpm"] <= 20
-    assert not manager.can_spend("alpaca", TaskKind.BOOTSTRAP, tokens=4)  # more than remaining RPM tokens
+    # RPM bucket is separate from daily spend
+    budget.tokens = 2
+    assert manager.try_acquire_rpm_tokens("alpaca", tokens=2)
+    assert budget.tokens < 1
+    assert not manager.try_acquire_rpm_tokens("alpaca", tokens=1)
 
 
 def test_budget_state_persists_and_recovers(budget_manager):
