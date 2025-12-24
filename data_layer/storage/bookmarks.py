@@ -7,7 +7,7 @@ enabling resume-from-last-checkpoint behavior across restarts.
 
 import json
 from typing import Optional, Dict
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import shutil
@@ -82,18 +82,18 @@ class BookmarkManager:
                     table=raw.get("table") or (key.split(":")[1] if ":" in key else key),
                     last_timestamp=raw.get("last_timestamp"),
                     last_row_count=int(raw.get("last_row_count", raw.get("row_count", 0) or 0)),
-                    updated_at=raw.get("updated_at") or datetime.utcnow().isoformat(),
+                    updated_at=raw.get("updated_at") or datetime.now(timezone.utc).isoformat(),
                 )
             # Keyed by source:table -> timestamp/row_count
             if isinstance(raw, dict) and len(raw.keys()) == 1 and ":" in list(raw.keys())[0]:
                 inner_key, inner_val = list(raw.items())[0]
                 src, tbl = inner_key.split(":", 1)
                 if isinstance(inner_val, str):
-                    return Bookmark(source=src, table=tbl, last_timestamp=inner_val, last_row_count=0, updated_at=datetime.utcnow().isoformat())
+                    return Bookmark(source=src, table=tbl, last_timestamp=inner_val, last_row_count=0, updated_at=datetime.now(timezone.utc).isoformat())
             # Simple timestamp string
             if isinstance(raw, str):
                 src, tbl = (key.split(":", 1) + ["unknown"])[:2] if ":" in key else (key, key)
-                return Bookmark(source=src, table=tbl, last_timestamp=raw, last_row_count=0, updated_at=datetime.utcnow().isoformat())
+                return Bookmark(source=src, table=tbl, last_timestamp=raw, last_row_count=0, updated_at=datetime.now(timezone.utc).isoformat())
             return None
 
         if self.s3:
@@ -266,7 +266,7 @@ class BookmarkManager:
                 table=table,
                 last_timestamp=last_timestamp,
                 last_row_count=row_count,
-                updated_at=datetime.utcnow().isoformat(),
+                updated_at=datetime.now(timezone.utc).isoformat(),
             )
 
             # Try to save
