@@ -18,8 +18,8 @@ from loguru import logger
 
 from validation.cpcv import CPCV
 
-def test_cpcv_multi_symbol():
-    """Test CPCV with a simple multi-symbol panel."""
+def run_cpcv_multi_symbol() -> bool:
+    """Run CPCV with a simple multi-symbol panel."""
 
     logger.info("=" * 80)
     logger.info("Testing Fixed CPCV with Multi-Symbol Panel")
@@ -99,8 +99,13 @@ def test_cpcv_multi_symbol():
         return True
 
 
-def test_cpcv_single_symbol():
-    """Test that CPCV still works for single-symbol case."""
+def test_cpcv_multi_symbol():
+    """Test CPCV with a simple multi-symbol panel."""
+    assert run_cpcv_multi_symbol()
+
+
+def run_cpcv_single_symbol() -> bool:
+    """Run CPCV for the single-symbol case."""
 
     logger.info("\n" + "=" * 80)
     logger.info("Testing CPCV with Single-Symbol Panel (Backward Compatibility)")
@@ -147,13 +152,18 @@ def test_cpcv_single_symbol():
     return True
 
 
+def test_cpcv_single_symbol():
+    """Test that CPCV still works for single-symbol case."""
+    assert run_cpcv_single_symbol()
+
+
 if __name__ == "__main__":
     logger.info("🧪 CPCV Multi-Symbol Fix Test Suite")
     logger.info("")
 
     # Run tests
-    test1_passed = test_cpcv_multi_symbol()
-    test2_passed = test_cpcv_single_symbol()
+    test1_passed = run_cpcv_multi_symbol()
+    test2_passed = run_cpcv_single_symbol()
 
     # Summary
     logger.info("\n" + "=" * 80)

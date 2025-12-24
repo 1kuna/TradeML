@@ -114,8 +114,8 @@ def generate_synthetic_data(
     return features, labels
 
 
-def test_cpcv():
-    """Test CPCV splits."""
+def run_cpcv():
+    """Run CPCV splits."""
     logger.info("\n" + "="*60)
     logger.info("TEST 1: CPCV Splits")
     logger.info("="*60)
@@ -141,8 +141,14 @@ def test_cpcv():
     return splits
 
 
-def test_pbo_with_simple_strategies():
-    """Test PBO with multiple simple strategies."""
+def test_cpcv():
+    """Test CPCV splits."""
+    splits = run_cpcv()
+    assert len(splits) > 0
+
+
+def run_pbo_with_simple_strategies():
+    """Run PBO with multiple simple strategies."""
     logger.info("\n" + "="*60)
     logger.info("TEST 2: PBO with Simple Strategies")
     logger.info("="*60)
@@ -203,8 +209,15 @@ def test_pbo_with_simple_strategies():
     return pbo_results
 
 
-def test_dsr_with_backtest():
-    """Test DSR with backtested strategy."""
+def test_pbo_with_simple_strategies():
+    """Test PBO with multiple simple strategies."""
+    pbo_results = run_pbo_with_simple_strategies()
+    assert "pbo" in pbo_results
+    assert 0.0 <= pbo_results["pbo"] <= 1.0
+
+
+def run_dsr_with_backtest():
+    """Run DSR with backtested strategy."""
     logger.info("\n" + "="*60)
     logger.info("TEST 3: DSR with Backtested Strategy")
     logger.info("="*60)
@@ -259,8 +272,14 @@ def test_dsr_with_backtest():
     return dsr_results
 
 
-def test_integrated_validation():
-    """Test the complete CPCV + PBO + DSR workflow."""
+def test_dsr_with_backtest():
+    """Test DSR with backtested strategy."""
+    dsr_results = run_dsr_with_backtest()
+    assert "dsr" in dsr_results
+
+
+def run_integrated_validation():
+    """Run the complete CPCV + PBO + DSR workflow."""
     logger.info("\n" + "="*60)
     logger.info("TEST 4: Integrated Validation (CPCV + PBO + DSR)")
     logger.info("="*60)
@@ -359,16 +378,22 @@ def test_integrated_validation():
     }
 
 
+def test_integrated_validation():
+    """Test the complete CPCV + PBO + DSR workflow."""
+    results = run_integrated_validation()
+    assert "overall_pass" in results
+
+
 if __name__ == "__main__":
     logger.info("Testing Anti-Overfitting Suite (CPCV + PBO + DSR)...")
 
     # Run individual tests
-    splits = test_cpcv()
-    pbo_results = test_pbo_with_simple_strategies()
-    dsr_results = test_dsr_with_backtest()
+    splits = run_cpcv()
+    pbo_results = run_pbo_with_simple_strategies()
+    dsr_results = run_dsr_with_backtest()
 
     # Run integrated test
-    integrated_results = test_integrated_validation()
+    integrated_results = run_integrated_validation()
 
     print("\n[OK] All anti-overfitting tests complete")
     print("\nKey Takeaways:")
