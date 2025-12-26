@@ -79,10 +79,11 @@ class BudgetManager:
         self._budgets: dict[str, VendorBudget] = {}
         self._last_save_time: float = 0.0  # For debounced saves
         self._save_interval: float = 1.0   # Save at most once per second
+        self._unknown_vendors_warned: set[str] = set()
 
         # Resolve paths
         if config_path is None:
-            config_path = Path("configs/backfill.yml")
+            config_path = Path(__file__).resolve().parents[1] / "configs" / "backfill.yml"
         if state_path is None:
             data_root = os.environ.get("DATA_ROOT", ".")
             state_path = Path(data_root) / "data_layer" / "control" / "budgets.json"
@@ -282,7 +283,12 @@ class BudgetManager:
         with self._lock:
             budget = self._budgets.get(vendor)
             if budget is None:
-                return False
+                if vendor not in self._unknown_vendors_warned:
+                    logger.warning(
+                        f"Budget config missing for vendor '{vendor}'; skipping RPM token gating"
+                    )
+                    self._unknown_vendors_warned.add(vendor)
+                return True
 
             self._refill_tokens(vendor)
             if budget.tokens < tokens:

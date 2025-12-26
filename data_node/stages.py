@@ -153,7 +153,7 @@ def _get_stage_config_path() -> Path:
 
 def _get_universe_path() -> Path:
     """Get path to universe symbols file."""
-    return Path("data_layer/reference/universe_symbols.txt")
+    return Path(__file__).resolve().parents[1] / "data_layer" / "reference" / "universe_symbols.txt"
 
 
 def load_stage_config() -> StageConfig:

@@ -77,6 +77,7 @@ def select_qc_samples(
         logger.warning("Empty universe, cannot select QC samples")
         return []
 
+    symbol_index = {symbol: idx for idx, symbol in enumerate(universe)}
     samples: list[tuple[str, str, date]] = []
     datasets = QC_PROBE_DATASETS
 
@@ -134,14 +135,12 @@ def select_qc_samples(
                 weight *= 2.0
 
             # Bias toward high-volume symbols (first 50 in universe)
-            try:
-                sym_idx = universe.index(symbol)
+            sym_idx = symbol_index.get(symbol)
+            if sym_idx is not None:
                 if sym_idx < 50:
                     weight *= 1.5
                 elif sym_idx < 100:
                     weight *= 1.2
-            except ValueError:
-                pass
 
             candidates.append((symbol, dt, weight))
 

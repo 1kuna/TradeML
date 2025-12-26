@@ -269,11 +269,6 @@ class AlpacaConnector(BaseConnector):
             batch = symbols[i:i + BATCH_SIZE]
             logger.debug(f"Fetching batch {i // BATCH_SIZE + 1} ({len(batch)} symbols)")
 
-            try:
-                self._rate_limit()
-            except Exception:
-                pass
-
             raw_data = self._fetch_raw(
                 symbols=batch,
                 start_date=start_date,

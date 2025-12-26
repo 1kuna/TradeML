@@ -327,16 +327,6 @@ class NodeDB:
         start_dt = date.fromisoformat(start_date) if isinstance(start_date, str) else start_date
         end_dt = date.fromisoformat(end_date) if isinstance(end_date, str) else end_date
 
-        # Skip if overlapping pending/leased task already exists (used by gap audit)
-        if not allow_overlap and self.task_exists_overlapping(
-            dataset=dataset,
-            symbol=symbol,
-            start_date=start_dt,
-            end_date=end_dt,
-        ):
-            logger.debug(f"Skipped enqueue (overlap pending/leased) for {dataset}/{symbol} [{start_dt}..{end_dt}]")
-            return None
-
         # Get max days for this dataset
         max_days = MAX_TASK_DAYS.get(dataset, MAX_TASK_DAYS["default"])
 
@@ -345,6 +335,17 @@ class NodeDB:
 
         # If small enough or chunking disabled, insert directly
         if not chunk or total_days <= max_days:
+            if not allow_overlap and self.task_exists_overlapping(
+                dataset=dataset,
+                symbol=symbol,
+                start_date=start_dt,
+                end_date=end_dt,
+            ):
+                logger.debug(
+                    f"Skipped enqueue (overlap pending/leased) for {dataset}/{symbol} "
+                    f"[{start_dt}..{end_dt}]"
+                )
+                return None
             return self._enqueue_single_task(dataset, symbol, start_date, end_date, kind, priority)
 
         # Chunk the date range
@@ -354,6 +355,20 @@ class NodeDB:
 
         while chunk_start <= end_dt:
             chunk_end = min(chunk_start + timedelta(days=max_days - 1), end_dt)
+
+            if not allow_overlap and self.task_exists_overlapping(
+                dataset=dataset,
+                symbol=symbol,
+                start_date=chunk_start,
+                end_date=chunk_end,
+            ):
+                logger.debug(
+                    f"Skipped enqueue (overlap pending/leased) for {dataset}/{symbol} "
+                    f"[{chunk_start}..{chunk_end}]"
+                )
+                chunk_start = chunk_end + timedelta(days=1)
+                chunk_num += 1
+                continue
 
             task_id = self._enqueue_single_task(
                 dataset,

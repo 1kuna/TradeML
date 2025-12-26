@@ -413,20 +413,29 @@ class BaseConnector(ABC):
 
         s3 = get_s3_client()
         path_str = str(path)
+        normalized = path_str.replace("\\", "/")
 
         # Normalize root mapping
-        if path_str.startswith("data_layer/raw"):
-            root = path_str.replace("data_layer/raw", "raw", 1)
-        elif path_str.startswith("data_layer/curated"):
-            root = path_str.replace("data_layer/curated", "curated", 1)
-        elif path_str.startswith("s3://"):
+        if normalized.startswith("s3://"):
             # Allow explicit s3://bucket/prefix (ignore client bucket)
             # Strip scheme and bucket if it matches current to get key prefix
             # Expected form: s3://<bucket>/<prefix>
-            parts = path_str[5:].split("/", 1)
+            parts = normalized[5:].split("/", 1)
             root = parts[1] if len(parts) > 1 else ""
+        elif "/data_layer/raw/" in normalized:
+            root = "raw/" + normalized.split("/data_layer/raw/", 1)[1].lstrip("/")
+        elif normalized.endswith("/data_layer/raw"):
+            root = "raw"
+        elif "/data_layer/curated/" in normalized:
+            root = "curated/" + normalized.split("/data_layer/curated/", 1)[1].lstrip("/")
+        elif normalized.endswith("/data_layer/curated"):
+            root = "curated"
+        elif normalized.startswith("data_layer/raw"):
+            root = normalized.replace("data_layer/raw", "raw", 1)
+        elif normalized.startswith("data_layer/curated"):
+            root = normalized.replace("data_layer/curated", "curated", 1)
         else:
-            root = path_str
+            root = normalized.lstrip("/")
 
         # Convert to bytes once per partition
         if partition_cols:
