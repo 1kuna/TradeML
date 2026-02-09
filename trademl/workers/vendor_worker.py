@@ -35,6 +35,25 @@ def _normalize_vendor(v: str) -> str:
     return m
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    """Read an integer environment variable safely."""
+
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        raw = raw.strip()
+    except AttributeError:
+        # Non-string values (rare) are ignored and defaulted
+        return default
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def _tasks_for_vendor_all(edge, vendor: str) -> List[str]:
     # Mirror mapping logic from VendorSupervisor
     mapping = {
@@ -98,8 +117,8 @@ def main():
 
     parser = argparse.ArgumentParser(description="Per-vendor worker")
     parser.add_argument("--vendor", default=os.getenv("VENDOR"), required=False)
-    parser.add_argument("--concurrency", type=int, default=int(os.getenv("CONCURRENCY", "0")))
-    parser.add_argument("--rpm", type=int, default=int(os.getenv("RPM_LIMIT", "0")))
+    parser.add_argument("--concurrency", type=int, default=_env_int("CONCURRENCY", 0))
+    parser.add_argument("--rpm", type=int, default=_env_int("RPM_LIMIT", 0))
     parser.add_argument("--budget", type=int, default=os.getenv("BUDGET") or 0)
     parser.add_argument("--config", default=os.getenv("EDGE_CONFIG", "configs/edge.yml"))
     parser.add_argument("--tasks", default=os.getenv("TASKS", ""))
