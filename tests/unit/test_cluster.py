@@ -123,6 +123,32 @@ def test_coordinator_bootstrap_and_rebuild_state(tmp_path: Path) -> None:
     assert (nas / "control" / "cluster" / "shards" / "equities_eod.json").exists()
 
 
+def test_coordinator_bootstraps_from_config_when_stage_file_is_missing(tmp_path: Path) -> None:
+    workspace, nas, config_path, env_path = _seed_workspace(tmp_path)
+    (workspace / "stage.yml").unlink()
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["stage"] = {"current": 0, "stage_0": {"symbols": 8, "eod_years": 3}}
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    coordinator = ClusterCoordinator(
+        nas_root=nas,
+        workspace_root=workspace,
+        config_path=config_path,
+        env_path=env_path,
+        local_state=workspace / "control",
+        nas_share="//nas/trademl",
+        worker_id="worker-a",
+    )
+
+    manifest = coordinator.ensure_cluster_ready(passphrase="pass123")
+
+    assert manifest["stage"]["current"] == 0
+    assert len(manifest["stage"]["symbols"]) == 8
+    stage_payload = yaml.safe_load((workspace / "stage.yml").read_text(encoding="utf-8"))
+    assert stage_payload["symbols"] == manifest["stage"]["symbols"]
+    assert stage_payload["years"] == 3
+
+
 def test_stale_lease_can_be_taken_over(tmp_path: Path) -> None:
     workspace, nas, config_path, env_path = _seed_workspace(tmp_path)
     coordinator_a = ClusterCoordinator(

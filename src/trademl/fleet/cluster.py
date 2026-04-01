@@ -28,6 +28,7 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 from trademl import __version__
 from trademl.calendars.exchange import get_trading_days
+from trademl.data_node.bootstrap import resolve_bootstrap_stage
 from trademl.data_node.db import DataNodeDB
 
 
@@ -446,7 +447,7 @@ class ClusterCoordinator:
             return manifest
         local_config = _read_yaml(self.config_path)
         local_stage = _read_yaml(self.workspace_root / "stage.yml")
-        stage_symbols = list(local_stage.get("symbols", []))
+        current_stage, stage_symbols, stage_years = resolve_bootstrap_stage(local_config, local_stage)
         if not stage_symbols:
             raise RuntimeError("cluster bootstrap requires stage.yml with symbols")
         manifest = {
@@ -462,9 +463,9 @@ class ClusterCoordinator:
                 ),
             },
             "stage": {
-                "current": int(local_stage.get("current", 0)),
+                "current": current_stage,
                 "symbols": stage_symbols,
-                "years": int(local_stage.get("years", 5)),
+                "years": stage_years,
             },
             "stage_config": local_config.get("stage", {}),
             "vendors": local_config.get("vendors", {}),

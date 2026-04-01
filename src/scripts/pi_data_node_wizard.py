@@ -13,21 +13,8 @@ from pathlib import Path
 
 import yaml
 
+from trademl.data_node.bootstrap import STAGE0_SYMBOLS
 from trademl.data_node.db import DataNodeDB
-
-
-STAGE0_SYMBOLS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK.B", "LLY", "JPM", "XOM",
-    "UNH", "V", "MA", "AVGO", "HD", "COST", "PG", "JNJ", "ORCL", "NFLX",
-    "ABBV", "BAC", "KO", "MRK", "CVX", "PEP", "TMO", "WMT", "ADBE", "CSCO",
-    "AMD", "CRM", "MCD", "LIN", "ACN", "QCOM", "DHR", "TXN", "ABT", "PM",
-    "WFC", "IBM", "GE", "NOW", "GS", "INTU", "MS", "AMAT", "ISRG", "CAT",
-    "DIS", "BLK", "RTX", "SPGI", "BKNG", "SCHW", "T", "PGR", "C", "AMGN",
-    "COP", "HON", "LOW", "ELV", "MDT", "VRTX", "PANW", "INTC", "BA", "GILD",
-    "DE", "ADI", "LRCX", "SYK", "MMC", "PLD", "CB", "TMUS", "NKE", "MU",
-    "SO", "CI", "UPS", "MDLZ", "REGN", "AXP", "PYPL", "FI", "KLAC", "ICE",
-    "SHW", "DUK", "TT", "SNPS", "USB", "ZTS", "AON", "CSX", "MO", "EQIX",
-]
 
 
 def run_wizard(
