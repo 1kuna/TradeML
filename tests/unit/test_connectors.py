@@ -116,7 +116,13 @@ def test_finnhub_connector_normalizes_equities_and_earnings() -> None:
 
 
 def test_alpha_vantage_and_fred_connectors() -> None:
-    av_session = FakeSession([FakeResponse(200, payload=[], text="symbol,name,exchange,assetType,ipoDate,delistingDate,status\nAAPL,Apple,NASDAQ,Stock,1980-12-12,,Active\n")])
+    av_session = FakeSession(
+        [
+            FakeResponse(200, payload=[], text="symbol,name,exchange,assetType,ipoDate,delistingDate,status\nAAPL,Apple,NASDAQ,Stock,1980-12-12,,Active\n"),
+            FakeResponse(200, {"data": [{"ex_dividend_date": "2024-01-05", "amount": "0.24"}]}),
+            FakeResponse(200, {"data": [{"effective_date": "2024-01-10", "split_factor": "0.5"}]}),
+        ]
+    )
     fred_session = FakeSession(
         [FakeResponse(200, {"observations": [{"date": "2024-01-02", "value": "4.2", "realtime_start": "2024-01-02"}]})]
     )
@@ -125,11 +131,44 @@ def test_alpha_vantage_and_fred_connectors() -> None:
     fred = FredConnector(base_url="https://api.stlouisfed.org", api_key="key", budget_manager=_budget_manager(), session=fred_session)
 
     listings = av.fetch("listings", [], "2024-01-01", "2024-01-31")
+    corp_actions = av.fetch("corp_actions", ["AAPL"], "2024-01-01", "2024-01-31")
     observations = fred.fetch("macros_treasury", ["DGS10"], "2024-01-01", "2024-01-31")
 
     assert listings.iloc[0]["symbol"] == "AAPL"
+    assert set(corp_actions["event_type"]) == {"dividend", "split"}
+    assert "amount" in corp_actions.columns
     assert observations.iloc[0]["series_id"] == "DGS10"
     assert observations.iloc[0]["value"] == pytest.approx(4.2)
+
+
+def test_alpha_vantage_corp_actions_normalize_splits_and_dividends() -> None:
+    av_session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "data": [
+                        {"symbol": "AAPL", "ex_dividend_date": "2024-01-15", "amount": "0.24"},
+                    ]
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "data": [
+                        {"symbol": "AAPL", "effective_date": "2024-02-01", "split_factor": "0.5"},
+                    ]
+                },
+            ),
+        ]
+    )
+    av = AlphaVantageConnector(base_url="https://www.alphavantage.co", api_key="key", budget_manager=_budget_manager(), session=av_session)
+
+    actions = av.fetch("corp_actions", ["AAPL"], "2024-01-01", "2024-03-01")
+
+    assert set(actions["event_type"]) == {"dividend", "split"}
+    assert set(actions["symbol"]) == {"AAPL"}
+    assert set(actions.columns) >= {"symbol", "event_type", "ex_date", "ratio", "source"}
 
 
 def test_fmp_and_sec_edgar_connectors() -> None:

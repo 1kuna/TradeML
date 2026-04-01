@@ -15,9 +15,12 @@ from trademl.features.equities import build_features
 from trademl.features.preprocessing import rank_normalize
 from trademl.labels.returns import build_labels
 from trademl.models.lgbm import LightGBMModel, tune_lightgbm_via_walk_forward
-from trademl.models.ridge import RidgeModel
+from trademl.models.ridge import RidgeModel, tune_ridge_via_walk_forward
 from trademl.reports.emitter import emit_report
 from trademl.validation.diagnostics import cost_stress_test, ic_by_year, placebo_test
+from trademl.validation.cpcv import combinatorially_purged_cv
+from trademl.validation.dsr import deflated_sharpe_ratio
+from trademl.validation.pbo import probability_of_backtest_overfitting
 from trademl.validation.walk_forward import expanding_walk_forward
 
 
@@ -67,7 +70,14 @@ def run_training(*, data_root: Path, config_path: Path, output_root: Path, repor
         "purge_days": 5,
     }
     run_ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    ridge_folds = expanding_walk_forward(normalized, feature_cols, "label_5d", lambda: RidgeModel(alpha=1.0), validation_config)
+    ridge_alpha = tune_ridge_via_walk_forward(
+        normalized,
+        feature_cols,
+        "label_5d",
+        expanding_walk_forward,
+        validation_config,
+    )
+    ridge_folds = expanding_walk_forward(normalized, feature_cols, "label_5d", lambda: RidgeModel(alpha=ridge_alpha), validation_config)
     lgbm_params = tune_lightgbm_via_walk_forward(
         normalized,
         feature_cols,
@@ -87,10 +97,35 @@ def run_training(*, data_root: Path, config_path: Path, output_root: Path, repor
     ridge_predictions = pd.concat([fold.predictions for fold in ridge_folds], ignore_index=True)
     ridge_predictions["gross_return"] = ridge_predictions["label_5d"]
     ridge_predictions["cost"] = 0.0005
+    cpcv_results = combinatorially_purged_cv(
+        normalized.dropna(subset=["label_5d"]),
+        feature_cols,
+        "label_5d",
+        lambda: RidgeModel(alpha=ridge_alpha),
+        n_folds=int(config["validation"].get("cpcv_folds", 8)),
+        embargo_days=int(config["validation"].get("embargo_days", 10)),
+    )
     diagnostics = {
         "ic_by_year": ic_by_year(ridge_predictions["prediction"], ridge_predictions["label_5d"], ridge_predictions["date"]),
-        "placebo": placebo_test(normalized[feature_cols + ["label_5d"]].dropna(), feature_cols, "label_5d", lambda: RidgeModel(alpha=1.0)),
+        "placebo": placebo_test(
+            normalized.dropna(subset=["label_5d"]),
+            feature_cols,
+            "label_5d",
+            lambda: RidgeModel(alpha=ridge_alpha),
+            validation_runner=expanding_walk_forward,
+            validation_config=validation_config,
+        ),
         "cost_stress": cost_stress_test(ridge_predictions[["gross_return", "cost"]], multiplier=float(config["portfolio"]["cost_stress_multiplier"])),
+        "cpcv": {
+            "folds": len(cpcv_results),
+            "mean_oos_score": float(pd.Series([result.out_of_sample_score for result in cpcv_results]).mean()) if cpcv_results else 0.0,
+            "mean_retention": float(pd.Series([result.retention for result in cpcv_results]).mean()) if cpcv_results else 0.0,
+        },
+        "pbo": probability_of_backtest_overfitting(cpcv_results),
+        "dsr": deflated_sharpe_ratio(
+            pd.Series([fold.decile_spread for fold in ridge_folds], dtype=float).dropna().to_numpy(),
+            num_trials=max(1, len(cpcv_results)),
+        ),
     }
 
     assessment = _phase_one_assessment(
@@ -105,6 +140,7 @@ def run_training(*, data_root: Path, config_path: Path, output_root: Path, repor
         "window_end": latest_date.strftime("%Y-%m-%d"),
         "missing_dates": missing_dates,
         "ridge": {
+            "alpha": ridge_alpha,
             "folds": [
                 {
                     "rank_ic": fold.rank_ic,
@@ -138,12 +174,13 @@ def run_training(*, data_root: Path, config_path: Path, output_root: Path, repor
             config=config,
             feature_cols=feature_cols,
             normalized=normalized,
-            ridge_model=RidgeModel(alpha=1.0).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"]),
+            ridge_model=RidgeModel(alpha=ridge_alpha).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"]),
             lgbm_model=LightGBMModel(n_trials=0, best_params=lgbm_params).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"]),
             report_preview={
                 "ridge_mean_rank_ic": float(pd.Series([fold.rank_ic for fold in ridge_folds]).mean()) if ridge_folds else 0.0,
                 "lightgbm_mean_rank_ic": float(pd.Series([fold.rank_ic for fold in lgbm_folds]).mean()) if lgbm_folds else 0.0,
                 "coverage": coverage,
+                "ridge_alpha": ridge_alpha,
             },
         ),
     }

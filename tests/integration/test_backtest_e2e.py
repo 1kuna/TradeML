@@ -70,8 +70,84 @@ def test_full_backtest_pipeline_is_deterministic() -> None:
     targets = build_portfolio(rebalance_scores.rename(columns={"prediction": "score"}), {})
     prices = panel[["date", "symbol", "close"]]
 
-    first = run_backtest(prices, targets, apply_costs, {"initial_capital": 1_000_000.0, "cost_spread_bps": 5.0})
-    second = run_backtest(prices, targets, apply_costs, {"initial_capital": 1_000_000.0, "cost_spread_bps": 5.0})
+    corp_actions = pd.DataFrame(
+        [
+            {"symbol": "AAPL", "event_type": "dividend", "ex_date": prediction_frame["date"].min(), "ratio": 0.1},
+        ]
+    )
+    first = run_backtest(
+        prices,
+        targets,
+        apply_costs,
+        {"initial_capital": 1_000_000.0, "cost_spread_bps": 5.0},
+        corp_actions=corp_actions,
+        prediction_frame=prediction_frame,
+    )
+    second = run_backtest(
+        prices,
+        targets,
+        apply_costs,
+        {"initial_capital": 1_000_000.0, "cost_spread_bps": 5.0},
+        corp_actions=corp_actions,
+        prediction_frame=prediction_frame,
+    )
 
     pd.testing.assert_frame_equal(first.equity_curve, second.equity_curve)
+    pd.testing.assert_frame_equal(first.ic_time_series, second.ic_time_series)
+    pd.testing.assert_frame_equal(first.decile_returns, second.decile_returns)
     assert not first.trade_log.empty
+    assert not first.ic_time_series.empty
+    assert not first.decile_returns.empty
+
+
+def test_backtest_applies_corporate_actions_and_emits_diagnostics() -> None:
+    prices = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-01-02"), pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-06")] * 2,
+            "symbol": ["AAPL"] * 3 + ["MSFT"] * 3,
+            "close": [100.0, 50.0, 51.0, 80.0, 81.0, 82.0],
+        }
+    )
+    targets = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-01-02"), pd.Timestamp("2026-01-02")],
+            "symbol": ["AAPL", "MSFT"],
+            "score": [2.0, 1.0],
+            "target_weight": [0.5, 0.5],
+        }
+    )
+    corp_actions = pd.DataFrame(
+        [
+            {"symbol": "AAPL", "event_type": "split", "ex_date": "2026-01-05", "ratio": 0.5},
+            {"symbol": "MSFT", "event_type": "dividend", "ex_date": "2026-01-06", "ratio": 1.0},
+        ]
+    )
+    prediction_frame = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-01-02")] * 2 + [pd.Timestamp("2026-01-05")] * 2,
+            "symbol": ["AAPL", "MSFT", "AAPL", "MSFT"],
+            "prediction": [0.20, 0.10, 0.15, 0.05],
+            "label_5d": [0.03, 0.01, 0.02, -0.01],
+        }
+    )
+
+    result = run_backtest(
+        prices,
+        targets,
+        apply_costs,
+        {"initial_capital": 1_000_000.0, "cost_spread_bps": 5.0},
+        corp_actions=corp_actions,
+        prediction_frame=prediction_frame,
+    )
+
+    assert not result.trade_log.empty
+    assert not result.ic_time_series.empty
+    assert not result.decile_returns.empty
+    assert "action" in result.trade_log.columns
+    assert (result.trade_log["action"] == "CORP_ACTION").any()
+    msft_dividend = result.trade_log.loc[
+        (result.trade_log["symbol"] == "MSFT") & (result.trade_log["action"] == "CORP_ACTION"),
+        "trade_value",
+    ]
+    assert not msft_dividend.empty
+    assert msft_dividend.iloc[0] > 0

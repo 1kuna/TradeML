@@ -5,10 +5,14 @@ from __future__ import annotations
 import signal
 import threading
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from time import sleep
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from trademl.calendars.exchange import is_trading_day
 from trademl.connectors.base import BaseConnector, ConnectorError
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.curator import Curator, CuratorResult
@@ -33,6 +37,10 @@ class DataNodePaths:
     def qc_root(self) -> Path:
         return self.root / "data" / "qc"
 
+    @property
+    def reference_root(self) -> Path:
+        return self.root / "data" / "reference"
+
 
 class DataNodeService:
     """Collect raw bars, audit completeness, curate data, and sync QC state."""
@@ -55,6 +63,10 @@ class DataNodeService:
         self.source_name = source_name
         self._stop_event = threading.Event()
         self.default_symbols: list[str] = []
+        self._collection_history: set[str] = set()
+        self._maintenance_history: set[str] = set()
+        self._reference_history: set[str] = set()
+        self._price_check_history: set[str] = set()
 
     def stop(self) -> None:
         """Request a graceful shutdown."""
@@ -112,8 +124,7 @@ class DataNodeService:
     def collect_reference_data(self, jobs: list[dict[str, object]]) -> list[Path]:
         """Collect reference datasets into parquet files."""
         outputs: list[Path] = []
-        reference_root = self.paths.root / "data" / "reference"
-        reference_root.mkdir(parents=True, exist_ok=True)
+        self.paths.reference_root.mkdir(parents=True, exist_ok=True)
         for job in jobs:
             connector = self.connectors[str(job["source"])]
             frame = connector.fetch(
@@ -122,7 +133,7 @@ class DataNodeService:
                 str(job["start_date"]),
                 str(job["end_date"]),
             )
-            output = reference_root / f"{job['output_name']}.parquet"
+            output = self.paths.reference_root / f"{job['output_name']}.parquet"
             frame.to_parquet(output, index=False)
             outputs.append(output)
         return outputs
@@ -169,14 +180,21 @@ class DataNodeService:
             pd.DataFrame().to_parquet(output, index=False)
         return output
 
-    def curate_dates(self, corp_actions: pd.DataFrame | None = None) -> CuratorResult:
+    def curate_dates(
+        self,
+        corp_actions: pd.DataFrame | None = None,
+        *,
+        changed_dates: list[str] | None = None,
+    ) -> CuratorResult:
         """Rebuild curated partitions from the current raw dataset."""
         raw_files = sorted(self.paths.raw_equities.glob("date=*/data.parquet"))
         raw_frame = pd.concat((pd.read_parquet(path) for path in raw_files), ignore_index=True) if raw_files else pd.DataFrame()
         result = self.curator.write_curated(
             raw_bars=raw_frame,
-            corp_actions=corp_actions if corp_actions is not None else pd.DataFrame(),
+            corp_actions=corp_actions if corp_actions is not None else self.load_corp_actions_reference(),
             output_root=self.paths.curated_equities,
+            changed_dates=changed_dates,
+            adjustment_log_path=self.paths.root / "data" / "curated" / "adjustment_log.parquet",
         )
         return result
 
@@ -187,6 +205,52 @@ class DataNodeService:
         rows = [dict(row) for row in self.db.fetch_partition_status()]
         pd.DataFrame(rows).to_parquet(output, index=False)
         return output
+
+    def load_corp_actions_reference(self) -> pd.DataFrame:
+        """Load any persisted corp-action reference parquet files into the curator schema."""
+        frames: list[pd.DataFrame] = []
+        for path in sorted(self.paths.reference_root.glob("*.parquet")):
+            frame = pd.read_parquet(path)
+            if frame.empty:
+                continue
+            if path.stem == "corp_actions":
+                normalized = frame.copy()
+                if "ex_date" in normalized.columns:
+                    normalized["ex_date"] = pd.to_datetime(normalized["ex_date"]).dt.date
+                frames.append(normalized)
+                continue
+            if path.stem == "splits":
+                normalized = pd.DataFrame(
+                    {
+                        "symbol": frame["symbol"],
+                        "event_type": "split",
+                        "ex_date": pd.to_datetime(frame.get("execution_date", frame.get("ex_date", frame.get("exDate")))).dt.date,
+                        "ratio": pd.to_numeric(frame.get("ratio"), errors="coerce"),
+                        "amount": pd.NA,
+                        "source": frame.get("source", pd.Series(["splits"] * len(frame))),
+                    }
+                )
+                if normalized["ratio"].isna().all() and {"split_from", "split_to"}.issubset(frame.columns):
+                    normalized["ratio"] = pd.to_numeric(frame["split_from"], errors="coerce") / pd.to_numeric(frame["split_to"], errors="coerce")
+                frames.append(normalized.dropna(subset=["ex_date", "ratio"]))
+                continue
+            if path.stem == "dividends":
+                frames.append(
+                    pd.DataFrame(
+                        {
+                            "symbol": frame["symbol"],
+                            "event_type": "dividend",
+                            "ex_date": pd.to_datetime(frame.get("ex_dividend_date", frame.get("ex_date", frame.get("exDate")))).dt.date,
+                            "ratio": pd.NA,
+                            "amount": pd.to_numeric(frame.get("cash_amount", frame.get("amount")), errors="coerce"),
+                            "source": frame.get("source", pd.Series(["dividends"] * len(frame))),
+                        }
+                    ).dropna(subset=["ex_date", "amount"])
+                )
+        if not frames:
+            return pd.DataFrame(columns=["symbol", "event_type", "ex_date", "ratio", "amount", "source"])
+        combined = pd.concat(frames, ignore_index=True)
+        return combined.sort_values(["symbol", "ex_date", "event_type"]).reset_index(drop=True)
 
     def run_cycle(
         self,
@@ -210,7 +274,11 @@ class DataNodeService:
             expected_rows=len(symbols),
         )
         backfill_dates = self.process_backfill_queue()
-        curated = self.curate_dates(corp_actions=corp_actions)
+        changed_dates = sorted(set(forward_dates + backfill_dates))
+        curated = self.curate_dates(
+            corp_actions=corp_actions,
+            changed_dates=None if corp_actions is not None and not corp_actions.empty else changed_dates,
+        )
         qc_path = self.sync_partition_status()
         return {
             "forward_dates": forward_dates,
@@ -219,3 +287,117 @@ class DataNodeService:
             "curated_rows": len(curated.frame),
             "qc_path": qc_path,
         }
+
+    def run_forever(
+        self,
+        *,
+        symbols: list[str],
+        exchange: str,
+        collection_time_et: str = "16:30",
+        maintenance_hour_local: int = 2,
+        poll_seconds: float = 60.0,
+        audit_lookback_days: int = 7,
+        corp_actions: pd.DataFrame | None = None,
+        macro_series_ids: list[str] | None = None,
+        reference_jobs: list[dict[str, object]] | None = None,
+        price_check_symbols: list[str] | None = None,
+        now_fn=lambda: datetime.now(tz=UTC),
+        sleep_fn=sleep,
+    ) -> None:
+        """Run the scheduled data-node loop until a stop signal is received."""
+        market_tz = ZoneInfo("America/New_York")
+        collection_hour, collection_minute = (int(part) for part in collection_time_et.split(":", 1))
+
+        while not self._stop_event.is_set():
+            current = now_fn()
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=UTC)
+            current_et = current.astimezone(market_tz)
+            current_local = current.astimezone()
+            trading_date = current_et.date()
+
+            if self._should_run_collection(
+                trading_date=trading_date.isoformat(),
+                current_et=current_et,
+                collection_hour=collection_hour,
+                collection_minute=collection_minute,
+                exchange=exchange,
+            ):
+                audit_start = (trading_date - pd.Timedelta(days=audit_lookback_days)).strftime("%Y-%m-%d")
+                self.run_cycle(
+                    trading_date=trading_date.isoformat(),
+                    symbols=symbols,
+                    exchange=exchange,
+                    audit_start=audit_start,
+                    audit_end=trading_date.isoformat(),
+                    corp_actions=corp_actions,
+                )
+                if macro_series_ids and "fred" in self.connectors:
+                    self.collect_macro_data(macro_series_ids, trading_date.isoformat(), trading_date.isoformat())
+                if reference_jobs and self._should_run_reference(current_et):
+                    materialized_jobs = [self._materialize_job(job, trading_date.isoformat()) for job in reference_jobs]
+                    self.collect_reference_data(materialized_jobs)
+                    if any(job.get("output_name") == "corp_actions" for job in materialized_jobs):
+                        corp_actions_path = self.paths.root / "data" / "reference" / "corp_actions.parquet"
+                        if corp_actions_path.exists():
+                            self.curate_dates(corp_actions=pd.read_parquet(corp_actions_path))
+                    self._reference_history.add(self._week_key(current_et))
+                if price_check_symbols and self._should_run_price_checks(current_et):
+                    self.run_cross_vendor_price_checks(
+                        trading_date=trading_date.isoformat(),
+                        sample_symbols=price_check_symbols,
+                    )
+                    self._price_check_history.add(self._week_key(current_et))
+                self.sync_partition_status()
+                self._collection_history.add(trading_date.isoformat())
+
+            local_day = current_local.date().isoformat()
+            if self._should_run_maintenance(local_day=local_day, current_local=current_local, maintenance_hour_local=maintenance_hour_local):
+                changed_dates = self.process_backfill_queue()
+                if changed_dates:
+                    self.curate_dates(corp_actions=corp_actions)
+                self.sync_partition_status()
+                self._maintenance_history.add(local_day)
+
+            if not self._stop_event.is_set():
+                sleep_fn(poll_seconds)
+
+    def _should_run_collection(
+        self,
+        *,
+        trading_date: str,
+        current_et: datetime,
+        collection_hour: int,
+        collection_minute: int,
+        exchange: str,
+    ) -> bool:
+        if trading_date in self._collection_history:
+            return False
+        if not is_trading_day(exchange, trading_date):
+            return False
+        if current_et.hour < collection_hour:
+            return False
+        if current_et.hour == collection_hour and current_et.minute < collection_minute:
+            return False
+        return True
+
+    def _should_run_maintenance(self, *, local_day: str, current_local: datetime, maintenance_hour_local: int) -> bool:
+        return local_day not in self._maintenance_history and current_local.hour >= maintenance_hour_local
+
+    @staticmethod
+    def _materialize_job(job: dict[str, object], trading_date: str) -> dict[str, object]:
+        materialized = dict(job)
+        materialized.setdefault("start_date", trading_date)
+        materialized.setdefault("end_date", trading_date)
+        return materialized
+
+    def _should_run_reference(self, current_et: datetime) -> bool:
+        return self._week_key(current_et) not in self._reference_history
+
+    def _should_run_price_checks(self, current_et: datetime) -> bool:
+        return self._week_key(current_et) not in self._price_check_history
+
+    @staticmethod
+    def _week_key(current_et: datetime) -> str:
+        iso = current_et.isocalendar()
+        return f"{iso.year}-W{iso.week:02d}"

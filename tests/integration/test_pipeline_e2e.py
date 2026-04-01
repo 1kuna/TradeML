@@ -41,6 +41,27 @@ class MockConnector:
         )
 
 
+@dataclass
+class MockReferenceConnector:
+    vendor_name: str = "alpha_vantage"
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        if dataset == "corp_actions":
+            return pd.DataFrame(
+                [
+                    {
+                        "symbol": "AAPL",
+                        "event_type": "dividend",
+                        "ex_date": start_date,
+                        "ratio": pd.NA,
+                        "amount": 1.0,
+                        "source": "alpha_vantage",
+                    }
+                ]
+            )
+        raise AssertionError(f"unexpected dataset {dataset}")
+
+
 def test_service_cycle_writes_raw_curated_and_qc(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
@@ -107,3 +128,35 @@ def test_auditor_creates_gap_tasks_for_missing_sessions(tmp_path: Path) -> None:
     assert leased is not None
     assert leased.kind == "GAP"
     assert leased.start_date == "2025-01-06"
+
+
+def test_service_can_curate_from_persisted_reference_actions(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": MockConnector(), "alpha_vantage": MockReferenceConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    service.collect_forward(trading_date="2025-01-06", symbols=["AAPL"])
+    service.collect_forward(trading_date="2025-01-07", symbols=["AAPL"])
+    service.collect_reference_data(
+        [
+            {
+                "source": "alpha_vantage",
+                "dataset": "corp_actions",
+                "symbols": ["AAPL"],
+                "start_date": "2025-01-07",
+                "end_date": "2025-01-07",
+                "output_name": "corp_actions",
+            }
+        ]
+    )
+
+    result = service.curate_dates()
+    prior_close = result.frame.loc[result.frame["date"] == pd.Timestamp("2025-01-06").date(), "close"].iloc[0]
+
+    assert prior_close < 100.5
+    assert (tmp_path / "data" / "reference" / "corp_actions.parquet").exists()

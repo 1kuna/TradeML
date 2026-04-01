@@ -6,6 +6,7 @@ import argparse
 import os
 from pathlib import Path
 
+import pandas as pd
 import yaml
 
 from trademl.calendars.exchange import ExchangeCalendarStore
@@ -33,12 +34,14 @@ def _load_dotenv() -> None:
 
 
 def main() -> int:
-    """Run one deterministic data-node cycle from config."""
-    parser = argparse.ArgumentParser(description="Run the TradeML data node once.")
+    """Run one deterministic data-node cycle or the scheduled service loop."""
+    parser = argparse.ArgumentParser(description="Run the TradeML data node.")
     parser.add_argument("--config", default="configs/node.yml")
-    parser.add_argument("--root", default=".")
-    parser.add_argument("--date", required=True)
-    parser.add_argument("--symbols", nargs="+", required=True)
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--date", default=None)
+    parser.add_argument("--symbols", nargs="*", default=None)
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--poll-seconds", type=float, default=60.0)
     args = parser.parse_args()
     _load_dotenv()
 
@@ -96,43 +99,84 @@ def main() -> int:
     )
     local_state = Path(os.getenv("LOCAL_STATE", config["node"]["local_state"])).expanduser()
     db = DataNodeDB(local_state / "node.sqlite")
+    data_root = Path(args.root or os.getenv("NAS_MOUNT", config["node"]["nas_mount"])).expanduser()
+    symbols = args.symbols or _load_stage_symbols(local_state.parent)
     service = DataNodeService(
         db=db,
         connectors=connectors,
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=Path(args.root) / "reference" / "calendars")),
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=data_root / "reference" / "calendars")),
         curator=Curator(),
-        paths=DataNodePaths(root=Path(args.root)),
+        paths=DataNodePaths(root=data_root),
     )
     service.install_signal_handlers()
-    service.run_cycle(
-        trading_date=args.date,
-        symbols=args.symbols,
-        exchange="XNYS",
-        audit_start=args.date,
-        audit_end=args.date,
-    )
-    if "fred" in connectors:
-        service.collect_macro_data(["DGS10"], args.date, args.date)
     reference_jobs: list[dict[str, object]] = []
     if "massive" in connectors:
         reference_jobs.extend(
             [
-                {"source": "massive", "dataset": "reference_tickers", "symbols": [], "start_date": args.date, "end_date": args.date, "output_name": "universe"},
-                {"source": "massive", "dataset": "reference_splits", "symbols": args.symbols[:10], "start_date": args.date, "end_date": args.date, "output_name": "splits"},
-                {"source": "massive", "dataset": "reference_dividends", "symbols": args.symbols[:10], "start_date": args.date, "end_date": args.date, "output_name": "dividends"},
+                {"source": "massive", "dataset": "reference_tickers", "symbols": [], "output_name": "universe"},
+                {"source": "massive", "dataset": "reference_splits", "symbols": symbols[:10], "output_name": "splits"},
+                {"source": "massive", "dataset": "reference_dividends", "symbols": symbols[:10], "output_name": "dividends"},
             ]
         )
     if "fmp" in connectors:
-        reference_jobs.append({"source": "fmp", "dataset": "delistings", "symbols": [], "start_date": args.date, "end_date": args.date, "output_name": "delistings"})
+        reference_jobs.extend(
+            [
+                {"source": "fmp", "dataset": "delistings", "symbols": [], "output_name": "delistings"},
+                {"source": "fmp", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar_fmp"},
+            ]
+        )
     if "alpha_vantage" in connectors:
-        reference_jobs.append({"source": "alpha_vantage", "dataset": "listings", "symbols": [], "start_date": args.date, "end_date": args.date, "output_name": "listings"})
-    if "sec_edgar" in connectors:
-        reference_jobs.append({"source": "sec_edgar", "dataset": "filing_index", "symbols": ["320193"], "start_date": args.date, "end_date": args.date, "output_name": "sec_filings"})
-    if reference_jobs:
-        service.collect_reference_data(reference_jobs)
-    if "massive" in connectors and "finnhub" in connectors:
-        service.run_cross_vendor_price_checks(trading_date=args.date, sample_symbols=args.symbols[:5])
+        reference_jobs.extend(
+            [
+                {"source": "alpha_vantage", "dataset": "listings", "symbols": [], "output_name": "listings"},
+                {"source": "alpha_vantage", "dataset": "corp_actions", "symbols": symbols[:10], "output_name": "corp_actions"},
+            ]
+        )
+    if "finnhub" in connectors:
+        reference_jobs.append({"source": "finnhub", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar"})
+    reference_jobs.append({"source": "sec_edgar", "dataset": "filing_index", "symbols": ["320193"], "output_name": "sec_filings"})
+
+    if args.once or args.date:
+        if not args.date:
+            raise SystemExit("--date is required with --once")
+        service.run_cycle(
+            trading_date=args.date,
+            symbols=symbols,
+            exchange="XNYS",
+            audit_start=args.date,
+            audit_end=args.date,
+        )
+        if "fred" in connectors:
+            service.collect_macro_data(["DGS10"], args.date, args.date)
+        if reference_jobs:
+            materialized = [service._materialize_job(job, args.date) for job in reference_jobs]
+            service.collect_reference_data(materialized)
+            service.curate_dates(corp_actions=service.load_corp_actions_reference())
+        if "massive" in connectors and "finnhub" in connectors:
+            service.run_cross_vendor_price_checks(trading_date=args.date, sample_symbols=symbols[:5])
+        service.sync_partition_status()
+        return 0
+
+    service.run_forever(
+        symbols=symbols,
+        exchange="XNYS",
+        collection_time_et=os.getenv("COLLECTION_TIME_ET", config["node"]["collection_time_et"]),
+        maintenance_hour_local=int(os.getenv("MAINTENANCE_HOUR_LOCAL", config["node"]["maintenance_hour_local"])),
+        poll_seconds=args.poll_seconds,
+        macro_series_ids=["DGS10"] if "fred" in connectors else [],
+        reference_jobs=reference_jobs,
+        price_check_symbols=symbols[:5] if {"massive", "finnhub"}.issubset(connectors) else [],
+    )
     return 0
+
+
+def _load_stage_symbols(root: Path) -> list[str]:
+    stage_path = root / "stage.yml"
+    if not stage_path.exists():
+        return []
+    with stage_path.open("r", encoding="utf-8") as handle:
+        stage = yaml.safe_load(handle) or {}
+    return list(stage.get("symbols", []))
 
 
 if __name__ == "__main__":

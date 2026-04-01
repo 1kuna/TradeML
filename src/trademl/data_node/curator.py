@@ -58,7 +58,8 @@ class Curator:
                     )
                 elif action.event_type == "dividend":
                     pre_ex_close = symbol_frame.loc[symbol_frame["date"] < action.ex_date, "close"].iloc[-1]
-                    dividend_ratio = float((pre_ex_close - float(action.ratio)) / pre_ex_close)
+                    dividend_amount = float(action.amount if getattr(action, "amount", None) is not None and pd.notna(action.amount) else action.ratio)
+                    dividend_ratio = float((pre_ex_close - dividend_amount) / pre_ex_close)
                     symbol_frame.loc[prior_mask, PRICE_COLUMNS] = symbol_frame.loc[prior_mask, PRICE_COLUMNS] * dividend_ratio
                     adjustment_log.append(
                         {
@@ -82,12 +83,21 @@ class Curator:
         raw_bars: pd.DataFrame,
         corp_actions: pd.DataFrame,
         output_root: Path,
+        changed_dates: list[str] | None = None,
+        adjustment_log_path: Path | None = None,
     ) -> CuratorResult:
         """Write curated parquet partitioned by date."""
         result = self.apply_adjustments(raw_bars=raw_bars, corp_actions=corp_actions)
         output_root.mkdir(parents=True, exist_ok=True)
+        changed_date_set = {pd.Timestamp(day).strftime("%Y-%m-%d") for day in changed_dates} if changed_dates else None
         for day, day_frame in result.frame.groupby("date"):
+            day_key = pd.Timestamp(day).strftime("%Y-%m-%d")
+            if changed_date_set is not None and day_key not in changed_date_set:
+                continue
             partition = output_root / f"date={pd.Timestamp(day).strftime('%Y-%m-%d')}"
             partition.mkdir(parents=True, exist_ok=True)
             day_frame.to_parquet(partition / "data.parquet", index=False)
+        if adjustment_log_path is not None:
+            adjustment_log_path.parent.mkdir(parents=True, exist_ok=True)
+            result.adjustment_log.to_parquet(adjustment_log_path, index=False)
         return result

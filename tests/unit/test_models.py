@@ -4,7 +4,8 @@ import numpy as np
 import pandas as pd
 
 from trademl.models.lgbm import LightGBMModel
-from trademl.models.ridge import RidgeModel
+from trademl.models.ridge import RidgeModel, tune_ridge_via_walk_forward
+from trademl.validation.walk_forward import expanding_walk_forward
 
 
 def _model_frame() -> tuple[pd.DataFrame, pd.Series]:
@@ -25,3 +26,23 @@ def test_ridge_and_lightgbm_train_and_predict() -> None:
     assert len(ridge_predictions) == 5
     assert len(lgbm_predictions) == 5
     assert lgbm.trials_run <= 20
+
+
+def test_ridge_tuning_returns_candidate_alpha() -> None:
+    X, y = _model_frame()
+    dates = pd.bdate_range("2022-01-03", periods=len(X))
+    frame = X.copy()
+    frame["date"] = dates
+    frame["symbol"] = ["AAPL"] * len(X)
+    frame["label"] = y
+
+    alpha = tune_ridge_via_walk_forward(
+        frame,
+        ["feature_1", "feature_2"],
+        "label",
+        expanding_walk_forward,
+        {"initial_train_years": 1, "step_months": 6, "purge_days": 5},
+        alphas=[0.1, 1.0, 10.0],
+    )
+
+    assert alpha in {0.1, 1.0, 10.0}

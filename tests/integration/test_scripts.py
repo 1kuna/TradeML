@@ -111,11 +111,21 @@ def test_backtest_script_writes_outputs(tmp_path: Path) -> None:
             "target_weight": [1.0, 1.0],
         }
     )
+    predictions = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-01")],
+            "symbol": ["AAPL", "MSFT"],
+            "prediction": [0.7, 0.2],
+            "label_5d": [0.03, -0.01],
+        }
+    )
     prices_path = tmp_path / "prices.parquet"
     targets_path = tmp_path / "targets.parquet"
+    predictions_path = tmp_path / "predictions.parquet"
     output_dir = tmp_path / "backtest"
     prices.to_parquet(prices_path, index=False)
     targets.to_parquet(targets_path, index=False)
+    predictions.to_parquet(predictions_path, index=False)
 
     subprocess.run(
         [
@@ -125,6 +135,8 @@ def test_backtest_script_writes_outputs(tmp_path: Path) -> None:
             str(prices_path),
             "--targets",
             str(targets_path),
+            "--predictions",
+            str(predictions_path),
             "--output",
             str(output_dir),
         ],
@@ -134,18 +146,36 @@ def test_backtest_script_writes_outputs(tmp_path: Path) -> None:
 
     assert (output_dir / "equity_curve.parquet").exists()
     assert (output_dir / "trade_log.parquet").exists()
+    assert (output_dir / "cost_attribution.parquet").exists()
+    assert (output_dir / "ic_time_series.parquet").exists()
+    assert (output_dir / "decile_returns.parquet").exists()
 
 
 def test_pi_wizard_initializes_state(tmp_path: Path) -> None:
     root = tmp_path / "pi"
+    env_file = tmp_path / "wizard.env"
+    fstab_path = tmp_path / "fstab"
+    config_path = tmp_path / "node.yml"
     result = subprocess.run(
         [
             sys.executable,
             "src/scripts/pi_data_node_wizard.py",
             "--root",
             str(root),
+            "--config",
+            str(config_path),
             "--stage-years",
             "5",
+            "--nas-mount",
+            str(tmp_path / "nas"),
+            "--collection-time-et",
+            "17:00",
+            "--maintenance-hour-local",
+            "3",
+            "--env-file",
+            str(env_file),
+            "--fstab-path",
+            str(fstab_path),
         ],
         check=True,
         cwd=Path.cwd(),
@@ -157,3 +187,13 @@ def test_pi_wizard_initializes_state(tmp_path: Path) -> None:
     assert payload["task_count"] == 100
     assert (root / "control" / "node.sqlite").exists()
     assert (root / "stage.yml").exists()
+    stage = yaml.safe_load((root / "stage.yml").read_text(encoding="utf-8"))
+    assert stage["schedule"]["collection_time_et"] == "17:00"
+    assert stage["schedule"]["maintenance_hour_local"] == 3
+    assert env_file.exists()
+    assert "NAS_MOUNT=" in env_file.read_text(encoding="utf-8")
+    assert fstab_path.exists()
+    assert str(tmp_path / "nas") in fstab_path.read_text(encoding="utf-8")
+    node_cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert node_cfg["node"]["collection_time_et"] == "17:00"
+    assert node_cfg["node"]["maintenance_hour_local"] == 3
