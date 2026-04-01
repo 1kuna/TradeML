@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trademl"
+version = "0.1.0"
+description = "Spec-driven equities research and data pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "exchange_calendars>=4.5",
+  "lightgbm>=4.5.0",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "pyarrow>=15.0",
+  "PyYAML>=6.0.2",
+  "requests>=2.32",
+  "scikit-learn>=1.5",
+  "scipy>=1.13",
+]
+
+[project.optional-dependencies]
+dev = [
+  "optuna>=4.3.0",
+  "pytest>=8.3,<9",
+  "pytest-cov>=5.0",
+  "rich>=13.9",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+  "liveapi: requires live vendor credentials",
+]
+testpaths = ["tests"]
