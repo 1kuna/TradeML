@@ -7,6 +7,7 @@ import json
 import os
 
 from trademl.dashboard.controller import (
+    _read_env_file,
     collect_dashboard_snapshot,
     force_release_lease,
     install_service,
@@ -55,7 +56,12 @@ def main() -> None:
         st.caption(f"Config: {settings.config_path}")
         st.caption(f"Env: {settings.env_path}")
         st.caption(f"Local state: {settings.local_state}")
-        cluster_passphrase = st.text_input("Cluster Passphrase", type="password", value=os.getenv("TRADEML_CLUSTER_PASSPHRASE", ""))
+        env_values = _read_env_file(settings.env_path)
+        cluster_passphrase = st.text_input(
+            "Cluster Passphrase",
+            type="password",
+            value=env_values.get("TRADEML_CLUSTER_PASSPHRASE", os.getenv("TRADEML_CLUSTER_PASSPHRASE", "")),
+        )
 
     snapshot = collect_dashboard_snapshot(settings)
     runtime = snapshot["runtime"]
@@ -67,13 +73,13 @@ def main() -> None:
 
     controls = st.columns([1, 1, 1, 2])
     if controls[0].button("Start Node", type="primary", use_container_width=True):
-        start_node(settings)
+        start_node(settings, passphrase=cluster_passphrase or None)
         st.rerun()
     if controls[1].button("Stop Node", use_container_width=True):
         stop_node(settings)
         st.rerun()
     if controls[2].button("Restart Node", use_container_width=True):
-        restart_node(settings)
+        restart_node(settings, passphrase=cluster_passphrase or None)
         st.rerun()
     controls[3].metric("Node Status", "Running" if running else "Stopped", f"PID {runtime.get('pid', '-')}")
 

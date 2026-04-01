@@ -210,8 +210,15 @@ def persist_fstab_entry(*, path: Path, nas_share: str, nas_mount: str) -> Path:
     return target_path
 
 
-def start_node(settings: NodeSettings, *, command: list[str] | None = None) -> dict[str, Any]:
+def start_node(
+    settings: NodeSettings,
+    *,
+    command: list[str] | None = None,
+    passphrase: str | None = None,
+) -> dict[str, Any]:
     """Start the data-node process in the background if it is not already running."""
+    if passphrase:
+        persist_cluster_passphrase(settings, passphrase)
     svc = systemd_status()
     if svc.get("supported") and svc.get("UnitFileState") not in {None, "not-found", "", "masked"}:
         subprocess.run(["systemctl", "start", "trademl-node.service"], check=False)
@@ -297,14 +304,16 @@ def stop_node(settings: NodeSettings, *, timeout_seconds: float = 10.0) -> dict[
     return runtime
 
 
-def restart_node(settings: NodeSettings) -> dict[str, Any]:
+def restart_node(settings: NodeSettings, *, passphrase: str | None = None) -> dict[str, Any]:
     """Restart the managed node and return the new runtime state."""
     stop_node(settings)
-    return start_node(settings)
+    return start_node(settings, passphrase=passphrase)
 
 
 def join_cluster(settings: NodeSettings, *, passphrase: str | None = None) -> dict[str, Any]:
     """Bootstrap or join the NAS-backed worker cluster."""
+    if passphrase:
+        persist_cluster_passphrase(settings, passphrase)
     coordinator = _coordinator(settings)
     manifest = coordinator.ensure_cluster_ready(passphrase=passphrase)
     rebuilt = coordinator.rebuild_local_state(local_db_path=settings.db_path)
@@ -313,6 +322,8 @@ def join_cluster(settings: NodeSettings, *, passphrase: str | None = None) -> di
 
 def rebuild_cluster_state(settings: NodeSettings, *, passphrase: str | None = None) -> dict[str, Any]:
     """Rebuild disposable local state from NAS-backed truth."""
+    if passphrase:
+        persist_cluster_passphrase(settings, passphrase)
     return rebuild_cluster_local_state(
         nas_root=settings.nas_mount,
         workspace_root=settings.workspace_root,
@@ -329,6 +340,13 @@ def leave_cluster(settings: NodeSettings) -> dict[str, Any]:
     """Leave the cluster and release any owned leases."""
     coordinator = _coordinator(settings)
     return coordinator.leave_cluster()
+
+
+def persist_cluster_passphrase(settings: NodeSettings, passphrase: str) -> None:
+    """Persist the cluster passphrase for non-interactive worker starts."""
+    env_values = _read_env_file(settings.env_path)
+    env_values["TRADEML_CLUSTER_PASSPHRASE"] = passphrase
+    _write_env_file(settings.env_path, env_values)
 
 
 def install_service(settings: NodeSettings, *, service_path: str | None = None) -> dict[str, Any]:
@@ -389,7 +407,7 @@ def reset_worker(settings: NodeSettings, *, passphrase: str | None = None) -> di
     _remove_worker_state(settings)
     joined = join_cluster(settings, passphrase=passphrase)
     if was_running:
-        start_node(settings)
+        start_node(settings, passphrase=passphrase)
     append_cluster_event(settings.cluster_paths, "worker_reset", {"worker_id": settings.worker_id})
     return {"joined": joined, "restarted": was_running, "workspace_root": str(settings.workspace_root)}
 
@@ -442,6 +460,7 @@ def rotate_cluster_passphrase(
     coordinator = _coordinator(settings)
     secrets = coordinator.decrypt_cluster_secrets(passphrase=old_passphrase)
     encrypt_secret_bundle(settings.cluster_paths.secrets_path, new_passphrase, secrets)
+    persist_cluster_passphrase(settings, new_passphrase)
     append_cluster_event(settings.cluster_paths, "passphrase_rotated", {"worker_id": settings.worker_id})
     return {"rotated_keys": sorted(secrets)}
 
@@ -457,6 +476,7 @@ def update_cluster_secrets(
     secrets = coordinator.decrypt_cluster_secrets(passphrase=passphrase)
     secrets.update({key: value for key, value in updates.items() if key})
     encrypt_secret_bundle(settings.cluster_paths.secrets_path, passphrase, secrets)
+    persist_cluster_passphrase(settings, passphrase)
     append_cluster_event(settings.cluster_paths, "secrets_updated", {"worker_id": settings.worker_id, "keys": sorted(updates)})
     return {"keys": sorted(secrets)}
 

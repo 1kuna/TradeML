@@ -9,6 +9,7 @@ import yaml
 
 from trademl.dashboard.controller import (
     collect_dashboard_snapshot,
+    join_cluster,
     reset_worker,
     persist_node_settings,
     resolve_node_settings,
@@ -170,6 +171,80 @@ def test_start_and_stop_node_manage_runtime_metadata(tmp_path: Path) -> None:
     stopped = stop_node(settings)
     assert stopped["running"] is False
     assert "last_pid" in stopped
+
+
+def test_start_node_persists_cluster_passphrase(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    runtime = start_node(
+        settings,
+        command=[sys.executable, "-c", "import time; time.sleep(60)"],
+        passphrase="pw123",
+    )
+
+    env_text = (workspace / ".env").read_text(encoding="utf-8")
+    assert "TRADEML_CLUSTER_PASSPHRASE=pw123" in env_text
+
+    stopped = stop_node(settings)
+    assert runtime["running"] is True
+    assert stopped["running"] is False
+
+
+def test_join_cluster_persists_cluster_passphrase(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    class FakeCoordinator:
+        worker_id = "worker-a"
+
+        def ensure_cluster_ready(self, *, passphrase=None):  # noqa: ANN001
+            return {"ok": True, "passphrase": passphrase}
+
+        def rebuild_local_state(self, *, local_db_path):  # noqa: ANN001
+            return {"db": str(local_db_path)}
+
+    monkeypatch.setattr("trademl.dashboard.controller._coordinator", lambda _settings: FakeCoordinator())
+
+    joined = join_cluster(settings, passphrase="pw123")
+
+    env_text = (workspace / ".env").read_text(encoding="utf-8")
+    assert "TRADEML_CLUSTER_PASSPHRASE=pw123" in env_text
+    assert joined["manifest"]["passphrase"] == "pw123"
 
 
 def test_update_worker_refreshes_wrapper_and_reports_paths(tmp_path: Path, monkeypatch) -> None:
