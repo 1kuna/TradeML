@@ -1,0 +1,47 @@
+model: ridge
+challenger: lightgbm
+
+target: universe_relative_5d
+
+data:
+  dependencies: [equities_ohlcv_adj]
+  green_threshold: 0.98
+  window_years: 5
+
+features:
+  price:
+    momentum: [5, 20, 60, 126]
+    reversal: [1, 5]
+    drawdown: [20, 60]
+    gap: [overnight]
+  volatility:
+    realized: [20, 60]
+    idiosyncratic: [60]
+  liquidity:
+    adv_dollar: [20]
+    amihud: [20]
+  controls:
+    log_price: true
+    log_market_cap: false
+
+preprocessing:
+  method: rank_normalize
+  missing_threshold: 0.30
+  missing_fill: cross_sectional_median
+
+validation:
+  primary: expanding_walk_forward
+  initial_train_years: 2
+  step: 3_months
+  secondary: [cpcv, pbo, dsr]
+  cpcv_folds: 8
+  embargo_days: 10
+  additional: [ic_by_year, ic_by_sector, placebo, cost_stress]
+
+portfolio:
+  method: equal_weight_top_quintile
+  rebalance: weekly
+  hedge: none
+  cost_spread_bps: 5
+  cost_stress_multiplier: 2.0
+

@@ -1,0 +1,49 @@
+node:
+  nas_mount: /mnt/trademl
+  local_state: ~/trademl/control/
+  collection_time_et: "16:30"
+  maintenance_hour_local: 2
+
+stage:
+  current: 0
+  stage_0:
+    symbols: 100
+    eod_years: 5
+    green_promote_threshold: 0.98
+
+vendors:
+  alpaca:
+    rpm: 150
+    daily_cap: 10000
+    datasets: [equities_eod]
+    role: primary_bars
+  massive:
+    rpm: 4
+    daily_cap: 300
+    datasets: [equities_eod, reference_tickers, reference_splits, reference_dividends]
+    role: cross_validation_bars
+  finnhub:
+    rpm: 50
+    daily_cap: 10000
+    datasets: [equities_eod, earnings_calendar, company_profile]
+    role: backup_bars
+  alpha_vantage:
+    rpm: 4
+    daily_cap: 400
+    datasets: [corp_actions, listings]
+    role: reference
+  fred:
+    rpm: 80
+    daily_cap: 5000
+    datasets: [macros_treasury]
+    role: macro
+  fmp:
+    rpm: 3
+    daily_cap: 200
+    datasets: [delistings, earnings_calendar, fundamentals]
+    role: reference
+  sec_edgar:
+    rpm: 8
+    daily_cap: 5000
+    datasets: [filing_index]
+    role: authoritative_events
