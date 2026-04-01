@@ -54,6 +54,7 @@ class DataNodeService:
         self.paths = paths
         self.source_name = source_name
         self._stop_event = threading.Event()
+        self.default_symbols: list[str] = []
 
     def stop(self) -> None:
         """Request a graceful shutdown."""
@@ -95,15 +96,78 @@ class DataNodeService:
         changed_dates: list[str] = []
         while task := self.db.lease_next_task():
             connector = self.connectors[self.source_name]
-            symbols = [task.symbol] if task.symbol else []
+            symbols = [task.symbol] if task.symbol else self.default_symbols
             try:
                 frame = connector.fetch(task.dataset, symbols, task.start_date, task.end_date)
             except ConnectorError as exc:
                 self.db.mark_task_failed(task.id, str(exc), backoff_minutes=30)
                 continue
+            if frame.empty:
+                self.db.mark_task_failed(task.id, "empty backfill result", backoff_minutes=30)
+                continue
             changed_dates.extend(self._write_raw_partition(frame))
             self.db.mark_task_done(task.id)
         return changed_dates
+
+    def collect_reference_data(self, jobs: list[dict[str, object]]) -> list[Path]:
+        """Collect reference datasets into parquet files."""
+        outputs: list[Path] = []
+        reference_root = self.paths.root / "data" / "reference"
+        reference_root.mkdir(parents=True, exist_ok=True)
+        for job in jobs:
+            connector = self.connectors[str(job["source"])]
+            frame = connector.fetch(
+                str(job["dataset"]),
+                list(job.get("symbols", [])),
+                str(job["start_date"]),
+                str(job["end_date"]),
+            )
+            output = reference_root / f"{job['output_name']}.parquet"
+            frame.to_parquet(output, index=False)
+            outputs.append(output)
+        return outputs
+
+    def collect_macro_data(self, series_ids: list[str], start_date: str, end_date: str) -> list[Path]:
+        """Collect FRED macro series partitions."""
+        connector = self.connectors["fred"]
+        frame = connector.fetch("macros_treasury", series_ids, start_date, end_date)
+        outputs: list[Path] = []
+        for series_id, series_frame in frame.groupby("series_id"):
+            partition = self.paths.root / "data" / "raw" / "macros_fred" / f"series={series_id}"
+            partition.mkdir(parents=True, exist_ok=True)
+            output = partition / "data.parquet"
+            series_frame.to_parquet(output, index=False)
+            outputs.append(output)
+        return outputs
+
+    def run_cross_vendor_price_checks(self, *, trading_date: str, sample_symbols: list[str]) -> Path:
+        """Compare the primary source against backup vendors for a sample of symbols."""
+        comparisons: list[pd.DataFrame] = []
+        primary = self.connectors[self.source_name].fetch("equities_eod", sample_symbols, trading_date, trading_date)
+        for vendor in ["massive", "finnhub"]:
+            if vendor not in self.connectors:
+                continue
+            try:
+                backup = self.connectors[vendor].fetch("equities_eod", sample_symbols, trading_date, trading_date)
+            except Exception:
+                continue
+            merged = primary[["symbol", "close"]].merge(
+                backup[["symbol", "close"]],
+                on="symbol",
+                how="inner",
+                suffixes=("_primary", f"_{vendor}"),
+            )
+            if not merged.empty:
+                merged["vendor"] = vendor
+                merged["date"] = trading_date
+                comparisons.append(merged)
+        self.paths.qc_root.mkdir(parents=True, exist_ok=True)
+        output = self.paths.qc_root / f"price_checks_{trading_date}.parquet"
+        if comparisons:
+            pd.concat(comparisons, ignore_index=True).to_parquet(output, index=False)
+        else:
+            pd.DataFrame().to_parquet(output, index=False)
+        return output
 
     def curate_dates(self, corp_actions: pd.DataFrame | None = None) -> CuratorResult:
         """Rebuild curated partitions from the current raw dataset."""
@@ -135,6 +199,7 @@ class DataNodeService:
         corp_actions: pd.DataFrame | None = None,
     ) -> dict[str, object]:
         """Run a single deterministic collection cycle."""
+        self.default_symbols = symbols
         forward_dates = self.collect_forward(trading_date=trading_date, symbols=symbols)
         audit_result = self.auditor.audit_range(
             exchange=exchange,

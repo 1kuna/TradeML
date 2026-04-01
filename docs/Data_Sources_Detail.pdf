@@ -1,0 +1,108 @@
+%PDF-1.4
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj
+4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj
+5 0 obj << /Length 1878 >> stream
+BT
+/F1 10 Tf
+72 760 Td
+(TradeML Data Sources Detail) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(Alpaca) Tj
+0 -14 Td
+(- Base URL: https://data.alpaca.markets) Tj
+0 -14 Td
+(- Endpoint: /v2/stocks/bars) Tj
+0 -14 Td
+(- Required headers: APCA-API-KEY-ID, APCA-API-SECRET-KEY) Tj
+0 -14 Td
+(- Key params: symbols, timeframe=1Day, start, end, adjustment=raw, feed=iex, page_token) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(Massive \(Polygon.io\)) Tj
+0 -14 Td
+(- Base URL: https://api.polygon.io) Tj
+0 -14 Td
+(- Endpoint: /v2/aggs/ticker/{symbol}/range/1/day/{from}/{to}) Tj
+0 -14 Td
+(- Auth param: apiKey) Tj
+0 -14 Td
+(- Key params: adjusted=false, sort=asc, limit=50000) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(Finnhub) Tj
+0 -14 Td
+(- Base URL: https://finnhub.io) Tj
+0 -14 Td
+(- Candle endpoint: /api/v1/stock/candle) Tj
+0 -14 Td
+(- Earnings endpoint: /api/v1/calendar/earnings) Tj
+0 -14 Td
+(- Profile endpoint: /api/v1/stock/profile2) Tj
+0 -14 Td
+(- Auth param: token) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(Alpha Vantage) Tj
+0 -14 Td
+(- Base URL: https://www.alphavantage.co) Tj
+0 -14 Td
+(- Endpoint: /query) Tj
+0 -14 Td
+(- Function: LISTING_STATUS) Tj
+0 -14 Td
+(- Auth param: apikey) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(FRED / ALFRED) Tj
+0 -14 Td
+(- Base URL: https://api.stlouisfed.org) Tj
+0 -14 Td
+(- Observations endpoint: /fred/series/observations) Tj
+0 -14 Td
+(- Vintage dates endpoint: /fred/series/vintagedates) Tj
+0 -14 Td
+(- Auth params: api_key, file_type=json) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(FMP stable) Tj
+0 -14 Td
+(- Base URL: https://financialmodelingprep.com) Tj
+0 -14 Td
+(- Delistings endpoint: /stable/delisted-companies) Tj
+0 -14 Td
+(- Earnings endpoint: /stable/earnings-calendar) Tj
+0 -14 Td
+(- Auth param: apikey) Tj
+0 -14 Td
+() Tj
+0 -14 Td
+(SEC EDGAR) Tj
+0 -14 Td
+(- Base URL: https://data.sec.gov) Tj
+0 -14 Td
+(- Endpoint: /submissions/CIK{cik}.json) Tj
+0 -14 Td
+(- Required header: User-Agent with contact address) Tj
+ET
+endstream endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000311 00000 n 
+trailer << /Size 6 /Root 1 0 R >>
+startxref
+2241
+%%EOF

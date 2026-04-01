@@ -66,6 +66,29 @@ def test_service_cycle_writes_raw_curated_and_qc(tmp_path: Path) -> None:
     assert (tmp_path / "data" / "qc" / "partition_status.parquet").exists()
 
 
+def test_gap_tasks_are_backfilled_with_default_symbol_universe(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": MockConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    result = service.run_cycle(
+        trading_date="2025-01-07",
+        symbols=["AAPL", "MSFT"],
+        exchange="XNYS",
+        audit_start="2025-01-06",
+        audit_end="2025-01-07",
+        corp_actions=pd.DataFrame(),
+    )
+
+    assert "2025-01-06" in result["backfill_dates"]
+    assert (tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-06" / "data.parquet").exists()
+
+
 def test_auditor_creates_gap_tasks_for_missing_sessions(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     auditor = PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars"))

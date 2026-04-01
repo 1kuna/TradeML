@@ -25,7 +25,7 @@ def rank_normalize(
             series = date_frame[column]
             missing_fraction = float(series.isna().mean())
             if missing_fraction > missing_threshold:
-                normalized.loc[index, column] = 0.0
+                normalized.loc[index, column] = pd.NA
                 continue
             ranked = series.rank(method="average", pct=True)
             normalized.loc[index, column] = ranked.fillna(0.5) * 2.0 - 1.0

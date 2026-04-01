@@ -82,6 +82,12 @@ class DataNodeDB:
             )
             connection.execute(
                 """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_backfill_queue_unique
+                ON backfill_queue(dataset, IFNULL(symbol, '__ALL__'), start_date, end_date, kind)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS partition_status (
                   source           TEXT NOT NULL,
                   dataset          TEXT NOT NULL,

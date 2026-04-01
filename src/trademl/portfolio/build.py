@@ -18,6 +18,13 @@ def build_portfolio(scores: pd.Series | pd.DataFrame, config: dict) -> pd.DataFr
         raise ValueError("scores dataframe must include a 'score' column")
     if "date" not in frame.columns:
         frame["date"] = config.get("date")
+    rebalance_day = str(config.get("rebalance_day", "FRI")).upper()[:3]
+    weekday_lookup = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4}
+    if frame["date"].notna().all():
+        frame["date"] = pd.to_datetime(frame["date"])
+        frame = frame.loc[frame["date"].dt.weekday == weekday_lookup.get(rebalance_day, 4)].copy()
+    if "earnings_within_5d" in frame.columns:
+        frame = frame.loc[~frame["earnings_within_5d"].fillna(False)].copy()
 
     targets: list[pd.DataFrame] = []
     for date, group in frame.groupby("date"):

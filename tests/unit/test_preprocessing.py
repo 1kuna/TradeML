@@ -20,3 +20,17 @@ def test_rank_normalize_maps_into_unit_range_without_nans() -> None:
     assert normalized[["feature_a", "feature_b"]].max().max() <= 1.0
     assert normalized[["feature_a", "feature_b"]].min().min() >= -1.0
     assert normalized[["feature_a", "feature_b"]].isna().sum().sum() == 0
+
+
+def test_feature_dates_over_missing_threshold_are_dropped() -> None:
+    frame = pd.DataFrame(
+        {
+            "date": ["2026-01-02"] * 4,
+            "symbol": list("ABCD"),
+            "feature_a": [1.0, None, None, None],
+        }
+    )
+
+    normalized = rank_normalize(frame, ["feature_a"], missing_threshold=0.30)
+
+    assert normalized["feature_a"].isna().all()

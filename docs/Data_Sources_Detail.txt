@@ -1,0 +1,43 @@
+TradeML Data Sources Detail
+
+Alpaca
+- Base URL: https://data.alpaca.markets
+- Endpoint: /v2/stocks/bars
+- Required headers: APCA-API-KEY-ID, APCA-API-SECRET-KEY
+- Key params: symbols, timeframe=1Day, start, end, adjustment=raw, feed=iex, page_token
+
+Massive (Polygon.io)
+- Base URL: https://api.polygon.io
+- Endpoint: /v2/aggs/ticker/{symbol}/range/1/day/{from}/{to}
+- Auth param: apiKey
+- Key params: adjusted=false, sort=asc, limit=50000
+
+Finnhub
+- Base URL: https://finnhub.io
+- Candle endpoint: /api/v1/stock/candle
+- Earnings endpoint: /api/v1/calendar/earnings
+- Profile endpoint: /api/v1/stock/profile2
+- Auth param: token
+
+Alpha Vantage
+- Base URL: https://www.alphavantage.co
+- Endpoint: /query
+- Function: LISTING_STATUS
+- Auth param: apikey
+
+FRED / ALFRED
+- Base URL: https://api.stlouisfed.org
+- Observations endpoint: /fred/series/observations
+- Vintage dates endpoint: /fred/series/vintagedates
+- Auth params: api_key, file_type=json
+
+FMP stable
+- Base URL: https://financialmodelingprep.com
+- Delistings endpoint: /stable/delisted-companies
+- Earnings endpoint: /stable/earnings-calendar
+- Auth param: apikey
+
+SEC EDGAR
+- Base URL: https://data.sec.gov
+- Endpoint: /submissions/CIK{cik}.json
+- Required header: User-Agent with contact address

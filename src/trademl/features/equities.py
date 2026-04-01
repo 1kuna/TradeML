@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import exchange_calendars as xcals
 import numpy as np
 import pandas as pd
 
 
-def build_features(panel: pd.DataFrame, config: dict, earnings_calendar: pd.DataFrame | None = None) -> pd.DataFrame:
+def build_features(
+    panel: pd.DataFrame,
+    config: dict,
+    earnings_calendar: pd.DataFrame | None = None,
+    *,
+    exchange: str = "XNYS",
+) -> pd.DataFrame:
     """Build lagged Phase 1 features from adjusted OHLCV bars."""
     frame = panel.copy()
     frame["date"] = pd.to_datetime(frame["date"])
@@ -65,11 +72,23 @@ def build_features(panel: pd.DataFrame, config: dict, earnings_calendar: pd.Data
         earnings = earnings_calendar.copy()
         earnings["earnings_date"] = pd.to_datetime(earnings["earnings_date"])
         earnings_map = earnings.groupby("symbol")["earnings_date"].apply(list).to_dict()
+        calendar = xcals.get_calendar(exchange)
+        trading_days = pd.Index(
+            calendar.sessions_in_range(frame["date"].min().normalize(), frame["date"].max().normalize())
+        )
+        trading_positions = {day: idx for idx, day in enumerate(trading_days)}
 
         def _within_earnings(row: pd.Series) -> bool:
             dates = earnings_map.get(row["symbol"], [])
             current = pd.Timestamp(row["date"])
-            return any(0 <= (earnings_date - current).days <= 7 for earnings_date in dates)
+            current_pos = trading_positions.get(current)
+            if current_pos is None:
+                return False
+            return any(
+                (earnings_date in trading_positions)
+                and 0 < (trading_positions[earnings_date] - current_pos) <= 5
+                for earnings_date in dates
+            )
 
         frame["earnings_within_5d"] = frame.apply(_within_earnings, axis=1)
     else:

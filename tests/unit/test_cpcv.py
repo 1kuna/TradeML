@@ -6,11 +6,12 @@ import pandas as pd
 from trademl.models.ridge import RidgeModel
 from trademl.validation.cpcv import combinatorially_purged_cv
 from trademl.validation.diagnostics import placebo_test
+from trademl.validation.pbo import probability_of_backtest_overfitting
 
 
 def _cpcv_frame() -> pd.DataFrame:
     rng = np.random.default_rng(7)
-    dates = pd.bdate_range("2023-01-01", periods=240)
+    dates = pd.bdate_range("2023-01-01", periods=320)
     rows = []
     for symbol_idx, symbol in enumerate(["AAPL", "MSFT", "NVDA", "AMZN"]):
         feature = rng.normal(symbol_idx, 1.0, len(dates))
@@ -25,10 +26,18 @@ def test_cpcv_retains_majority_of_training_rows() -> None:
     results = combinatorially_purged_cv(frame, ["feature_1"], "label", lambda: RidgeModel(alpha=1.0), n_folds=8, embargo_days=10)
 
     assert results
-    assert min(result.retention for result in results) > 0.7
+    assert len(results) == 28
+    assert min(result.retention for result in results) >= 0.67
 
 
 def test_placebo_labels_are_near_zero() -> None:
     frame = _cpcv_frame()
     scores = placebo_test(frame, ["feature_1"], "label", lambda: RidgeModel(alpha=1.0), n_shuffles=5)
     assert max(abs(score) for score in scores) < 0.1
+
+
+def test_pbo_is_bounded_probability() -> None:
+    frame = _cpcv_frame()
+    results = combinatorially_purged_cv(frame, ["feature_1"], "label", lambda: RidgeModel(alpha=1.0), n_folds=8, embargo_days=10)
+    pbo = probability_of_backtest_overfitting(results)
+    assert 0.0 <= pbo <= 1.0

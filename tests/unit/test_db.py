@@ -48,6 +48,14 @@ def test_duplicate_tasks_rejected(tmp_path: Path) -> None:
         database.enqueue_task("equities_eod", "NVDA", "2024-01-01", "2024-01-05", "BOOTSTRAP", 5)
 
 
+def test_duplicate_gap_tasks_with_null_symbol_are_rejected(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    database.enqueue_task("equities_eod", None, "2024-01-01", "2024-01-01", "GAP", 1)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        database.enqueue_task("equities_eod", None, "2024-01-01", "2024-01-01", "GAP", 1)
+
+
 def test_priority_ordering(tmp_path: Path) -> None:
     database = DataNodeDB(tmp_path / "node.sqlite")
     database.enqueue_task("equities_eod", "LOW", "2024-01-01", "2024-01-05", "GAP", 5)
