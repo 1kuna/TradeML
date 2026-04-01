@@ -124,6 +124,10 @@ def main() -> int:
         )
     if "fmp" in connectors:
         reference_jobs.append({"source": "fmp", "dataset": "delistings", "symbols": [], "start_date": args.date, "end_date": args.date, "output_name": "delistings"})
+    if "alpha_vantage" in connectors:
+        reference_jobs.append({"source": "alpha_vantage", "dataset": "listings", "symbols": [], "start_date": args.date, "end_date": args.date, "output_name": "listings"})
+    if "sec_edgar" in connectors:
+        reference_jobs.append({"source": "sec_edgar", "dataset": "filing_index", "symbols": ["320193"], "start_date": args.date, "end_date": args.date, "output_name": "sec_filings"})
     if reference_jobs:
         service.collect_reference_data(reference_jobs)
     if "massive" in connectors and "finnhub" in connectors:
