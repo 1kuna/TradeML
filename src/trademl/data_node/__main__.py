@@ -62,6 +62,7 @@ def main() -> int:
     budgets = BudgetManager({vendor: {"rpm": values["rpm"], "daily_cap": values["daily_cap"]} for vendor, values in config["vendors"].items()})
     connector = AlpacaConnector(
         base_url=os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
+        trading_base_url=os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
         api_key=os.getenv("ALPACA_API_KEY", ""),
         secret_key=os.getenv("ALPACA_API_SECRET", ""),
         budget_manager=budgets,
@@ -151,7 +152,12 @@ def main() -> int:
             ]
         )
     if "finnhub" in connectors:
-        reference_jobs.append({"source": "finnhub", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar"})
+        reference_jobs.extend(
+            [
+                {"source": "finnhub", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar"},
+                {"source": "finnhub", "dataset": "company_profile", "symbols": symbols, "output_name": "company_profiles"},
+            ]
+        )
     reference_jobs.append({"source": "sec_edgar", "dataset": "filing_index", "symbols": ["320193"], "output_name": "sec_filings"})
 
     if args.once or args.date:

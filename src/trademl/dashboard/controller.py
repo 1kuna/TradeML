@@ -24,8 +24,10 @@ import yaml
 
 from trademl.calendars.exchange import get_trading_days
 from trademl.connectors.alpaca import AlpacaConnector
+from trademl.connectors.base import ConnectorError
 from trademl.data_node.bootstrap import Stage0UniverseBuilder
 from trademl.data_node.budgets import BudgetManager
+from trademl.data_node.db import DataNodeDB
 from trademl.fleet.cluster import (
     ClusterCoordinator,
     ClusterPaths,
@@ -37,6 +39,7 @@ from trademl.fleet.cluster import (
     systemd_journal_tail,
     systemd_status,
 )
+from trademl.reference.universe import build_stage1_universe, build_time_varying_universe
 
 
 @dataclass(slots=True)
@@ -331,6 +334,86 @@ def join_cluster(settings: NodeSettings, *, passphrase: str | None = None) -> di
     return {"manifest": manifest, "rebuilt": rebuilt, "worker_id": coordinator.worker_id}
 
 
+def advance_collection_stage(
+    settings: NodeSettings,
+    *,
+    target_stage: int,
+    symbol_count: int | None = None,
+    years: int | None = None,
+    passphrase: str | None = None,
+) -> dict[str, Any]:
+    """Promote the active collection stage, persist cluster state, and seed backlog tasks."""
+    if passphrase:
+        persist_cluster_passphrase(settings, passphrase)
+    config = _read_yaml(settings.config_path)
+    stage_cfg = config.get("stage", {})
+    stage_defaults = stage_cfg.get(f"stage_{target_stage}", {})
+    stage_years = int(years or stage_defaults.get("eod_years", 5 if target_stage == 0 else 10))
+    target_count = int(symbol_count or stage_defaults.get("symbols", 100 if target_stage == 0 else 500))
+    alpaca = _alpaca_connector(settings)
+    if alpaca is None:
+        raise RuntimeError("ALPACA_API_KEY is required to build a collection universe")
+    as_of = datetime.now(tz=UTC).date().isoformat()
+    if target_stage == 0:
+        symbols = Stage0UniverseBuilder(connector=alpaca).build(symbol_count=target_count, as_of_date=as_of)
+    elif target_stage == 1:
+        listing_history_path = settings.reference_root / "listing_history.parquet"
+        if not listing_history_path.exists():
+            raise RuntimeError("listing_history.parquet is required before promoting to Stage 1")
+        listing_history = pd.read_parquet(listing_history_path)
+        symbols = build_stage1_universe(
+            listing_history=listing_history,
+            connector=alpaca,
+            symbol_count=target_count,
+            as_of_date=as_of,
+        )
+    else:
+        raise RuntimeError(f"unsupported stage target: {target_stage}")
+    history_probe = _probe_available_history_years(
+        connector=alpaca,
+        sample_symbols=symbols[: min(5, len(symbols))],
+        requested_years=stage_years,
+        as_of_date=as_of,
+    )
+    effective_years = int(history_probe["effective_years"])
+    if effective_years <= 0:
+        raise RuntimeError(f"unable to collect historical bars for Stage {target_stage} with the current vendor entitlements")
+    stage_years = effective_years
+
+    stage_payload = _read_yaml(settings.stage_path)
+    stage_payload["current"] = int(target_stage)
+    stage_payload["symbols"] = list(symbols)
+    stage_payload["years"] = stage_years
+    stage_payload.setdefault("selection", {})
+    stage_payload["selection"] = {"target_stage": int(target_stage), "as_of_date": as_of, "symbol_count": len(symbols)}
+    _write_yaml(settings.stage_path, stage_payload)
+
+    config.setdefault("stage", {})
+    config["stage"]["current"] = int(target_stage)
+    config["stage"].setdefault(f"stage_{target_stage}", {})
+    config["stage"][f"stage_{target_stage}"]["symbols"] = target_count
+    config["stage"][f"stage_{target_stage}"]["eod_years"] = stage_years
+    _write_yaml(settings.config_path, config)
+
+    coordinator = _coordinator(settings)
+    manifest = coordinator.update_stage(current_stage=target_stage, symbols=symbols, years=stage_years)
+    seeded = _seed_stage_backfill(settings.db_path, symbols=symbols, years=stage_years)
+
+    runtime_before = collect_dashboard_snapshot(settings)["runtime"]
+    restarted = False
+    if runtime_before.get("running"):
+        restart_node(settings, passphrase=passphrase)
+        restarted = True
+
+    return {
+        "stage": {"current": target_stage, "years": stage_years, "symbol_count": len(symbols), "symbols_preview": symbols[:10]},
+        "seeded_tasks": seeded,
+        "manifest": manifest,
+        "restarted": restarted,
+        "history_probe": history_probe,
+    }
+
+
 def rebuild_cluster_state(settings: NodeSettings, *, passphrase: str | None = None) -> dict[str, Any]:
     """Rebuild disposable local state from NAS-backed truth."""
     if passphrase:
@@ -346,6 +429,51 @@ def rebuild_cluster_state(settings: NodeSettings, *, passphrase: str | None = No
         passphrase=passphrase,
         universe_builder=_coordinator(settings).universe_builder,
     )
+
+
+def stage_one_universe_snapshot(settings: NodeSettings, *, top_n: int = 500) -> dict[str, Any]:
+    """Preview the current Stage 1 expansion universe and any available time-varying membership."""
+    listing_history_path = settings.reference_root / "listing_history.parquet"
+    if not listing_history_path.exists():
+        raise RuntimeError("listing_history.parquet is required to preview Stage 1")
+    listing_history = pd.read_parquet(listing_history_path)
+    alpaca = _alpaca_connector(settings)
+    if alpaca is None:
+        raise RuntimeError("ALPACA_API_KEY is required to build the Stage 1 universe")
+    as_of = datetime.now(tz=UTC).date().isoformat()
+    symbols = build_stage1_universe(
+        listing_history=listing_history,
+        connector=alpaca,
+        symbol_count=top_n,
+        as_of_date=as_of,
+    )
+    history_probe = _probe_available_history_years(
+        connector=alpaca,
+        sample_symbols=symbols[: min(5, len(symbols))],
+        requested_years=10,
+        as_of_date=as_of,
+    )
+    curated_files = sorted(settings.curated_equities_root.glob("date=*/data.parquet"))
+    tv_membership = pd.DataFrame()
+    if curated_files:
+        preview_files = curated_files[-65:]
+        panel = pd.concat((pd.read_parquet(path)[["date", "symbol", "close", "volume"]] for path in preview_files), ignore_index=True)
+        rebalance_dates = sorted(pd.to_datetime(panel["date"]).dropna().dt.normalize().unique())
+        rebalance_dates = [date.isoformat() for date in rebalance_dates[-13::5]]
+        tv_membership = build_time_varying_universe(
+            listing_history=listing_history,
+            daily_bars=panel,
+            rebalance_dates=rebalance_dates,
+            top_n=min(top_n, 500),
+        )
+    return {
+        "symbol_count": len(symbols),
+        "symbols_preview": symbols[:25],
+        "listing_history_rows": len(listing_history),
+        "time_varying_dates": sorted(tv_membership["date"].astype("string").unique().tolist()) if not tv_membership.empty else [],
+        "time_varying_rows": len(tv_membership),
+        "history_probe": history_probe,
+    }
 
 
 def leave_cluster(settings: NodeSettings) -> dict[str, Any]:
@@ -599,6 +727,7 @@ def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
         universe_builder = Stage0UniverseBuilder(
             connector=AlpacaConnector(
                 base_url=env_values.get("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
+                trading_base_url=env_values.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
                 api_key=env_values.get("ALPACA_API_KEY", ""),
                 secret_key=env_values.get("ALPACA_API_SECRET", ""),
                 budget_manager=BudgetManager({"alpaca": alpaca_budget}),
@@ -614,6 +743,76 @@ def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
         worker_id=settings.worker_id,
         universe_builder=universe_builder,
     )
+
+
+def _alpaca_connector(settings: NodeSettings) -> AlpacaConnector | None:
+    env_values = _read_env_file(settings.env_path)
+    config = _read_yaml(settings.config_path)
+    vendors = config.get("vendors", {})
+    alpaca_budget = vendors.get("alpaca", {"rpm": 150, "daily_cap": 10000})
+    if not env_values.get("ALPACA_API_KEY"):
+        return None
+    return AlpacaConnector(
+        base_url=env_values.get("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
+        trading_base_url=env_values.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
+        api_key=env_values.get("ALPACA_API_KEY", ""),
+        secret_key=env_values.get("ALPACA_API_SECRET", ""),
+        budget_manager=BudgetManager({"alpaca": alpaca_budget}),
+    )
+
+
+def _seed_stage_backfill(db_path: Path, *, symbols: list[str], years: int) -> int:
+    db = DataNodeDB(db_path)
+    end_date = datetime.now(tz=UTC).date().isoformat()
+    start_date = f"{int(end_date[:4]) - years}-{end_date[5:]}"
+    created = 0
+    for symbol in symbols:
+        try:
+            db.enqueue_task("equities_eod", symbol, start_date, end_date, "BOOTSTRAP", 5)
+        except Exception:
+            continue
+        else:
+            created += 1
+    return created
+
+
+def _probe_available_history_years(
+    *,
+    connector: AlpacaConnector,
+    sample_symbols: list[str],
+    requested_years: int,
+    as_of_date: str,
+) -> dict[str, Any]:
+    """Probe the primary bar source to find the largest usable historical window."""
+    if requested_years <= 0 or not sample_symbols:
+        return {"requested_years": requested_years, "effective_years": 0, "probe_symbol_count": len(sample_symbols)}
+    anchor = pd.Timestamp(as_of_date).normalize()
+    last_error: str | None = None
+    for years in range(int(requested_years), 0, -1):
+        start = (anchor - pd.DateOffset(years=years)).date().isoformat()
+        probe_end = min(anchor, pd.Timestamp(start) + pd.Timedelta(days=14)).date().isoformat()
+        try:
+            frame = connector.fetch("equities_eod", sample_symbols, start, probe_end)
+        except ConnectorError as exc:
+            last_error = str(exc)
+            continue
+        if not frame.empty:
+            return {
+                "requested_years": int(requested_years),
+                "effective_years": years,
+                "probe_start": start,
+                "probe_end": probe_end,
+                "probe_symbol_count": len(sample_symbols),
+                "sample_symbols": list(sample_symbols),
+                "rows": len(frame),
+            }
+    return {
+        "requested_years": int(requested_years),
+        "effective_years": 0,
+        "probe_symbol_count": len(sample_symbols),
+        "sample_symbols": list(sample_symbols),
+        "error": last_error,
+    }
 
 
 def _read_queue_counts(db_path: Path) -> dict[str, int]:

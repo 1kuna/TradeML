@@ -78,6 +78,7 @@ def test_alpaca_connector_normalizes_bars() -> None:
     )
     connector: BaseConnector = AlpacaConnector(
         base_url="https://data.alpaca.markets",
+        trading_base_url="https://paper-api.alpaca.markets/v2",
         api_key="key",
         budget_manager=_budget_manager(),
         session=session,
@@ -109,6 +110,7 @@ def test_alpaca_connector_normalizes_assets() -> None:
     )
     connector: BaseConnector = AlpacaConnector(
         base_url="https://data.alpaca.markets",
+        trading_base_url="https://paper-api.alpaca.markets/v2",
         api_key="key",
         budget_manager=_budget_manager(),
         session=session,
@@ -119,6 +121,7 @@ def test_alpaca_connector_normalizes_assets() -> None:
     assert frame.iloc[0]["symbol"] == "AAPL"
     assert frame.iloc[0]["asset_class"] == "us_equity"
     assert bool(frame.iloc[0]["tradable"]) is True
+    assert session.calls[0][1] == "https://paper-api.alpaca.markets/v2/assets"
 
 
 def test_massive_connector_normalizes_bars() -> None:

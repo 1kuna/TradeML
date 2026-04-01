@@ -490,10 +490,14 @@ class ClusterCoordinator:
         shard_path = self.paths.shards_root / "equities_eod.json"
         if shard_path.exists():
             return
+        self.write_shards(manifest)
+
+    def write_shards(self, manifest: dict[str, Any]) -> None:
+        """Write the current equities shard map from the manifest stage symbols."""
         shard_count = int(manifest["datasets"]["equities_eod"]["shard_count"])
         shard_specs = build_shard_map("equities_eod", manifest["stage"]["symbols"], shard_count)
         _write_json(
-            shard_path,
+            self.paths.shards_root / "equities_eod.json",
             {
                 "dataset": "equities_eod",
                 "shard_count": shard_count,
@@ -508,6 +512,21 @@ class ClusterCoordinator:
                 ],
             },
         )
+
+    def update_stage(self, *, current_stage: int, symbols: list[str], years: int) -> dict[str, Any]:
+        """Persist a new active stage into the manifest and refresh shard layout."""
+        manifest = self.load_manifest()
+        if not manifest:
+            raise RuntimeError("cluster manifest missing")
+        manifest["stage"] = {"current": int(current_stage), "symbols": list(symbols), "years": int(years)}
+        _write_yaml(self.paths.manifest_path, manifest)
+        self.write_shards(manifest)
+        append_cluster_event(
+            self.paths,
+            "stage_updated",
+            {"worker_id": self.worker_id, "current_stage": int(current_stage), "symbol_count": len(symbols), "years": int(years)},
+        )
+        return manifest
 
     def _ensure_secret_bundle(self, *, passphrase: str | None) -> None:
         if self.paths.secrets_path.exists():

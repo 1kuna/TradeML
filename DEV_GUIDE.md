@@ -3,7 +3,7 @@
 **Read this first.** This document tells you what to build, in what order, and how to know when each phase is done. It is the instruction set for autonomous implementation.
 
 **Reference documents:**
-- `SSOT_V3.md` — the canonical spec. Every design decision, schema, and contract lives there. When in doubt, the SSOT wins.
+- `SSOT.md` — the canonical spec. Every design decision, schema, and contract lives there. When in doubt, the SSOT wins.
 - `Data_Sourcing_Playbook.md` — vendor details and PIT practices
 - `Data_Sources_Detail.pdf` — exact API endpoint paths and parameters
 
@@ -11,7 +11,7 @@
 - **Phase**: a group of work that produces a testable, working milestone.
 - **Gate**: a concrete checklist of pass/fail criteria. All items must pass before moving to the next phase.
 - **Your call**: marks where multiple valid implementations exist. Pick one, document why in a code comment.
-- **SSOT §X.Y**: references a specific section in SSOT_V3.md.
+- **SSOT §X.Y**: references a specific section in SSOT.md.
 
 **General rules:**
 - Test-first where practical. Write the test, then make it pass.
@@ -28,7 +28,7 @@
 
 ```
 trademl/
-├── SSOT_V3.md                          # Canonical spec (copy in)
+├── SSOT.md                             # Canonical spec
 ├── CLAUDE.md                           # Agent instructions (copy in)
 ├── README.md                           # Brief project overview
 ├── pyproject.toml                      # Dependencies, project config
@@ -132,7 +132,7 @@ trademl/
 │   └── node.yml                        # Pi node config (SSOT §10.2)
 │
 └── docs/
-    ├── SSOT_V3.md
+    ├── archive/
     ├── Data_Sourcing_Playbook.md
     ├── Data_Sources_Detail.pdf
     └── archive/                        # All old docs go here
@@ -163,7 +163,7 @@ trademl/
        assert trademl is not None
    ```
 
-5. **Copy SSOT_V3.md** into `docs/`.
+5. **Keep `SSOT.md` at repo root as the canonical spec.**
 
 ### Gate 0
 - [ ] `pip install -e .` succeeds

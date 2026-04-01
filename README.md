@@ -77,4 +77,4 @@ For Raspberry Pi / Linux workers, you can also install the systemd unit:
 
 ## Status
 
-This repository follows `DEV_GUIDE.md` phase-by-phase. The canonical design contract lives in `docs/SSOT_V3.md`.
+This repository follows `DEV_GUIDE.md` phase-by-phase. The canonical design contract lives in `SSOT.md`.

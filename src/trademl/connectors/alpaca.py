@@ -22,9 +22,10 @@ class AlpacaConnector(HTTPConnector):
 
     vendor_name = "alpaca"
 
-    def __init__(self, *, secret_key: str | None = None, **kwargs: object) -> None:
+    def __init__(self, *, secret_key: str | None = None, trading_base_url: str | None = None, **kwargs: object) -> None:
         super().__init__(**kwargs)
         self.secret_key = secret_key
+        self.trading_base_url = (trading_base_url or kwargs.get("base_url") or "").rstrip("/")
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -42,7 +43,8 @@ class AlpacaConnector(HTTPConnector):
         """Fetch normalized Alpaca bars."""
         if dataset == "assets":
             payload = self.request_json(
-                endpoint="/v2/assets",
+                base_url=self.trading_base_url,
+                endpoint=self._assets_endpoint(),
                 params={"status": "active", "asset_class": "us_equity"},
                 task_kind="OTHER",
             )
@@ -122,3 +124,9 @@ class AlpacaConnector(HTTPConnector):
             "source_uri",
             "vendor_ts",
         ]
+
+    def _assets_endpoint(self) -> str:
+        """Return the assets endpoint relative to the configured trading base URL."""
+        if self.trading_base_url.endswith("/v2"):
+            return "/assets"
+        return "/v2/assets"

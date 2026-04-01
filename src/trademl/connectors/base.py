@@ -114,6 +114,7 @@ class HTTPConnector:
         *,
         method: str,
         endpoint: str,
+        base_url: str | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         task_kind: str = "OTHER",
@@ -129,7 +130,7 @@ class HTTPConnector:
             start = time.perf_counter()
             response = self.session.request(
                 method=method,
-                url=f"{self.base_url}{endpoint}",
+                url=f"{(base_url or self.base_url).rstrip('/')}{endpoint}",
                 params=params,
                 headers=request_headers,
                 timeout=timeout,
@@ -158,23 +159,39 @@ class HTTPConnector:
         self,
         *,
         endpoint: str,
+        base_url: str | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         task_kind: str = "OTHER",
     ) -> dict[str, Any] | list[Any]:
         """Issue a JSON request."""
-        response = self._request(method="GET", endpoint=endpoint, params=params, headers=headers, task_kind=task_kind)
+        response = self._request(
+            method="GET",
+            endpoint=endpoint,
+            base_url=base_url,
+            params=params,
+            headers=headers,
+            task_kind=task_kind,
+        )
         return response.json()
 
     def request_csv(
         self,
         *,
         endpoint: str,
+        base_url: str | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         task_kind: str = "OTHER",
     ) -> pd.DataFrame:
         """Issue a CSV request."""
-        response = self._request(method="GET", endpoint=endpoint, params=params, headers=headers, task_kind=task_kind)
+        response = self._request(
+            method="GET",
+            endpoint=endpoint,
+            base_url=base_url,
+            params=params,
+            headers=headers,
+            task_kind=task_kind,
+        )
         reader = csv.DictReader(io.StringIO(response.text))
         return pd.DataFrame(reader)

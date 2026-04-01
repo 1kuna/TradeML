@@ -6,7 +6,7 @@ TradeML: autonomous equities research system. Pi collects daily bars → NAS →
 
 ## Canonical Spec
 
-`docs/SSOT_V3.md` is the single source of truth. Every design decision lives there. When in doubt, the SSOT wins over comments, old code, or your own intuition.
+`SSOT.md` is the single source of truth. Every design decision lives there. When in doubt, the SSOT wins over comments, old code, or your own intuition.
 
 ## Build Order
 

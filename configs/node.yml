@@ -14,6 +14,10 @@ stage:
     symbols: 100
     eod_years: 5
     green_promote_threshold: 0.98
+  stage_1:
+    symbols: 500
+    eod_years: 10
+    green_promote_threshold: 0.98
 vendors:
   alpaca:
     rpm: 150
@@ -56,6 +60,7 @@ vendors:
     daily_cap: 200
     datasets:
     - delistings
+    - symbol_changes
     - earnings_calendar
     - fundamentals
     role: reference

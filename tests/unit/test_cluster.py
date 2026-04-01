@@ -230,3 +230,25 @@ def test_sync_shard_leases_does_not_release_singleton_leases(tmp_path: Path) -> 
 
     singleton_path = nas / "control" / "cluster" / "leases" / "singleton__backfill__2026-04-01.json"
     assert singleton_path.exists()
+
+
+def test_update_stage_rewrites_manifest_and_shards(tmp_path: Path) -> None:
+    workspace, nas, config_path, env_path = _seed_workspace(tmp_path)
+    coordinator = ClusterCoordinator(
+        nas_root=nas,
+        workspace_root=workspace,
+        config_path=config_path,
+        env_path=env_path,
+        local_state=workspace / "control",
+        nas_share="//nas/trademl",
+        worker_id="worker-a",
+        universe_builder=lambda count: [f"SYM{index:03d}" for index in range(count)],
+    )
+    coordinator.ensure_cluster_ready(passphrase="pass123")
+
+    manifest = coordinator.update_stage(current_stage=1, symbols=["AAA", "BBB", "CCC", "DDD"], years=10)
+
+    assert manifest["stage"]["current"] == 1
+    assert manifest["stage"]["years"] == 10
+    shard_payload = json.loads((nas / "control" / "cluster" / "shards" / "equities_eod.json").read_text(encoding="utf-8"))
+    assert sum(len(item["symbols"]) for item in shard_payload["shards"]) == 4

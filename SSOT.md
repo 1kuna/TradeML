@@ -44,9 +44,11 @@ All machines on the same LAN. NAS is the single shared filesystem for data. Pi k
       sec_filings/                       # date=YYYY-MM-DD/data.parquet (filing index)
     curated/                             # Adjusted, PIT-safe derived tables
       equities_ohlcv_adj/               # date=YYYY-MM-DD/data.parquet
-    reference/                           # Corp actions, delistings, calendars, universe, events
+    reference/                           # Corp actions, delistings, calendars, universe, security master
       corp_actions.parquet
-      delistings.parquet
+      listing_history.parquet            # Active + delisted symbols with IPO/delist dates
+      ticker_changes.parquet             # Symbol renames with CIK linkage
+      delistings.parquet                 # Enhanced delistings with reason + last price
       calendars/                         # Per-exchange session files
         XNYS.parquet                     # NYSE sessions, holidays, early closes
         XNAS.parquet                     # NASDAQ
@@ -89,7 +91,7 @@ Pi local (NOT on NAS):
 | Phase | Scope | Gate to Next Phase |
 |-------|-------|--------------------|
 | **Phase 1: Prove the Pipeline** | Pi collects daily EOD bars (free Alpaca) → NAS. Build features. Train Ridge baseline + LightGBM challenger. Walk-forward validation. Long-only, weekly rebalance, equal-weight buckets. | Stable positive rank IC across multiple years. Monotone decile spreads. Signal survives doubled costs. |
-| **Phase 2: Prove the Signal** | Buy clean data (Norgate, Databento, or Sharadar). Proper security master with permanent IDs. Expand to 500+ symbols with 10+ years. Add sector/fundamental features. Paper trade (long-only or ETF-hedged). | Go/no-go bars met on clean data with realistic costs. Paper trading operational for 4+ weeks. |
+| **Phase 2: Prove the Signal** | Build free security master (AV listings + FMP delistings + Polygon tickers + SEC filings). Track ticker changes, splits, delistings historically. Expand to 500+ symbols with 10+ years via time-varying survivorship-aware universe. Add sector/fundamental features. Paper trade (long-only or ETF-hedged). | Go/no-go bars met on clean data with realistic costs. Paper trading operational for 4+ weeks. |
 | **Phase 3: Add Complexity** | Options sleeve (with paid OPRA data). Meta-stacker. Champion/challenger automation. Long/short if borrow permits. | Options delta-hedged PnL passes go/no-go. Stacker outperforms single sleeves. |
 | **Phase 4: Scale** | Intraday models (only if justified). Offline RL for sizing (only if justified). DGX for heavy experiments. Live trading. | Prior phases fully stable. |
 
@@ -145,35 +147,120 @@ Source: FRED API (free, generous limits)
 | `vintage_date` | DATE (for ALFRED revisions) |
 | `ingested_at` | TIMESTAMP |
 
-**Reference — Corporate Actions** (Phase 1: basic; Phase 2: proper security master)
+**Reference — Corporate Actions**
 
-Phase 1 (from Alpha Vantage / FMP):
+Sources: Alpha Vantage (splits/dividends), Massive/Polygon (`get_stock_splits`, `get_stock_dividends`), Alpaca (`/v2/stocks/{symbol}/corporate_actions/announcements`). Cross-reference across sources to improve coverage.
 
-| Column | Type |
-|--------|------|
-| `symbol` | TEXT |
-| `event_type` | TEXT (split, dividend) |
-| `ex_date` | DATE |
-| `ratio` | FLOAT |
-| `source` | TEXT |
+| Column | Type | Notes |
+|--------|------|-------|
+| `symbol` | TEXT | Ticker at time of event |
+| `event_type` | TEXT | `split`, `dividend`, `reverse_split` |
+| `ex_date` | DATE | |
+| `record_date` | DATE | Nullable |
+| `pay_date` | DATE | Nullable |
+| `ratio` | FLOAT | Split: 2.0 = 2-for-1. Dividend: cash per share. |
+| `source` | TEXT | Which vendor(s) reported this |
+| `source_count` | INT | Number of vendors that agree (higher = more confident) |
+| `ingested_at` | TIMESTAMP | |
 
-**⚠ Phase 1 security-master limitations (accepted, fixed in Phase 2):**
-- No permanent identifiers — symbols can be reused after delistings
-- No ticker/name change history
-- No merger/spinoff handling
-- No terminal delisting return data
-- No historical index constituent membership
+Stored at: `reference/corp_actions.parquet`
 
-These limitations mean Phase 1 backtests have residual survivorship bias and imprecise corporate-action adjustments. This is acceptable for pipeline validation but NOT for concluding whether alpha exists. Phase 2 addresses this by purchasing a proper reference dataset (Norgate, Databento, or Sharadar/Nasdaq Data Link) that provides PIT IDs, delisted coverage, and corporate-action history.
+**Reference — Listing History (Free Security Master)**
 
-**Reference — Delistings** (Phase 1: basic)
+This is the core of our survivorship-bias-free universe. Built by cross-referencing multiple free sources.
 
-| Column | Type |
-|--------|------|
-| `symbol` | TEXT |
-| `delist_date` | DATE |
-| `reason` | TEXT |
-| `source` | TEXT |
+Sources:
+- **Alpha Vantage `LISTING_STATUS`**: returns both active AND delisted symbols with `ipoDate` and `delistingDate`
+- **FMP `/api/v3/delisted-company`**: delisted companies with last trading date
+- **Polygon `get_tickers`**: ticker metadata including active/delisted status
+- **Finnhub `/stock/symbol`** and `/stock/profile2`: active symbols with exchange, industry, sector
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `symbol` | TEXT | Ticker |
+| `name` | TEXT | Company name |
+| `exchange` | TEXT | NYSE, NASDAQ, etc. |
+| `asset_type` | TEXT | `common_stock`, `etf`, `preferred`, etc. |
+| `ipo_date` | DATE | First trading date |
+| `delist_date` | DATE | Nullable (NULL = still active) |
+| `delist_reason` | TEXT | Nullable — `merged`, `acquired`, `bankruptcy`, `moved_exchange`, `unknown` |
+| `sector` | TEXT | Nullable |
+| `industry` | TEXT | Nullable |
+| `status` | TEXT | `active` or `delisted` |
+| `sources` | TEXT | Comma-separated list of vendors that confirm this record |
+| `last_verified` | TIMESTAMP | Last time we checked this record |
+
+Stored at: `reference/listing_history.parquet`
+
+**How we build the time-varying universe from this:**
+```python
+def get_universe(as_of_date, min_dollar_volume=None, top_n=500):
+    """Return symbols that were listed and not yet delisted on as_of_date."""
+    listings = pd.read_parquet("reference/listing_history.parquet")
+    eligible = listings[
+        (listings.ipo_date <= as_of_date) &
+        (listings.delist_date.isna() | (listings.delist_date > as_of_date)) &
+        (listings.asset_type == "common_stock")
+    ]
+    if min_dollar_volume:
+        # rank by dollar volume and take top N
+        ...
+    return eligible.head(top_n)
+```
+
+**Reference — Ticker Changes**
+
+Tracks when a company changes its ticker symbol (e.g., FB → META). Without this, a renamed stock looks like a delisting + a new IPO, which breaks return continuity and inflates the universe with phantom entries.
+
+Sources:
+- **Polygon `/v3/reference/tickers`**: includes `cik` (SEC Central Index Key) which persists across ticker changes
+- **FMP `/api/v3/symbol-change`**: explicit ticker change history
+- **SEC EDGAR**: CIK-based lookups connect old and new tickers for the same entity
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `old_symbol` | TEXT | Previous ticker |
+| `new_symbol` | TEXT | New ticker |
+| `change_date` | DATE | Date the change took effect |
+| `cik` | TEXT | Nullable — SEC CIK if available (persists across changes) |
+| `reason` | TEXT | `rename`, `merger`, `spinoff`, `reorg` |
+| `source` | TEXT | |
+
+Stored at: `reference/ticker_changes.parquet`
+
+**Usage:** When building historical price series for a symbol, check `ticker_changes` and chain the old symbol's history to the new one. For example, META's price history should include FB's data before June 2022. The CIK field (from Polygon or SEC EDGAR) serves as a pseudo-permanent-ID that survives ticker changes.
+
+**Reference — Delistings**
+
+Enhanced delisting tracking cross-referenced from multiple free sources.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `symbol` | TEXT | Ticker at time of delisting |
+| `delist_date` | DATE | Last trading date |
+| `reason` | TEXT | `merged`, `acquired`, `bankruptcy`, `moved_exchange`, `regulatory`, `unknown` |
+| `acquiring_symbol` | TEXT | Nullable — if merged/acquired, who bought them |
+| `last_price` | FLOAT | Nullable — last known closing price (for terminal return calc) |
+| `source` | TEXT | |
+| `source_count` | INT | Number of vendors confirming |
+
+Stored at: `reference/delistings.parquet`
+
+**Terminal delisting returns:** If we have `last_price` from the final trading day, we can compute the terminal return for delisted names rather than silently dropping them. For mergers/acquisitions, the acquiring symbol's price on the deal close date is a reasonable proxy for the terminal value. For bankruptcies, assume total loss. This isn't perfect but it's much better than ignoring delistings entirely.
+
+**⚠ Free-source security master limitations (honest):**
+- No true permanent IDs — we use CIK where available (from Polygon/SEC EDGAR), but not all symbols have CIKs
+- Ticker change coverage depends on FMP and Polygon data quality; some changes may be missed
+- Delist reason and terminal price coverage is incomplete
+- No historical index constituent membership (e.g., "was AAPL in the S&P 500 on 2015-03-15?") — deferred unless a free source emerges
+- Merger/spinoff cash+stock deal handling is approximate
+
+These limitations are real but small for the top 500 liquid US stocks. Ticker reuse, complex spinoffs, and missing delistings mostly affect micro/small-cap names. For large/mid-cap research, this free security master is ~80% of what a paid vendor provides.
+
+**Optional paid upgrade:** If the free security master proves too leaky (backtests show unexplained return discontinuities or phantom symbols), the upgrade path is:
+- **Norgate Data** (~$50–100/mo): gold standard for survivorship-bias-free backtesting
+- **Databento**: PIT security master with official corporate actions
+- **Sharadar / Nasdaq Data Link** (~$30–50/mo): EOD + fundamentals + corp actions with delisted coverage
 
 **Curated — Equities OHLCV Adjusted**
 
@@ -211,11 +298,11 @@ Same column schema as raw bars, with our own split/dividend adjustments applied.
 
 Having multiple sources for the same data enables cross-vendor validation — if Alpaca and Massive disagree on a close price, we flag it for review.
 
-**Phase 2 data upgrade candidates** (in order of value-for-money):
-- **Norgate Data**: survivorship-bias-free US stocks, delisted names, historical constituents, corporate actions. Gold standard for backtesting.
-- **Databento**: PIT security master, corporate actions, official closing prices. API-native. New but comprehensive.
-- **Sharadar / Nasdaq Data Link**: EOD prices + fundamentals + corporate actions with delisted coverage.
-- **Tiingo**: EOD data with splits/dividends, decent API. Cheaper option.
+**Optional paid data upgrades** (if free security master proves insufficient):
+- **Norgate Data**: survivorship-bias-free US stocks, delisted names, historical constituents, corporate actions. Gold standard for backtesting. ~$50–100/mo.
+- **Databento**: PIT security master, corporate actions, official closing prices. API-native. Pay-per-use.
+- **Sharadar / Nasdaq Data Link**: EOD prices + fundamentals + corporate actions with delisted coverage. ~$30–50/mo.
+- **Tiingo**: EOD data with splits/dividends, decent API. Free–$30/mo.
 
 ### 1.3 Completeness Model (GREEN / AMBER / RED)
 
@@ -270,10 +357,26 @@ CREATE TABLE backfill_queue (
 
 | Stage | Universe | EOD History | Promotion Trigger |
 |-------|----------|-------------|-------------------|
-| **Stage 0** (Phase 1) | 100 liquid US large/mid-caps | 5 years | ≥98% GREEN on EOD bars |
-| **Stage 1** (Phase 2) | 500+ US equities (incl. delisted, with paid data) | 10–15 years | Manual, after data vendor purchased |
+| **Stage 0** (Phase 1) | 100 liquid US large/mid-caps (current tickers) | 5 years | ≥98% GREEN on EOD bars |
+| **Stage 1** (Phase 2) | 500+ US equities (time-varying, survivorship-aware, including delisted) | 10–15 years | Listing history + ticker changes built and validated |
 
-Universe selection (Phase 1): US common stocks above a liquidity floor, based on Alpaca's available symbols. Accept that this is survivorship-biased — the universe is names that are still listed today. Phase 2 fixes this with a proper security master.
+**Phase 1 universe build** (programmatic):
+1. Query Alpaca `/v2/assets` for all tradable US common stocks
+2. Filter: active, listed on NYSE/NASDAQ, asset class = `us_equity`
+3. Rank by 20-day average dollar volume (IEX-only, rough proxy but fine for relative ranking)
+4. Take top 100
+5. Accept that this is survivorship-biased — these are names that exist today
+
+**Phase 2 universe build** (programmatic, survivorship-aware):
+1. Build `reference/listing_history.parquet` from AV `LISTING_STATUS` + FMP delistings + Polygon tickers (see §1.1)
+2. Build `reference/ticker_changes.parquet` from FMP symbol changes + Polygon CIK data + SEC EDGAR (see §1.1)
+3. For each rebalance date in the backtest, compute the as-of universe:
+   - All symbols where `ipo_date <= rebalance_date` and (`delist_date IS NULL` or `delist_date > rebalance_date`)
+   - Filter to `asset_type = 'common_stock'`
+   - Rank by trailing dollar volume, take top 500
+4. Chain ticker histories via `ticker_changes` so renamed stocks keep continuous price series
+5. Include terminal returns for delisted names (merger price, last trade, or assumed loss)
+6. This produces a **different 500-symbol universe for each rebalance date** — the correct way to handle survivorship
 
 ### 1.6 QC Checks
 
@@ -294,7 +397,7 @@ Universe selection (Phase 1): US common stocks above a liquidity floor, based on
 - Corporate actions applied downstream, never modifying raw data
 - FRED series: store vintage dates where available (ALFRED) for revision-aware research
 - Earnings dates: use the *announcement date* (not the report date) for distance-to-earnings features and for avoiding rebalancing into known events
-- **Phase 1 honest limitation**: universe is survivorship-biased (current tickers only). Acknowledged and accepted. Fixed in Phase 2.
+- **Phase 1 honest limitation**: universe is survivorship-biased (current tickers only). Acknowledged and accepted for pipeline validation. Phase 2 builds a time-varying universe from free listing history data.
 
 ### 1.8 Exchange Calendars
 
@@ -337,7 +440,7 @@ Curated tables are deterministic rebuilds from raw data plus reference data. The
 
 **Lineage:** Each curated file records `curated_at` timestamp and the set of raw + reference files that contributed to it.
 
-**Phase 1 limitations:** Adjustments are best-effort. Without a proper security master, we may miss some corporate actions, handle ticker changes incorrectly, or fail to account for mergers/spinoffs. Accepted for Phase 1.
+**Phase 1 limitations:** Adjustments are best-effort with a single-source corp actions table. Phase 2 cross-references multiple free sources (AV + Polygon + Alpaca) for higher-confidence adjustments and chains ticker histories via `ticker_changes.parquet` so renamed stocks get continuous adjusted series.
 
 ### 1.10 Events & Earnings Data
 
@@ -402,16 +505,16 @@ Per `(date, symbol)`, computed from curated OHLCV:
 **Size/Price (important controls):**
 - Log price level
 
-**⚠ Dropped from Phase 1 — market cap:** Computing market cap requires historical shares outstanding as a dated PIT series. If shares come from a latest company profile (e.g., Finnhub `/stock/profile2`), that is straight lookahead bias — you'd be using today's share count for past dates. Market cap features are deferred to Phase 2 when a proper security master with historical shares is available.
+**⚠ Dropped from Phase 1 — market cap:** Computing market cap requires historical shares outstanding as a dated PIT series. If shares come from a latest company profile (e.g., Finnhub `/stock/profile2`), that is straight lookahead bias — you'd be using today's share count for past dates. Phase 2 may be able to use FMP's `/api/v3/historical-market-cap/{symbol}` or Polygon's financials for dated market cap, but PIT safety of these free endpoints must be verified before use as a feature. Until verified, market cap is excluded.
 
 **Event proximity (risk control only — not a predictive feature in Phase 1):**
 - Binary flag: earnings within next 5 trading days → **used to exclude names from rebalancing**, not as a model input
 - ⚠ `days_to_next_earnings` is only PIT-safe if the historical earnings calendar preserves what was known as of each date. Finnhub and FMP calendars may backfill corrected dates, which leaks future info. Only SEC EDGAR 8-K filing dates are clearly defensible for historical PIT timing. In Phase 1, use the earnings flag **only as a risk/exclusion filter** (don't trade into imminent earnings), not as a predictive feature. Promote to a feature in Phase 2 if/when you have a verified PIT earnings calendar.
 
-**Phase 2 additions (with paid data):**
-- Industry-relative features (momentum, vol, returns relative to sector average)
+**Phase 2 additions (with expanded reference data):**
+- Industry-relative features (momentum, vol, returns relative to sector average — sector from listing history)
 - Residual momentum (return after stripping market + sector + size factors)
-- Fundamental features if data permits: valuation (E/P, B/P), profitability (ROE, gross margins), investment (asset growth), accruals, issuance
+- Fundamental features where free sources permit: FMP income statements, balance sheets; Finnhub financial metrics; Polygon financials. Must verify PIT safety before using as features (filing date vs report date).
 
 ### 2.2 Feature Preprocessing
 
@@ -485,7 +588,7 @@ Only after the Ridge baseline establishes whether there's signal at all:
 ### 3.3 Phase 2: CatBoost + Expanded Features
 
 - CatBoost as second nonlinear challenger
-- Expanded feature set including sector-relative, fundamental (with paid data)
+- Expanded feature set including sector-relative, fundamental (from free sources with PIT verification)
 - Regime masks: exclude pre-2012 data from training, use for stress testing only
 - Wider universe (500+ symbols, 10+ years)
 
@@ -1029,9 +1132,12 @@ vendors:
 
 ### Phase 2 Complete When:
 
-- [ ] Paid data vendor integrated (security master, delisted names, PIT corp actions)
+- [ ] Free security master built (listing history + ticker changes + delistings from AV/FMP/Polygon/SEC)
+- [ ] Time-varying survivorship-aware universe operational (different 500 symbols per rebalance date)
+- [ ] Ticker change chaining working (renamed stocks have continuous price series)
+- [ ] Terminal delisting returns computed (merger price, last trade, or assumed loss)
 - [ ] Universe expanded to 500+ with 10+ years of history
-- [ ] Features expanded (sector-relative, fundamental where available)
+- [ ] Features expanded (sector-relative, fundamental where PIT-verifiable)
 - [ ] Net Sharpe ≥ 0.7 on walk-forward with realistic costs
 - [ ] Signal robust across years, sectors, size buckets
 - [ ] Paper trading operational for 4+ weeks
@@ -1128,9 +1234,9 @@ See **Data_Sourcing_Playbook.md** for full vendor details and **Data_Sources_Det
 
 ---
 
-## Appendix C: Phase 2 Data Vendor Comparison
+## Appendix C: Optional Paid Data Vendor Comparison
 
-When Phase 1 results justify upgrading data quality, evaluate these vendors:
+If the free security master (AV + FMP + Polygon + SEC EDGAR) proves too leaky — e.g., backtests show unexplained return jumps, phantom symbols, or missing corporate actions — consider upgrading to a paid vendor:
 
 | Vendor | PIT IDs | Delisted | Corp Actions | Constituents | EOD Prices | Fundamentals | Approx. Cost |
 |--------|---------|----------|-------------|--------------|------------|-------------|-------------|

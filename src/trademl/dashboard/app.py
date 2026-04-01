@@ -18,6 +18,8 @@ from trademl.dashboard.controller import (
     reset_worker,
     resolve_node_settings,
     restart_node,
+    stage_one_universe_snapshot,
+    advance_collection_stage,
     rotate_cluster_passphrase,
     start_node,
     stop_node,
@@ -225,6 +227,46 @@ def main() -> None:
         if lifecycle_cols[2].button("Uninstall Worker", use_container_width=True):
             result = uninstall_worker(settings)
             st.success(f"Removed local worker artifacts: {len(result['removed_paths'])}")
+        st.subheader("Stage Expansion")
+        try:
+            stage_preview = stage_one_universe_snapshot(settings, top_n=500)
+        except Exception as exc:
+            st.info(f"Stage 1 preview unavailable: {exc}")
+        else:
+            st.write(f"Stage 1 candidate symbols: `{stage_preview['symbol_count']}`")
+            st.write(f"Listing-history rows: `{stage_preview['listing_history_rows']}`")
+            st.write(f"Time-varying rows available from collected bars: `{stage_preview['time_varying_rows']}`")
+            if stage_preview["history_probe"].get("effective_years", 0):
+                st.write(
+                    "Primary-source history currently available: "
+                    f"`{stage_preview['history_probe']['effective_years']}` years "
+                    f"(requested preview target: `{stage_preview['history_probe']['requested_years']}`)"
+                )
+            st.write(stage_preview["symbols_preview"])
+        with st.form("stage_promotion"):
+            target_stage = st.selectbox("Target Stage", [0, 1], format_func=lambda value: f"Stage {value}")
+            stage_symbol_count = st.number_input("Target Symbol Count", min_value=10, max_value=1000, step=10, value=500)
+            stage_years = st.number_input("History Years", min_value=1, max_value=20, step=1, value=10)
+            if st.form_submit_button("Advance Collection Stage"):
+                result = advance_collection_stage(
+                    settings,
+                    target_stage=int(target_stage),
+                    symbol_count=int(stage_symbol_count),
+                    years=int(stage_years),
+                    passphrase=cluster_passphrase or None,
+                )
+                message = (
+                    f"Stage {result['stage']['current']} ready with "
+                    f"{result['stage']['symbol_count']} symbols over "
+                    f"{result['stage']['years']} years; seeded {result['seeded_tasks']} tasks."
+                )
+                if result["history_probe"]["effective_years"] < result["history_probe"]["requested_years"]:
+                    st.warning(
+                        "Requested history was capped by live vendor availability: "
+                        f"{result['history_probe']['requested_years']} -> {result['history_probe']['effective_years']} years."
+                    )
+                st.success(message)
+                st.rerun()
 
     with tabs[3]:
         inventory_cols = st.columns(2)
