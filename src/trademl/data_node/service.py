@@ -356,24 +356,14 @@ class DataNodeService:
                     self.curate_dates(corp_actions=self.load_corp_actions_reference())
                     self.sync_partition_status()
                     coordinator.mark_singleton_success("audit_curate", trading_date, {"symbol_count": len(symbols)})
-
-                if macro_series_ids and "fred" in self.connectors and coordinator.acquire_singleton("macro", trading_date):
-                    self.collect_macro_data(macro_series_ids, trading_date, trading_date)
-                    coordinator.mark_singleton_success("macro", trading_date, {"series_count": len(macro_series_ids)})
-
-                week_key = self._week_key(current_et)
-                if reference_jobs and coordinator.acquire_singleton("reference", week_key):
-                    materialized_jobs = [self._materialize_job(job, trading_date) for job in reference_jobs]
-                    self.collect_reference_data(materialized_jobs)
-                    if any(job.get("output_name") == "corp_actions" for job in materialized_jobs):
-                        corp_actions_path = self.paths.root / "data" / "reference" / "corp_actions.parquet"
-                        if corp_actions_path.exists():
-                            self.curate_dates(corp_actions=pd.read_parquet(corp_actions_path))
-                    coordinator.mark_singleton_success("reference", week_key, {"job_count": len(materialized_jobs)})
-
-                if price_check_symbols and coordinator.acquire_singleton("price_checks", week_key):
-                    self.run_cross_vendor_price_checks(trading_date=trading_date, sample_symbols=price_check_symbols)
-                    coordinator.mark_singleton_success("price_checks", week_key, {"symbol_count": len(price_check_symbols)})
+                self._run_cluster_auxiliary_tasks(
+                    coordinator=coordinator,
+                    trading_date=trading_date,
+                    current_et=current_et,
+                    macro_series_ids=macro_series_ids,
+                    reference_jobs=reference_jobs,
+                    price_check_symbols=price_check_symbols,
+                )
 
             local_day = current_local.date().isoformat()
             should_run_maintenance = self._should_run_maintenance(
@@ -390,6 +380,20 @@ class DataNodeService:
                     self.sync_partition_status()
                     coordinator.mark_singleton_success("backfill", local_day, {"changed_dates": len(changed_dates)})
                     self._maintenance_history.add(local_day)
+
+            # Once EOD bars are fully present, opportunistically fill the slower
+            # auxiliary datasets instead of waiting for the next scheduled lane.
+            if not self.db.has_pending_backfill():
+                anchor_date = self._latest_raw_date()
+                if anchor_date:
+                    self._run_cluster_auxiliary_tasks(
+                        coordinator=coordinator,
+                        trading_date=anchor_date,
+                        current_et=current_et,
+                        macro_series_ids=macro_series_ids,
+                        reference_jobs=reference_jobs,
+                        price_check_symbols=price_check_symbols,
+                    )
 
             if not self._stop_event.is_set():
                 sleep_fn(poll_seconds)
@@ -507,6 +511,42 @@ class DataNodeService:
     def _week_key(current_et: datetime) -> str:
         iso = current_et.isocalendar()
         return f"{iso.year}-W{iso.week:02d}"
+
+    def _latest_raw_date(self) -> str | None:
+        latest: str | None = None
+        for path in self.paths.raw_equities.glob("date=*"):
+            _, _, value = path.name.partition("=")
+            if value and (latest is None or value > latest):
+                latest = value
+        return latest
+
+    def _run_cluster_auxiliary_tasks(
+        self,
+        *,
+        coordinator: ClusterCoordinator,
+        trading_date: str,
+        current_et: datetime,
+        macro_series_ids: list[str] | None,
+        reference_jobs: list[dict[str, object]] | None,
+        price_check_symbols: list[str] | None,
+    ) -> None:
+        if macro_series_ids and "fred" in self.connectors and coordinator.acquire_singleton("macro", trading_date):
+            self.collect_macro_data(macro_series_ids, trading_date, trading_date)
+            coordinator.mark_singleton_success("macro", trading_date, {"series_count": len(macro_series_ids)})
+
+        week_key = self._week_key(current_et)
+        if reference_jobs and coordinator.acquire_singleton("reference", week_key):
+            materialized_jobs = [self._materialize_job(job, trading_date) for job in reference_jobs]
+            self.collect_reference_data(materialized_jobs)
+            if any(job.get("output_name") == "corp_actions" for job in materialized_jobs):
+                corp_actions_path = self.paths.root / "data" / "reference" / "corp_actions.parquet"
+                if corp_actions_path.exists():
+                    self.curate_dates(corp_actions=pd.read_parquet(corp_actions_path))
+            coordinator.mark_singleton_success("reference", week_key, {"job_count": len(materialized_jobs)})
+
+        if price_check_symbols and coordinator.acquire_singleton("price_checks", week_key):
+            self.run_cross_vendor_price_checks(trading_date=trading_date, sample_symbols=price_check_symbols)
+            coordinator.mark_singleton_success("price_checks", week_key, {"symbol_count": len(price_check_symbols)})
 
     def _write_raw_shard_partition(self, frame: pd.DataFrame, *, shard_id: str) -> list[str]:
         changed_dates: list[str] = []

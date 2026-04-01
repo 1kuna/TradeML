@@ -22,6 +22,7 @@ class _NoopConnector:
 class _ClusterCoordinatorStub:
     def __init__(self) -> None:
         self._lease_calls: list[str] = []
+        self.allowed: set[str] = {"backfill"}
 
     def heartbeat_worker(self) -> dict[str, str]:
         return {"worker_id": "worker-a"}
@@ -31,7 +32,7 @@ class _ClusterCoordinatorStub:
 
     def acquire_singleton(self, task_name: str, bucket_key: str) -> bool:
         self._lease_calls.append(f"{task_name}:{bucket_key}")
-        return task_name == "backfill"
+        return task_name in self.allowed
 
     def mark_singleton_success(self, task_name: str, bucket_key: str, metadata: dict | None = None) -> None:
         self._lease_calls.append(f"success:{task_name}:{bucket_key}:{metadata or {}}")
@@ -123,3 +124,49 @@ def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(tmp_
     )
 
     assert calls == ["process_backfill_queue"]
+
+
+def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfill(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    raw_partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31"
+    raw_partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"symbol": "AAPL", "date": "2026-03-31", "close": 100.0}]).to_parquet(
+        raw_partition / "data.parquet",
+        index=False,
+    )
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector(), "fred": _NoopConnector(), "massive": _NoopConnector(), "finnhub": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    coordinator = _ClusterCoordinatorStub()
+    coordinator.allowed = {"macro", "reference", "price_checks"}
+    calls: list[str] = []
+
+    service.collect_macro_data = lambda *args, **kwargs: calls.append("macro") or []  # type: ignore[method-assign]
+    service.collect_reference_data = lambda *args, **kwargs: calls.append("reference") or []  # type: ignore[method-assign]
+
+    def _price_checks(*args, **kwargs):
+        calls.append("price_checks")
+        service.stop()
+        return tmp_path / "data" / "qc" / "price_checks_2026-03-31.parquet"
+
+    service.run_cross_vendor_price_checks = _price_checks  # type: ignore[method-assign]
+
+    service.run_cluster_forever(
+        coordinator=coordinator,  # type: ignore[arg-type]
+        symbols=["AAPL"],
+        exchange="XNYS",
+        collection_time_et="16:30",
+        maintenance_hour_local=23,
+        poll_seconds=0.0,
+        now_fn=lambda: datetime.fromisoformat("2026-03-31T18:00:00+00:00"),
+        sleep_fn=lambda _seconds: None,
+        macro_series_ids=["DGS10"],
+        reference_jobs=[{"source": "alpaca", "dataset": "equities_eod", "symbols": ["AAPL"], "output_name": "noop"}],
+        price_check_symbols=["AAPL"],
+    )
+
+    assert calls == ["macro", "reference", "price_checks"]
