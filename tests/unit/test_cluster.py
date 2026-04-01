@@ -124,6 +124,57 @@ def test_coordinator_bootstrap_and_rebuild_state(tmp_path: Path) -> None:
     assert (nas / "control" / "cluster" / "shards" / "equities_eod.json").exists()
 
 
+def test_rebuild_local_state_requeues_underfilled_partitions_after_stage_promotion(tmp_path: Path) -> None:
+    workspace, nas, config_path, env_path = _seed_workspace(tmp_path)
+    qc_root = nas / "data" / "qc"
+    qc_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "source": "alpaca",
+                "dataset": "equities_eod",
+                "date": "2025-01-02",
+                "status": "GREEN",
+                "row_count": 6,
+                "expected_rows": 6,
+            }
+        ]
+    ).to_parquet(qc_root / "partition_status.parquet", index=False)
+    raw_partition = nas / "data" / "raw" / "equities_bars" / "date=2025-01-02"
+    raw_partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"symbol": "AAPL", "close": 100.0}]).to_parquet(raw_partition / "data.parquet", index=False)
+
+    stage_symbols = [f"SYM{index:03d}" for index in range(20)]
+    coordinator = ClusterCoordinator(
+        nas_root=nas,
+        workspace_root=workspace,
+        config_path=config_path,
+        env_path=env_path,
+        local_state=workspace / "control",
+        nas_share="//nas/trademl",
+        worker_id="worker-a",
+        universe_builder=lambda count: stage_symbols[:count],
+    )
+    coordinator.ensure_cluster_ready(passphrase="pass123")
+    coordinator.update_stage(current_stage=1, symbols=stage_symbols, years=1)
+
+    rebuilt = coordinator.rebuild_local_state(local_db_path=workspace / "control" / "node.sqlite", current_date="2025-01-06")
+
+    assert rebuilt["gap_tasks"] >= 1
+    import sqlite3
+
+    conn = sqlite3.connect(workspace / "control" / "node.sqlite")
+    queued = conn.execute(
+        "SELECT COUNT(*) FROM backfill_queue WHERE dataset='equities_eod' AND start_date='2025-01-02' AND kind='GAP'"
+    ).fetchone()[0]
+    status_row = conn.execute(
+        "SELECT status, row_count, expected_rows FROM partition_status WHERE source='alpaca' AND dataset='equities_eod' AND date='2025-01-02'"
+    ).fetchone()
+    conn.close()
+    assert queued == 1
+    assert status_row == ("AMBER", 6, 20)
+
+
 def test_coordinator_bootstraps_from_config_when_stage_file_is_missing(tmp_path: Path) -> None:
     workspace, nas, config_path, env_path = _seed_workspace(tmp_path)
     (workspace / "stage.yml").unlink()

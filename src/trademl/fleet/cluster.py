@@ -220,6 +220,7 @@ class ClusterCoordinator:
         """Rebuild the local disposable DB from NAS data and cluster manifest."""
         manifest = self.load_manifest()
         current_ts = pd.Timestamp(current_date or datetime.now(tz=UTC).date())
+        expected_rows = len(manifest["stage"]["symbols"])
         if local_db_path.exists():
             local_db_path.unlink()
         db = DataNodeDB(local_db_path)
@@ -243,10 +244,40 @@ class ClusterCoordinator:
         start_ts = current_ts - pd.DateOffset(years=stage_years)
         expected_days = [day.isoformat() for day in get_trading_days("XNYS", start_ts.date(), current_ts.date())]
         raw_root = self.paths.nas_root / "data" / "raw" / "equities_bars"
+        statuses = {
+            (row["source"], row["dataset"], row["date"]): row
+            for row in db.fetch_partition_status()
+        }
         queue_count = 0
         for day in expected_days:
             partition = raw_root / f"date={day}" / "data.parquet"
-            if partition.exists():
+            existing = statuses.get(("alpaca", "equities_eod", day))
+            needs_gap = not partition.exists()
+            row_count = int(existing["row_count"] or 0) if existing else 0
+            if partition.exists() and expected_rows and row_count < expected_rows:
+                needs_gap = True
+                db.update_partition_status(
+                    source="alpaca",
+                    dataset="equities_eod",
+                    date=day,
+                    status="AMBER",
+                    row_count=row_count,
+                    expected_rows=expected_rows,
+                    qc_code="LOW_ROW_COUNT",
+                    note="rebuild detected partition below current stage symbol count",
+                )
+            elif partition.exists() and existing and int(existing["expected_rows"] or 0) < expected_rows:
+                db.update_partition_status(
+                    source="alpaca",
+                    dataset="equities_eod",
+                    date=day,
+                    status=str(existing["status"]),
+                    row_count=row_count,
+                    expected_rows=expected_rows,
+                    qc_code=existing["qc_code"],
+                    note=existing["note"],
+                )
+            if not needs_gap:
                 continue
             try:
                 db.enqueue_task("equities_eod", None, day, day, "GAP", 1)
