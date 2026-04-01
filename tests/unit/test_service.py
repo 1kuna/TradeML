@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from trademl.calendars.exchange import ExchangeCalendarStore
+from trademl.connectors.base import TemporaryConnectorError
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
@@ -17,6 +18,13 @@ class _NoopConnector:
 
     def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
         return pd.DataFrame()
+
+
+class _BudgetFailConnector:
+    vendor_name = "massive"
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        raise TemporaryConnectorError("budget exhausted for vendor=massive")
 
 
 class _ClusterCoordinatorStub:
@@ -170,3 +178,45 @@ def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfil
     )
 
     assert calls == ["macro", "reference", "price_checks"]
+
+
+def test_run_cluster_forever_reference_budget_failure_does_not_crash_worker(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    raw_partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31"
+    raw_partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"symbol": "AAPL", "date": "2026-03-31", "close": 100.0}]).to_parquet(
+        raw_partition / "data.parquet",
+        index=False,
+    )
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector(), "fred": _NoopConnector(), "massive": _BudgetFailConnector(), "finnhub": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    coordinator = _ClusterCoordinatorStub()
+    coordinator.allowed = {"reference", "price_checks"}
+    calls: list[str] = []
+
+    def _price_checks(*args, **kwargs):
+        calls.append("price_checks")
+        service.stop()
+        return tmp_path / "data" / "qc" / "price_checks_2026-03-31.parquet"
+
+    service.run_cross_vendor_price_checks = _price_checks  # type: ignore[method-assign]
+
+    service.run_cluster_forever(
+        coordinator=coordinator,  # type: ignore[arg-type]
+        symbols=["AAPL"],
+        exchange="XNYS",
+        collection_time_et="16:30",
+        maintenance_hour_local=23,
+        poll_seconds=0.0,
+        now_fn=lambda: datetime.fromisoformat("2026-03-31T18:00:00+00:00"),
+        sleep_fn=lambda _seconds: None,
+        reference_jobs=[{"source": "massive", "dataset": "reference_splits", "symbols": ["AAPL"], "output_name": "splits"}],
+        price_check_symbols=["AAPL"],
+    )
+
+    assert calls == ["price_checks"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import signal
 import threading
@@ -21,6 +22,8 @@ from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.curator import Curator, CuratorResult
 from trademl.data_node.db import DataNodeDB
 from trademl.fleet.cluster import ClusterCoordinator, ShardSpec
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -531,22 +534,34 @@ class DataNodeService:
         price_check_symbols: list[str] | None,
     ) -> None:
         if macro_series_ids and "fred" in self.connectors and coordinator.acquire_singleton("macro", trading_date):
-            self.collect_macro_data(macro_series_ids, trading_date, trading_date)
-            coordinator.mark_singleton_success("macro", trading_date, {"series_count": len(macro_series_ids)})
+            try:
+                self.collect_macro_data(macro_series_ids, trading_date, trading_date)
+            except ConnectorError:
+                LOGGER.exception("macro collection failed for trading_date=%s", trading_date)
+            else:
+                coordinator.mark_singleton_success("macro", trading_date, {"series_count": len(macro_series_ids)})
 
         week_key = self._week_key(current_et)
         if reference_jobs and coordinator.acquire_singleton("reference", week_key):
             materialized_jobs = [self._materialize_job(job, trading_date) for job in reference_jobs]
-            self.collect_reference_data(materialized_jobs)
-            if any(job.get("output_name") == "corp_actions" for job in materialized_jobs):
-                corp_actions_path = self.paths.root / "data" / "reference" / "corp_actions.parquet"
-                if corp_actions_path.exists():
-                    self.curate_dates(corp_actions=pd.read_parquet(corp_actions_path))
-            coordinator.mark_singleton_success("reference", week_key, {"job_count": len(materialized_jobs)})
+            try:
+                self.collect_reference_data(materialized_jobs)
+            except ConnectorError:
+                LOGGER.exception("reference collection failed for bucket=%s trading_date=%s", week_key, trading_date)
+            else:
+                if any(job.get("output_name") == "corp_actions" for job in materialized_jobs):
+                    corp_actions_path = self.paths.root / "data" / "reference" / "corp_actions.parquet"
+                    if corp_actions_path.exists():
+                        self.curate_dates(corp_actions=pd.read_parquet(corp_actions_path))
+                coordinator.mark_singleton_success("reference", week_key, {"job_count": len(materialized_jobs)})
 
         if price_check_symbols and coordinator.acquire_singleton("price_checks", week_key):
-            self.run_cross_vendor_price_checks(trading_date=trading_date, sample_symbols=price_check_symbols)
-            coordinator.mark_singleton_success("price_checks", week_key, {"symbol_count": len(price_check_symbols)})
+            try:
+                self.run_cross_vendor_price_checks(trading_date=trading_date, sample_symbols=price_check_symbols)
+            except ConnectorError:
+                LOGGER.exception("price check collection failed for bucket=%s trading_date=%s", week_key, trading_date)
+            else:
+                coordinator.mark_singleton_success("price_checks", week_key, {"symbol_count": len(price_check_symbols)})
 
     def _write_raw_shard_partition(self, frame: pd.DataFrame, *, shard_id: str) -> list[str]:
         changed_dates: list[str] = []
