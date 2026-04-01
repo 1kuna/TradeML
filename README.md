@@ -19,6 +19,37 @@ pip install -e ".[dev]"
 pytest tests/unit/test_scaffold.py -v
 ```
 
+## Dashboard
+
+Install the operator dashboard with one script:
+
+```bash
+./install_dashboard.sh
+```
+
+That installs the package in a local virtualenv, drops a `trademl` wrapper into `~/.local/bin`, and lets you launch the node UI from anywhere:
+
+```bash
+trademl dashboard
+```
+
+The dashboard provides:
+
+- Node start / stop / restart controls
+- Live queue and partition-status metrics
+- NAS reachability and mount write checks
+- Editable NAS share / mount and schedule settings
+- Log tailing and restart-safe progress inspection from SQLite + parquet state
+
+CLI controls are also available:
+
+```bash
+trademl node status
+trademl node start
+trademl node stop
+trademl node restart
+```
+
 ## Status
 
 This repository follows `DEV_GUIDE.md` phase-by-phase. The canonical design contract lives in `docs/SSOT_V3.md`.

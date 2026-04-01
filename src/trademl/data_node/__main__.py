@@ -21,9 +21,8 @@ from trademl.data_node.db import DataNodeDB
 from trademl.data_node.service import DataNodePaths, DataNodeService
 
 
-def _load_dotenv() -> None:
-    env_path = Path(".env")
-    if not env_path.exists():
+def _load_dotenv(env_path: Path | None) -> None:
+    if env_path is None or not env_path.exists():
         return
     for line in env_path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
@@ -38,12 +37,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run the TradeML data node.")
     parser.add_argument("--config", default="configs/node.yml")
     parser.add_argument("--root", default=None)
+    parser.add_argument("--data-root", default=None)
+    parser.add_argument("--env-file", default=None)
     parser.add_argument("--date", default=None)
     parser.add_argument("--symbols", nargs="*", default=None)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=60.0)
     args = parser.parse_args()
-    _load_dotenv()
+    env_path = None
+    if args.env_file:
+        env_path = Path(args.env_file).expanduser()
+    elif args.root:
+        env_path = Path(args.root).expanduser() / ".env"
+    elif Path(".env").exists():
+        env_path = Path(".env")
+    _load_dotenv(env_path)
 
     with Path(args.config).open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -97,10 +105,14 @@ def main() -> int:
         user_agent=os.getenv("SEC_EDGAR_USER_AGENT", "TradeML/0.1 test@example.com"),
         budget_manager=budgets,
     )
-    local_state = Path(os.getenv("LOCAL_STATE", config["node"]["local_state"])).expanduser()
+    workspace_root = Path(args.root).expanduser() if args.root else Path(
+        os.getenv("LOCAL_STATE", config["node"]["local_state"])
+    ).expanduser().parent
+    local_state_default = workspace_root / "control" if args.root else Path(config["node"]["local_state"]).expanduser()
+    local_state = Path(os.getenv("LOCAL_STATE", str(local_state_default))).expanduser()
     db = DataNodeDB(local_state / "node.sqlite")
-    data_root = Path(args.root or os.getenv("NAS_MOUNT", config["node"]["nas_mount"])).expanduser()
-    symbols = args.symbols or _load_stage_symbols(local_state.parent)
+    data_root = Path(args.data_root or os.getenv("NAS_MOUNT", config["node"]["nas_mount"])).expanduser()
+    symbols = args.symbols or _load_stage_symbols(workspace_root)
     service = DataNodeService(
         db=db,
         connectors=connectors,

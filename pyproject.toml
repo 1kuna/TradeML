@@ -20,12 +20,18 @@ dependencies = [
   "scipy>=1.13",
 ]
 
+[project.scripts]
+trademl = "trademl.cli:main"
+
 [project.optional-dependencies]
 dev = [
   "optuna>=4.3.0",
   "pytest>=8.3,<9",
   "pytest-cov>=5.0",
   "rich>=13.9",
+]
+dashboard = [
+  "streamlit>=1.39",
 ]
 
 [tool.setuptools]

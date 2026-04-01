@@ -192,8 +192,10 @@ def test_pi_wizard_initializes_state(tmp_path: Path) -> None:
     assert stage["schedule"]["maintenance_hour_local"] == 3
     assert env_file.exists()
     assert "NAS_MOUNT=" in env_file.read_text(encoding="utf-8")
+    assert "NAS_SHARE=" in env_file.read_text(encoding="utf-8")
     assert fstab_path.exists()
     assert str(tmp_path / "nas") in fstab_path.read_text(encoding="utf-8")
     node_cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert node_cfg["node"]["nas_share"] == "//nas/trademl"
     assert node_cfg["node"]["collection_time_et"] == "17:00"
     assert node_cfg["node"]["maintenance_hour_local"] == 3

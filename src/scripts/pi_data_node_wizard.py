@@ -72,6 +72,7 @@ def run_wizard(
     _write_node_config(
         config_path=config_path,
         nas_mount=nas_mount,
+        nas_share=nas_share,
         local_state=local_state,
         collection_time_et=collection_time_et,
         maintenance_hour_local=maintenance_hour_local,
@@ -119,6 +120,7 @@ def main() -> int:
     env_values = {
         "TRADEML_ENV": "local",
         "NAS_MOUNT": args.nas_mount or _prompt("NAS mount", "/mnt/trademl"),
+        "NAS_SHARE": args.nas_share,
         "LOCAL_STATE": str((root / "control").expanduser()),
         "EDGE_NODE_ID": os.getenv("EDGE_NODE_ID", "rpi-01"),
         "COLLECTION_TIME_ET": args.collection_time_et,
@@ -150,7 +152,17 @@ def main() -> int:
     result.update({"nas_write_ok": nas_write_ok, "env_file": str(env_path)})
     if args.start_node:
         subprocess.Popen(
-            [os.sys.executable, "-m", "trademl.data_node", "--config", args.config, "--root", str(root)],  # noqa: S603
+            [
+                os.sys.executable,
+                "-m",
+                "trademl.data_node",
+                "--config",
+                str(Path(args.config).expanduser()),
+                "--root",
+                str(root),
+                "--env-file",
+                str(env_path),
+            ],  # noqa: S603
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -213,6 +225,7 @@ def _write_node_config(
     *,
     config_path: Path,
     nas_mount: str,
+    nas_share: str,
     local_state: Path,
     collection_time_et: str,
     maintenance_hour_local: int,
@@ -223,6 +236,7 @@ def _write_node_config(
         config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     node = config.setdefault("node", {})
     node["nas_mount"] = nas_mount
+    node["nas_share"] = nas_share
     node["local_state"] = str(local_state)
     node["collection_time_et"] = collection_time_et
     node["maintenance_hour_local"] = maintenance_hour_local

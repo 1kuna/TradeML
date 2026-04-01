@@ -1,8 +1,9 @@
 node:
-  nas_mount: /private/var/folders/_r/xgq7ts511g540xbhl73dz00w0000gn/T/pytest-of-zach/pytest-222/test_pi_wizard_initializes_sta0/nas
-  local_state: /private/var/folders/_r/xgq7ts511g540xbhl73dz00w0000gn/T/pytest-of-zach/pytest-222/test_pi_wizard_initializes_sta0/pi/control
-  collection_time_et: '17:00'
-  maintenance_hour_local: 3
+  nas_mount: /mnt/trademl
+  nas_share: //nas/trademl
+  local_state: ~/trademl/control
+  collection_time_et: '16:30'
+  maintenance_hour_local: 2
 stage:
   current: 0
   stage_0:
