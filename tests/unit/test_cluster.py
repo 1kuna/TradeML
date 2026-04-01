@@ -205,3 +205,23 @@ def test_render_and_install_systemd_service(tmp_path: Path) -> None:
         service_path=workspace / "trademl-node.service",
     )
     assert Path(result["service_path"]).exists()
+
+
+def test_sync_shard_leases_does_not_release_singleton_leases(tmp_path: Path) -> None:
+    workspace, nas, config_path, env_path = _seed_workspace(tmp_path)
+    coordinator = ClusterCoordinator(
+        nas_root=nas,
+        workspace_root=workspace,
+        config_path=config_path,
+        env_path=env_path,
+        local_state=workspace / "control",
+        nas_share="//nas/trademl",
+        worker_id="worker-a",
+    )
+    coordinator.ensure_cluster_ready(passphrase="pass123")
+    assert coordinator.acquire_singleton("backfill", "2026-04-01")
+
+    coordinator.sync_shard_leases()
+
+    singleton_path = nas / "control" / "cluster" / "leases" / "singleton__backfill__2026-04-01.json"
+    assert singleton_path.exists()

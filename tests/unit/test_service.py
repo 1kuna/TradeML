@@ -19,6 +19,24 @@ class _NoopConnector:
         return pd.DataFrame()
 
 
+class _ClusterCoordinatorStub:
+    def __init__(self) -> None:
+        self._lease_calls: list[str] = []
+
+    def heartbeat_worker(self) -> dict[str, str]:
+        return {"worker_id": "worker-a"}
+
+    def sync_shard_leases(self):
+        return []
+
+    def acquire_singleton(self, task_name: str, bucket_key: str) -> bool:
+        self._lease_calls.append(f"{task_name}:{bucket_key}")
+        return task_name == "backfill"
+
+    def mark_singleton_success(self, task_name: str, bucket_key: str, metadata: dict | None = None) -> None:
+        self._lease_calls.append(f"success:{task_name}:{bucket_key}:{metadata or {}}")
+
+
 def test_run_forever_executes_collection_cycle_and_stops(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
@@ -70,3 +88,38 @@ def test_run_forever_executes_collection_cycle_and_stops(tmp_path: Path) -> None
     assert "collect_macro_data" in executed
     assert "collect_reference_data" in executed
     assert "run_cross_vendor_price_checks" in executed
+
+
+def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    db.enqueue_task("equities_eod", "AAPL", "2026-03-31", "2026-03-31", "GAP", 1)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    coordinator = _ClusterCoordinatorStub()
+    calls: list[str] = []
+
+    def process_backfill_queue() -> list[str]:
+        calls.append("process_backfill_queue")
+        service.stop()
+        return []
+
+    service.process_backfill_queue = process_backfill_queue  # type: ignore[method-assign]
+    service.sync_partition_status = lambda: tmp_path / "data" / "qc" / "partition_status.parquet"  # type: ignore[method-assign]
+
+    service.run_cluster_forever(
+        coordinator=coordinator,  # type: ignore[arg-type]
+        symbols=["AAPL"],
+        exchange="XNYS",
+        collection_time_et="16:30",
+        maintenance_hour_local=23,
+        poll_seconds=0.0,
+        now_fn=lambda: datetime.fromisoformat("2026-03-31T20:35:00+00:00"),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert calls == ["process_backfill_queue"]

@@ -225,3 +225,18 @@ class DataNodeDB:
             return connection.execute(
                 "SELECT * FROM partition_status ORDER BY source, dataset, date"
             ).fetchall()
+
+    def has_pending_backfill(self) -> bool:
+        """Return whether any backfill work is currently eligible to run."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM backfill_queue
+                WHERE status IN ('PENDING', 'FAILED')
+                  AND COALESCE(next_not_before, '1970-01-01T00:00:00+00:00') <= ?
+                LIMIT 1
+                """,
+                (utc_now().isoformat(),),
+            ).fetchone()
+        return row is not None

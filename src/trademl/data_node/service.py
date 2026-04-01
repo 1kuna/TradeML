@@ -376,14 +376,20 @@ class DataNodeService:
                     coordinator.mark_singleton_success("price_checks", week_key, {"symbol_count": len(price_check_symbols)})
 
             local_day = current_local.date().isoformat()
-            if self._should_run_maintenance(local_day=local_day, current_local=current_local, maintenance_hour_local=maintenance_hour_local):
+            should_run_maintenance = self._should_run_maintenance(
+                local_day=local_day,
+                current_local=current_local,
+                maintenance_hour_local=maintenance_hour_local,
+            )
+            should_drain_backlog = self.db.has_pending_backfill()
+            if should_run_maintenance or should_drain_backlog:
                 if coordinator.acquire_singleton("backfill", local_day):
                     changed_dates = self.process_backfill_queue()
                     if changed_dates:
                         self.curate_dates(corp_actions=self.load_corp_actions_reference())
                     self.sync_partition_status()
                     coordinator.mark_singleton_success("backfill", local_day, {"changed_dates": len(changed_dates)})
-                self._maintenance_history.add(local_day)
+                    self._maintenance_history.add(local_day)
 
             if not self._stop_event.is_set():
                 sleep_fn(poll_seconds)

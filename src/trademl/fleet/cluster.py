@@ -343,7 +343,7 @@ class ClusterCoordinator:
     def sync_shard_leases(self) -> list[ShardSpec]:
         """Acquire or renew the shards this worker should own, and release others."""
         target = {spec.lease_id: spec for spec in self.desired_shards_for_worker()}
-        current = set(self.list_owned_lease_ids())
+        current = {lease_id for lease_id in self.list_owned_lease_ids() if lease_id.startswith("equities_eod::")}
         for lease_id in current - set(target):
             self.release_lease(lease_id)
         owned_specs: list[ShardSpec] = []
