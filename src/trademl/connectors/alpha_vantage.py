@@ -26,10 +26,17 @@ class AlphaVantageConnector(HTTPConnector):
     ) -> pd.DataFrame:
         """Fetch normalized Alpha Vantage datasets."""
         if dataset == "listings":
-            return self.request_csv(
-                endpoint="/query",
-                params={"function": "LISTING_STATUS", "date": pd.Timestamp(end_date).strftime("%Y-%m-%d"), "state": "active"},
-            )
+            frames = [
+                self.request_csv(
+                    endpoint="/query",
+                    params={"function": "LISTING_STATUS", "date": pd.Timestamp(end_date).strftime("%Y-%m-%d"), "state": state},
+                )
+                for state in ["active", "delisted"]
+            ]
+            combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            if combined.empty:
+                return combined
+            return combined.drop_duplicates().reset_index(drop=True)
         if dataset in {"corp_actions", "splits", "dividends"}:
             return self._fetch_corp_actions(dataset=dataset, symbols=symbols, start_date=start_date, end_date=end_date)
         raise ValueError(f"unsupported dataset for alpha_vantage: {dataset}")

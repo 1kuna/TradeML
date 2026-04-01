@@ -13,7 +13,9 @@ from pathlib import Path
 
 import yaml
 
-from trademl.data_node.bootstrap import STAGE0_SYMBOLS
+from trademl.connectors.alpaca import AlpacaConnector
+from trademl.data_node.bootstrap import DEFAULT_STAGE0_SYMBOL_COUNT, Stage0UniverseBuilder
+from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
 
 
@@ -21,6 +23,7 @@ def run_wizard(
     *,
     root: Path,
     config_path: Path,
+    stage_symbols: list[str],
     stage_years: int = 5,
     nas_mount: str = "/mnt/trademl",
     nas_share: str = "//nas/trademl",
@@ -34,12 +37,12 @@ def run_wizard(
     db = DataNodeDB(local_state / "node.sqlite")
     bookmarks = root / "bookmarks.json"
     stage_file = root / "stage.yml"
-    bookmarks.write_text(json.dumps({"stage": 0, "symbols_seeded": len(STAGE0_SYMBOLS)}, indent=2), encoding="utf-8")
+    bookmarks.write_text(json.dumps({"stage": 0, "symbols_seeded": len(stage_symbols)}, indent=2), encoding="utf-8")
     stage_file.write_text(
         yaml.safe_dump(
             {
                 "current": 0,
-                "symbols": STAGE0_SYMBOLS,
+                "symbols": stage_symbols,
                 "years": stage_years,
                 "environment": _detect_environment(),
                 "schedule": {
@@ -67,7 +70,7 @@ def run_wizard(
 
     end_date = datetime.now(UTC).date().isoformat()
     start_date = f"{int(end_date[:4]) - stage_years}-{end_date[5:]}"
-    for symbol in STAGE0_SYMBOLS:
+    for symbol in stage_symbols:
         try:
             db.enqueue_task("equities_eod", symbol, start_date, end_date, "BOOTSTRAP", 5)
         except Exception:
@@ -75,7 +78,7 @@ def run_wizard(
 
     return {
         "local_state": str(local_state),
-        "task_count": len(STAGE0_SYMBOLS),
+        "task_count": len(stage_symbols),
         "config_path": str(config_path),
         "fstab_path": str(persisted_fstab),
     }
@@ -101,6 +104,7 @@ def main() -> int:
     parser.add_argument("--fmp-api-key", default="")
     parser.add_argument("--massive-api-key", default="")
     parser.add_argument("--cluster-passphrase", default="")
+    parser.add_argument("--stage-symbol", action="append", default=[])
     parser.add_argument("--start-node", action="store_true")
     args = parser.parse_args()
 
@@ -127,9 +131,21 @@ def main() -> int:
     nas_write_ok = _test_nas_mount(Path(env_values["NAS_MOUNT"]))
     env_path = Path(args.env_file).expanduser() if args.env_file else root / ".env"
     _write_env_file(env_path, env_values)
+    stage_symbols = [symbol.strip().upper() for symbol in args.stage_symbol if symbol.strip()]
+    if not stage_symbols:
+        builder = Stage0UniverseBuilder(
+            connector=AlpacaConnector(
+                base_url=os.getenv("ALPACA_DATA_BASE_URL", env_values["ALPACA_DATA_BASE_URL"]),
+                api_key=env_values["ALPACA_API_KEY"],
+                secret_key=env_values["ALPACA_API_SECRET"],
+                budget_manager=BudgetManager({"alpaca": {"rpm": 150, "daily_cap": 10000}}),
+            )
+        )
+        stage_symbols = builder.build(symbol_count=DEFAULT_STAGE0_SYMBOL_COUNT)
     result = run_wizard(
         root=root,
         config_path=Path(args.config),
+        stage_symbols=stage_symbols,
         stage_years=args.stage_years,
         nas_mount=env_values["NAS_MOUNT"],
         nas_share=args.nas_share,

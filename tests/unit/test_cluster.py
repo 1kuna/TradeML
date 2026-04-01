@@ -112,6 +112,7 @@ def test_coordinator_bootstrap_and_rebuild_state(tmp_path: Path) -> None:
         local_state=workspace / "control",
         nas_share="//nas/trademl",
         worker_id="worker-a",
+        universe_builder=lambda count: [f"SYM{index:03d}" for index in range(count)],
     )
     manifest = coordinator.ensure_cluster_ready(passphrase="pass123")
     rebuilt = coordinator.rebuild_local_state(local_db_path=workspace / "control" / "node.sqlite", current_date="2025-01-06")
@@ -138,6 +139,7 @@ def test_coordinator_bootstraps_from_config_when_stage_file_is_missing(tmp_path:
         local_state=workspace / "control",
         nas_share="//nas/trademl",
         worker_id="worker-a",
+        universe_builder=lambda count: [f"SYM{index:03d}" for index in range(count)],
     )
 
     manifest = coordinator.ensure_cluster_ready(passphrase="pass123")
@@ -160,6 +162,7 @@ def test_stale_lease_can_be_taken_over(tmp_path: Path) -> None:
         nas_share="//nas/trademl",
         worker_id="worker-a",
         lease_ttl_seconds=1,
+        universe_builder=lambda count: [f"SYM{index:03d}" for index in range(max(count, 6))],
     )
     coordinator_b = ClusterCoordinator(
         nas_root=nas,
@@ -170,6 +173,7 @@ def test_stale_lease_can_be_taken_over(tmp_path: Path) -> None:
         nas_share="//nas/trademl",
         worker_id="worker-b",
         lease_ttl_seconds=1,
+        universe_builder=lambda count: [f"SYM{index:03d}" for index in range(max(count, 6))],
     )
     coordinator_a.ensure_cluster_ready(passphrase="pass123")
     coordinator_b.ensure_cluster_ready(passphrase="pass123")
@@ -217,6 +221,7 @@ def test_sync_shard_leases_does_not_release_singleton_leases(tmp_path: Path) -> 
         local_state=workspace / "control",
         nas_share="//nas/trademl",
         worker_id="worker-a",
+        universe_builder=lambda count: [f"SYM{index:03d}" for index in range(count)],
     )
     coordinator.ensure_cluster_ready(passphrase="pass123")
     assert coordinator.acquire_singleton("backfill", "2026-04-01")

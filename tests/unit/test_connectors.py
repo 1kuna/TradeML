@@ -89,6 +89,38 @@ def test_alpaca_connector_normalizes_bars() -> None:
     assert frame.iloc[0]["volume"] == 10
 
 
+def test_alpaca_connector_normalizes_assets() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                [
+                    {
+                        "symbol": "AAPL",
+                        "name": "Apple Inc.",
+                        "exchange": "NASDAQ",
+                        "status": "active",
+                        "tradable": True,
+                        "class": "us_equity",
+                    }
+                ],
+            )
+        ]
+    )
+    connector: BaseConnector = AlpacaConnector(
+        base_url="https://data.alpaca.markets",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    frame = connector.fetch("assets", [], "2026-01-02", "2026-01-02")
+
+    assert frame.iloc[0]["symbol"] == "AAPL"
+    assert frame.iloc[0]["asset_class"] == "us_equity"
+    assert bool(frame.iloc[0]["tradable"]) is True
+
+
 def test_massive_connector_normalizes_bars() -> None:
     session = FakeSession([FakeResponse(200, {"results": [{"t": 1704153600000, "o": 10, "h": 11, "l": 9, "c": 10.5, "vw": 10.2, "v": 20, "n": 4}]})])
     connector = MassiveConnector(base_url="https://api.polygon.io", api_key="key", budget_manager=_budget_manager(), session=session)
@@ -119,6 +151,7 @@ def test_alpha_vantage_and_fred_connectors() -> None:
     av_session = FakeSession(
         [
             FakeResponse(200, payload=[], text="symbol,name,exchange,assetType,ipoDate,delistingDate,status\nAAPL,Apple,NASDAQ,Stock,1980-12-12,,Active\n"),
+            FakeResponse(200, payload=[], text="symbol,name,exchange,assetType,ipoDate,delistingDate,status\nOLD,Old Co,NASDAQ,Stock,1980-12-12,2024-01-15,Delisted\n"),
             FakeResponse(200, {"data": [{"ex_dividend_date": "2024-01-05", "amount": "0.24"}]}),
             FakeResponse(200, {"data": [{"effective_date": "2024-01-10", "split_factor": "0.5"}]}),
         ]
@@ -134,7 +167,7 @@ def test_alpha_vantage_and_fred_connectors() -> None:
     corp_actions = av.fetch("corp_actions", ["AAPL"], "2024-01-01", "2024-01-31")
     observations = fred.fetch("macros_treasury", ["DGS10"], "2024-01-01", "2024-01-31")
 
-    assert listings.iloc[0]["symbol"] == "AAPL"
+    assert set(listings["symbol"]) == {"AAPL", "OLD"}
     assert set(corp_actions["event_type"]) == {"dividend", "split"}
     assert "amount" in corp_actions.columns
     assert observations.iloc[0]["series_id"] == "DGS10"
@@ -172,7 +205,12 @@ def test_alpha_vantage_corp_actions_normalize_splits_and_dividends() -> None:
 
 
 def test_fmp_and_sec_edgar_connectors() -> None:
-    fmp_session = FakeSession([FakeResponse(200, [{"symbol": "XYZ", "delistedDate": "2024-01-05"}])])
+    fmp_session = FakeSession(
+        [
+            FakeResponse(200, [{"symbol": "XYZ", "delistedDate": "2024-01-05"}]),
+            FakeResponse(200, [{"oldSymbol": "FB", "newSymbol": "META", "date": "2022-06-09"}]),
+        ]
+    )
     sec_session = FakeSession(
         [
             FakeResponse(
@@ -199,9 +237,11 @@ def test_fmp_and_sec_edgar_connectors() -> None:
     )
 
     delistings = fmp.fetch("delistings", [], "2024-01-01", "2024-01-31")
+    symbol_changes = fmp.fetch("symbol_changes", [], "2024-01-01", "2024-01-31")
     filings = sec.fetch("filing_index", ["320193"], "2024-01-01", "2024-01-31")
 
     assert delistings.iloc[0]["symbol"] == "XYZ"
+    assert symbol_changes.iloc[0]["newSymbol"] == "META"
     assert filings.iloc[0]["form"] == "8-K"
 
 

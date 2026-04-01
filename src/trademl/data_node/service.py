@@ -22,6 +22,7 @@ from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.curator import Curator, CuratorResult
 from trademl.data_node.db import DataNodeDB
 from trademl.fleet.cluster import ClusterCoordinator, ShardSpec
+from trademl.reference.security_master import rebuild_derived_references
 
 LOGGER = logging.getLogger(__name__)
 
@@ -162,6 +163,7 @@ class DataNodeService:
                 frame = frame.drop_duplicates().reset_index(drop=True)
             frame.to_parquet(output, index=False)
             outputs.append(output)
+        outputs.extend(rebuild_derived_references(self.paths.reference_root))
         if failures:
             raise TemporaryConnectorError(f"reference collection incomplete: {' | '.join(failures)}")
         return outputs

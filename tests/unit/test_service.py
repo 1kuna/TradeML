@@ -48,6 +48,38 @@ class _PartialReferenceConnector:
         )
 
 
+class _ListingConnector:
+    vendor_name = "alpha_vantage"
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        if dataset == "listings":
+            return pd.DataFrame(
+                [
+                    {
+                        "symbol": "AAPL",
+                        "name": "Apple Inc.",
+                        "exchange": "NASDAQ",
+                        "assetType": "Stock",
+                        "ipoDate": "1980-12-12",
+                        "delistingDate": None,
+                        "status": "Active",
+                    }
+                ]
+            )
+        raise ValueError(dataset)
+
+
+class _DelistingConnector:
+    vendor_name = "fmp"
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        if dataset == "delistings":
+            return pd.DataFrame([{"symbol": "OLD", "companyName": "Old Co", "delistedDate": "2024-01-05", "reason": "acquired"}])
+        if dataset == "symbol_changes":
+            return pd.DataFrame([{"oldSymbol": "FB", "newSymbol": "META", "date": "2022-06-09"}])
+        raise ValueError(dataset)
+
+
 class _ClusterCoordinatorStub:
     def __init__(self) -> None:
         self._lease_calls: list[str] = []
@@ -273,3 +305,46 @@ def test_collect_reference_data_persists_partial_results_before_budget_failure(t
 
     stored = pd.read_parquet(tmp_path / "data" / "reference" / "corp_actions.parquet")
     assert stored["symbol"].tolist() == ["AAPL"]
+
+
+def test_collect_reference_data_rebuilds_security_master_outputs(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector(), "alpha_vantage": _ListingConnector(), "fmp": _DelistingConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    outputs = service.collect_reference_data(
+        [
+            {
+                "source": "alpha_vantage",
+                "dataset": "listings",
+                "symbols": [],
+                "start_date": "2026-04-01",
+                "end_date": "2026-04-01",
+                "output_name": "listings",
+            },
+            {
+                "source": "fmp",
+                "dataset": "delistings",
+                "symbols": [],
+                "start_date": "2026-04-01",
+                "end_date": "2026-04-01",
+                "output_name": "delistings",
+            },
+            {
+                "source": "fmp",
+                "dataset": "symbol_changes",
+                "symbols": [],
+                "start_date": "2026-04-01",
+                "end_date": "2026-04-01",
+                "output_name": "symbol_changes",
+            },
+        ]
+    )
+
+    assert tmp_path / "data" / "reference" / "listing_history.parquet" in outputs
+    assert tmp_path / "data" / "reference" / "ticker_changes.parquet" in outputs

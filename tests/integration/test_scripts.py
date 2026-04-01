@@ -156,6 +156,7 @@ def test_pi_wizard_initializes_state(tmp_path: Path) -> None:
     env_file = tmp_path / "wizard.env"
     fstab_path = tmp_path / "fstab"
     config_path = tmp_path / "node.yml"
+    stage_symbols = [f"SYM{index:03d}" for index in range(100)]
     result = subprocess.run(
         [
             sys.executable,
@@ -176,6 +177,7 @@ def test_pi_wizard_initializes_state(tmp_path: Path) -> None:
             str(env_file),
             "--fstab-path",
             str(fstab_path),
+            *[item for symbol in stage_symbols for item in ("--stage-symbol", symbol)],
         ],
         check=True,
         cwd=Path.cwd(),
@@ -188,6 +190,7 @@ def test_pi_wizard_initializes_state(tmp_path: Path) -> None:
     assert (root / "control" / "node.sqlite").exists()
     assert (root / "stage.yml").exists()
     stage = yaml.safe_load((root / "stage.yml").read_text(encoding="utf-8"))
+    assert stage["symbols"] == stage_symbols
     assert stage["schedule"]["collection_time_et"] == "17:00"
     assert stage["schedule"]["maintenance_hour_local"] == 3
     assert env_file.exists()

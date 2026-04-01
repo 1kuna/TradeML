@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import pandas as pd
 import yaml
@@ -136,6 +136,7 @@ class ClusterCoordinator:
         worker_id: str | None = None,
         lease_ttl_seconds: int = 90,
         heartbeat_interval_seconds: int = 30,
+        universe_builder: Callable[[int], list[str]] | None = None,
     ) -> None:
         self.paths = ClusterPaths(nas_root=nas_root)
         self.workspace_root = workspace_root
@@ -146,6 +147,7 @@ class ClusterCoordinator:
         self.worker_id = worker_id or os.getenv("EDGE_NODE_ID") or socket.gethostname()
         self.lease_ttl_seconds = lease_ttl_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.universe_builder = universe_builder
 
     def ensure_cluster_ready(self, *, passphrase: str | None = None) -> dict[str, Any]:
         """Bootstrap manifest/secrets if needed, then sync local config and registration."""
@@ -447,9 +449,13 @@ class ClusterCoordinator:
             return manifest
         local_config = _read_yaml(self.config_path)
         local_stage = _read_yaml(self.workspace_root / "stage.yml")
-        current_stage, stage_symbols, stage_years = resolve_bootstrap_stage(local_config, local_stage)
+        current_stage, stage_symbols, stage_years = resolve_bootstrap_stage(
+            local_config,
+            local_stage,
+            universe_builder=self.universe_builder,
+        )
         if not stage_symbols:
-            raise RuntimeError("cluster bootstrap requires stage.yml with symbols")
+            raise RuntimeError("cluster bootstrap requires explicit stage symbols or a Stage 0 universe builder")
         manifest = {
             "version": 1,
             "nas_share": self.nas_share,
@@ -612,6 +618,7 @@ def rebuild_local_state(
     worker_id: str | None = None,
     passphrase: str | None = None,
     current_date: str | None = None,
+    universe_builder: Callable[[int], list[str]] | None = None,
 ) -> dict[str, Any]:
     """Convenience wrapper for one-shot cluster join + rebuild."""
     coordinator = ClusterCoordinator(
@@ -622,6 +629,7 @@ def rebuild_local_state(
         local_state=local_state,
         nas_share=nas_share,
         worker_id=worker_id,
+        universe_builder=universe_builder,
     )
     manifest = coordinator.ensure_cluster_ready(passphrase=passphrase)
     rebuilt = coordinator.rebuild_local_state(local_db_path=local_state / "node.sqlite", current_date=current_date)

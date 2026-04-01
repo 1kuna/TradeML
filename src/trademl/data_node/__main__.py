@@ -15,6 +15,7 @@ from trademl.connectors.alpha_vantage import AlphaVantageConnector
 from trademl.connectors.fmp import FMPConnector
 from trademl.connectors.sec_edgar import SecEdgarConnector
 from trademl.data_node.auditor import PartitionAuditor
+from trademl.data_node.bootstrap import Stage0UniverseBuilder
 from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
@@ -65,6 +66,7 @@ def main() -> int:
         secret_key=os.getenv("ALPACA_API_SECRET", ""),
         budget_manager=budgets,
     )
+    stage0_universe_builder = Stage0UniverseBuilder(connector=connector)
     connectors = {"alpaca": connector}
     if os.getenv("MASSIVE_API_KEY"):
         from trademl.connectors.massive import MassiveConnector
@@ -137,6 +139,7 @@ def main() -> int:
         reference_jobs.extend(
             [
                 {"source": "fmp", "dataset": "delistings", "symbols": [], "output_name": "delistings"},
+                {"source": "fmp", "dataset": "symbol_changes", "symbols": [], "output_name": "symbol_changes"},
                 {"source": "fmp", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar_fmp"},
             ]
         )
@@ -182,6 +185,7 @@ def main() -> int:
         worker_id=worker_id,
         lease_ttl_seconds=int(config["node"].get("lease_ttl_seconds", 90)),
         heartbeat_interval_seconds=int(config["node"].get("heartbeat_interval_seconds", 30)),
+        universe_builder=stage0_universe_builder,
     )
     manifest = coordinator.ensure_cluster_ready(passphrase=args.passphrase)
     rebuilt = coordinator.rebuild_local_state(local_db_path=local_state / "node.sqlite")

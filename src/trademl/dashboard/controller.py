@@ -23,6 +23,9 @@ import pandas as pd
 import yaml
 
 from trademl.calendars.exchange import get_trading_days
+from trademl.connectors.alpaca import AlpacaConnector
+from trademl.data_node.bootstrap import Stage0UniverseBuilder
+from trademl.data_node.budgets import BudgetManager
 from trademl.fleet.cluster import (
     ClusterCoordinator,
     ClusterPaths,
@@ -341,6 +344,7 @@ def rebuild_cluster_state(settings: NodeSettings, *, passphrase: str | None = No
         nas_share=settings.nas_share,
         worker_id=settings.worker_id,
         passphrase=passphrase,
+        universe_builder=_coordinator(settings).universe_builder,
     )
 
 
@@ -586,6 +590,20 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
 
 
 def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
+    env_values = _read_env_file(settings.env_path)
+    config = _read_yaml(settings.config_path)
+    vendors = config.get("vendors", {})
+    alpaca_budget = vendors.get("alpaca", {"rpm": 150, "daily_cap": 10000})
+    universe_builder = None
+    if env_values.get("ALPACA_API_KEY"):
+        universe_builder = Stage0UniverseBuilder(
+            connector=AlpacaConnector(
+                base_url=env_values.get("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
+                api_key=env_values.get("ALPACA_API_KEY", ""),
+                secret_key=env_values.get("ALPACA_API_SECRET", ""),
+                budget_manager=BudgetManager({"alpaca": alpaca_budget}),
+            )
+        )
     return ClusterCoordinator(
         nas_root=settings.nas_mount,
         workspace_root=settings.workspace_root,
@@ -594,6 +612,7 @@ def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
         local_state=settings.local_state,
         nas_share=settings.nas_share,
         worker_id=settings.worker_id,
+        universe_builder=universe_builder,
     )
 
 

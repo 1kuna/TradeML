@@ -28,6 +28,9 @@ class FMPConnector(HTTPConnector):
         if dataset == "delistings":
             payload = self.request_json(endpoint="/stable/delisted-companies")
             return pd.DataFrame(payload)
+        if dataset == "symbol_changes":
+            payload = self.request_json(endpoint="/stable/symbol-change")
+            return pd.DataFrame(payload)
         if dataset == "earnings_calendar":
             payload = self.request_json(
                 endpoint="/stable/earnings-calendar",
