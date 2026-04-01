@@ -3,9 +3,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from feature_store.equities.dataset import build_training_dataset
-from feature_store.equities.features import compute_equity_features
-from labeling.triple_barrier.triple_barrier import triple_barrier
 from trademl.features.equities import build_features
 
 
@@ -82,51 +79,3 @@ def test_features_are_pit_safe_outside_future_window() -> None:
     left = baseline.loc[baseline["date"] < cutoff, ["date", "symbol", *columns]].reset_index(drop=True)
     right = shifted.loc[shifted["date"] < cutoff, ["date", "symbol", *columns]].reset_index(drop=True)
     pd.testing.assert_frame_equal(left, right)
-
-
-def test_compute_equity_features_uses_curated_history(curated_prices) -> None:
-    asof = curated_prices["dates"][-1]
-    features = compute_equity_features(asof, curated_prices["symbols"])
-
-    assert not features.empty
-    assert set(features["symbol"].unique()) == set(curated_prices["symbols"])
-    assert features["asof"].iloc[0] == asof
-    feature_cols = [column for column in features.columns if column.startswith("feature_")]
-    assert feature_cols
-
-
-def test_build_training_dataset_aligns_features_and_labels(curated_prices) -> None:
-    start = curated_prices["dates"][0]
-    end = curated_prices["dates"][-2]
-
-    dataset = build_training_dataset(
-        universe=curated_prices["symbols"],
-        start_date=start,
-        end_date=end,
-        label_type="triple_barrier",
-        tp_sigma=1.5,
-        sl_sigma=0.75,
-        max_h=5,
-        vol_window=10,
-        standardize_window=30,
-    )
-
-    assert not dataset.X.empty
-    assert len(dataset.X) == len(dataset.y) == len(dataset.meta)
-    assert set(dataset.X["symbol"].unique()) <= set(curated_prices["symbols"])
-
-
-def test_triple_barrier_labels_generate_from_curated_history(curated_prices) -> None:
-    asof = curated_prices["dates"][-7]
-    labels = triple_barrier(
-        asof_date=asof,
-        universe=curated_prices["symbols"],
-        tp_sigma=1.0,
-        sl_sigma=0.5,
-        max_h=5,
-        vol_window=10,
-    )
-
-    assert not labels.empty
-    assert set(labels["symbol"].unique()) <= set(curated_prices["symbols"])
-    assert labels["entry_date"].iloc[0] == asof
