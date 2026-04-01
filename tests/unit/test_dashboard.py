@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pandas as pd
 import yaml
+import sqlite3
 
+import trademl.dashboard.controller as dashboard_controller
 from trademl.dashboard.controller import (
     collect_dashboard_snapshot,
     join_cluster,
@@ -259,6 +261,46 @@ def test_join_cluster_persists_cluster_passphrase(tmp_path: Path, monkeypatch) -
     env_text = (workspace / ".env").read_text(encoding="utf-8")
     assert "TRADEML_CLUSTER_PASSPHRASE=pw123" in env_text
     assert joined["manifest"]["passphrase"] == "pw123"
+
+
+def test_collect_dashboard_snapshot_tolerates_locked_queue_db(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 0, "symbols": ["AAPL"], "years": 1}, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    real_connect = dashboard_controller.sqlite3.connect
+
+    def locked_connect(*args, **kwargs):
+        if args and str(args[0]).endswith("node.sqlite"):
+            raise sqlite3.OperationalError("database is locked")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_controller.sqlite3, "connect", locked_connect)
+
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    snapshot = collect_dashboard_snapshot(settings)
+
+    assert snapshot["queue_counts"]["PENDING"] == 0
+    assert snapshot["queue_counts"]["FAILED"] == 0
 
 
 def test_update_worker_refreshes_wrapper_and_reports_paths(tmp_path: Path, monkeypatch) -> None:

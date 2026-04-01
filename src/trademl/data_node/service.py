@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from trademl.calendars.exchange import is_trading_day
-from trademl.connectors.base import BaseConnector, ConnectorError
+from trademl.connectors.base import BaseConnector, ConnectorError, TemporaryConnectorError
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.curator import Curator, CuratorResult
 from trademl.data_node.db import DataNodeDB
@@ -141,17 +141,29 @@ class DataNodeService:
         """Collect reference datasets into parquet files."""
         outputs: list[Path] = []
         self.paths.reference_root.mkdir(parents=True, exist_ok=True)
-        for job in jobs:
+        failures: list[str] = []
+        for job in self._expand_reference_jobs(jobs):
             connector = self.connectors[str(job["source"])]
-            frame = connector.fetch(
-                str(job["dataset"]),
-                list(job.get("symbols", [])),
-                str(job["start_date"]),
-                str(job["end_date"]),
-            )
+            try:
+                frame = connector.fetch(
+                    str(job["dataset"]),
+                    list(job.get("symbols", [])),
+                    str(job["start_date"]),
+                    str(job["end_date"]),
+                )
+            except ConnectorError as exc:
+                failures.append(f"{job['source']}:{job['dataset']}:{job.get('symbols', [])}:{exc}")
+                continue
             output = self.paths.reference_root / f"{job['output_name']}.parquet"
+            if output.exists():
+                existing = pd.read_parquet(output)
+                frame = pd.concat([existing, frame], ignore_index=True) if not frame.empty else existing
+            if not frame.empty:
+                frame = frame.drop_duplicates().reset_index(drop=True)
             frame.to_parquet(output, index=False)
             outputs.append(output)
+        if failures:
+            raise TemporaryConnectorError(f"reference collection incomplete: {' | '.join(failures)}")
         return outputs
 
     def collect_macro_data(self, series_ids: list[str], start_date: str, end_date: str) -> list[Path]:
@@ -562,6 +574,20 @@ class DataNodeService:
                 LOGGER.exception("price check collection failed for bucket=%s trading_date=%s", week_key, trading_date)
             else:
                 coordinator.mark_singleton_success("price_checks", week_key, {"symbol_count": len(price_check_symbols)})
+
+    @staticmethod
+    def _expand_reference_jobs(jobs: list[dict[str, object]]) -> list[dict[str, object]]:
+        expanded: list[dict[str, object]] = []
+        for job in jobs:
+            symbols = list(job.get("symbols", []))
+            if len(symbols) <= 1:
+                expanded.append(dict(job))
+                continue
+            for symbol in symbols:
+                item = dict(job)
+                item["symbols"] = [symbol]
+                expanded.append(item)
+        return expanded
 
     def _write_raw_shard_partition(self, frame: pd.DataFrame, *, shard_id: str) -> list[str]:
         changed_dates: list[str] = []

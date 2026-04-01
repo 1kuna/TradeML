@@ -600,9 +600,13 @@ def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
 def _read_queue_counts(db_path: Path) -> dict[str, int]:
     if not db_path.exists():
         return {"PENDING": 0, "LEASED": 0, "FAILED": 0, "DONE": 0, "BOOTSTRAP": 0, "FORWARD": 0, "GAP": 0}
-    with sqlite3.connect(db_path) as connection:
-        status_rows = connection.execute("SELECT status, COUNT(*) FROM backfill_queue GROUP BY status").fetchall()
-        kind_rows = connection.execute("SELECT kind, COUNT(*) FROM backfill_queue GROUP BY kind").fetchall()
+    try:
+        with sqlite3.connect(db_path, timeout=5.0) as connection:
+            connection.execute("PRAGMA busy_timeout = 5000")
+            status_rows = connection.execute("SELECT status, COUNT(*) FROM backfill_queue GROUP BY status").fetchall()
+            kind_rows = connection.execute("SELECT kind, COUNT(*) FROM backfill_queue GROUP BY kind").fetchall()
+    except sqlite3.OperationalError:
+        return {"PENDING": 0, "LEASED": 0, "FAILED": 0, "DONE": 0, "BOOTSTRAP": 0, "FORWARD": 0, "GAP": 0}
     counts = {str(status): int(count) for status, count in status_rows}
     counts.update({str(kind): int(count) for kind, count in kind_rows})
     return counts

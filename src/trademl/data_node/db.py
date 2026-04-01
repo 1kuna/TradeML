@@ -46,8 +46,9 @@ class DataNodeDB:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=5.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
         try:
             yield connection
             connection.commit()
@@ -60,6 +61,7 @@ class DataNodeDB:
     def _initialize(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS backfill_queue (
