@@ -2,8 +2,12 @@ node:
   nas_mount: /mnt/trademl
   nas_share: //nas/trademl
   local_state: ~/trademl/control
+  worker_id: rpi-01
   collection_time_et: '16:30'
   maintenance_hour_local: 2
+  shard_count: 8
+  lease_ttl_seconds: 90
+  heartbeat_interval_seconds: 30
 stage:
   current: 0
   stage_0:

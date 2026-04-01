@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from trademl.dashboard.controller import (
     collect_dashboard_snapshot,
+    force_release_lease,
+    install_service,
+    join_cluster,
+    leave_cluster,
+    rebuild_cluster_state,
     resolve_node_settings,
     restart_node,
+    rotate_cluster_passphrase,
     start_node,
     stop_node,
+    update_cluster_secrets,
 )
 
 
@@ -39,6 +47,21 @@ def main(argv: list[str] | None = None) -> int:
     node_subparsers.add_parser("start", help="Start the node in the background.")
     node_subparsers.add_parser("stop", help="Stop the node if it is running.")
     node_subparsers.add_parser("restart", help="Restart the node.")
+    join_parser = node_subparsers.add_parser("join-cluster", help="Bootstrap or join the NAS-backed worker cluster.")
+    join_parser.add_argument("--passphrase", default=None)
+    rebuild_parser = node_subparsers.add_parser("rebuild-state", help="Rebuild local disposable state from NAS truth.")
+    rebuild_parser.add_argument("--passphrase", default=None)
+    node_subparsers.add_parser("leave-cluster", help="Release leases and mark this worker inactive.")
+    install_parser = node_subparsers.add_parser("install-service", help="Install the Linux systemd unit.")
+    install_parser.add_argument("--service-path", default=None)
+    rotate_parser = node_subparsers.add_parser("rotate-passphrase", help="Rotate the cluster secret bundle passphrase.")
+    rotate_parser.add_argument("--old-passphrase", default=None)
+    rotate_parser.add_argument("--new-passphrase", default=None)
+    secrets_parser = node_subparsers.add_parser("update-secrets", help="Update NAS-backed encrypted shared secrets.")
+    secrets_parser.add_argument("--passphrase", default=None)
+    secrets_parser.add_argument("--set", action="append", default=[])
+    release_parser = node_subparsers.add_parser("force-release", help="Force-release a lease.")
+    release_parser.add_argument("lease_id")
 
     args = parser.parse_args(argv)
     if args.command == "dashboard":
@@ -59,6 +82,40 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.node_command == "restart":
         print(json.dumps(restart_node(settings), indent=2, default=str))
+        return 0
+    if args.node_command == "join-cluster":
+        print(json.dumps(join_cluster(settings, passphrase=args.passphrase), indent=2, default=str))
+        return 0
+    if args.node_command == "rebuild-state":
+        print(json.dumps(rebuild_cluster_state(settings, passphrase=args.passphrase), indent=2, default=str))
+        return 0
+    if args.node_command == "leave-cluster":
+        print(json.dumps(leave_cluster(settings), indent=2, default=str))
+        return 0
+    if args.node_command == "install-service":
+        print(json.dumps(install_service(settings, service_path=args.service_path), indent=2, default=str))
+        return 0
+    if args.node_command == "rotate-passphrase":
+        old_passphrase = args.old_passphrase or os.getenv("TRADEML_CLUSTER_PASSPHRASE")
+        new_passphrase = args.new_passphrase or os.getenv("TRADEML_CLUSTER_NEW_PASSPHRASE")
+        if not old_passphrase or not new_passphrase:
+            raise SystemExit("old/new cluster passphrases must be provided")
+        print(json.dumps(rotate_cluster_passphrase(settings, old_passphrase=old_passphrase, new_passphrase=new_passphrase), indent=2, default=str))
+        return 0
+    if args.node_command == "update-secrets":
+        passphrase = args.passphrase or os.getenv("TRADEML_CLUSTER_PASSPHRASE")
+        if not passphrase:
+            raise SystemExit("cluster passphrase required")
+        updates: dict[str, str] = {}
+        for item in args.set:
+            if "=" not in item:
+                raise SystemExit(f"invalid secret assignment: {item}")
+            key, value = item.split("=", 1)
+            updates[key] = value
+        print(json.dumps(update_cluster_secrets(settings, passphrase=passphrase, updates=updates), indent=2, default=str))
+        return 0
+    if args.node_command == "force-release":
+        print(json.dumps({"released": force_release_lease(settings, args.lease_id), "lease_id": args.lease_id}, indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported node command: {args.node_command}")
 

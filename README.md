@@ -37,9 +37,11 @@ The dashboard provides:
 
 - Node start / stop / restart controls
 - Live queue and partition-status metrics
+- NAS-backed fleet view for workers, shard leases, and recent events
 - NAS reachability and mount write checks
 - Editable NAS share / mount and schedule settings
 - Log tailing and restart-safe progress inspection from SQLite + parquet state
+- Cluster join / rebuild / leave controls and systemd install integration
 
 CLI controls are also available:
 
@@ -48,6 +50,15 @@ trademl node status
 trademl node start
 trademl node stop
 trademl node restart
+trademl node join-cluster --passphrase 'your-passphrase'
+trademl node rebuild-state --passphrase 'your-passphrase'
+trademl node install-service
+```
+
+For Raspberry Pi / Linux workers, you can also install the systemd unit:
+
+```bash
+./install_systemd.sh
 ```
 
 ## Status

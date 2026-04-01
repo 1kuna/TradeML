@@ -4,8 +4,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
-from trademl.dashboard.controller import collect_dashboard_snapshot, persist_node_settings, resolve_node_settings, restart_node, start_node, stop_node
+from trademl.dashboard.controller import (
+    collect_dashboard_snapshot,
+    force_release_lease,
+    install_service,
+    join_cluster,
+    leave_cluster,
+    persist_node_settings,
+    rebuild_cluster_state,
+    resolve_node_settings,
+    restart_node,
+    rotate_cluster_passphrase,
+    start_node,
+    stop_node,
+    update_cluster_secrets,
+)
 
 
 def main() -> None:
@@ -43,6 +58,7 @@ def main() -> None:
     nas = snapshot["nas"]
     partition_summary = snapshot["partition_summary"]
     queue_counts = snapshot["queue_counts"]
+    cluster = snapshot["cluster"]
     running = bool(runtime.get("running"))
 
     controls = st.columns([1, 1, 1, 2])
@@ -73,13 +89,23 @@ def main() -> None:
     lower_metrics[4].metric("Latest Raw", snapshot["latest_raw_date"] or "-")
     lower_metrics[5].metric("Latest Curated", snapshot["latest_curated_date"] or "-")
 
-    tabs = st.tabs(["Overview", "NAS & Schedule", "Data Inventory", "Logs"])
+    tabs = st.tabs(["Overview", "Fleet", "Cluster Config", "Data Inventory", "Logs"])
 
     with tabs[0]:
         overview_cols = st.columns(2)
         with overview_cols[0]:
             st.subheader("Runtime")
             st.json(runtime, expanded=False)
+            service_cols = st.columns(3)
+            if service_cols[0].button("Join Cluster", use_container_width=True):
+                join_cluster(settings)
+                st.rerun()
+            if service_cols[1].button("Rebuild Local State", use_container_width=True):
+                rebuild_cluster_state(settings)
+                st.rerun()
+            if service_cols[2].button("Leave Cluster", use_container_width=True):
+                leave_cluster(settings)
+                st.rerun()
         with overview_cols[1]:
             st.subheader("NAS Health")
             st.write(f"Share: `{nas['share']}`")
@@ -89,8 +115,31 @@ def main() -> None:
             st.write(f"Mount writable: `{nas['mount_writable']}`")
             st.write(f"Expected stage sessions: `{snapshot['expected_stage_sessions'] or '-'}`")
             st.write(f"Stage progress ratio: `{_format_ratio(snapshot.get('stage_progress_ratio'))}`")
+            st.write(f"Systemd: `{snapshot['systemd'].get('ActiveState', snapshot['systemd'].get('reason', 'unknown'))}`")
 
     with tabs[1]:
+        worker_cols = st.columns(2)
+        with worker_cols[0]:
+            st.subheader("Workers")
+            st.dataframe(cluster["workers"], use_container_width=True)
+            st.caption(f"Active workers: {len(cluster['active_workers'])}")
+        with worker_cols[1]:
+            st.subheader("Leases")
+            st.dataframe(cluster["leases"], use_container_width=True)
+            lease_options = [lease["lease_id"] for lease in cluster["leases"] if lease]
+            selected = st.selectbox("Force release lease", [""] + lease_options)
+            if selected and st.button("Force Release", type="secondary"):
+                force_release_lease(settings, selected)
+                st.rerun()
+        lower = st.columns(2)
+        with lower[0]:
+            st.subheader("Shard Map")
+            st.dataframe(cluster["shards"], use_container_width=True)
+        with lower[1]:
+            st.subheader("Recent Events")
+            st.dataframe(cluster["recent_events"], use_container_width=True)
+
+    with tabs[2]:
         st.subheader("NAS and Schedule Settings")
         with st.form("nas_settings"):
             nas_share = st.text_input("NAS Share", value=settings.nas_share, help="Example: //192.168.1.20/trademl")
@@ -116,8 +165,32 @@ def main() -> None:
                 st.success(f"Saved settings to {result['config_path']} and {result['env_path']}.")
                 st.caption(f"fstab entry persisted to {result['fstab_path']}")
                 st.rerun()
+        secret_cols = st.columns(2)
+        with secret_cols[0]:
+            st.subheader("Shared Secret Updates")
+            with st.form("secret_update"):
+                secret_key = st.text_input("Secret Key")
+                secret_value = st.text_input("Secret Value")
+                secret_passphrase = st.text_input("Cluster Passphrase", type="password", value=os.getenv("TRADEML_CLUSTER_PASSPHRASE", ""))
+                if st.form_submit_button("Update Secret") and secret_key:
+                    update_cluster_secrets(settings, passphrase=secret_passphrase, updates={secret_key: secret_value})
+                    st.success(f"Updated {secret_key}")
+                    st.rerun()
+        with secret_cols[1]:
+            st.subheader("Passphrase Rotation")
+            with st.form("passphrase_rotate"):
+                old_pass = st.text_input("Old Passphrase", type="password")
+                new_pass = st.text_input("New Passphrase", type="password")
+                if st.form_submit_button("Rotate Passphrase") and old_pass and new_pass:
+                    rotate_cluster_passphrase(settings, old_passphrase=old_pass, new_passphrase=new_pass)
+                    st.success("Cluster passphrase rotated")
+                    st.rerun()
+            if st.button("Install systemd Service", use_container_width=True):
+                result = install_service(settings)
+                st.success(f"Service written to {result['service_path']}")
+                st.rerun()
 
-    with tabs[2]:
+    with tabs[3]:
         inventory_cols = st.columns(2)
         with inventory_cols[0]:
             st.subheader("Reference Files")
@@ -129,10 +202,17 @@ def main() -> None:
         st.json(queue_counts, expanded=False)
         st.subheader("Resolved Settings")
         st.json(snapshot["settings"], expanded=False)
+        st.subheader("Last Success")
+        st.json(cluster["last_success"], expanded=False)
+        st.subheader("Manifest")
+        st.json(cluster["manifest"], expanded=False)
 
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("Node Log")
         st.text_area("Recent log lines", value=snapshot["log_tail"], height=500)
+        if snapshot["journal_tail"]:
+            st.subheader("systemd Journal")
+            st.text_area("Recent journal lines", value=snapshot["journal_tail"], height=300)
         st.download_button(
             "Download runtime snapshot",
             data=json.dumps(snapshot, indent=2, default=str),

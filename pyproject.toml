@@ -9,6 +9,7 @@ description = "Spec-driven equities research and data pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "cryptography>=45.0",
   "exchange_calendars>=4.5",
   "lightgbm>=4.5.0",
   "numpy>=1.26",

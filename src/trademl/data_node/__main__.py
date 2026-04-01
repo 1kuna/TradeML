@@ -19,6 +19,7 @@ from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.service import DataNodePaths, DataNodeService
+from trademl.fleet.cluster import ClusterCoordinator
 
 
 def _load_dotenv(env_path: Path | None) -> None:
@@ -41,6 +42,7 @@ def main() -> int:
     parser.add_argument("--env-file", default=None)
     parser.add_argument("--date", default=None)
     parser.add_argument("--symbols", nargs="*", default=None)
+    parser.add_argument("--passphrase", default=None)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=60.0)
     args = parser.parse_args()
@@ -110,6 +112,7 @@ def main() -> int:
     ).expanduser().parent
     local_state_default = workspace_root / "control" if args.root else Path(config["node"]["local_state"]).expanduser()
     local_state = Path(os.getenv("LOCAL_STATE", str(local_state_default))).expanduser()
+    worker_id = os.getenv("EDGE_NODE_ID", config.get("node", {}).get("worker_id", os.uname().nodename if hasattr(os, "uname") else "worker"))
     db = DataNodeDB(local_state / "node.sqlite")
     data_root = Path(args.data_root or os.getenv("NAS_MOUNT", config["node"]["nas_mount"])).expanduser()
     symbols = args.symbols or _load_stage_symbols(workspace_root)
@@ -169,15 +172,32 @@ def main() -> int:
         service.sync_partition_status()
         return 0
 
-    service.run_forever(
-        symbols=symbols,
-        exchange="XNYS",
-        collection_time_et=os.getenv("COLLECTION_TIME_ET", config["node"]["collection_time_et"]),
-        maintenance_hour_local=int(os.getenv("MAINTENANCE_HOUR_LOCAL", config["node"]["maintenance_hour_local"])),
+    coordinator = ClusterCoordinator(
+        nas_root=data_root,
+        workspace_root=workspace_root,
+        config_path=Path(args.config).expanduser(),
+        env_path=env_path or (workspace_root / ".env"),
+        local_state=local_state,
+        nas_share=os.getenv("NAS_SHARE", config["node"].get("nas_share", "//nas/trademl")),
+        worker_id=worker_id,
+        lease_ttl_seconds=int(config["node"].get("lease_ttl_seconds", 90)),
+        heartbeat_interval_seconds=int(config["node"].get("heartbeat_interval_seconds", 30)),
+    )
+    manifest = coordinator.ensure_cluster_ready(passphrase=args.passphrase)
+    rebuilt = coordinator.rebuild_local_state(local_db_path=local_state / "node.sqlite")
+    db = DataNodeDB(local_state / "node.sqlite")
+    service.db = db
+    service.auditor.db = db
+    service.run_cluster_forever(
+        coordinator=coordinator,
+        symbols=symbols or manifest["stage"]["symbols"],
+        exchange=manifest["datasets"]["equities_eod"].get("exchange", "XNYS"),
+        collection_time_et=os.getenv("COLLECTION_TIME_ET", manifest["schedule"]["collection_time_et"]),
+        maintenance_hour_local=int(os.getenv("MAINTENANCE_HOUR_LOCAL", manifest["schedule"]["maintenance_hour_local"])),
         poll_seconds=args.poll_seconds,
         macro_series_ids=["DGS10"] if "fred" in connectors else [],
         reference_jobs=reference_jobs,
-        price_check_symbols=symbols[:5] if {"massive", "finnhub"}.issubset(connectors) else [],
+        price_check_symbols=(symbols or manifest["stage"]["symbols"])[:5] if {"massive", "finnhub"}.issubset(connectors) else [],
     )
     return 0
 

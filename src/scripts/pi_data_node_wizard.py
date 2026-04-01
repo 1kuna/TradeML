@@ -113,6 +113,7 @@ def main() -> int:
     parser.add_argument("--fred-api-key", default="")
     parser.add_argument("--fmp-api-key", default="")
     parser.add_argument("--massive-api-key", default="")
+    parser.add_argument("--cluster-passphrase", default="")
     parser.add_argument("--start-node", action="store_true")
     args = parser.parse_args()
 
@@ -151,6 +152,9 @@ def main() -> int:
     )
     result.update({"nas_write_ok": nas_write_ok, "env_file": str(env_path)})
     if args.start_node:
+        child_env = os.environ.copy()
+        if args.cluster_passphrase:
+            child_env["TRADEML_CLUSTER_PASSPHRASE"] = args.cluster_passphrase
         subprocess.Popen(
             [
                 os.sys.executable,
@@ -163,6 +167,7 @@ def main() -> int:
                 "--env-file",
                 str(env_path),
             ],  # noqa: S603
+            env=child_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

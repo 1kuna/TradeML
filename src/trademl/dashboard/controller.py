@@ -20,6 +20,17 @@ import pandas as pd
 import yaml
 
 from trademl.calendars.exchange import get_trading_days
+from trademl.fleet.cluster import (
+    ClusterCoordinator,
+    ClusterPaths,
+    append_cluster_event,
+    encrypt_secret_bundle,
+    install_systemd_service,
+    read_cluster_snapshot,
+    rebuild_local_state as rebuild_cluster_local_state,
+    systemd_journal_tail,
+    systemd_status,
+)
 
 
 @dataclass(slots=True)
@@ -35,6 +46,7 @@ class NodeSettings:
     nas_share: str
     collection_time_et: str
     maintenance_hour_local: int
+    worker_id: str
 
     @property
     def stage_path(self) -> Path:
@@ -68,6 +80,10 @@ class NodeSettings:
     def reference_root(self) -> Path:
         return self.nas_mount / "data" / "reference"
 
+    @property
+    def cluster_paths(self) -> ClusterPaths:
+        return ClusterPaths(self.nas_mount)
+
 
 def resolve_node_settings(
     *,
@@ -96,6 +112,7 @@ def resolve_node_settings(
     maintenance_hour_local = int(
         env_values.get("MAINTENANCE_HOUR_LOCAL") or node.get("maintenance_hour_local") or 2
     )
+    worker_id = env_values.get("EDGE_NODE_ID") or node.get("worker_id") or socket.gethostname()
     return NodeSettings(
         repo_root=repo_root,
         workspace_root=resolved_workspace,
@@ -106,6 +123,7 @@ def resolve_node_settings(
         nas_share=nas_share,
         collection_time_et=collection_time_et,
         maintenance_hour_local=maintenance_hour_local,
+        worker_id=worker_id,
     )
 
 
@@ -126,6 +144,7 @@ def persist_node_settings(
     node["local_state"] = str(settings.local_state)
     node["collection_time_et"] = collection_time_et
     node["maintenance_hour_local"] = int(maintenance_hour_local)
+    node["worker_id"] = settings.worker_id
     _write_yaml(settings.config_path, config)
 
     env_values = _read_env_file(settings.env_path)
@@ -150,6 +169,14 @@ def persist_node_settings(
         stage["nas"]["share"] = nas_share
         stage["nas"]["mount"] = nas_mount
         _write_yaml(settings.stage_path, stage)
+
+    manifest = _read_yaml(settings.cluster_paths.manifest_path)
+    if manifest:
+        manifest["nas_share"] = nas_share
+        manifest.setdefault("schedule", {})
+        manifest["schedule"]["collection_time_et"] = collection_time_et
+        manifest["schedule"]["maintenance_hour_local"] = int(maintenance_hour_local)
+        _write_yaml(settings.cluster_paths.manifest_path, manifest)
 
     persisted_fstab = persist_fstab_entry(
         path=Path(fstab_path).expanduser() if fstab_path else Path("/etc/fstab"),
@@ -182,6 +209,12 @@ def persist_fstab_entry(*, path: Path, nas_share: str, nas_mount: str) -> Path:
 
 def start_node(settings: NodeSettings, *, command: list[str] | None = None) -> dict[str, Any]:
     """Start the data-node process in the background if it is not already running."""
+    svc = systemd_status()
+    if svc.get("supported") and svc.get("UnitFileState") not in {None, "not-found", "", "masked"}:
+        subprocess.run(["systemctl", "start", "trademl-node.service"], check=False)
+        snapshot = collect_dashboard_snapshot(settings)
+        snapshot["runtime"]["managed_by"] = "systemd"
+        return snapshot["runtime"]
     runtime = _read_runtime_state(settings)
     pid = runtime.get("pid")
     if isinstance(pid, int) and _is_process_running(pid):
@@ -229,6 +262,14 @@ def start_node(settings: NodeSettings, *, command: list[str] | None = None) -> d
 
 def stop_node(settings: NodeSettings, *, timeout_seconds: float = 10.0) -> dict[str, Any]:
     """Stop the managed node process if it is running."""
+    svc = systemd_status()
+    if svc.get("supported") and svc.get("UnitFileState") not in {None, "not-found", "", "masked"}:
+        subprocess.run(["systemctl", "stop", "trademl-node.service"], check=False)
+        runtime = _read_runtime_state(settings)
+        runtime["running"] = False
+        runtime["managed_by"] = "systemd"
+        _write_runtime_state(settings, runtime)
+        return runtime
     runtime = _read_runtime_state(settings)
     pid = runtime.get("pid")
     if not isinstance(pid, int) or not _is_process_running(pid):
@@ -257,6 +298,85 @@ def restart_node(settings: NodeSettings) -> dict[str, Any]:
     """Restart the managed node and return the new runtime state."""
     stop_node(settings)
     return start_node(settings)
+
+
+def join_cluster(settings: NodeSettings, *, passphrase: str | None = None) -> dict[str, Any]:
+    """Bootstrap or join the NAS-backed worker cluster."""
+    coordinator = _coordinator(settings)
+    manifest = coordinator.ensure_cluster_ready(passphrase=passphrase)
+    rebuilt = coordinator.rebuild_local_state(local_db_path=settings.db_path)
+    return {"manifest": manifest, "rebuilt": rebuilt, "worker_id": coordinator.worker_id}
+
+
+def rebuild_cluster_state(settings: NodeSettings, *, passphrase: str | None = None) -> dict[str, Any]:
+    """Rebuild disposable local state from NAS-backed truth."""
+    return rebuild_cluster_local_state(
+        nas_root=settings.nas_mount,
+        workspace_root=settings.workspace_root,
+        config_path=settings.config_path,
+        env_path=settings.env_path,
+        local_state=settings.local_state,
+        nas_share=settings.nas_share,
+        worker_id=settings.worker_id,
+        passphrase=passphrase,
+    )
+
+
+def leave_cluster(settings: NodeSettings) -> dict[str, Any]:
+    """Leave the cluster and release any owned leases."""
+    coordinator = _coordinator(settings)
+    return coordinator.leave_cluster()
+
+
+def install_service(settings: NodeSettings, *, service_path: str | None = None) -> dict[str, Any]:
+    """Install the Linux systemd service definition for the worker."""
+    result = install_systemd_service(
+        python_executable=sys.executable,
+        config_path=settings.config_path,
+        workspace_root=settings.workspace_root,
+        env_path=settings.env_path,
+        service_path=Path(service_path).expanduser() if service_path else None,
+    )
+    append_cluster_event(settings.cluster_paths, "service_installed", {"worker_id": settings.worker_id, **result})
+    return result
+
+
+def rotate_cluster_passphrase(
+    settings: NodeSettings,
+    *,
+    old_passphrase: str,
+    new_passphrase: str,
+) -> dict[str, Any]:
+    """Rotate the NAS-backed encrypted secret bundle passphrase."""
+    coordinator = _coordinator(settings)
+    secrets = coordinator.decrypt_cluster_secrets(passphrase=old_passphrase)
+    encrypt_secret_bundle(settings.cluster_paths.secrets_path, new_passphrase, secrets)
+    append_cluster_event(settings.cluster_paths, "passphrase_rotated", {"worker_id": settings.worker_id})
+    return {"rotated_keys": sorted(secrets)}
+
+
+def update_cluster_secrets(
+    settings: NodeSettings,
+    *,
+    passphrase: str,
+    updates: dict[str, str],
+) -> dict[str, Any]:
+    """Update the encrypted NAS-backed shared secret bundle."""
+    coordinator = _coordinator(settings)
+    secrets = coordinator.decrypt_cluster_secrets(passphrase=passphrase)
+    secrets.update({key: value for key, value in updates.items() if key})
+    encrypt_secret_bundle(settings.cluster_paths.secrets_path, passphrase, secrets)
+    append_cluster_event(settings.cluster_paths, "secrets_updated", {"worker_id": settings.worker_id, "keys": sorted(updates)})
+    return {"keys": sorted(secrets)}
+
+
+def force_release_lease(settings: NodeSettings, lease_id: str) -> bool:
+    """Force-release a lease from the dashboard/CLI."""
+    coordinator = _coordinator(settings)
+    released = coordinator.force_release_lease(lease_id)
+    if released:
+        append_cluster_event(settings.cluster_paths, "lease_force_released", {"worker_id": settings.worker_id, "lease_id": lease_id})
+    return released
 
 
 def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
@@ -306,8 +426,23 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         },
         "reference_files": sorted(path.name for path in settings.reference_root.glob("*.parquet")) if settings.reference_root.exists() else [],
         "log_tail": _tail_file(settings.log_path),
+        "cluster": read_cluster_snapshot(nas_root=settings.nas_mount, worker_id=settings.worker_id),
+        "systemd": systemd_status(),
+        "journal_tail": systemd_journal_tail(),
     }
     return snapshot
+
+
+def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
+    return ClusterCoordinator(
+        nas_root=settings.nas_mount,
+        workspace_root=settings.workspace_root,
+        config_path=settings.config_path,
+        env_path=settings.env_path,
+        local_state=settings.local_state,
+        nas_share=settings.nas_share,
+        worker_id=settings.worker_id,
+    )
 
 
 def _read_queue_counts(db_path: Path) -> dict[str, int]:

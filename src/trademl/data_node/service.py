@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import signal
 import threading
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +20,7 @@ from trademl.connectors.base import BaseConnector, ConnectorError
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.curator import Curator, CuratorResult
 from trademl.data_node.db import DataNodeDB
+from trademl.fleet.cluster import ClusterCoordinator, ShardSpec
 
 
 @dataclass(slots=True)
@@ -102,6 +106,15 @@ class DataNodeService:
         if frame.empty:
             return []
         return self._write_raw_partition(frame)
+
+    def collect_forward_shard(self, *, trading_date: str, symbols: list[str], shard_id: str) -> list[str]:
+        """Fetch and persist a shard-specific daily bar slice."""
+        if not symbols:
+            return []
+        frame = self.connectors[self.source_name].fetch("equities_eod", symbols, trading_date, trading_date)
+        if frame.empty:
+            return []
+        return self._write_raw_shard_partition(frame, shard_id=shard_id)
 
     def process_backfill_queue(self) -> list[str]:
         """Process queued backfill or gap tasks until the queue is drained."""
@@ -288,6 +301,93 @@ class DataNodeService:
             "qc_path": qc_path,
         }
 
+    def run_cluster_forever(
+        self,
+        *,
+        coordinator: ClusterCoordinator,
+        symbols: list[str],
+        exchange: str,
+        collection_time_et: str = "16:30",
+        maintenance_hour_local: int = 2,
+        poll_seconds: float = 60.0,
+        audit_lookback_days: int = 7,
+        macro_series_ids: list[str] | None = None,
+        reference_jobs: list[dict[str, object]] | None = None,
+        price_check_symbols: list[str] | None = None,
+        now_fn=lambda: datetime.now(tz=UTC),
+        sleep_fn=sleep,
+    ) -> None:
+        """Run the clustered scheduled data-node loop until a stop signal is received."""
+        market_tz = ZoneInfo("America/New_York")
+        collection_hour, collection_minute = (int(part) for part in collection_time_et.split(":", 1))
+        self.default_symbols = symbols
+
+        while not self._stop_event.is_set():
+            coordinator.heartbeat_worker()
+            current = now_fn()
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=UTC)
+            current_et = current.astimezone(market_tz)
+            current_local = current.astimezone()
+            trading_date = current_et.date().isoformat()
+            owned_shards = coordinator.sync_shard_leases()
+
+            if self._should_run_collection(
+                trading_date=trading_date,
+                current_et=current_et,
+                collection_hour=collection_hour,
+                collection_minute=collection_minute,
+                exchange=exchange,
+            ):
+                for shard in owned_shards:
+                    self._collect_cluster_shard(trading_date=trading_date, shard=shard)
+                self._collection_history.add(trading_date)
+
+                if coordinator.acquire_singleton("audit_curate", trading_date):
+                    audit_start = (pd.Timestamp(trading_date) - pd.Timedelta(days=audit_lookback_days)).strftime("%Y-%m-%d")
+                    self.auditor.audit_range(
+                        exchange=exchange,
+                        source=self.source_name,
+                        dataset="equities_eod",
+                        start_date=audit_start,
+                        end_date=trading_date,
+                        expected_rows=len(symbols),
+                    )
+                    self.curate_dates(corp_actions=self.load_corp_actions_reference())
+                    self.sync_partition_status()
+                    coordinator.mark_singleton_success("audit_curate", trading_date, {"symbol_count": len(symbols)})
+
+                if macro_series_ids and "fred" in self.connectors and coordinator.acquire_singleton("macro", trading_date):
+                    self.collect_macro_data(macro_series_ids, trading_date, trading_date)
+                    coordinator.mark_singleton_success("macro", trading_date, {"series_count": len(macro_series_ids)})
+
+                week_key = self._week_key(current_et)
+                if reference_jobs and coordinator.acquire_singleton("reference", week_key):
+                    materialized_jobs = [self._materialize_job(job, trading_date) for job in reference_jobs]
+                    self.collect_reference_data(materialized_jobs)
+                    if any(job.get("output_name") == "corp_actions" for job in materialized_jobs):
+                        corp_actions_path = self.paths.root / "data" / "reference" / "corp_actions.parquet"
+                        if corp_actions_path.exists():
+                            self.curate_dates(corp_actions=pd.read_parquet(corp_actions_path))
+                    coordinator.mark_singleton_success("reference", week_key, {"job_count": len(materialized_jobs)})
+
+                if price_check_symbols and coordinator.acquire_singleton("price_checks", week_key):
+                    self.run_cross_vendor_price_checks(trading_date=trading_date, sample_symbols=price_check_symbols)
+                    coordinator.mark_singleton_success("price_checks", week_key, {"symbol_count": len(price_check_symbols)})
+
+            local_day = current_local.date().isoformat()
+            if self._should_run_maintenance(local_day=local_day, current_local=current_local, maintenance_hour_local=maintenance_hour_local):
+                if coordinator.acquire_singleton("backfill", local_day):
+                    changed_dates = self.process_backfill_queue()
+                    if changed_dates:
+                        self.curate_dates(corp_actions=self.load_corp_actions_reference())
+                    self.sync_partition_status()
+                    coordinator.mark_singleton_success("backfill", local_day, {"changed_dates": len(changed_dates)})
+                self._maintenance_history.add(local_day)
+
+            if not self._stop_event.is_set():
+                sleep_fn(poll_seconds)
+
     def run_forever(
         self,
         *,
@@ -401,3 +501,56 @@ class DataNodeService:
     def _week_key(current_et: datetime) -> str:
         iso = current_et.isocalendar()
         return f"{iso.year}-W{iso.week:02d}"
+
+    def _write_raw_shard_partition(self, frame: pd.DataFrame, *, shard_id: str) -> list[str]:
+        changed_dates: list[str] = []
+        for day, day_frame in frame.groupby("date"):
+            day_value = pd.Timestamp(day).strftime("%Y-%m-%d")
+            partition = self.paths.raw_equities / f"date={day_value}"
+            shard_root = partition / "shards"
+            shard_root.mkdir(parents=True, exist_ok=True)
+            shard_path = shard_root / f"{shard_id}.parquet"
+            tmp_path = shard_root / f"{shard_id}.{uuid.uuid4().hex}.tmp"
+            day_frame.to_parquet(tmp_path, index=False)
+            os.replace(tmp_path, shard_path)
+            self._merge_raw_shards_for_date(day_value)
+            changed_dates.append(day_value)
+        return changed_dates
+
+    def _merge_raw_shards_for_date(self, day_value: str) -> Path:
+        partition = self.paths.raw_equities / f"date={day_value}"
+        shard_root = partition / "shards"
+        lock_path = partition / ".merge.lock"
+        self._acquire_file_lock(lock_path)
+        try:
+            frames = [pd.read_parquet(path) for path in sorted(shard_root.glob("*.parquet"))]
+            merged = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            tmp_path = partition / f"data.{uuid.uuid4().hex}.tmp"
+            merged.to_parquet(tmp_path, index=False)
+            output = partition / "data.parquet"
+            os.replace(tmp_path, output)
+            return output
+        finally:
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
+
+    @staticmethod
+    def _acquire_file_lock(path: Path, *, stale_after_seconds: int = 15) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                return
+            except FileExistsError:
+                if path.exists() and (datetime.now(tz=UTC).timestamp() - path.stat().st_mtime) > stale_after_seconds:
+                    with contextlib.suppress(OSError):
+                        path.unlink()
+                    continue
+                sleep(0.05)
+
+    def _collect_cluster_shard(self, *, trading_date: str, shard: ShardSpec) -> None:
+        partition = self.paths.raw_equities / f"date={trading_date}" / "shards" / f"{shard.shard_id}.parquet"
+        if partition.exists():
+            return
+        self.collect_forward_shard(trading_date=trading_date, symbols=shard.symbols, shard_id=shard.shard_id)
