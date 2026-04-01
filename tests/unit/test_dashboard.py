@@ -116,10 +116,20 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
         qc_root / "partition_status.parquet",
         index=False,
     )
+    pd.DataFrame([{"symbol": "AAPL", "massive_close": 1.0, "finnhub_close": 1.0}]).to_parquet(
+        qc_root / "price_checks_2025-01-02.parquet",
+        index=False,
+    )
     for root in [nas_mount / "data" / "raw" / "equities_bars", nas_mount / "data" / "curated" / "equities_ohlcv_adj"]:
         partition = root / "date=2025-01-02"
         partition.mkdir(parents=True, exist_ok=True)
         pd.DataFrame([{"symbol": "AAPL"}]).to_parquet(partition / "data.parquet", index=False)
+    macro_partition = nas_mount / "data" / "raw" / "macros_fred" / "series=DGS10"
+    macro_partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"date": "2025-01-02", "value": 4.5}]).to_parquet(macro_partition / "data.parquet", index=False)
+    reference_root = nas_mount / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"symbol": "AAPL"}]).to_parquet(reference_root / "universe.parquet", index=False)
 
     local_state.mkdir(parents=True, exist_ok=True)
     (local_state / "node_runtime.json").write_text(
@@ -137,6 +147,10 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert snapshot["partition_summary"]["counts"]["GREEN"] == 1
     assert snapshot["raw_partitions"] == 1
     assert snapshot["latest_raw_date"] == "2025-01-02"
+    assert snapshot["reference_file_count"] == 1
+    assert snapshot["macro_series_count"] == 1
+    assert snapshot["price_check_count"] == 1
+    assert snapshot["data_readiness"]["missing"] == ["equities EOD backfill"]
     assert "cycle done" in snapshot["log_tail"]
 
 

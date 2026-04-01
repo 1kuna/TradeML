@@ -84,6 +84,14 @@ class NodeSettings:
         return self.nas_mount / "data" / "reference"
 
     @property
+    def macro_root(self) -> Path:
+        return self.nas_mount / "data" / "raw" / "macros_fred"
+
+    @property
+    def price_checks_root(self) -> Path:
+        return self.nas_mount / "data" / "qc"
+
+    @property
     def cluster_paths(self) -> ClusterPaths:
         return ClusterPaths(self.nas_mount)
 
@@ -519,6 +527,9 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
     partition_summary = _read_partition_summary(settings.qc_path)
     raw_dates = _partition_dates(settings.raw_equities_root)
     curated_dates = _partition_dates(settings.curated_equities_root)
+    reference_files = sorted(path.name for path in settings.reference_root.glob("*.parquet")) if settings.reference_root.exists() else []
+    macro_series = _macro_series(settings.macro_root)
+    price_check_files = _price_check_files(settings.price_checks_root)
     stage = _read_yaml(settings.stage_path)
     stage_symbols = stage.get("symbols", [])
     stage_years = stage.get("years")
@@ -531,6 +542,14 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         if expected_sessions:
             progress_ratio = len(raw_dates) / expected_sessions
     host = _extract_share_host(settings.nas_share)
+    data_readiness = _summarize_data_readiness(
+        raw_dates=len(raw_dates),
+        expected_sessions=expected_sessions,
+        partition_summary=partition_summary,
+        reference_files=reference_files,
+        macro_series=macro_series,
+        price_check_files=price_check_files,
+    )
     snapshot = {
         "settings": asdict(settings),
         "runtime": runtime,
@@ -540,10 +559,17 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "curated_partitions": len(curated_dates),
         "latest_raw_date": max(raw_dates) if raw_dates else None,
         "latest_curated_date": max(curated_dates) if curated_dates else None,
+        "reference_files": reference_files,
+        "reference_file_count": len(reference_files),
+        "macro_series": macro_series,
+        "macro_series_count": len(macro_series),
+        "price_check_files": price_check_files,
+        "price_check_count": len(price_check_files),
         "stage_symbol_count": len(stage_symbols),
         "stage_years": stage_years,
         "expected_stage_sessions": expected_sessions,
         "stage_progress_ratio": progress_ratio,
+        "data_readiness": data_readiness,
         "nas": {
             "share": settings.nas_share,
             "host": host,
@@ -551,7 +577,6 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
             "mount_path": str(settings.nas_mount),
             "mount_writable": _check_mount_writable(settings.nas_mount),
         },
-        "reference_files": sorted(path.name for path in settings.reference_root.glob("*.parquet")) if settings.reference_root.exists() else [],
         "log_tail": _tail_file(settings.log_path),
         "cluster": read_cluster_snapshot(nas_root=settings.nas_mount, worker_id=settings.worker_id),
         "systemd": systemd_status(),
@@ -604,6 +629,64 @@ def _partition_dates(root: Path) -> list[str]:
         if value:
             dates.append(value)
     return sorted(set(dates))
+
+
+def _macro_series(root: Path) -> list[str]:
+    if not root.exists():
+        return []
+    series: list[str] = []
+    for path in root.glob("series=*"):
+        _, _, value = path.name.partition("=")
+        if value:
+            series.append(value)
+    return sorted(set(series))
+
+
+def _price_check_files(root: Path) -> list[str]:
+    if not root.exists():
+        return []
+    return sorted(path.name for path in root.glob("price_checks_*.parquet"))
+
+
+def _summarize_data_readiness(
+    *,
+    raw_dates: int,
+    expected_sessions: int | None,
+    partition_summary: dict[str, Any],
+    reference_files: list[str],
+    macro_series: list[str],
+    price_check_files: list[str],
+) -> dict[str, Any]:
+    eod_complete = bool(
+        expected_sessions
+        and raw_dates >= expected_sessions
+        and partition_summary.get("coverage_green") == 1.0
+    )
+    missing: list[str] = []
+    if not eod_complete:
+        missing.append("equities EOD backfill")
+    if not reference_files:
+        missing.append("reference datasets")
+    if not macro_series:
+        missing.append("macro series")
+    if not price_check_files:
+        missing.append("cross-vendor price checks")
+
+    if not missing:
+        headline = "All tracked Stage 0 datasets present"
+        state = "complete"
+    elif eod_complete:
+        headline = "Equities EOD complete; additional datasets still pending"
+        state = "partial"
+    else:
+        headline = "Initial collection still in progress"
+        state = "collecting"
+    return {
+        "state": state,
+        "headline": headline,
+        "missing": missing,
+        "eod_complete": eod_complete,
+    }
 
 
 def _extract_share_host(nas_share: str) -> str | None:

@@ -69,6 +69,7 @@ def main() -> None:
     partition_summary = snapshot["partition_summary"]
     queue_counts = snapshot["queue_counts"]
     cluster = snapshot["cluster"]
+    data_readiness = snapshot["data_readiness"]
     running = bool(runtime.get("running"))
 
     controls = st.columns([1, 1, 1, 2])
@@ -86,22 +87,31 @@ def main() -> None:
     top_metrics = st.columns(6)
     top_metrics[0].metric("Pending", queue_counts.get("PENDING", 0))
     top_metrics[1].metric("Failed", queue_counts.get("FAILED", 0))
-    top_metrics[2].metric("Green", partition_summary["counts"].get("GREEN", 0))
-    top_metrics[3].metric("Amber", partition_summary["counts"].get("AMBER", 0))
-    top_metrics[4].metric("Red", partition_summary["counts"].get("RED", 0))
-    top_metrics[5].metric("Coverage", _format_ratio(partition_summary.get("coverage_green")))
+    top_metrics[2].metric("EOD QC Green", partition_summary["counts"].get("GREEN", 0))
+    top_metrics[3].metric("EOD QC Amber", partition_summary["counts"].get("AMBER", 0))
+    top_metrics[4].metric("EOD QC Red", partition_summary["counts"].get("RED", 0))
+    top_metrics[5].metric("EOD Date Coverage", _format_ratio(snapshot.get("stage_progress_ratio")))
 
     lower_metrics = st.columns(6)
     lower_metrics[0].metric("Raw Dates", snapshot["raw_partitions"])
     lower_metrics[1].metric("Curated Dates", snapshot["curated_partitions"])
-    lower_metrics[2].metric("Stage Symbols", snapshot["stage_symbol_count"])
-    lower_metrics[3].metric("Stage Years", snapshot["stage_years"] or "-")
-    lower_metrics[4].metric("Latest Raw", snapshot["latest_raw_date"] or "-")
-    lower_metrics[5].metric("Latest Curated", snapshot["latest_curated_date"] or "-")
+    lower_metrics[2].metric("Reference Files", snapshot["reference_file_count"])
+    lower_metrics[3].metric("Macro Series", snapshot["macro_series_count"])
+    lower_metrics[4].metric("Price Checks", snapshot["price_check_count"])
+    lower_metrics[5].metric("Latest Raw", snapshot["latest_raw_date"] or "-")
 
     tabs = st.tabs(["Overview", "Fleet", "Cluster Config", "Data Inventory", "Logs"])
 
     with tabs[0]:
+        if data_readiness["state"] == "complete":
+            st.success(data_readiness["headline"])
+        elif data_readiness["state"] == "partial":
+            st.warning(data_readiness["headline"])
+        else:
+            st.info(data_readiness["headline"])
+        if data_readiness["missing"]:
+            st.write("Still missing:")
+            st.write(data_readiness["missing"])
         overview_cols = st.columns(2)
         with overview_cols[0]:
             st.subheader("Runtime")
@@ -117,14 +127,18 @@ def main() -> None:
                 leave_cluster(settings)
                 st.rerun()
         with overview_cols[1]:
-            st.subheader("NAS Health")
+            st.subheader("NAS and Dataset Status")
             st.write(f"Share: `{nas['share']}`")
             st.write(f"Host: `{nas.get('host') or 'n/a'}`")
             st.write(f"Host reachable on 445: `{nas['host_reachable']}`")
             st.write(f"Mount path: `{nas['mount_path']}`")
             st.write(f"Mount writable: `{nas['mount_writable']}`")
             st.write(f"Expected stage sessions: `{snapshot['expected_stage_sessions'] or '-'}`")
-            st.write(f"Stage progress ratio: `{_format_ratio(snapshot.get('stage_progress_ratio'))}`")
+            st.write(f"EOD date coverage: `{_format_ratio(snapshot.get('stage_progress_ratio'))}`")
+            st.write(f"EOD QC green ratio: `{_format_ratio(partition_summary.get('coverage_green'))}`")
+            st.write(f"Reference files present: `{snapshot['reference_file_count']}`")
+            st.write(f"Macro series present: `{snapshot['macro_series_count']}`")
+            st.write(f"Price check files present: `{snapshot['price_check_count']}`")
             st.write(f"Systemd: `{snapshot['systemd'].get('ActiveState', snapshot['systemd'].get('reason', 'unknown'))}`")
 
     with tabs[1]:
@@ -218,8 +232,17 @@ def main() -> None:
             st.subheader("Reference Files")
             st.write(snapshot["reference_files"] or ["No reference parquet files found"])
         with inventory_cols[1]:
-            st.subheader("Partition Summary")
-            st.json(partition_summary, expanded=False)
+            st.subheader("Dataset Readiness")
+            st.json(snapshot["data_readiness"], expanded=False)
+        extra_inventory_cols = st.columns(2)
+        with extra_inventory_cols[0]:
+            st.subheader("Macro Series")
+            st.write(snapshot["macro_series"] or ["No macro series parquet files found"])
+        with extra_inventory_cols[1]:
+            st.subheader("Price Check Files")
+            st.write(snapshot["price_check_files"] or ["No cross-vendor price check files found"])
+        st.subheader("Partition Summary")
+        st.json(partition_summary, expanded=False)
         st.subheader("Queue Summary")
         st.json(queue_counts, expanded=False)
         st.subheader("Resolved Settings")
