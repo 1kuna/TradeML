@@ -42,18 +42,32 @@ The dashboard provides:
 - Editable NAS share / mount and schedule settings
 - Log tailing and restart-safe progress inspection from SQLite + parquet state
 - Cluster join / rebuild / leave controls and systemd install integration
+- Local worker lifecycle controls for update / reset / uninstall
 
-CLI controls are also available:
+The intended operator flow is:
+
+- Use `trademl dashboard` to configure the worker, join the cluster, monitor progress, and run the node day to day.
+- Use the CLI only for install/update/reset/uninstall and launching the dashboard.
+
+Minimal lifecycle commands:
 
 ```bash
-trademl node status
-trademl node start
-trademl node stop
-trademl node restart
-trademl node join-cluster --passphrase 'your-passphrase'
-trademl node rebuild-state --passphrase 'your-passphrase'
+trademl dashboard
+trademl node update
+trademl node reset --passphrase 'your-passphrase'
+trademl node uninstall
 trademl node install-service
 ```
+
+The dashboard now exposes the rest of the worker lifecycle:
+
+- Start / stop / restart
+- Join cluster
+- Rebuild local state from NAS
+- Leave cluster
+- Edit NAS and schedule settings
+- Inspect fleet leases, workers, and recent events
+- Rotate cluster passphrase and update encrypted shared secrets
 
 For Raspberry Pi / Linux workers, you can also install the systemd unit:
 

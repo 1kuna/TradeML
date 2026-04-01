@@ -21,6 +21,9 @@ from trademl.dashboard.controller import (
     rotate_cluster_passphrase,
     start_node,
     stop_node,
+    reset_worker,
+    uninstall_worker,
+    update_worker,
     update_cluster_secrets,
 )
 
@@ -62,6 +65,10 @@ def main(argv: list[str] | None = None) -> int:
     secrets_parser.add_argument("--set", action="append", default=[])
     release_parser = node_subparsers.add_parser("force-release", help="Force-release a lease.")
     release_parser.add_argument("lease_id")
+    reset_parser = node_subparsers.add_parser("reset", help="Wipe local disposable worker state and rebuild from NAS.")
+    reset_parser.add_argument("--passphrase", default=None)
+    node_subparsers.add_parser("update", help="Update the local worker installation.")
+    node_subparsers.add_parser("uninstall", help="Remove local worker artifacts from this machine.")
 
     args = parser.parse_args(argv)
     if args.command == "dashboard":
@@ -116,6 +123,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.node_command == "force-release":
         print(json.dumps({"released": force_release_lease(settings, args.lease_id), "lease_id": args.lease_id}, indent=2, default=str))
+        return 0
+    if args.node_command == "reset":
+        print(json.dumps(reset_worker(settings, passphrase=args.passphrase), indent=2, default=str))
+        return 0
+    if args.node_command == "update":
+        print(json.dumps(update_worker(settings), indent=2, default=str))
+        return 0
+    if args.node_command == "uninstall":
+        print(json.dumps(uninstall_worker(settings), indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported node command: {args.node_command}")
 

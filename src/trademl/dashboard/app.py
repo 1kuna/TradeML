@@ -14,11 +14,14 @@ from trademl.dashboard.controller import (
     leave_cluster,
     persist_node_settings,
     rebuild_cluster_state,
+    reset_worker,
     resolve_node_settings,
     restart_node,
     rotate_cluster_passphrase,
     start_node,
     stop_node,
+    uninstall_worker,
+    update_worker,
     update_cluster_secrets,
 )
 
@@ -52,6 +55,7 @@ def main() -> None:
         st.caption(f"Config: {settings.config_path}")
         st.caption(f"Env: {settings.env_path}")
         st.caption(f"Local state: {settings.local_state}")
+        cluster_passphrase = st.text_input("Cluster Passphrase", type="password", value=os.getenv("TRADEML_CLUSTER_PASSPHRASE", ""))
 
     snapshot = collect_dashboard_snapshot(settings)
     runtime = snapshot["runtime"]
@@ -98,10 +102,10 @@ def main() -> None:
             st.json(runtime, expanded=False)
             service_cols = st.columns(3)
             if service_cols[0].button("Join Cluster", use_container_width=True):
-                join_cluster(settings)
+                join_cluster(settings, passphrase=cluster_passphrase or None)
                 st.rerun()
             if service_cols[1].button("Rebuild Local State", use_container_width=True):
-                rebuild_cluster_state(settings)
+                rebuild_cluster_state(settings, passphrase=cluster_passphrase or None)
                 st.rerun()
             if service_cols[2].button("Leave Cluster", use_container_width=True):
                 leave_cluster(settings)
@@ -189,6 +193,18 @@ def main() -> None:
                 result = install_service(settings)
                 st.success(f"Service written to {result['service_path']}")
                 st.rerun()
+        lifecycle_cols = st.columns(3)
+        if lifecycle_cols[0].button("Update Worker", use_container_width=True):
+            result = update_worker(settings)
+            st.success(f"Updated worker at {result['wrapper_path']}")
+            st.rerun()
+        if lifecycle_cols[1].button("Reset Worker", use_container_width=True):
+            result = reset_worker(settings, passphrase=cluster_passphrase or None)
+            st.success(f"Reset worker workspace {result['workspace_root']}")
+            st.rerun()
+        if lifecycle_cols[2].button("Uninstall Worker", use_container_width=True):
+            result = uninstall_worker(settings)
+            st.success(f"Removed local worker artifacts: {len(result['removed_paths'])}")
 
     with tabs[3]:
         inventory_cols = st.columns(2)

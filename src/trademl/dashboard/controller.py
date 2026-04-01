@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import platform
+import shutil
 import signal
 import socket
 import sqlite3
@@ -341,6 +344,94 @@ def install_service(settings: NodeSettings, *, service_path: str | None = None) 
     return result
 
 
+def update_worker(settings: NodeSettings) -> dict[str, Any]:
+    """Update the local worker installation and optionally restart it."""
+    runtime_before = collect_dashboard_snapshot(settings)["runtime"]
+    was_running = bool(runtime_before.get("running"))
+    if was_running:
+        stop_node(settings)
+
+    venv_path = settings.repo_root / ".venv"
+    bin_dir = Path.home() / ".local" / "bin"
+    wrapper_path = bin_dir / "trademl"
+    subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True)
+    pip_path = venv_path / "bin" / "pip"
+    subprocess.run([str(pip_path), "install", "--upgrade", "pip"], check=True)
+    subprocess.run([str(pip_path), "install", "-e", f"{settings.repo_root}[dev,dashboard]"], check=True)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    wrapper_path.write_text(
+        "#!/usr/bin/env sh\n"
+        f'exec "{venv_path / "bin" / "trademl"}" "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper_path.chmod(0o755)
+
+    service_result = None
+    if settings.cluster_paths.manifest_path.exists():
+        service_result = install_service(settings)
+    if was_running:
+        start_node(settings)
+    append_cluster_event(settings.cluster_paths, "worker_updated", {"worker_id": settings.worker_id, "wrapper_path": str(wrapper_path)})
+    return {
+        "venv_path": str(venv_path),
+        "wrapper_path": str(wrapper_path),
+        "service": service_result,
+        "restarted": was_running,
+    }
+
+
+def reset_worker(settings: NodeSettings, *, passphrase: str | None = None) -> dict[str, Any]:
+    """Wipe local disposable worker state, then rejoin/rebuild from NAS truth."""
+    runtime_before = collect_dashboard_snapshot(settings)["runtime"]
+    was_running = bool(runtime_before.get("running"))
+    stop_node(settings)
+    leave_cluster(settings)
+    _remove_worker_state(settings)
+    joined = join_cluster(settings, passphrase=passphrase)
+    if was_running:
+        start_node(settings)
+    append_cluster_event(settings.cluster_paths, "worker_reset", {"worker_id": settings.worker_id})
+    return {"joined": joined, "restarted": was_running, "workspace_root": str(settings.workspace_root)}
+
+
+def uninstall_worker(settings: NodeSettings) -> dict[str, Any]:
+    """Remove local worker artifacts and detach the machine from the cluster."""
+    stop_node(settings)
+    leave_cluster(settings)
+    removed_paths: list[str] = []
+
+    if platform.system() == "Linux" and shutil.which("systemctl"):
+        subprocess.run(["systemctl", "disable", "--now", "trademl-node.service"], check=False)
+        for candidate in [Path("/etc/systemd/system/trademl-node.service"), settings.workspace_root / "trademl-node.service"]:
+            if candidate.exists():
+                try:
+                    candidate.unlink()
+                    removed_paths.append(str(candidate))
+                except OSError:
+                    pass
+        subprocess.run(["systemctl", "daemon-reload"], check=False)
+
+    wrapper_path = Path.home() / ".local" / "bin" / "trademl"
+    if wrapper_path.exists():
+        try:
+            wrapper_path.unlink()
+            removed_paths.append(str(wrapper_path))
+        except OSError:
+            pass
+
+    if settings.workspace_root.exists():
+        shutil.rmtree(settings.workspace_root, ignore_errors=True)
+        removed_paths.append(str(settings.workspace_root))
+
+    runtime_path = settings.local_state / "node_runtime.json"
+    if runtime_path.exists():
+        with contextlib.suppress(OSError):
+            runtime_path.unlink()
+
+    append_cluster_event(settings.cluster_paths, "worker_uninstalled", {"worker_id": settings.worker_id, "removed_paths": removed_paths})
+    return {"removed_paths": removed_paths, "worker_id": settings.worker_id}
+
+
 def rotate_cluster_passphrase(
     settings: NodeSettings,
     *,
@@ -377,6 +468,22 @@ def force_release_lease(settings: NodeSettings, lease_id: str) -> bool:
     if released:
         append_cluster_event(settings.cluster_paths, "lease_force_released", {"worker_id": settings.worker_id, "lease_id": lease_id})
     return released
+
+
+def _remove_worker_state(settings: NodeSettings) -> None:
+    for path in [
+        settings.local_state,
+        settings.workspace_root / "stage.yml",
+        settings.workspace_root / "node.yml",
+        settings.workspace_root / ".env",
+        settings.workspace_root / "bookmarks.json",
+        settings.workspace_root / "fstab.tradeML",
+    ]:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            with contextlib.suppress(OSError):
+                path.unlink()
 
 
 def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:

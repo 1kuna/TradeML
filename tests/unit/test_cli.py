@@ -124,3 +124,34 @@ def test_join_cluster_cli_bootstraps_manifest(tmp_path: Path, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["worker_id"]
     assert (tmp_path / "nas" / "control" / "cluster" / "manifest.yml").exists()
+
+
+def test_reset_update_and_uninstall_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "reset_worker", lambda settings, passphrase=None: {"action": "reset", "passphrase": passphrase})
+    monkeypatch.setattr(cli, "update_worker", lambda settings: {"action": "update"})
+    monkeypatch.setattr(cli, "uninstall_worker", lambda settings: {"action": "uninstall"})
+
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "reset", "--passphrase", "pw"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "reset"
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "update"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "update"
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "uninstall"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "uninstall"

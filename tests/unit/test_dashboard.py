@@ -9,10 +9,13 @@ import yaml
 
 from trademl.dashboard.controller import (
     collect_dashboard_snapshot,
+    reset_worker,
     persist_node_settings,
     resolve_node_settings,
     start_node,
     stop_node,
+    uninstall_worker,
+    update_worker,
 )
 from trademl.data_node.db import DataNodeDB
 
@@ -167,3 +170,91 @@ def test_start_and_stop_node_manage_runtime_metadata(tmp_path: Path) -> None:
     stopped = stop_node(settings)
     assert stopped["running"] is False
     assert "last_pid" in stopped
+
+
+def test_update_worker_refreshes_wrapper_and_reports_paths(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.setattr("trademl.dashboard.controller.collect_dashboard_snapshot", lambda _settings: {"runtime": {"running": False}})
+    commands: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(command, check=True, **_kwargs):  # noqa: ANN001
+        commands.append([str(part) for part in command])
+        return _Result()
+
+    monkeypatch.setattr("trademl.dashboard.controller.subprocess.run", fake_run)
+    monkeypatch.setattr("trademl.dashboard.controller.install_service", lambda _settings: {"service_path": str(workspace / "svc")})
+
+    result = update_worker(settings)
+
+    assert result["wrapper_path"].endswith("/.local/bin/trademl")
+    assert Path(result["wrapper_path"]).exists()
+    assert any("venv" in " ".join(command) for command in commands)
+    assert any("install" in command for command in commands)
+
+
+def test_reset_and_uninstall_worker_manage_local_artifacts(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text("NAS_MOUNT=/tmp/nas\n", encoding="utf-8")
+    (workspace / "stage.yml").write_text("current: 0\n", encoding="utf-8")
+    (workspace / "control").mkdir(parents=True, exist_ok=True)
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.setattr("trademl.dashboard.controller.collect_dashboard_snapshot", lambda _settings: {"runtime": {"running": False}})
+    monkeypatch.setattr("trademl.dashboard.controller.stop_node", lambda _settings: {"running": False})
+    monkeypatch.setattr("trademl.dashboard.controller.leave_cluster", lambda _settings: {"ok": True})
+    monkeypatch.setattr(
+        "trademl.dashboard.controller.join_cluster",
+        lambda _settings, passphrase=None: {"worker_id": _settings.worker_id, "passphrase_used": passphrase},
+    )
+
+    reset_result = reset_worker(settings, passphrase="pass123")
+
+    assert reset_result["joined"]["worker_id"] == settings.worker_id
+    assert not (workspace / ".env").exists()
+
+    wrapper = Path.home() / ".local" / "bin" / "trademl"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text("test", encoding="utf-8")
+    uninstall_result = uninstall_worker(settings)
+
+    assert str(workspace) in uninstall_result["removed_paths"]
+    assert not workspace.exists()
