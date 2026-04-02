@@ -280,6 +280,7 @@ def start_node(
     settings.workspace_root.mkdir(parents=True, exist_ok=True)
     settings.local_state.mkdir(parents=True, exist_ok=True)
     settings.log_path.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_runtime_log(settings.log_path)
     launch_command = command or [
         sys.executable,
         "-m",
@@ -678,6 +679,15 @@ def _remove_worker_state(settings: NodeSettings) -> None:
         elif path.exists():
             with contextlib.suppress(OSError):
                 path.unlink()
+
+
+def _rotate_runtime_log(log_path: Path) -> None:
+    """Rotate the previous node log so the dashboard tail reflects the current process."""
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        return
+    timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
+    archived = log_path.with_name(f"{log_path.stem}_{timestamp}{log_path.suffix}")
+    log_path.replace(archived)
 
 
 def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:

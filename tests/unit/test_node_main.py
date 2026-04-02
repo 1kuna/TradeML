@@ -33,10 +33,8 @@ def test_build_reference_jobs_uses_verified_defaults_and_caps_symbol_fanout() ->
     )
 
     assert all(job["dataset"] != "supported_tickers" for job in jobs)
-
-    tiingo_dividends = next(job for job in jobs if job["source"] == "tiingo" and job["dataset"] == "corp_actions_dividends")
-    assert tiingo_dividends["explode_symbols"] is False
-    assert tiingo_dividends["max_symbols_per_run"] == 50
+    assert all(job["source"] != "tiingo" for job in jobs)
+    assert all(job["dataset"] != "symbol_changes" for job in jobs)
 
     finnhub_profiles = next(job for job in jobs if job["source"] == "finnhub" and job["dataset"] == "company_profile")
     assert finnhub_profiles["max_symbols_per_run"] == 50

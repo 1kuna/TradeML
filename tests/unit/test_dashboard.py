@@ -233,6 +233,43 @@ def test_start_and_stop_node_manage_runtime_metadata(tmp_path: Path) -> None:
     assert "last_pid" in stopped
 
 
+def test_start_node_rotates_existing_log(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    settings.log_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.log_path.write_text("old crash\n", encoding="utf-8")
+
+    runtime = start_node(
+        settings,
+        command=[sys.executable, "-c", "import time; time.sleep(60)"],
+    )
+
+    rotated_logs = list(settings.log_path.parent.glob("node_*.log"))
+    assert runtime["running"] is True
+    assert settings.log_path.exists()
+    assert rotated_logs
+    assert rotated_logs[0].read_text(encoding="utf-8") == "old crash\n"
+
+    stop_node(settings)
+
+
 def test_start_node_persists_cluster_passphrase(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     config_path = workspace / "node.yml"

@@ -67,7 +67,6 @@ def _build_reference_jobs(*, connectors: dict[str, object], symbols: list[str]) 
         reference_jobs.extend(
             [
                 {"source": "fmp", "dataset": "delistings", "symbols": [], "output_name": "delistings"},
-                {"source": "fmp", "dataset": "symbol_changes", "symbols": [], "output_name": "symbol_changes"},
                 {"source": "fmp", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar_fmp"},
             ]
         )
@@ -82,37 +81,6 @@ def _build_reference_jobs(*, connectors: dict[str, object], symbols: list[str]) 
                     "max_symbols_per_run": 10,
                     "rotation_key": "alpha_vantage:corp_actions",
                     "output_name": "corp_actions",
-                },
-            ]
-        )
-    if "tiingo" in connectors:
-        reference_jobs.extend(
-            [
-                {
-                    "source": "tiingo",
-                    "dataset": "corp_actions_dividends",
-                    "symbols": symbols,
-                    "max_symbols_per_run": 50,
-                    "rotation_key": "tiingo:corp_actions_dividends",
-                    "explode_symbols": False,
-                    "output_name": "corp_actions",
-                },
-                {
-                    "source": "tiingo",
-                    "dataset": "corp_actions_splits",
-                    "symbols": symbols,
-                    "max_symbols_per_run": 50,
-                    "rotation_key": "tiingo:corp_actions_splits",
-                    "explode_symbols": False,
-                    "output_name": "corp_actions",
-                },
-                {
-                    "source": "tiingo",
-                    "dataset": "fundamentals",
-                    "symbols": symbols,
-                    "max_symbols_per_run": 20,
-                    "rotation_key": "tiingo:fundamentals",
-                    "output_name": "fundamentals_tiingo",
                 },
             ]
         )
