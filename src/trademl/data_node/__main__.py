@@ -19,6 +19,8 @@ from trademl.connectors.twelve_data import TwelveDataConnector
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.bootstrap import Stage0UniverseBuilder
 from trademl.data_node.budgets import BudgetManager
+from trademl.data_node.capabilities import build_reference_jobs as build_reference_jobs_from_registry
+from trademl.data_node.capabilities import default_macro_series, load_audit_state
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.service import DataNodePaths, DataNodeService
@@ -40,98 +42,7 @@ DEFAULT_VENDOR_LIMITS = {
 
 def _build_reference_jobs(*, connectors: dict[str, object], symbols: list[str]) -> list[dict[str, object]]:
     """Build the default weekly reference collection plan from verified connector lanes."""
-    reference_jobs: list[dict[str, object]] = []
-    if "massive" in connectors:
-        reference_jobs.extend(
-            [
-                {"source": "massive", "dataset": "reference_tickers", "symbols": [], "output_name": "universe"},
-                {
-                    "source": "massive",
-                    "dataset": "reference_splits",
-                    "symbols": symbols,
-                    "max_symbols_per_run": 10,
-                    "rotation_key": "massive:reference_splits",
-                    "output_name": "splits",
-                },
-                {
-                    "source": "massive",
-                    "dataset": "reference_dividends",
-                    "symbols": symbols,
-                    "max_symbols_per_run": 10,
-                    "rotation_key": "massive:reference_dividends",
-                    "output_name": "dividends",
-                },
-            ]
-        )
-    if "fmp" in connectors:
-        reference_jobs.extend(
-            [
-                {"source": "fmp", "dataset": "delistings", "symbols": [], "output_name": "delistings"},
-                {"source": "fmp", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar_fmp"},
-            ]
-        )
-    if "alpha_vantage" in connectors:
-        reference_jobs.extend(
-            [
-                {"source": "alpha_vantage", "dataset": "listings", "symbols": [], "output_name": "listings"},
-                {
-                    "source": "alpha_vantage",
-                    "dataset": "corp_actions",
-                    "symbols": symbols,
-                    "max_symbols_per_run": 10,
-                    "rotation_key": "alpha_vantage:corp_actions",
-                    "output_name": "corp_actions",
-                },
-            ]
-        )
-    if "twelve_data" in connectors:
-        reference_jobs.extend(
-            [
-                {"source": "twelve_data", "dataset": "stocks", "symbols": [], "output_name": "twelve_data_stocks"},
-                {
-                    "source": "twelve_data",
-                    "dataset": "dividends",
-                    "symbols": symbols,
-                    "max_symbols_per_run": 50,
-                    "rotation_key": "twelve_data:dividends",
-                    "output_name": "corp_actions",
-                },
-                {
-                    "source": "twelve_data",
-                    "dataset": "splits",
-                    "symbols": symbols,
-                    "max_symbols_per_run": 50,
-                    "rotation_key": "twelve_data:splits",
-                    "output_name": "corp_actions",
-                },
-                {"source": "twelve_data", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar_twelve_data"},
-                {
-                    "source": "twelve_data",
-                    "dataset": "financial_statements",
-                    "symbols": symbols,
-                    "max_symbols_per_run": 20,
-                    "rotation_key": "twelve_data:financial_statements",
-                    "output_name": "financial_statements_twelve_data",
-                },
-            ]
-        )
-    if "finnhub" in connectors:
-        reference_jobs.extend(
-            [
-                {"source": "finnhub", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar"},
-                {
-                    "source": "finnhub",
-                    "dataset": "company_profile",
-                    "symbols": symbols,
-                    "max_symbols_per_run": 50,
-                    "rotation_key": "finnhub:company_profile",
-                    "output_name": "company_profiles",
-                },
-            ]
-        )
-    if "sec_edgar" in connectors:
-        reference_jobs.append({"source": "sec_edgar", "dataset": "filing_index", "symbols": ["320193"], "output_name": "sec_filings"})
-    return reference_jobs
+    return build_reference_jobs_from_registry(connectors=connectors, symbols=symbols)
 
 
 def _load_dotenv(env_path: Path | None) -> None:
@@ -241,6 +152,7 @@ def main() -> int:
     worker_id = os.getenv("EDGE_NODE_ID", config.get("node", {}).get("worker_id", os.uname().nodename if hasattr(os, "uname") else "worker"))
     db = DataNodeDB(local_state / "node.sqlite")
     data_root = Path(args.data_root or os.getenv("NAS_MOUNT", config["node"]["nas_mount"])).expanduser()
+    audit_state = load_audit_state(data_root / "control" / "cluster" / "state" / "vendor_audit.json")
     symbols = args.symbols or _load_stage_symbols(workspace_root)
     service = DataNodeService(
         db=db,
@@ -248,9 +160,11 @@ def main() -> int:
         auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=data_root / "reference" / "calendars")),
         curator=Curator(),
         paths=DataNodePaths(root=data_root),
+        capability_audit_state=audit_state,
+        worker_id=worker_id,
     )
     service.install_signal_handlers()
-    reference_jobs = _build_reference_jobs(connectors=connectors, symbols=symbols)
+    reference_jobs = build_reference_jobs_from_registry(connectors=connectors, symbols=symbols, audit_state=audit_state)
 
     if args.once or args.date:
         if not args.date:
@@ -297,7 +211,7 @@ def main() -> int:
         collection_time_et=os.getenv("COLLECTION_TIME_ET", manifest["schedule"]["collection_time_et"]),
         maintenance_hour_local=int(os.getenv("MAINTENANCE_HOUR_LOCAL", manifest["schedule"]["maintenance_hour_local"])),
         poll_seconds=args.poll_seconds,
-        macro_series_ids=["DGS10"] if "fred" in connectors else [],
+        macro_series_ids=default_macro_series() if "fred" in connectors else [],
         reference_jobs=reference_jobs,
         price_check_symbols=(symbols or manifest["stage"]["symbols"])[:5] if {"massive", "finnhub"}.issubset(connectors) else [],
     )

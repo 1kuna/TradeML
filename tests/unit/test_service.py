@@ -382,6 +382,31 @@ def test_run_cluster_forever_reference_budget_failure_does_not_crash_worker(tmp_
     assert calls == ["price_checks"]
 
 
+def test_run_cluster_auxiliary_tasks_uses_daily_reference_bucket_until_core_ready(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector(), "fred": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    coordinator = _ClusterCoordinatorStub()
+    coordinator.allowed = {"reference"}
+    service.collect_reference_data = lambda *args, **kwargs: []  # type: ignore[method-assign]
+
+    service._run_cluster_auxiliary_tasks(
+        coordinator=coordinator,  # type: ignore[arg-type]
+        trading_date="2026-03-31",
+        current_et=datetime.fromisoformat("2026-03-31T18:00:00+00:00"),
+        macro_series_ids=["DGS10"],
+        reference_jobs=[{"source": "alpaca", "dataset": "assets", "symbols": [], "output_name": "alpaca_assets"}],
+        price_check_symbols=["AAPL"],
+    )
+
+    assert "reference:2026-03-31" in coordinator._lease_calls
+
+
 def test_collect_reference_data_persists_partial_results_before_budget_failure(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

@@ -13,9 +13,12 @@ from trademl.dashboard.controller import (
     advance_collection_stage,
     collect_dashboard_snapshot,
     join_cluster,
+    replan_coverage,
     reset_worker,
+    run_vendor_audit,
     persist_node_settings,
     resolve_node_settings,
+    start_phase_training,
     start_node,
     stop_node,
     uninstall_worker,
@@ -197,7 +200,128 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert snapshot["macro_series_count"] == 1
     assert snapshot["price_check_count"] == 1
     assert snapshot["data_readiness"]["missing"] == ["equities EOD backfill"]
+    assert snapshot["training_readiness"]["phase1"]["ready"] is False
+    assert "corp_actions" in snapshot["training_readiness"]["phase1"]["blockers"]
+    assert snapshot["vendor_attempt_summary"]["counts"] == {}
     assert "cycle done" in snapshot["log_tail"]
+
+
+def test_run_vendor_audit_and_replan_coverage_persist_outputs(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text(
+        f"NAS_MOUNT={nas_mount}\nNAS_SHARE=//127.0.0.1/trademl\nLOCAL_STATE={workspace / 'control'}\n",
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 1, "symbols": ["AAPL", "MSFT"], "years": 5}, sort_keys=False),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    monkeypatch.setattr(
+        dashboard_controller,
+        "run_capability_audit",
+        lambda **kwargs: {"checked_at": "2026-04-02T00:00:00+00:00", "summary": {"live_status": {"live_verified": 1}}},
+    )
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_connectors_from_settings",
+        lambda settings: {"alpaca": object()},
+    )
+
+    audit = run_vendor_audit(settings)
+    plan = replan_coverage(settings)
+
+    assert audit["summary"]["live_status"]["live_verified"] == 1
+    assert (nas_mount / "control" / "cluster" / "state" / "coverage_plan.json").exists()
+    assert plan["task_count"] >= 0
+
+
+def test_start_phase_training_launches_background_process_when_ready(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    local_state = workspace / "control"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(local_state),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text(
+        f"NAS_MOUNT={nas_mount}\nNAS_SHARE=//127.0.0.1/trademl\nLOCAL_STATE={local_state}\n",
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 1, "symbols": [f"S{i:03d}" for i in range(500)], "years": 10}, sort_keys=False),
+        encoding="utf-8",
+    )
+    reference_root = nas_mount / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    for name in ["corp_actions", "listing_history", "delistings", "sec_filings", "ticker_changes"]:
+        pd.DataFrame([{"symbol": "AAPL"}]).to_parquet(reference_root / f"{name}.parquet", index=False)
+    for series in dashboard_controller.default_macro_series():
+        series_root = nas_mount / "data" / "raw" / "macros_fred" / f"series={series}"
+        series_root.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([{"date": "2025-01-02", "value": 1.0}]).to_parquet(series_root / "data.parquet", index=False)
+    qc_root = nas_mount / "data" / "qc"
+    qc_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [{"source": "alpaca", "dataset": "equities_eod", "date": f"2025-01-{day:02d}", "status": "GREEN"} for day in range(1, 11)]
+    ).to_parquet(qc_root / "partition_status.parquet", index=False)
+    curated_partition = nas_mount / "data" / "curated" / "equities_ohlcv_adj" / "date=2025-01-10"
+    curated_partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"date": "2025-01-10", "symbol": "AAPL", "close": 1.0, "volume": 10.0}]).to_parquet(
+        curated_partition / "data.parquet",
+        index=False,
+    )
+
+    launched: dict[str, object] = {}
+
+    class _Process:
+        pid = 4321
+
+    def fake_popen(command, cwd, env, stdout, stderr, start_new_session):  # noqa: ANN001
+        launched["command"] = command
+        launched["cwd"] = cwd
+        return _Process()
+
+    monkeypatch.setattr(dashboard_controller.subprocess, "Popen", fake_popen)
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    result = start_phase_training(settings, phase=1)
+
+    assert result["pid"] == 4321
+    assert "train.py" in " ".join(str(part) for part in launched["command"])
+    assert (local_state / "training_phase_1.json").exists()
 
 
 def test_start_and_stop_node_manage_runtime_metadata(tmp_path: Path) -> None:

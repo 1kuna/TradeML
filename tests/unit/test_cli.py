@@ -155,3 +155,36 @@ def test_reset_update_and_uninstall_cli_dispatch(tmp_path: Path, monkeypatch, ca
     assert json.loads(capsys.readouterr().out)["action"] == "update"
     assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "uninstall"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "uninstall"
+
+
+def test_audit_replan_and_training_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "run_vendor_audit", lambda settings: {"action": "audit"})
+    monkeypatch.setattr(cli, "replan_coverage", lambda settings: {"action": "replan"})
+    monkeypatch.setattr(cli, "start_phase_training", lambda settings, phase: {"action": f"phase{phase}"})
+
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "run-audit"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "audit"
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "replan-coverage"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "replan"
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "start-phase1"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "phase1"
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "start-phase2"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "phase2"

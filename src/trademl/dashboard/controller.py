@@ -26,10 +26,20 @@ import yaml
 from trademl.calendars.exchange import get_trading_days
 from trademl.connectors.alpaca import AlpacaConnector
 from trademl.connectors.base import BaseConnector, ConnectorError
+from trademl.connectors.alpha_vantage import AlphaVantageConnector
+from trademl.connectors.finnhub import FinnhubConnector
+from trademl.connectors.fmp import FMPConnector
+from trademl.connectors.fred import FredConnector
+from trademl.connectors.massive import MassiveConnector
+from trademl.connectors.sec_edgar import SecEdgarConnector
+from trademl.connectors.twelve_data import TwelveDataConnector
 from trademl.connectors.tiingo import TiingoConnector
+from trademl.data_node.audit import run_capability_audit
 from trademl.data_node.bootstrap import Stage0UniverseBuilder
 from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
+from trademl.data_node.capabilities import default_macro_series, load_audit_state
+from trademl.data_node.planner import plan_auxiliary_tasks, training_readiness
 from trademl.fleet.cluster import (
     ClusterCoordinator,
     ClusterPaths,
@@ -665,6 +675,120 @@ def force_release_lease(settings: NodeSettings, lease_id: str) -> bool:
     return released
 
 
+def run_vendor_audit(settings: NodeSettings) -> dict[str, Any]:
+    """Run live capability canaries and persist the audit report on the NAS."""
+    report = run_capability_audit(
+        connectors=_connectors_from_settings(settings),
+        output_path=_audit_report_path(settings),
+    )
+    append_cluster_event(
+        settings.cluster_paths,
+        "vendor_audit_completed",
+        {"worker_id": settings.worker_id, "summary": report.get("summary", {})},
+    )
+    return report
+
+
+def replan_coverage(settings: NodeSettings) -> dict[str, Any]:
+    """Materialize the current coverage plan and persist it for dashboard consumption."""
+    stage = _read_yaml(settings.stage_path)
+    stage_symbols = list(stage.get("symbols", []))
+    stage_years = int(stage.get("years", 5) or 5)
+    audit_state = load_audit_state(_audit_report_path(settings))
+    plan = plan_auxiliary_tasks(
+        data_root=settings.nas_mount,
+        stage_symbols=stage_symbols,
+        stage_years=stage_years,
+        connectors=_connectors_from_settings(settings),
+        audit_state=audit_state,
+    )
+    payload = {
+        "generated_at": datetime.now(tz=UTC).isoformat(),
+        "task_count": len(plan),
+        "tasks": [
+            {
+                "task_key": task.task_key,
+                "planner_group": task.planner_group,
+                "dataset": task.dataset,
+                "tier": task.tier,
+                "priority": task.priority,
+                "symbols": list(task.symbols),
+                "preferred_vendors": list(task.preferred_vendors),
+                "output_name": task.output_name,
+            }
+            for task in plan
+        ],
+    }
+    path = _coverage_plan_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    append_cluster_event(
+        settings.cluster_paths,
+        "coverage_replanned",
+        {"worker_id": settings.worker_id, "task_count": len(plan)},
+    )
+    return payload
+
+
+def start_phase_training(settings: NodeSettings, *, phase: int) -> dict[str, Any]:
+    """Launch a readiness-gated training run after a lightweight preflight."""
+    snapshot = collect_dashboard_snapshot(settings)
+    readiness = snapshot["training_readiness"]["phase1" if phase == 1 else "phase2"]
+    if not readiness["ready"]:
+        raise RuntimeError(f"phase {phase} training blocked: {', '.join(readiness['blockers'])}")
+
+    preflight = _training_preflight(settings)
+    if not preflight["ok"]:
+        raise RuntimeError(f"phase {phase} training preflight failed: {preflight['reason']}")
+
+    log_path = settings.local_state / "logs" / f"training_phase_{phase}.log"
+    runtime_path = settings.local_state / f"training_phase_{phase}.json"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path = settings.repo_root / "configs" / "equities_xs.yml"
+    report_date = date.today().isoformat()
+    command = [
+        sys.executable,
+        str(settings.repo_root / "src" / "scripts" / "train.py"),
+        "--data-root",
+        str(settings.nas_mount),
+        "--config",
+        str(config_path),
+        "--output-root",
+        str(settings.nas_mount),
+        "--report-date",
+        report_date,
+    ]
+    env = os.environ.copy()
+    env.update(_read_env_file(settings.env_path))
+    with log_path.open("a", encoding="utf-8") as handle:
+        process = subprocess.Popen(  # noqa: S603
+            command,
+            cwd=settings.repo_root,
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    runtime_payload = {
+        "phase": phase,
+        "pid": process.pid,
+        "started_at": datetime.now(tz=UTC).isoformat(),
+        "command": command,
+        "log_path": str(log_path),
+        "config_path": str(config_path),
+        "report_date": report_date,
+        "running": True,
+        "preflight": preflight,
+    }
+    runtime_path.write_text(json.dumps(runtime_payload, indent=2, sort_keys=True), encoding="utf-8")
+    append_cluster_event(
+        settings.cluster_paths,
+        f"phase_{phase}_training_started",
+        {"worker_id": settings.worker_id, "pid": process.pid, "report_date": report_date},
+    )
+    return runtime_payload
+
+
 def _remove_worker_state(settings: NodeSettings) -> None:
     for path in [
         settings.local_state,
@@ -708,6 +832,13 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
     reference_files = sorted(path.name for path in settings.reference_root.glob("*.parquet")) if settings.reference_root.exists() else []
     macro_series = _macro_series(settings.macro_root)
     price_check_files = _price_check_files(settings.price_checks_root)
+    audit = load_audit_state(_audit_report_path(settings))
+    coverage_plan = _read_optional_json(_coverage_plan_path(settings))
+    training_runs = {
+        "phase1": _read_training_runtime(settings, phase=1),
+        "phase2": _read_training_runtime(settings, phase=2),
+    }
+    vendor_attempt_summary = _read_vendor_attempt_summary(settings.db_path)
     stage = _read_yaml(settings.stage_path)
     stage_symbols = stage.get("symbols", [])
     stage_years = stage.get("years")
@@ -734,10 +865,18 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         macro_series=macro_series,
         price_check_files=price_check_files,
     )
+    readiness = _training_readiness_snapshot(
+        settings=settings,
+        stage=stage,
+        partition_summary=partition_summary,
+        reference_files=reference_files,
+        macro_series=macro_series,
+    )
     snapshot = {
         "settings": asdict(settings),
         "runtime": runtime,
         "queue_counts": queue_counts,
+        "vendor_attempt_summary": vendor_attempt_summary,
         "partition_summary": partition_summary,
         "raw_partitions": len(raw_dates),
         "curated_partitions": len(curated_dates),
@@ -758,6 +897,10 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "stage_progress_ratio": progress_ratio,
         "stage_datapoint_progress_ratio": datapoint_progress_ratio,
         "data_readiness": data_readiness,
+        "training_readiness": readiness,
+        "training_runs": training_runs,
+        "audit": audit,
+        "coverage_plan": coverage_plan,
         "nas": {
             "share": settings.nas_share,
             "host": host,
@@ -771,6 +914,141 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "journal_tail": systemd_journal_tail(),
     }
     return snapshot
+
+
+def _audit_report_path(settings: NodeSettings) -> Path:
+    return settings.cluster_paths.state_root / "vendor_audit.json"
+
+
+def _coverage_plan_path(settings: NodeSettings) -> Path:
+    return settings.cluster_paths.state_root / "coverage_plan.json"
+
+
+def _read_optional_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _read_training_runtime(settings: NodeSettings, *, phase: int) -> dict[str, Any]:
+    path = settings.local_state / f"training_phase_{phase}.json"
+    payload = _read_optional_json(path)
+    pid = payload.get("pid")
+    payload["running"] = isinstance(pid, int) and _is_process_running(pid)
+    return payload
+
+
+def _read_vendor_attempt_summary(db_path: Path) -> dict[str, Any]:
+    if not db_path.exists():
+        return {"counts": {}, "by_vendor": [], "recent_failures": []}
+    attempts = DataNodeDB(db_path).fetch_vendor_attempts()
+    if not attempts:
+        return {"counts": {}, "by_vendor": [], "recent_failures": []}
+    count_by_status: dict[str, int] = {}
+    vendor_rows: dict[str, dict[str, Any]] = {}
+    recent_failures: list[dict[str, Any]] = []
+    for attempt in attempts:
+        count_by_status[attempt.status] = count_by_status.get(attempt.status, 0) + 1
+        row = vendor_rows.setdefault(
+            attempt.vendor,
+            {"vendor": attempt.vendor, "total": 0, "leased": 0, "success": 0, "failed": 0, "permanent_failed": 0, "latest_update": attempt.updated_at},
+        )
+        row["total"] += 1
+        row["latest_update"] = max(str(row["latest_update"]), attempt.updated_at)
+        if attempt.status == "LEASED":
+            row["leased"] += 1
+        elif attempt.status == "SUCCESS":
+            row["success"] += 1
+        elif attempt.status == "FAILED":
+            row["failed"] += 1
+        elif attempt.status == "PERMANENT_FAILED":
+            row["permanent_failed"] += 1
+        if attempt.status in {"FAILED", "PERMANENT_FAILED"} and attempt.last_error:
+            recent_failures.append(
+                {
+                    "vendor": attempt.vendor,
+                    "task_key": attempt.task_key,
+                    "status": attempt.status,
+                    "last_error": attempt.last_error,
+                    "updated_at": attempt.updated_at,
+                }
+            )
+    recent_failures.sort(key=lambda item: item["updated_at"], reverse=True)
+    return {
+        "counts": count_by_status,
+        "by_vendor": sorted(vendor_rows.values(), key=lambda item: item["vendor"]),
+        "recent_failures": recent_failures[:20],
+    }
+
+
+def _training_readiness_snapshot(
+    *,
+    settings: NodeSettings,
+    stage: dict[str, Any],
+    partition_summary: dict[str, Any],
+    reference_files: list[str],
+    macro_series: list[str],
+) -> dict[str, Any]:
+    has_reference = set(reference_files)
+    phase1 = training_readiness(
+        raw_green_ratio=partition_summary.get("coverage_green"),
+        has_corp_actions=("corp_actions.parquet" in has_reference) or {"dividends.parquet", "splits.parquet"}.issubset(has_reference),
+        has_listing_history="listing_history.parquet" in has_reference,
+        has_delistings="delistings.parquet" in has_reference,
+        has_sec_filings="sec_filings.parquet" in has_reference,
+        macro_series_count=len(macro_series),
+        required_macro_series=len(default_macro_series()),
+    )
+    phase2_blockers = list(phase1["blockers"])
+    stage_symbols = len(stage.get("symbols", []))
+    stage_years = int(stage.get("years", 0) or 0)
+    if "ticker_changes.parquet" not in has_reference:
+        phase2_blockers.append("ticker_changes")
+    if stage_symbols < 500:
+        phase2_blockers.append("expanded_universe")
+    if stage_years < 10:
+        phase2_blockers.append("history_depth")
+    if not _terminal_delisting_returns_present(settings):
+        phase2_blockers.append("terminal_delisting_returns")
+    phase2 = {"ready": not phase2_blockers, "blockers": phase2_blockers}
+    return {"phase1": phase1, "phase2": phase2}
+
+
+def _training_preflight(settings: NodeSettings) -> dict[str, Any]:
+    config_path = settings.repo_root / "configs" / "equities_xs.yml"
+    qc_path = settings.nas_mount / "data" / "qc" / "partition_status.parquet"
+    curated_root = settings.nas_mount / "data" / "curated" / "equities_ohlcv_adj"
+    if not config_path.exists():
+        return {"ok": False, "reason": f"missing config: {config_path}"}
+    if not qc_path.exists():
+        return {"ok": False, "reason": f"missing qc parquet: {qc_path}"}
+    curated_files = sorted(curated_root.glob("date=*/data.parquet"))
+    if not curated_files:
+        return {"ok": False, "reason": f"no curated parquet files under {curated_root}"}
+    sample = pd.read_parquet(curated_files[-1])
+    if sample.empty:
+        return {"ok": False, "reason": "latest curated partition is empty"}
+    return {
+        "ok": True,
+        "sample_rows": int(len(sample)),
+        "sample_date": curated_files[-1].parent.name.partition("=")[2],
+        "qc_path": str(qc_path),
+    }
+
+
+def _terminal_delisting_returns_present(settings: NodeSettings) -> bool:
+    report_path = settings.reference_root / "delistings.parquet"
+    if not report_path.exists():
+        return False
+    try:
+        frame = pd.read_parquet(report_path)
+    except Exception:
+        return False
+    lowered = {column.lower() for column in frame.columns}
+    return "delisteddate" in lowered or "delisted_date" in lowered
 
 
 def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
@@ -799,6 +1077,70 @@ def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
         worker_id=settings.worker_id,
         universe_builder=universe_builder,
     )
+
+
+def _connectors_from_settings(settings: NodeSettings) -> dict[str, BaseConnector]:
+    env_values = _read_env_file(settings.env_path)
+    config = _read_yaml(settings.config_path)
+    vendors = config.get("vendors", {})
+    connectors: dict[str, BaseConnector] = {}
+    if env_values.get("ALPACA_API_KEY"):
+        connectors["alpaca"] = AlpacaConnector(
+            base_url=env_values.get("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
+            trading_base_url=env_values.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
+            api_key=env_values.get("ALPACA_API_KEY", ""),
+            secret_key=env_values.get("ALPACA_API_SECRET", ""),
+            budget_manager=BudgetManager({"alpaca": vendors.get("alpaca", {"rpm": 150, "daily_cap": 10000})}),
+        )
+    if env_values.get("TIINGO_API_KEY"):
+        connectors["tiingo"] = TiingoConnector(
+            base_url="https://api.tiingo.com",
+            api_key=env_values.get("TIINGO_API_KEY", ""),
+            budget_manager=BudgetManager({"tiingo": vendors.get("tiingo", {"rpm": 40, "daily_cap": 400})}),
+        )
+    if env_values.get("TWELVE_DATA_API_KEY"):
+        connectors["twelve_data"] = TwelveDataConnector(
+            base_url="https://api.twelvedata.com",
+            api_key=env_values.get("TWELVE_DATA_API_KEY", ""),
+            budget_manager=BudgetManager({"twelve_data": vendors.get("twelve_data", {"rpm": 8, "daily_cap": 800})}),
+        )
+    if env_values.get("MASSIVE_API_KEY"):
+        connectors["massive"] = MassiveConnector(
+            base_url="https://api.massive.com",
+            api_key=env_values.get("MASSIVE_API_KEY", ""),
+            budget_manager=BudgetManager({"massive": vendors.get("massive", {"rpm": 5, "daily_cap": 500})}),
+        )
+    if env_values.get("FINNHUB_API_KEY"):
+        connectors["finnhub"] = FinnhubConnector(
+            base_url="https://finnhub.io/api/v1",
+            api_key=env_values.get("FINNHUB_API_KEY", ""),
+            budget_manager=BudgetManager({"finnhub": vendors.get("finnhub", {"rpm": 30, "daily_cap": 3000})}),
+        )
+    if env_values.get("ALPHA_VANTAGE_API_KEY"):
+        connectors["alpha_vantage"] = AlphaVantageConnector(
+            base_url="https://www.alphavantage.co",
+            api_key=env_values.get("ALPHA_VANTAGE_API_KEY", ""),
+            budget_manager=BudgetManager({"alpha_vantage": vendors.get("alpha_vantage", {"rpm": 5, "daily_cap": 500})}),
+        )
+    if env_values.get("FRED_API_KEY"):
+        connectors["fred"] = FredConnector(
+            base_url="https://api.stlouisfed.org/fred",
+            api_key=env_values.get("FRED_API_KEY", ""),
+            budget_manager=BudgetManager({"fred": vendors.get("fred", {"rpm": 120, "daily_cap": 20000})}),
+        )
+    if env_values.get("FMP_API_KEY"):
+        connectors["fmp"] = FMPConnector(
+            base_url="https://financialmodelingprep.com/api",
+            api_key=env_values.get("FMP_API_KEY", ""),
+            budget_manager=BudgetManager({"fmp": vendors.get("fmp", {"rpm": 10, "daily_cap": 1000})}),
+        )
+    if env_values.get("SEC_EDGAR_USER_AGENT"):
+        connectors["sec_edgar"] = SecEdgarConnector(
+            base_url="https://data.sec.gov",
+            user_agent=env_values.get("SEC_EDGAR_USER_AGENT", ""),
+            budget_manager=BudgetManager({"sec_edgar": vendors.get("sec_edgar", {"rpm": 5, "daily_cap": 1000})}),
+        )
+    return connectors
 
 
 def _alpaca_connector(settings: NodeSettings) -> AlpacaConnector | None:

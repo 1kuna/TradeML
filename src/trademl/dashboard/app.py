@@ -8,18 +8,21 @@ import os
 
 from trademl.dashboard.controller import (
     _read_env_file,
+    advance_collection_stage,
     collect_dashboard_snapshot,
     force_release_lease,
     install_service,
     join_cluster,
     leave_cluster,
     persist_node_settings,
+    replan_coverage,
     rebuild_cluster_state,
     reset_worker,
     resolve_node_settings,
     restart_node,
+    run_vendor_audit,
     stage_one_universe_snapshot,
-    advance_collection_stage,
+    start_phase_training,
     rotate_cluster_passphrase,
     start_node,
     stop_node,
@@ -70,8 +73,13 @@ def main() -> None:
     nas = snapshot["nas"]
     partition_summary = snapshot["partition_summary"]
     queue_counts = snapshot["queue_counts"]
+    vendor_attempt_summary = snapshot["vendor_attempt_summary"]
     cluster = snapshot["cluster"]
     data_readiness = snapshot["data_readiness"]
+    training_readiness = snapshot["training_readiness"]
+    training_runs = snapshot["training_runs"]
+    audit = snapshot["audit"]
+    coverage_plan = snapshot["coverage_plan"]
     running = bool(runtime.get("running"))
 
     controls = st.columns([1, 1, 1, 2])
@@ -102,7 +110,7 @@ def main() -> None:
     lower_metrics[4].metric("Price Checks", snapshot["price_check_count"])
     lower_metrics[5].metric("Latest Raw", snapshot["latest_raw_date"] or "-")
 
-    tabs = st.tabs(["Overview", "Fleet", "Cluster Config", "Data Inventory", "Logs"])
+    tabs = st.tabs(["Overview", "Coverage", "Fleet", "Cluster Config", "Data Inventory", "Logs"])
 
     with tabs[0]:
         if data_readiness["state"] == "complete":
@@ -114,6 +122,17 @@ def main() -> None:
         if data_readiness["missing"]:
             st.write("Still missing:")
             st.write(data_readiness["missing"])
+        readiness_cols = st.columns(2)
+        readiness_cols[0].metric(
+            "Phase 1 Gate",
+            "Ready" if training_readiness["phase1"]["ready"] else "Blocked",
+            ", ".join(training_readiness["phase1"]["blockers"][:2]) if training_readiness["phase1"]["blockers"] else None,
+        )
+        readiness_cols[1].metric(
+            "Phase 2 Gate",
+            "Ready" if training_readiness["phase2"]["ready"] else "Blocked",
+            ", ".join(training_readiness["phase2"]["blockers"][:2]) if training_readiness["phase2"]["blockers"] else None,
+        )
         overview_cols = st.columns(2)
         with overview_cols[0]:
             st.subheader("Runtime")
@@ -145,8 +164,59 @@ def main() -> None:
             st.write(f"Macro series present: `{snapshot['macro_series_count']}`")
             st.write(f"Price check files present: `{snapshot['price_check_count']}`")
             st.write(f"Systemd: `{snapshot['systemd'].get('ActiveState', snapshot['systemd'].get('reason', 'unknown'))}`")
+        training_cols = st.columns(2)
+        with training_cols[0]:
+            st.subheader("Training Control")
+            phase1_disabled = not training_readiness["phase1"]["ready"]
+            phase2_disabled = not training_readiness["phase2"]["ready"]
+            if st.button("Start Phase 1 Training", use_container_width=True, disabled=phase1_disabled):
+                result = start_phase_training(settings, phase=1)
+                st.success(f"Phase 1 training launched with PID {result['pid']}")
+                st.rerun()
+            if st.button("Start Phase 2 Training", use_container_width=True, disabled=phase2_disabled):
+                result = start_phase_training(settings, phase=2)
+                st.success(f"Phase 2 training launched with PID {result['pid']}")
+                st.rerun()
+        with training_cols[1]:
+            st.subheader("Training Runs")
+            st.json(training_runs, expanded=False)
 
     with tabs[1]:
+        action_cols = st.columns(4)
+        if action_cols[0].button("Run Vendor Audit", use_container_width=True):
+            result = run_vendor_audit(settings)
+            st.success(f"Audit completed at {result['checked_at']}")
+            st.rerun()
+        if action_cols[1].button("Replan Coverage", use_container_width=True):
+            result = replan_coverage(settings)
+            st.success(f"Planned {result['task_count']} auxiliary tasks")
+            st.rerun()
+        action_cols[2].metric("Vendor Attempts", sum(vendor_attempt_summary["counts"].values()))
+        action_cols[3].metric("Audit Failures", len(audit.get("summary", {}).get("failures", [])))
+        coverage_cols = st.columns(2)
+        with coverage_cols[0]:
+            st.subheader("Training Readiness")
+            st.json(training_readiness, expanded=False)
+            if training_readiness["phase1"]["blockers"]:
+                st.write("Phase 1 blockers:", training_readiness["phase1"]["blockers"])
+            if training_readiness["phase2"]["blockers"]:
+                st.write("Phase 2 blockers:", training_readiness["phase2"]["blockers"])
+        with coverage_cols[1]:
+            st.subheader("Vendor Audit Summary")
+            st.json(audit.get("summary", {}), expanded=False)
+        lower_coverage_cols = st.columns(2)
+        with lower_coverage_cols[0]:
+            st.subheader("Vendor Throughput")
+            st.dataframe(vendor_attempt_summary["by_vendor"], use_container_width=True)
+            if vendor_attempt_summary["recent_failures"]:
+                st.caption("Recent vendor failures")
+                st.dataframe(vendor_attempt_summary["recent_failures"], use_container_width=True)
+        with lower_coverage_cols[1]:
+            st.subheader("Coverage Plan")
+            st.caption(f"Planned tasks: {coverage_plan.get('task_count', 0)}")
+            st.dataframe(coverage_plan.get("tasks", []), use_container_width=True)
+
+    with tabs[2]:
         worker_cols = st.columns(2)
         with worker_cols[0]:
             st.subheader("Workers")
@@ -168,7 +238,7 @@ def main() -> None:
             st.subheader("Recent Events")
             st.dataframe(cluster["recent_events"], use_container_width=True)
 
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("NAS and Schedule Settings")
         with st.form("nas_settings"):
             nas_share = st.text_input("NAS Share", value=settings.nas_share, help="Example: //192.168.1.20/trademl")
@@ -271,7 +341,7 @@ def main() -> None:
                 st.success(message)
                 st.rerun()
 
-    with tabs[3]:
+    with tabs[4]:
         inventory_cols = st.columns(2)
         with inventory_cols[0]:
             st.subheader("Reference Files")
@@ -290,6 +360,12 @@ def main() -> None:
         st.json(partition_summary, expanded=False)
         st.subheader("Queue Summary")
         st.json(queue_counts, expanded=False)
+        st.subheader("Vendor Attempt Summary")
+        st.json(vendor_attempt_summary["counts"], expanded=False)
+        st.subheader("Audit Report")
+        st.json(audit, expanded=False)
+        st.subheader("Coverage Plan")
+        st.json(coverage_plan, expanded=False)
         st.subheader("Resolved Settings")
         st.json(snapshot["settings"], expanded=False)
         st.subheader("Last Success")
@@ -297,7 +373,7 @@ def main() -> None:
         st.subheader("Manifest")
         st.json(cluster["manifest"], expanded=False)
 
-    with tabs[4]:
+    with tabs[5]:
         st.subheader("Node Log")
         st.text_area("Recent log lines", value=snapshot["log_tail"], height=500)
         if snapshot["journal_tail"]:

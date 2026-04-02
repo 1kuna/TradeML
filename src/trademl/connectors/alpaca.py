@@ -62,6 +62,34 @@ class AlpacaConnector(HTTPConnector):
                 }
             )
             return normalized.sort_values("symbol").reset_index(drop=True)
+        if dataset == "corp_actions":
+            frames: list[pd.DataFrame] = []
+            start = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+            end = pd.Timestamp(end_date).strftime("%Y-%m-%d")
+            for symbol in symbols:
+                payload = self.request_json(
+                    endpoint=f"/v2/stocks/{symbol}/corporate_actions/announcements",
+                    params={"since": start, "until": end},
+                    task_kind="OTHER",
+                )
+                rows = payload.get("announcements", payload.get("results", payload if isinstance(payload, list) else [])) if isinstance(payload, dict) else payload
+                frame = pd.DataFrame(rows)
+                if frame.empty:
+                    continue
+                frame["symbol"] = symbol
+                frame["event_type"] = frame.get("ca_type", frame.get("event_type", pd.Series(dtype="string"))).astype("string").str.lower()
+                frame["ex_date"] = pd.to_datetime(frame.get("ex_date", frame.get("execution_date", frame.get("date"))), errors="coerce").dt.date
+                frame["record_date"] = pd.to_datetime(frame.get("record_date"), errors="coerce").dt.date
+                frame["pay_date"] = pd.to_datetime(frame.get("payable_date", frame.get("pay_date")), errors="coerce").dt.date
+                frame["ratio"] = pd.to_numeric(frame.get("ratio"), errors="coerce")
+                frame["amount"] = pd.to_numeric(frame.get("cash", frame.get("amount")), errors="coerce")
+                frame["source"] = self.vendor_name
+                frame["source_count"] = 1
+                frame["ingested_at"] = pd.Timestamp.utcnow()
+                frames.append(frame[["symbol", "event_type", "ex_date", "record_date", "pay_date", "ratio", "amount", "source", "source_count", "ingested_at"]])
+            if not frames:
+                return pd.DataFrame(columns=["symbol", "event_type", "ex_date", "record_date", "pay_date", "ratio", "amount", "source", "source_count", "ingested_at"])
+            return pd.concat(frames, ignore_index=True).dropna(subset=["symbol", "ex_date"]).reset_index(drop=True)
         if dataset != "equities_eod":
             raise ValueError(f"unsupported dataset for alpaca: {dataset}")
 

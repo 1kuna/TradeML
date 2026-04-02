@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
+import json
 
 
 UTC = timezone.utc
@@ -37,10 +38,40 @@ class BackfillTask:
     updated_at: str
 
 
+@dataclass(slots=True)
+class VendorAttempt:
+    """Persistent per-vendor attempt state for canonical and supplemental tasks."""
+
+    task_key: str
+    task_family: str
+    planner_group: str
+    vendor: str
+    lease_owner: str | None
+    status: str
+    attempts: int
+    last_error: str | None
+    next_eligible_at: str | None
+    leased_at: str | None
+    lease_expires_at: str | None
+    rows_returned: int | None
+    payload_json: str | None
+    updated_at: str
+
+    @property
+    def payload(self) -> dict:
+        """Deserialize the optional planner payload."""
+        if not self.payload_json:
+            return {}
+        try:
+            return json.loads(self.payload_json)
+        except json.JSONDecodeError:
+            return {}
+
+
 class DataNodeDB:
     """Small transactional wrapper around the local SQLite state store."""
 
-    REQUIRED_TABLES = frozenset({"backfill_queue", "partition_status"})
+    REQUIRED_TABLES = frozenset({"backfill_queue", "partition_status", "vendor_attempts"})
 
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
@@ -115,6 +146,27 @@ class DataNodeDB:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vendor_attempts (
+                  task_key         TEXT NOT NULL,
+                  task_family      TEXT NOT NULL,
+                  planner_group    TEXT NOT NULL,
+                  vendor           TEXT NOT NULL,
+                  lease_owner      TEXT,
+                  status           TEXT NOT NULL,
+                  attempts         INTEGER DEFAULT 0,
+                  last_error       TEXT,
+                  next_eligible_at TIMESTAMP,
+                  leased_at        TIMESTAMP,
+                  lease_expires_at TIMESTAMP,
+                  rows_returned    INTEGER,
+                  payload_json     TEXT,
+                  updated_at       TIMESTAMP NOT NULL,
+                  PRIMARY KEY (task_key, vendor)
+                )
+                """
+            )
         self._validate_schema()
 
     def _validate_schema(self) -> None:
@@ -178,6 +230,46 @@ class DataNodeDB:
             leased_row = connection.execute("SELECT * FROM backfill_queue WHERE id = ?", (row["id"],)).fetchone()
             assert leased_row is not None
             return BackfillTask(**dict(leased_row))
+
+    def peek_next_tasks(self, *, limit: int = 25, now: datetime | None = None) -> list[BackfillTask]:
+        """Return eligible tasks without leasing them."""
+        lease_time = (now or utc_now()).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM backfill_queue
+                WHERE status IN ('PENDING', 'FAILED')
+                  AND COALESCE(next_not_before, '1970-01-01T00:00:00+00:00') <= ?
+                ORDER BY priority ASC, created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (lease_time, limit),
+            ).fetchall()
+        return [BackfillTask(**dict(row)) for row in rows]
+
+    def lease_task_by_id(self, task_id: int, now: datetime | None = None) -> BackfillTask | None:
+        """Lease a specific task if it is still eligible."""
+        lease_time = (now or utc_now()).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM backfill_queue
+                WHERE id = ?
+                  AND status IN ('PENDING', 'FAILED')
+                  AND COALESCE(next_not_before, '1970-01-01T00:00:00+00:00') <= ?
+                """,
+                (task_id, lease_time),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE backfill_queue SET status = 'LEASED', updated_at = ? WHERE id = ?",
+                (lease_time, task_id),
+            )
+            leased_row = connection.execute("SELECT * FROM backfill_queue WHERE id = ?", (task_id,)).fetchone()
+        return BackfillTask(**dict(leased_row)) if leased_row is not None else None
 
     def mark_task_done(self, task_id: int) -> None:
         """Mark a leased task as complete."""
@@ -280,3 +372,150 @@ class DataNodeDB:
         if row is None:
             return None
         return row["updated_at"]
+
+    def lease_vendor_attempt(
+        self,
+        *,
+        task_key: str,
+        task_family: str,
+        planner_group: str,
+        vendor: str,
+        lease_owner: str,
+        payload: dict | None = None,
+        lease_ttl_seconds: int = 90,
+        now: datetime | None = None,
+    ) -> VendorAttempt | None:
+        """Lease a vendor attempt if it is eligible and not already complete."""
+        current = (now or utc_now())
+        lease_time = current.isoformat()
+        expires_at = (current + timedelta(seconds=lease_ttl_seconds)).isoformat()
+        payload_json = json.dumps(payload, sort_keys=True) if payload else None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM vendor_attempts WHERE task_key = ? AND vendor = ?",
+                (task_key, vendor),
+            ).fetchone()
+            if row is not None:
+                status = str(row["status"])
+                lease_expiry = row["lease_expires_at"]
+                if status == "SUCCESS":
+                    return None
+                if status == "LEASED" and lease_expiry and lease_expiry > lease_time and row["lease_owner"] != lease_owner:
+                    return None
+                if row["next_eligible_at"] and row["next_eligible_at"] > lease_time:
+                    return None
+                connection.execute(
+                    """
+                    UPDATE vendor_attempts
+                    SET task_family = ?,
+                        planner_group = ?,
+                        lease_owner = ?,
+                        status = 'LEASED',
+                        leased_at = ?,
+                        lease_expires_at = ?,
+                        payload_json = COALESCE(?, payload_json),
+                        updated_at = ?
+                    WHERE task_key = ? AND vendor = ?
+                    """,
+                    (
+                        task_family,
+                        planner_group,
+                        lease_owner,
+                        lease_time,
+                        expires_at,
+                        payload_json,
+                        lease_time,
+                        task_key,
+                        vendor,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO vendor_attempts (
+                      task_key, task_family, planner_group, vendor, lease_owner, status, attempts,
+                      leased_at, lease_expires_at, payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'LEASED', 0, ?, ?, ?, ?)
+                    """,
+                    (task_key, task_family, planner_group, vendor, lease_owner, lease_time, expires_at, payload_json, lease_time),
+                )
+            leased = connection.execute(
+                "SELECT * FROM vendor_attempts WHERE task_key = ? AND vendor = ?",
+                (task_key, vendor),
+            ).fetchone()
+        return VendorAttempt(**dict(leased)) if leased is not None else None
+
+    def mark_vendor_attempt_success(
+        self,
+        *,
+        task_key: str,
+        vendor: str,
+        rows_returned: int = 0,
+    ) -> None:
+        """Mark a vendor attempt successful."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE vendor_attempts
+                SET status = 'SUCCESS',
+                    rows_returned = ?,
+                    lease_owner = NULL,
+                    next_eligible_at = NULL,
+                    last_error = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE task_key = ? AND vendor = ?
+                """,
+                (rows_returned, utc_now().isoformat(), task_key, vendor),
+            )
+
+    def mark_vendor_attempt_failed(
+        self,
+        *,
+        task_key: str,
+        vendor: str,
+        error: str,
+        backoff_minutes: int,
+        permanent: bool = False,
+    ) -> None:
+        """Mark a vendor attempt failed with backoff or permanently."""
+        status = "PERMANENT_FAILED" if permanent else "FAILED"
+        next_eligible_at = None if permanent else (utc_now() + timedelta(minutes=backoff_minutes)).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE vendor_attempts
+                SET status = ?,
+                    attempts = attempts + 1,
+                    last_error = ?,
+                    next_eligible_at = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE task_key = ? AND vendor = ?
+                """,
+                (status, error, next_eligible_at, utc_now().isoformat(), task_key, vendor),
+            )
+
+    def vendor_attempts_for_task(self, task_key: str) -> list[VendorAttempt]:
+        """Return all vendor attempts for a deterministic task key."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM vendor_attempts WHERE task_key = ? ORDER BY vendor",
+                (task_key,),
+            ).fetchall()
+        return [VendorAttempt(**dict(row)) for row in rows]
+
+    def fetch_vendor_attempts(self, *, planner_group: str | None = None) -> list[VendorAttempt]:
+        """Return all vendor attempts for dashboard/status views."""
+        with self._connect() as connection:
+            if planner_group:
+                rows = connection.execute(
+                    "SELECT * FROM vendor_attempts WHERE planner_group = ? ORDER BY updated_at DESC, task_key, vendor",
+                    (planner_group,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM vendor_attempts ORDER BY updated_at DESC, task_key, vendor"
+                ).fetchall()
+        return [VendorAttempt(**dict(row)) for row in rows]

@@ -65,3 +65,71 @@ def test_priority_ordering(tmp_path: Path) -> None:
     leased = [database.lease_next_task(), database.lease_next_task(), database.lease_next_task()]
 
     assert [task.symbol for task in leased if task is not None] == ["HIGH", "MID", "LOW"]
+
+
+def test_vendor_attempt_lease_success_and_backoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    now = db_module.utc_now()
+    monkeypatch.setattr(db_module, "utc_now", lambda: now)
+
+    leased = database.lease_vendor_attempt(
+        task_key="reference::listings::2026-04-02",
+        task_family="reference",
+        planner_group="reference_events_backlog",
+        vendor="alpha_vantage",
+        lease_owner="worker-a",
+        payload={"dataset": "listings"},
+        lease_ttl_seconds=30,
+    )
+
+    assert leased is not None
+    assert leased.status == "LEASED"
+    database.mark_vendor_attempt_failed(
+        task_key="reference::listings::2026-04-02",
+        vendor="alpha_vantage",
+        error="429",
+        backoff_minutes=30,
+    )
+    assert database.lease_vendor_attempt(
+        task_key="reference::listings::2026-04-02",
+        task_family="reference",
+        planner_group="reference_events_backlog",
+        vendor="alpha_vantage",
+        lease_owner="worker-a",
+        payload={"dataset": "listings"},
+        now=now + timedelta(minutes=29),
+    ) is None
+    assert database.lease_vendor_attempt(
+        task_key="reference::listings::2026-04-02",
+        task_family="reference",
+        planner_group="reference_events_backlog",
+        vendor="alpha_vantage",
+        lease_owner="worker-a",
+        payload={"dataset": "listings"},
+        now=now + timedelta(minutes=31),
+    ) is not None
+
+
+def test_vendor_attempt_success_is_terminal(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    leased = database.lease_vendor_attempt(
+        task_key="canonical::equities_eod::AAPL::2024-01-01::2024-01-31::GAP",
+        task_family="canonical",
+        planner_group="canonical_bars_backlog",
+        vendor="tiingo",
+        lease_owner="worker-a",
+    )
+
+    assert leased is not None
+    database.mark_vendor_attempt_success(
+        task_key="canonical::equities_eod::AAPL::2024-01-01::2024-01-31::GAP",
+        vendor="tiingo",
+        rows_returned=22,
+    )
+    assert database.lease_vendor_attempt(
+        task_key="canonical::equities_eod::AAPL::2024-01-01::2024-01-31::GAP",
+        task_family="canonical",
+        planner_group="canonical_bars_backlog",
+        vendor="tiingo",
+        lease_owner="worker-a",
+    ) is None

@@ -8,6 +8,7 @@ import os
 import signal
 import threading
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,10 +18,12 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from trademl.calendars.exchange import is_trading_day
-from trademl.connectors.base import BaseConnector, ConnectorError, TemporaryConnectorError
+from trademl.connectors.base import BaseConnector, ConnectorError, PermanentConnectorError, TemporaryConnectorError
 from trademl.data_node.auditor import PartitionAuditor
+from trademl.data_node.capabilities import auxiliary_capabilities, backfill_capabilities, default_macro_series
 from trademl.data_node.curator import Curator, CuratorResult
 from trademl.data_node.db import DataNodeDB
+from trademl.data_node.planner import canonical_task_key, choose_vendor_for_canonical_task
 from trademl.fleet.cluster import ClusterCoordinator, ShardSpec
 from trademl.reference.security_master import rebuild_derived_references
 
@@ -71,6 +74,8 @@ class DataNodeService:
         curator: Curator,
         paths: DataNodePaths,
         source_name: str = "alpaca",
+        capability_audit_state: dict[str, object] | None = None,
+        worker_id: str = "local-worker",
     ) -> None:
         self.db = db
         self.connectors = connectors
@@ -78,6 +83,8 @@ class DataNodeService:
         self.curator = curator
         self.paths = paths
         self.source_name = source_name
+        self.capability_audit_state = capability_audit_state or {}
+        self.worker_id = worker_id
         self._stop_event = threading.Event()
         self.default_symbols: list[str] = []
         self._collection_history: set[str] = set()
@@ -130,29 +137,36 @@ class DataNodeService:
         return self._write_raw_shard_partition(frame, shard_id=shard_id)
 
     def process_backfill_queue(self) -> list[str]:
-        """Process queued backfill or gap tasks until the queue is drained."""
+        """Process queued backfill or gap tasks with vendor-parallel lanes."""
+        lane_widths = self._backfill_lane_widths()
+        if not lane_widths:
+            return []
         changed_dates: list[str] = []
-        while task := self.db.lease_next_task():
-            symbols = [task.symbol] if task.symbol else self.default_symbols
-            frame = pd.DataFrame()
-            errors: list[str] = []
-            for connector_name in self._backfill_connector_order(dataset=task.dataset):
-                connector = self.connectors[connector_name]
-                try:
-                    frame = connector.fetch(task.dataset, symbols, task.start_date, task.end_date)
-                except ConnectorError as exc:
-                    errors.append(f"{connector_name}: {exc}")
+        futures: dict[object, str] = {}
+        with ThreadPoolExecutor(max_workers=sum(lane_widths.values())) as executor:
+            while True:
+                scheduled = False
+                for vendor, width in lane_widths.items():
+                    active_for_vendor = sum(1 for active_vendor in futures.values() if active_vendor == vendor)
+                    while active_for_vendor < width:
+                        task = self._lease_next_task_for_vendor(vendor)
+                        if task is None:
+                            break
+                        future = executor.submit(self._process_backfill_task_for_vendor, task, vendor)
+                        futures[future] = vendor
+                        active_for_vendor += 1
+                        scheduled = True
+                if not futures and not scheduled:
+                    break
+                if not futures:
                     continue
-                if frame.empty:
-                    errors.append(f"{connector_name}: empty backfill result")
-                    continue
-                break
-            if frame.empty:
-                self.db.mark_task_failed(task.id, " | ".join(errors) or "empty backfill result", backoff_minutes=30)
-                continue
-            changed_dates.extend(self._write_raw_partition(frame))
-            self.db.mark_task_done(task.id)
-        return changed_dates
+                done, _pending = wait(list(futures), return_when=FIRST_COMPLETED, timeout=0.1)
+                for future in done:
+                    changed_dates.extend(future.result())
+                    futures.pop(future, None)
+            for future in list(futures):
+                changed_dates.extend(future.result())
+        return sorted(set(changed_dates))
 
     def collect_reference_data(self, jobs: list[dict[str, object]]) -> ReferenceCollectionResult:
         """Collect reference datasets into parquet files."""
@@ -160,41 +174,41 @@ class DataNodeService:
         self.paths.reference_root.mkdir(parents=True, exist_ok=True)
         failures: list[str] = []
         deferred: dict[str, int] = {}
-        exhausted_vendors: set[str] = set()
-        for job in self._expand_reference_jobs(jobs):
-            vendor = str(job["source"])
-            if vendor in exhausted_vendors:
-                deferred[vendor] = deferred.get(vendor, 0) + 1
-                continue
-            connector = self.connectors[vendor]
-            budget_manager = getattr(connector, "budget_manager", None)
-            if budget_manager is not None and not budget_manager.can_spend(vendor, task_kind="OTHER"):
-                exhausted_vendors.add(vendor)
-                deferred[vendor] = deferred.get(vendor, 0) + 1
-                continue
-            try:
-                frame = connector.fetch(
-                    str(job["dataset"]),
-                    list(job.get("symbols", [])),
-                    str(job["start_date"]),
-                    str(job["end_date"]),
-                )
-            except ConnectorError as exc:
-                message = str(exc)
-                if "budget exhausted" in message:
-                    exhausted_vendors.add(vendor)
-                    deferred[vendor] = deferred.get(vendor, 0) + 1
+        expanded_jobs = self._expand_reference_jobs(jobs)
+        lane_widths = self._aux_lane_widths(task_kinds={"REFERENCE", "EVENT"})
+        vendor_jobs: dict[str, list[dict[str, object]]] = {}
+        for job in expanded_jobs:
+            vendor_jobs.setdefault(str(job["source"]), []).append(job)
+
+        with ThreadPoolExecutor(max_workers=max(1, sum(lane_widths.get(vendor, 1) for vendor in vendor_jobs))) as executor:
+            futures: dict[object, str] = {}
+            positions = {vendor: 0 for vendor in vendor_jobs}
+            while True:
+                scheduled = False
+                for vendor, jobs_for_vendor in vendor_jobs.items():
+                    width = max(1, lane_widths.get(vendor, 1))
+                    active_for_vendor = sum(1 for active_vendor in futures.values() if active_vendor == vendor)
+                    while active_for_vendor < width and positions[vendor] < len(jobs_for_vendor):
+                        job = jobs_for_vendor[positions[vendor]]
+                        positions[vendor] += 1
+                        future = executor.submit(self._run_reference_job, job)
+                        futures[future] = vendor
+                        active_for_vendor += 1
+                        scheduled = True
+                if not futures and not scheduled:
+                    break
+                if not futures:
                     continue
-                failures.append(f"{vendor}:{job['dataset']}:{job.get('symbols', [])}:{message}")
-                continue
-            output = self.paths.reference_root / f"{job['output_name']}.parquet"
-            if output.exists():
-                existing = pd.read_parquet(output)
-                frame = pd.concat([existing, frame], ignore_index=True) if not frame.empty else existing
-            if not frame.empty:
-                frame = frame.drop_duplicates().reset_index(drop=True)
-            frame.to_parquet(output, index=False)
-            outputs.append(output)
+                done, _pending = wait(list(futures), return_when=FIRST_COMPLETED, timeout=0.1)
+                for future in done:
+                    vendor = futures.pop(future)
+                    result = future.result()
+                    for output in result.get("outputs", []):
+                        outputs.append(Path(output))
+                    for failure in result.get("failures", []):
+                        failures.append(failure)
+                    if result.get("deferred"):
+                        deferred[vendor] = deferred.get(vendor, 0) + int(result["deferred"])
         outputs.extend(rebuild_derived_references(self.paths.reference_root))
         deferred_messages = [f"{vendor}: deferred {count} jobs after budget exhaustion" for vendor, count in sorted(deferred.items())]
         return ReferenceCollectionResult(outputs=outputs, failures=failures, deferred=deferred_messages)
@@ -623,7 +637,8 @@ class DataNodeService:
                 coordinator.mark_singleton_success("macro", trading_date, {"series_count": len(macro_series_ids)})
 
         week_key = self._week_key(current_et)
-        if reference_jobs and coordinator.acquire_singleton("reference", week_key):
+        reference_bucket = trading_date if self._core_auxiliary_incomplete() else week_key
+        if reference_jobs and coordinator.acquire_singleton("reference", reference_bucket):
             materialized_jobs = [self._materialize_job(job, trading_date) for job in reference_jobs]
             result = self.collect_reference_data(materialized_jobs)
             if isinstance(result, list):
@@ -631,7 +646,7 @@ class DataNodeService:
             if result.failures or result.deferred:
                 LOGGER.warning(
                     "reference collection partial for bucket=%s trading_date=%s failures=%s deferred=%s",
-                    week_key,
+                    reference_bucket,
                     trading_date,
                     " | ".join(result.failures) if result.failures else "-",
                     " | ".join(result.deferred) if result.deferred else "-",
@@ -642,7 +657,7 @@ class DataNodeService:
                     self.curate_dates(corp_actions=pd.read_parquet(corp_actions_path))
             coordinator.mark_singleton_success(
                 "reference",
-                week_key,
+                reference_bucket,
                 {
                     "job_count": len(materialized_jobs),
                     "output_count": len(result.outputs),
@@ -658,6 +673,14 @@ class DataNodeService:
                 LOGGER.exception("price check collection failed for bucket=%s trading_date=%s", week_key, trading_date)
             else:
                 coordinator.mark_singleton_success("price_checks", week_key, {"symbol_count": len(price_check_symbols)})
+
+    def _core_auxiliary_incomplete(self) -> bool:
+        required_reference = {"listing_history.parquet", "delistings.parquet", "corp_actions.parquet", "sec_filings.parquet"}
+        available_reference = {path.name for path in self.paths.reference_root.glob("*.parquet")} if self.paths.reference_root.exists() else set()
+        if not required_reference.issubset(available_reference):
+            return True
+        available_macro = {path.name.partition("=")[2] for path in (self.paths.root / "data" / "raw" / "macros_fred").glob("series=*")}
+        return not set(default_macro_series()).issubset(available_macro)
 
     @staticmethod
     def _expand_reference_jobs(jobs: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -741,9 +764,162 @@ class DataNodeService:
         self.collect_forward_shard(trading_date=trading_date, symbols=shard.symbols, shard_id=shard.shard_id)
 
     def _backfill_connector_order(self, *, dataset: str) -> list[str]:
-        preferred: list[str] = []
         if dataset == "equities_eod":
-            preferred.extend(["tiingo", self.source_name, "twelve_data", "massive", "finnhub"])
-        else:
-            preferred.append(self.source_name)
+            capabilities = backfill_capabilities(
+                dataset=dataset,
+                connectors=self.connectors,
+                audit_state=self.capability_audit_state,
+            )
+            ordered = [capability.vendor for capability in capabilities]
+            if ordered:
+                return ordered
+        preferred = [self.source_name]
         return [name for index, name in enumerate(preferred) if name in self.connectors and name not in preferred[:index]]
+
+    def _backfill_lane_widths(self) -> dict[str, int]:
+        widths: dict[str, int] = {}
+        for capability in backfill_capabilities(
+            dataset="equities_eod",
+            connectors=self.connectors,
+            audit_state=self.capability_audit_state,
+        ):
+            widths[capability.vendor] = max(widths.get(capability.vendor, 0), int(capability.lane_width or 1))
+        return widths
+
+    def _aux_lane_widths(self, *, task_kinds: set[str]) -> dict[str, int]:
+        widths: dict[str, int] = {}
+        for job in auxiliary_capabilities(
+            connectors=self.connectors,
+            audit_state=self.capability_audit_state,
+            include_research=False,
+        ):
+            if job.task_kind not in task_kinds:
+                continue
+            widths[job.vendor] = max(widths.get(job.vendor, 0), int(job.lane_width or 1))
+        return widths
+
+    def _lease_next_task_for_vendor(self, vendor: str):
+        for candidate in self.db.peek_next_tasks(limit=64):
+            chosen = choose_vendor_for_canonical_task(
+                task=candidate,
+                connectors=self.connectors,
+                audit_state=self.capability_audit_state,
+                attempts=self.db.vendor_attempts_for_task(canonical_task_key(candidate)),
+            )
+            if chosen != vendor:
+                continue
+            leased = self.db.lease_task_by_id(candidate.id)
+            if leased is not None:
+                return leased
+        return None
+
+    def _process_backfill_task_for_vendor(self, task, vendor: str) -> list[str]:
+        task_key = canonical_task_key(task)
+        symbols = [task.symbol] if task.symbol else self.default_symbols
+        attempt = self.db.lease_vendor_attempt(
+            task_key=task_key,
+            task_family="canonical",
+            planner_group="canonical_bars_backlog",
+            vendor=vendor,
+            lease_owner=self.worker_id,
+            payload={
+                "dataset": task.dataset,
+                "symbol": task.symbol,
+                "start_date": task.start_date,
+                "end_date": task.end_date,
+                "kind": task.kind,
+            },
+        )
+        if attempt is None:
+            self.db.mark_task_failed(task.id, f"{vendor}: attempt unavailable", backoff_minutes=1)
+            return []
+        connector = self.connectors[vendor]
+        try:
+            frame = connector.fetch(task.dataset, symbols, task.start_date, task.end_date)
+        except PermanentConnectorError as exc:
+            self.db.mark_vendor_attempt_failed(task_key=task_key, vendor=vendor, error=str(exc), backoff_minutes=0, permanent=True)
+            self.db.mark_task_failed(task.id, f"{vendor}: {exc}", backoff_minutes=1)
+            return []
+        except ConnectorError as exc:
+            self.db.mark_vendor_attempt_failed(task_key=task_key, vendor=vendor, error=str(exc), backoff_minutes=15)
+            self.db.mark_task_failed(task.id, f"{vendor}: {exc}", backoff_minutes=1)
+            return []
+        if frame.empty:
+            self.db.mark_vendor_attempt_failed(task_key=task_key, vendor=vendor, error="empty backfill result", backoff_minutes=30)
+            self.db.mark_task_failed(task.id, f"{vendor}: empty backfill result", backoff_minutes=1)
+            return []
+        changed = self._write_raw_partition(frame)
+        self.db.mark_vendor_attempt_success(task_key=task_key, vendor=vendor, rows_returned=len(frame))
+        self.db.mark_task_done(task.id)
+        return changed
+
+    def _run_reference_job(self, job: dict[str, object]) -> dict[str, object]:
+        vendor = str(job["source"])
+        connector = self.connectors[vendor]
+        budget_manager = getattr(connector, "budget_manager", None)
+        if budget_manager is not None and not budget_manager.can_spend(vendor, task_kind="OTHER"):
+            return {"outputs": [], "failures": [], "deferred": 1}
+        task_key = self._aux_task_key(job)
+        leased = self.db.lease_vendor_attempt(
+            task_key=task_key,
+            task_family="auxiliary",
+            planner_group=str(job.get("planner_group", "reference_events_backlog")),
+            vendor=vendor,
+            lease_owner=self.worker_id,
+            payload=job,
+        )
+        if leased is None:
+            return {"outputs": [], "failures": [], "deferred": 0}
+        try:
+            frame = connector.fetch(
+                str(job["dataset"]),
+                list(job.get("symbols", [])),
+                str(job["start_date"]),
+                str(job["end_date"]),
+            )
+        except PermanentConnectorError as exc:
+            self.db.mark_vendor_attempt_failed(task_key=task_key, vendor=vendor, error=str(exc), backoff_minutes=0, permanent=True)
+            return {"outputs": [], "failures": [f"{vendor}:{job['dataset']}:{job.get('symbols', [])}:{exc}"], "deferred": 0}
+        except ConnectorError as exc:
+            message = str(exc)
+            if "budget exhausted" in message:
+                self.db.mark_vendor_attempt_failed(task_key=task_key, vendor=vendor, error=message, backoff_minutes=30)
+                return {"outputs": [], "failures": [], "deferred": 1}
+            self.db.mark_vendor_attempt_failed(task_key=task_key, vendor=vendor, error=message, backoff_minutes=15)
+            return {"outputs": [], "failures": [f"{vendor}:{job['dataset']}:{job.get('symbols', [])}:{message}"], "deferred": 0}
+        output = self.paths.reference_root / f"{job['output_name']}.parquet"
+        self._append_reference_frame(output, frame)
+        self.db.mark_vendor_attempt_success(task_key=task_key, vendor=vendor, rows_returned=len(frame))
+        return {"outputs": [str(output)], "failures": [], "deferred": 0}
+
+    def _append_reference_frame(self, output: Path, frame: pd.DataFrame) -> None:
+        lock_path = output.with_suffix(".lock")
+        self._acquire_file_lock(lock_path)
+        try:
+            if output.exists():
+                existing = pd.read_parquet(output)
+                frame = pd.concat([existing, frame], ignore_index=True) if not frame.empty else existing
+            if not frame.empty:
+                frame = frame.drop_duplicates().reset_index(drop=True)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = output.with_suffix(output.suffix + f".{uuid.uuid4().hex}.tmp")
+            frame.to_parquet(tmp_path, index=False)
+            os.replace(tmp_path, output)
+        finally:
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
+
+    @staticmethod
+    def _aux_task_key(job: dict[str, object]) -> str:
+        symbols = ",".join(list(job.get("symbols", []))) or "__GLOBAL__"
+        return "::".join(
+            [
+                "aux",
+                str(job.get("source", "")),
+                str(job.get("dataset", "")),
+                symbols,
+                str(job.get("start_date", "")),
+                str(job.get("end_date", "")),
+                str(job.get("output_name", "")),
+            ]
+        )

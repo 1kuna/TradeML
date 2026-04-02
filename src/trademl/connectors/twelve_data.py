@@ -43,6 +43,22 @@ class TwelveDataConnector(HTTPConnector):
             payload = self.request_json(endpoint="/stocks", task_kind="OTHER")
             rows = payload.get("data", payload if isinstance(payload, list) else []) if isinstance(payload, dict) else payload
             return pd.DataFrame(rows)
+        if dataset == "price_target":
+            frames = []
+            for symbol in symbols:
+                payload = self.request_json(endpoint="/price_target", params={"symbol": symbol}, task_kind="OTHER")
+                frames.append(pd.DataFrame([payload.get("data", payload)] if isinstance(payload, dict) else payload))
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if dataset == "insider_transactions":
+            frames = []
+            for symbol in symbols:
+                payload = self.request_json(endpoint="/insider_transactions", params={"symbol": symbol}, task_kind="OTHER")
+                rows = payload.get("data", payload if isinstance(payload, list) else []) if isinstance(payload, dict) else payload
+                frame = pd.DataFrame(rows)
+                if not frame.empty:
+                    frame["symbol"] = symbol
+                    frames.append(frame)
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         raise ValueError(f"unsupported dataset for twelve_data: {dataset}")
 
     def _fetch_equities(

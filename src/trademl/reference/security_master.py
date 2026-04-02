@@ -11,6 +11,7 @@ import pandas as pd
 def build_listing_history(
     *,
     listings: pd.DataFrame,
+    alpaca_assets: pd.DataFrame | None = None,
     delistings: pd.DataFrame | None = None,
     reference_tickers: pd.DataFrame | None = None,
     company_profiles: pd.DataFrame | None = None,
@@ -40,6 +41,25 @@ def build_listing_history(
             }
         )
         frames.append(listing_frame)
+
+    if alpaca_assets is not None and not alpaca_assets.empty:
+        asset_frame = pd.DataFrame(
+            {
+                "symbol": alpaca_assets.get("symbol", pd.Series(dtype="string")).astype("string").str.strip().str.upper(),
+                "name": alpaca_assets.get("name", pd.Series(dtype="string")).astype("string"),
+                "exchange": alpaca_assets.get("exchange", pd.Series(dtype="string")).astype("string").str.upper(),
+                "asset_type": alpaca_assets.get("asset_class", pd.Series(dtype="string")).map(_normalize_asset_type),
+                "ipo_date": pd.Series(pd.NaT, index=alpaca_assets.index, dtype="datetime64[ns]"),
+                "delist_date": pd.Series(pd.NaT, index=alpaca_assets.index, dtype="datetime64[ns]"),
+                "delist_reason": pd.Series(pd.NA, index=alpaca_assets.index, dtype="string"),
+                "sector": pd.Series(pd.NA, index=alpaca_assets.index, dtype="string"),
+                "industry": pd.Series(pd.NA, index=alpaca_assets.index, dtype="string"),
+                "status": alpaca_assets.get("status", pd.Series(dtype="string")).astype("string").str.lower(),
+                "sources": pd.Series(["alpaca"] * len(alpaca_assets), dtype="string"),
+                "last_verified": pd.Series([verified_at] * len(alpaca_assets)),
+            }
+        )
+        frames.append(asset_frame)
 
     if reference_tickers is not None and not reference_tickers.empty:
         ticker_frame = pd.DataFrame(
@@ -215,6 +235,7 @@ def rebuild_derived_references(reference_root: Path) -> list[Path]:
     outputs: list[Path] = []
     listing_inputs = {
         "listings": _read_optional_parquet(reference_root / "listings.parquet"),
+        "alpaca_assets": _read_optional_parquet(reference_root / "alpaca_assets.parquet"),
         "delistings": _read_optional_parquet(reference_root / "delistings.parquet"),
         "reference_tickers": _read_optional_parquet(reference_root / "universe.parquet"),
         "company_profiles": _read_optional_parquet(reference_root / "company_profiles.parquet"),

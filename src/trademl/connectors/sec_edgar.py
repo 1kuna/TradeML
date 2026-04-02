@@ -29,6 +29,30 @@ class SecEdgarConnector(HTTPConnector):
         end_date: str | date_type,
     ) -> pd.DataFrame:
         """Fetch filing index rows for supplied CIKs."""
+        if dataset == "company_tickers":
+            payload = self.request_json(
+                base_url="https://www.sec.gov",
+                endpoint="/files/company_tickers.json",
+            )
+            rows = payload.values() if isinstance(payload, dict) else payload
+            return pd.DataFrame(rows)
+        if dataset == "companyfacts":
+            frames = []
+            for cik in symbols:
+                normalized_cik = str(cik).zfill(10)
+                payload = self.request_json(endpoint=f"/api/xbrl/companyfacts/CIK{normalized_cik}.json")
+                frames.append(
+                    pd.DataFrame(
+                        [
+                            {
+                                "cik": normalized_cik,
+                                "entityName": payload.get("entityName"),
+                                "facts": payload.get("facts", {}),
+                            }
+                        ]
+                    )
+                )
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["cik", "entityName", "facts"])
         if dataset != "filing_index":
             raise ValueError(f"unsupported dataset for sec_edgar: {dataset}")
 
