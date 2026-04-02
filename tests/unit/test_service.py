@@ -506,36 +506,6 @@ def test_run_cluster_auxiliary_tasks_uses_daily_reference_bucket_until_core_read
     assert "reference:2026-03-31" in coordinator._lease_calls
 
 
-def test_run_cluster_forever_triggers_training_autopilot_when_backfill_clear(tmp_path: Path) -> None:
-    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    raw_partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31"
-    raw_partition.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{"symbol": "AAPL", "date": "2026-03-31", "close": 100.0}]).to_parquet(raw_partition / "data.parquet", index=False)
-    calls: list[str] = []
-    service = DataNodeService(
-        db=db,
-        connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
-        curator=Curator(),
-        paths=DataNodePaths(root=tmp_path),
-        training_autopilot=lambda: calls.append("training") or service.stop(),
-    )
-    coordinator = _ClusterCoordinatorStub()
-
-    service.run_cluster_forever(
-        coordinator=coordinator,  # type: ignore[arg-type]
-        symbols=["AAPL"],
-        exchange="XNYS",
-        collection_time_et="16:30",
-        maintenance_hour_local=23,
-        poll_seconds=0.0,
-        now_fn=lambda: datetime.fromisoformat("2026-03-31T18:00:00+00:00"),
-        sleep_fn=lambda _seconds: None,
-    )
-
-    assert calls == ["training"]
-
-
 def test_collect_reference_data_persists_partial_results_before_budget_failure(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

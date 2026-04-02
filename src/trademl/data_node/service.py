@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import sleep
-from typing import Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -77,7 +76,6 @@ class DataNodeService:
         source_name: str = "alpaca",
         capability_audit_state: dict[str, object] | None = None,
         worker_id: str = "local-worker",
-        training_autopilot: Callable[[], object] | None = None,
         stage_years: int = 5,
     ) -> None:
         self.db = db
@@ -88,7 +86,6 @@ class DataNodeService:
         self.source_name = source_name
         self.capability_audit_state = capability_audit_state or {}
         self.worker_id = worker_id
-        self.training_autopilot = training_autopilot
         self.stage_years = stage_years
         self._stop_event = threading.Event()
         self.default_symbols: list[str] = []
@@ -135,14 +132,6 @@ class DataNodeService:
         if last_error is not None:
             LOGGER.warning("forward collection exhausted fallback order for trading_date=%s error=%s", trading_date, last_error)
         return self.source_name, pd.DataFrame()
-
-    def _maybe_auto_launch_training(self) -> None:
-        if self.training_autopilot is None or self.db.has_pending_backfill():
-            return
-        try:
-            self.training_autopilot()
-        except Exception:
-            LOGGER.exception("automatic training launch check failed")
 
     def _write_raw_partition(self, frame: pd.DataFrame, *, source_name: str) -> list[str]:
         changed_dates: list[str] = []
@@ -510,7 +499,6 @@ class DataNodeService:
                     )
 
             if not self._stop_event.is_set():
-                self._maybe_auto_launch_training()
                 sleep_fn(poll_seconds)
 
     def run_forever(
@@ -585,7 +573,6 @@ class DataNodeService:
                 self._maintenance_history.add(local_day)
 
             if not self._stop_event.is_set():
-                self._maybe_auto_launch_training()
                 sleep_fn(poll_seconds)
 
     def _should_run_collection(

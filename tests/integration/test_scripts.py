@@ -95,6 +95,48 @@ def test_train_script_emits_report(tmp_path: Path) -> None:
     assert (data_root / "reports" / "daily" / "2026-03-31.md").exists()
 
 
+def test_train_script_phase1_ridge_only_skips_lightgbm_artifacts(tmp_path: Path) -> None:
+    data_root = tmp_path / "workspace"
+    _write_training_dataset(data_root)
+    config = {
+        "data": {"green_threshold": 0.9},
+        "features": {
+            "price": {"momentum": [5, 20, 60, 126], "reversal": [1, 5], "drawdown": [20, 60]},
+            "volatility": {"realized": [20, 60], "idiosyncratic": [60]},
+            "liquidity": {"adv_dollar": [20], "amihud": [20]},
+            "controls": {"log_price": True},
+        },
+        "preprocessing": {"missing_threshold": 0.30},
+        "validation": {"initial_train_years": 1, "step": "6_months"},
+        "portfolio": {"cost_stress_multiplier": 2.0},
+    }
+    config_path = tmp_path / "train.yml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    subprocess.run(
+        [
+            sys.executable,
+            "src/scripts/train.py",
+            "--data-root",
+            str(data_root),
+            "--config",
+            str(config_path),
+            "--output-root",
+            str(data_root),
+            "--report-date",
+            "2026-04-01",
+            "--model-suite",
+            "ridge_only",
+        ],
+        check=True,
+        cwd=Path.cwd(),
+    )
+
+    report = json.loads((data_root / "reports" / "daily" / "2026-04-01.json").read_text(encoding="utf-8"))
+    assert report["lightgbm"]["skipped"] is True
+    assert not (data_root / "models" / "lightgbm").exists()
+
+
 def test_backtest_script_writes_outputs(tmp_path: Path) -> None:
     prices = pd.DataFrame(
         {

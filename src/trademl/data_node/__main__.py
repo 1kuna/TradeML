@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -25,7 +24,6 @@ from trademl.data_node.capabilities import default_macro_series, load_audit_stat
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.service import DataNodePaths, DataNodeService
-from trademl.data_node.training_control import auto_launch_phase_training
 from trademl.fleet.cluster import ClusterCoordinator
 
 
@@ -165,14 +163,6 @@ def main() -> int:
         paths=DataNodePaths(root=data_root),
         capability_audit_state=audit_state,
         worker_id=worker_id,
-        training_autopilot=lambda: auto_launch_phase_training(
-            repo_root=Path(__file__).resolve().parents[3],
-            data_root=data_root,
-            local_state=local_state,
-            env_path=env_path or (workspace_root / ".env"),
-            stage_path=workspace_root / "stage.yml",
-            python_executable=os.environ.get("TRADEML_PYTHON_EXECUTABLE", sys.executable),
-        ),
         stage_years=stage_years,
     )
     service.install_signal_handlers()

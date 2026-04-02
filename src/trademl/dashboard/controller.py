@@ -40,11 +40,7 @@ from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.capabilities import load_audit_state
 from trademl.data_node.planner import plan_auxiliary_tasks
-from trademl.data_node.training_control import (
-    evaluate_training_gates,
-    launch_training_process,
-    read_training_runtime,
-)
+from trademl.data_node.training_control import evaluate_training_gates
 from trademl.fleet.cluster import (
     ClusterCoordinator,
     ClusterPaths,
@@ -735,29 +731,6 @@ def replan_coverage(settings: NodeSettings) -> dict[str, Any]:
     return payload
 
 
-def start_phase_training(settings: NodeSettings, *, phase: int) -> dict[str, Any]:
-    """Launch a readiness-gated training run after a lightweight preflight."""
-    snapshot = collect_dashboard_snapshot(settings)
-    readiness = snapshot["training_readiness"]["phase1" if phase == 1 else "phase2"]
-    if not readiness["ready"]:
-        raise RuntimeError(f"phase {phase} training blocked: {', '.join(readiness['blockers'])}")
-    runtime_payload = launch_training_process(
-        repo_root=settings.repo_root,
-        data_root=settings.nas_mount,
-        local_state=settings.local_state,
-        env_path=settings.env_path,
-        phase=phase,
-        python_executable=sys.executable,
-        report_date=date.today().isoformat(),
-    )
-    append_cluster_event(
-        settings.cluster_paths,
-        f"phase_{phase}_training_started",
-        {"worker_id": settings.worker_id, "pid": runtime_payload["pid"], "report_date": runtime_payload["report_date"]},
-    )
-    return runtime_payload
-
-
 def _remove_worker_state(settings: NodeSettings) -> None:
     for path in [
         settings.local_state,
@@ -803,10 +776,6 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
     price_check_files = _price_check_files(settings.price_checks_root)
     audit = load_audit_state(_audit_report_path(settings))
     coverage_plan = _read_optional_json(_coverage_plan_path(settings))
-    training_runs = {
-        "phase1": _read_training_runtime(settings, phase=1),
-        "phase2": _read_training_runtime(settings, phase=2),
-    }
     vendor_attempt_summary = _read_vendor_attempt_summary(settings.db_path)
     stage = _read_yaml(settings.stage_path)
     stage_symbols = stage.get("symbols", [])
@@ -865,7 +834,6 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "stage_datapoint_progress_ratio": datapoint_progress_ratio,
         "data_readiness": data_readiness,
         "training_readiness": readiness,
-        "training_runs": training_runs,
         "audit": audit,
         "coverage_plan": coverage_plan,
         "nas": {
@@ -898,12 +866,6 @@ def _read_optional_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
-
-
-def _read_training_runtime(settings: NodeSettings, *, phase: int) -> dict[str, Any]:
-    return read_training_runtime(local_state=settings.local_state, phase=phase)
-
-
 def _read_vendor_attempt_summary(db_path: Path) -> dict[str, Any]:
     if not db_path.exists():
         return {"counts": {}, "by_vendor": [], "recent_failures": []}

@@ -19,7 +19,6 @@ from trademl.dashboard.controller import (
     run_vendor_audit,
     persist_node_settings,
     resolve_node_settings,
-    start_phase_training,
     start_node,
     stop_node,
     uninstall_worker,
@@ -254,70 +253,6 @@ def test_run_vendor_audit_and_replan_coverage_persist_outputs(tmp_path: Path, mo
     assert audit["summary"]["live_status"]["live_verified"] == 1
     assert (nas_mount / "control" / "cluster" / "state" / "coverage_plan.json").exists()
     assert plan["task_count"] >= 0
-
-
-def test_start_phase_training_launches_background_process_when_ready(tmp_path: Path, monkeypatch) -> None:
-    workspace = tmp_path / "workspace"
-    nas_mount = tmp_path / "nas"
-    workspace.mkdir(parents=True, exist_ok=True)
-    config_path = workspace / "node.yml"
-    local_state = workspace / "control"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "node": {
-                    "nas_mount": str(nas_mount),
-                    "nas_share": "//127.0.0.1/trademl",
-                    "local_state": str(local_state),
-                    "collection_time_et": "16:30",
-                    "maintenance_hour_local": 2,
-                }
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-    (workspace / ".env").write_text(
-        f"NAS_MOUNT={nas_mount}\nNAS_SHARE=//127.0.0.1/trademl\nLOCAL_STATE={local_state}\n",
-        encoding="utf-8",
-    )
-    (workspace / "stage.yml").write_text(
-        yaml.safe_dump({"current": 1, "symbols": [f"S{i:03d}" for i in range(500)], "years": 10}, sort_keys=False),
-        encoding="utf-8",
-    )
-    reference_root = nas_mount / "data" / "reference"
-    reference_root.mkdir(parents=True, exist_ok=True)
-    for name in ["corp_actions", "listing_history", "delistings", "sec_filings", "ticker_changes", "fred_vintagedates"]:
-        pd.DataFrame([{"symbol": "AAPL"}]).to_parquet(reference_root / f"{name}.parquet", index=False)
-    for series in default_macro_series():
-        series_root = nas_mount / "data" / "raw" / "macros_fred" / f"series={series}"
-        series_root.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame([{"date": "2025-01-02", "value": 1.0}]).to_parquet(series_root / "data.parquet", index=False)
-    qc_root = nas_mount / "data" / "qc"
-    qc_root.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
-        [{"source": "alpaca", "dataset": "equities_eod", "date": f"2025-01-{day:02d}", "status": "GREEN"} for day in range(1, 11)]
-    ).to_parquet(qc_root / "partition_status.parquet", index=False)
-    curated_partition = nas_mount / "data" / "curated" / "equities_ohlcv_adj" / "date=2025-01-10"
-    curated_partition.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{"date": "2025-01-10", "symbol": "AAPL", "close": 1.0, "volume": 10.0}]).to_parquet(
-        curated_partition / "data.parquet",
-        index=False,
-    )
-
-    launched: dict[str, object] = {}
-
-    def fake_launch_training_process(**kwargs):  # noqa: ANN003
-        launched["command"] = kwargs
-        return {"pid": 4321, "phase": kwargs["phase"], "report_date": "2026-04-02"}
-
-    monkeypatch.setattr(dashboard_controller, "launch_training_process", fake_launch_training_process)
-    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
-
-    result = start_phase_training(settings, phase=1)
-
-    assert result["pid"] == 4321
-    assert launched["command"]["phase"] == 1
 
 
 def test_start_and_stop_node_manage_runtime_metadata(tmp_path: Path) -> None:

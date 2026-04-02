@@ -21,7 +21,6 @@ from trademl.dashboard.controller import (
     restart_node,
     run_vendor_audit,
     rotate_cluster_passphrase,
-    start_phase_training,
     start_node,
     stop_node,
     reset_worker,
@@ -74,10 +73,6 @@ def main(argv: list[str] | None = None) -> int:
     node_subparsers.add_parser("uninstall", help="Remove local worker artifacts from this machine.")
     node_subparsers.add_parser("run-audit", help="Run live vendor capability canaries and persist the report.")
     node_subparsers.add_parser("replan-coverage", help="Materialize the current auxiliary coverage plan.")
-    phase1_parser = node_subparsers.add_parser("start-phase1", help="Launch readiness-gated Phase 1 training.")
-    phase1_parser.add_argument("--json", action="store_true")
-    phase2_parser = node_subparsers.add_parser("start-phase2", help="Launch readiness-gated Phase 2 training.")
-    phase2_parser.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
     if args.command == "dashboard":
@@ -147,12 +142,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.node_command == "replan-coverage":
         print(json.dumps(replan_coverage(settings), indent=2, default=str))
-        return 0
-    if args.node_command == "start-phase1":
-        print(json.dumps(start_phase_training(settings, phase=1), indent=2, default=str))
-        return 0
-    if args.node_command == "start-phase2":
-        print(json.dumps(start_phase_training(settings, phase=2), indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported node command: {args.node_command}")
 

@@ -22,7 +22,6 @@ from trademl.dashboard.controller import (
     restart_node,
     run_vendor_audit,
     stage_one_universe_snapshot,
-    start_phase_training,
     rotate_cluster_passphrase,
     start_node,
     stop_node,
@@ -77,7 +76,6 @@ def main() -> None:
     cluster = snapshot["cluster"]
     data_readiness = snapshot["data_readiness"]
     training_readiness = snapshot["training_readiness"]
-    training_runs = snapshot["training_runs"]
     audit = snapshot["audit"]
     coverage_plan = snapshot["coverage_plan"]
     running = bool(runtime.get("running"))
@@ -166,20 +164,15 @@ def main() -> None:
             st.write(f"Systemd: `{snapshot['systemd'].get('ActiveState', snapshot['systemd'].get('reason', 'unknown'))}`")
         training_cols = st.columns(2)
         with training_cols[0]:
-            st.subheader("Training Control")
-            phase1_disabled = not training_readiness["phase1"]["ready"]
-            phase2_disabled = not training_readiness["phase2"]["ready"]
-            if st.button("Start Phase 1 Training", use_container_width=True, disabled=phase1_disabled):
-                result = start_phase_training(settings, phase=1)
-                st.success(f"Phase 1 training launched with PID {result['pid']}")
-                st.rerun()
-            if st.button("Start Phase 2 Training", use_container_width=True, disabled=phase2_disabled):
-                result = start_phase_training(settings, phase=2)
-                st.success(f"Phase 2 training launched with PID {result['pid']}")
-                st.rerun()
+            st.subheader("Training Readiness")
+            st.info("This Pi dashboard does not launch training. Use the workstation/DGX against the NAS-backed corpus once the gate is ready.")
+            st.write(f"Phase 1 ready: `{training_readiness['phase1']['ready']}`")
+            st.write(f"Phase 2 ready: `{training_readiness['phase2']['ready']}`")
         with training_cols[1]:
-            st.subheader("Training Runs")
-            st.json(training_runs, expanded=False)
+            st.subheader("Off-Node Training")
+            st.write("Train from the workstation or DGX against this NAS-backed corpus.")
+            st.write(f"Phase 1 blockers: `{', '.join(training_readiness['phase1']['blockers']) or 'none'}`")
+            st.write(f"Phase 2 blockers: `{', '.join(training_readiness['phase2']['blockers']) or 'none'}`")
 
     with tabs[1]:
         action_cols = st.columns(4)

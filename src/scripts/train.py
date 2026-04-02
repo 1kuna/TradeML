@@ -24,8 +24,17 @@ from trademl.validation.pbo import probability_of_backtest_overfitting
 from trademl.validation.walk_forward import expanding_walk_forward
 
 
-def run_training(*, data_root: Path, config_path: Path, output_root: Path, report_date: str | None = None) -> dict:
+def run_training(
+    *,
+    data_root: Path,
+    config_path: Path,
+    output_root: Path,
+    report_date: str | None = None,
+    model_suite: str = "full",
+) -> dict:
     """Run the end-to-end training workflow and persist a report."""
+    if model_suite not in {"full", "ridge_only"}:
+        raise ValueError(f"unsupported model suite: {model_suite}")
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
 
@@ -78,21 +87,24 @@ def run_training(*, data_root: Path, config_path: Path, output_root: Path, repor
         validation_config,
     )
     ridge_folds = expanding_walk_forward(normalized, feature_cols, "label_5d", lambda: RidgeModel(alpha=ridge_alpha), validation_config)
-    lgbm_params = tune_lightgbm_via_walk_forward(
-        normalized,
-        feature_cols,
-        "label_5d",
-        expanding_walk_forward,
-        validation_config,
-        n_trials=5,
-    )
-    lgbm_folds = expanding_walk_forward(
-        normalized,
-        feature_cols,
-        "label_5d",
-        lambda: LightGBMModel(n_trials=0, best_params=lgbm_params),
-        validation_config,
-    )
+    lgbm_params: dict | None = None
+    lgbm_folds = []
+    if model_suite == "full":
+        lgbm_params = tune_lightgbm_via_walk_forward(
+            normalized,
+            feature_cols,
+            "label_5d",
+            expanding_walk_forward,
+            validation_config,
+            n_trials=5,
+        )
+        lgbm_folds = expanding_walk_forward(
+            normalized,
+            feature_cols,
+            "label_5d",
+            lambda: LightGBMModel(n_trials=0, best_params=lgbm_params),
+            validation_config,
+        )
 
     ridge_predictions = pd.concat([fold.predictions for fold in ridge_folds], ignore_index=True)
     ridge_predictions["gross_return"] = ridge_predictions["label_5d"]
@@ -153,21 +165,26 @@ def run_training(*, data_root: Path, config_path: Path, output_root: Path, repor
             "mean_rank_ic": float(pd.Series([fold.rank_ic for fold in ridge_folds]).mean()) if ridge_folds else 0.0,
             "decile_chart_data": {f"fold_{idx + 1}": fold.bucket_returns for idx, fold in enumerate(ridge_folds)},
         },
-        "lightgbm": {
-            "folds": [
-                {
-                    "rank_ic": fold.rank_ic,
-                    "decile_spread": fold.decile_spread,
-                    "hit_rate": fold.hit_rate,
-                    "bucket_returns": fold.bucket_returns,
-                }
-                for fold in lgbm_folds
-            ],
-            "mean_rank_ic": float(pd.Series([fold.rank_ic for fold in lgbm_folds]).mean()) if lgbm_folds else 0.0,
-            "decile_chart_data": {f"fold_{idx + 1}": fold.bucket_returns for idx, fold in enumerate(lgbm_folds)},
-        },
+        "lightgbm": (
+            {
+                "folds": [
+                    {
+                        "rank_ic": fold.rank_ic,
+                        "decile_spread": fold.decile_spread,
+                        "hit_rate": fold.hit_rate,
+                        "bucket_returns": fold.bucket_returns,
+                    }
+                    for fold in lgbm_folds
+                ],
+                "mean_rank_ic": float(pd.Series([fold.rank_ic for fold in lgbm_folds]).mean()) if lgbm_folds else 0.0,
+                "decile_chart_data": {f"fold_{idx + 1}": fold.bucket_returns for idx, fold in enumerate(lgbm_folds)},
+            }
+            if model_suite == "full"
+            else {"skipped": True, "reason": "ridge_only_phase1_baseline"}
+        ),
         "diagnostics": diagnostics,
         "assessment": assessment,
+        "model_suite": model_suite,
         "artifacts": _persist_run_artifacts(
             output_root=output_root,
             run_ts=run_ts,
@@ -175,12 +192,17 @@ def run_training(*, data_root: Path, config_path: Path, output_root: Path, repor
             feature_cols=feature_cols,
             normalized=normalized,
             ridge_model=RidgeModel(alpha=ridge_alpha).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"]),
-            lgbm_model=LightGBMModel(n_trials=0, best_params=lgbm_params).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"]),
+            lgbm_model=(
+                LightGBMModel(n_trials=0, best_params=lgbm_params).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"])
+                if model_suite == "full" and lgbm_params is not None
+                else None
+            ),
             report_preview={
                 "ridge_mean_rank_ic": float(pd.Series([fold.rank_ic for fold in ridge_folds]).mean()) if ridge_folds else 0.0,
                 "lightgbm_mean_rank_ic": float(pd.Series([fold.rank_ic for fold in lgbm_folds]).mean()) if lgbm_folds else 0.0,
                 "coverage": coverage,
                 "ridge_alpha": ridge_alpha,
+                "model_suite": model_suite,
             },
         ),
     }
@@ -196,6 +218,7 @@ def main() -> int:
     parser.add_argument("--config", default="configs/equities_xs.yml")
     parser.add_argument("--output-root", default=".")
     parser.add_argument("--report-date", default=None)
+    parser.add_argument("--model-suite", default="full", choices=["full", "ridge_only"])
     args = parser.parse_args()
 
     report = run_training(
@@ -203,6 +226,7 @@ def main() -> int:
         config_path=Path(args.config),
         output_root=Path(args.output_root),
         report_date=args.report_date,
+        model_suite=args.model_suite,
     )
     print(json.dumps(report, default=str))
     return 0
@@ -215,11 +239,14 @@ def _persist_run_artifacts(
     feature_cols: list[str],
     normalized: pd.DataFrame,
     ridge_model: RidgeModel,
-    lgbm_model: LightGBMModel,
+    lgbm_model: LightGBMModel | None,
     report_preview: dict,
 ) -> dict[str, str]:
     artifacts: dict[str, str] = {}
-    for model_name, model in {"ridge": ridge_model, "lightgbm": lgbm_model}.items():
+    models = {"ridge": ridge_model}
+    if lgbm_model is not None:
+        models["lightgbm"] = lgbm_model
+    for model_name, model in models.items():
         run_dir = output_root / "models" / model_name / f"run_{run_ts}"
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "feature_list.json").write_text(json.dumps(feature_cols, indent=2), encoding="utf-8")
@@ -251,7 +278,8 @@ def _write_training_log(*, output_root: Path, run_ts: str, report: dict) -> Path
         f"coverage={report['coverage']:.4f}",
         f"window={report['window_start']}..{report['window_end']}",
         f"ridge_mean_rank_ic={report['ridge']['mean_rank_ic']:.4f}",
-        f"lightgbm_mean_rank_ic={report['lightgbm']['mean_rank_ic']:.4f}",
+        f"lightgbm_mean_rank_ic={report.get('lightgbm', {}).get('mean_rank_ic', 0.0):.4f}",
+        f"model_suite={report.get('model_suite', 'full')}",
         f"assessment={report['assessment']['decision']}",
         f"artifact_paths={json.dumps(report['artifacts'])}",
     ]

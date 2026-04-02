@@ -1,4 +1,4 @@
-"""Training readiness and launch helpers shared by the node and dashboard."""
+"""Training readiness and off-node launch helpers for model runs."""
 
 from __future__ import annotations
 
@@ -91,6 +91,7 @@ def launch_training_process(
     local_state: Path,
     env_path: Path,
     phase: int,
+    model_suite: str | None = None,
     python_executable: str = sys.executable,
     report_date: str | None = None,
 ) -> dict[str, Any]:
@@ -118,6 +119,8 @@ def launch_training_process(
         str(data_root),
         "--report-date",
         report_date or date.today().isoformat(),
+        "--model-suite",
+        model_suite or ("ridge_only" if phase == 1 else "full"),
     ]
     env = os.environ.copy()
     env.update(_read_env_file(env_path))
@@ -138,53 +141,12 @@ def launch_training_process(
         "log_path": str(log_path),
         "config_path": str(config_path),
         "report_date": report_date or date.today().isoformat(),
+        "model_suite": model_suite or ("ridge_only" if phase == 1 else "full"),
         "running": True,
         "preflight": preflight,
     }
     runtime_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return payload
-
-
-def auto_launch_phase_training(
-    *,
-    repo_root: Path,
-    data_root: Path,
-    local_state: Path,
-    env_path: Path,
-    stage_path: Path,
-    python_executable: str = sys.executable,
-) -> list[dict[str, Any]]:
-    """Launch any ready training phases that are not already running."""
-    stage = _read_yaml(stage_path)
-    readiness = evaluate_training_gates(
-        data_root=data_root,
-        stage_symbol_count=len(stage.get("symbols", [])),
-        stage_years=int(stage.get("years", 0) or 0),
-    )
-    launched: list[dict[str, Any]] = []
-    if readiness["phase1"]["ready"]:
-        launched.append(
-            launch_training_process(
-                repo_root=repo_root,
-                data_root=data_root,
-                local_state=local_state,
-                env_path=env_path,
-                phase=1,
-                python_executable=python_executable,
-            )
-        )
-    if readiness["phase2"]["ready"]:
-        launched.append(
-            launch_training_process(
-                repo_root=repo_root,
-                data_root=data_root,
-                local_state=local_state,
-                env_path=env_path,
-                phase=2,
-                python_executable=python_executable,
-            )
-        )
-    return launched
 
 
 def _raw_green_ratio(qc_path: Path) -> float | None:
