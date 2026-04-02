@@ -81,6 +81,47 @@ def test_persist_node_settings_updates_config_env_stage_and_fstab(tmp_path: Path
     assert "//192.168.1.20/trademl" in fstab_path.read_text(encoding="utf-8")
 
 
+def test_resolve_node_settings_autodetects_populated_worker_workspace(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = home / "trademl-node"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text(
+        f"LOCAL_STATE={workspace / 'control'}\nNAS_MOUNT={tmp_path / 'nas'}\nNAS_SHARE=//127.0.0.1/trademl\n",
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 0, "symbols": ["AAPL"], "years": 1}, sort_keys=False),
+        encoding="utf-8",
+    )
+    (workspace / "control").mkdir(parents=True, exist_ok=True)
+    (workspace / "control" / "node_runtime.json").write_text('{"pid": 123, "running": true}', encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("TRADEML_WORKSPACE_ROOT", raising=False)
+
+    settings = resolve_node_settings()
+
+    assert settings.workspace_root == workspace
+    assert settings.config_path == config_path
+    assert settings.env_path == workspace / ".env"
+
+
 def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     nas_mount = tmp_path / "nas"

@@ -112,7 +112,7 @@ def resolve_node_settings(
 ) -> NodeSettings:
     """Resolve dashboard settings from workspace files and defaults."""
     repo_root = Path(__file__).resolve().parents[3]
-    resolved_workspace = Path(workspace_root or os.getenv("TRADEML_WORKSPACE_ROOT", "~/trademl")).expanduser()
+    resolved_workspace = _resolve_workspace_root(workspace_root=workspace_root)
     resolved_config = (
         Path(config_path).expanduser()
         if config_path
@@ -144,6 +144,36 @@ def resolve_node_settings(
         maintenance_hour_local=maintenance_hour_local,
         worker_id=worker_id,
     )
+
+
+def _resolve_workspace_root(*, workspace_root: str | Path | None = None) -> Path:
+    """Resolve the most likely active worker workspace root."""
+    if workspace_root:
+        return Path(workspace_root).expanduser()
+    env_workspace = os.getenv("TRADEML_WORKSPACE_ROOT")
+    if env_workspace:
+        return Path(env_workspace).expanduser()
+
+    candidates = [Path("~/trademl-node").expanduser(), Path("~/trademl").expanduser()]
+    scored: list[tuple[int, Path]] = []
+    for candidate in candidates:
+        score = 0
+        if (candidate / "node.yml").exists():
+            score += 4
+        if (candidate / ".env").exists():
+            score += 3
+        if (candidate / "control" / "node_runtime.json").exists():
+            score += 3
+        if (candidate / "control" / "node.sqlite").exists():
+            score += 2
+        if (candidate / "stage.yml").exists():
+            score += 1
+        if score:
+            scored.append((score, candidate))
+    if scored:
+        scored.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+        return scored[0][1]
+    return Path("~/trademl").expanduser()
 
 
 def persist_node_settings(
