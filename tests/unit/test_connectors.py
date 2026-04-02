@@ -4,10 +4,11 @@ import json
 
 import pandas as pd
 import pytest
+import requests
 
 from trademl.connectors.alpaca import AlpacaConnector
 from trademl.connectors.alpha_vantage import AlphaVantageConnector
-from trademl.connectors.base import BaseConnector, PermanentConnectorError, RetryConfig
+from trademl.connectors.base import BaseConnector, PermanentConnectorError, RetryConfig, TemporaryConnectorError
 from trademl.connectors.finnhub import FinnhubConnector
 from trademl.connectors.fmp import FMPConnector
 from trademl.connectors.fred import FredConnector
@@ -48,6 +49,16 @@ class FakeSession:
         if not self.responses:
             raise AssertionError("no fake responses left")
         return self.responses.pop(0)
+
+
+class ErrorSession:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.calls: list[tuple[str, str, dict | None, dict | None]] = []
+
+    def request(self, method: str, url: str, params: dict | None, headers: dict | None, timeout: int) -> FakeResponse:
+        self.calls.append((method, url, params, headers))
+        raise self.error
 
 
 def _budget_manager() -> BudgetManager:
@@ -420,3 +431,17 @@ def test_retry_and_permanent_error_behavior() -> None:
 
     with pytest.raises(PermanentConnectorError):
         permanent.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-02")
+
+
+def test_http_connector_wraps_request_exception_as_temporary_error() -> None:
+    connector = MassiveConnector(
+        base_url="https://api.polygon.io",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=ErrorSession(requests.ReadTimeout("timed out")),
+        retry_config=RetryConfig(max_attempts=1, base_delay_seconds=0.0, max_delay_seconds=0.0),
+        sleep_fn=lambda _: None,
+    )
+
+    with pytest.raises(TemporaryConnectorError):
+        connector.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-02")

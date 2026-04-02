@@ -128,13 +128,20 @@ class HTTPConnector:
                 raise TemporaryConnectorError(f"budget exhausted for vendor={self.vendor_name}")
 
             start = time.perf_counter()
-            response = self.session.request(
-                method=method,
-                url=f"{(base_url or self.base_url).rstrip('/')}{endpoint}",
-                params=params,
-                headers=request_headers,
-                timeout=timeout,
-            )
+            try:
+                response = self.session.request(
+                    method=method,
+                    url=f"{(base_url or self.base_url).rstrip('/')}{endpoint}",
+                    params=params,
+                    headers=request_headers,
+                    timeout=timeout,
+                )
+            except requests.RequestException as exc:
+                self.budget_manager.record_spend(self.vendor_name, task_kind=task_kind)
+                if attempt < self.retry_config.max_attempts:
+                    self.sleep_fn(self._sleep_duration(attempt))
+                    continue
+                raise TemporaryConnectorError(f"{self.vendor_name} request failed: {exc}") from exc
             elapsed_ms = (time.perf_counter() - start) * 1000
             self.budget_manager.record_spend(self.vendor_name, task_kind=task_kind)
 

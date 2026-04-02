@@ -149,6 +149,8 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert snapshot["queue_counts"]["FAILED"] == 1
     assert snapshot["partition_summary"]["counts"]["GREEN"] == 1
     assert snapshot["raw_partitions"] == 1
+    assert snapshot["raw_datapoints"] == 1
+    assert snapshot["curated_datapoints"] == 1
     assert snapshot["latest_raw_date"] == "2025-01-02"
     assert snapshot["reference_file_count"] == 1
     assert snapshot["macro_series_count"] == 1

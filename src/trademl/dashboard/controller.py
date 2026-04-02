@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pyarrow.parquet as pq
 import yaml
 
 from trademl.calendars.exchange import get_trading_days
@@ -662,6 +663,8 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
     partition_summary = _read_partition_summary(settings.qc_path)
     raw_dates = _partition_dates(settings.raw_equities_root)
     curated_dates = _partition_dates(settings.curated_equities_root)
+    raw_datapoints = _count_partition_rows(settings.raw_equities_root)
+    curated_datapoints = _count_partition_rows(settings.curated_equities_root)
     reference_files = sorted(path.name for path in settings.reference_root.glob("*.parquet")) if settings.reference_root.exists() else []
     macro_series = _macro_series(settings.macro_root)
     price_check_files = _price_check_files(settings.price_checks_root)
@@ -670,12 +673,18 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
     stage_years = stage.get("years")
     expected_sessions = None
     progress_ratio = None
+    expected_datapoints = None
+    datapoint_progress_ratio = None
     if stage_years:
         end = date.today()
         start = (pd.Timestamp(end) - pd.DateOffset(years=int(stage_years))).date()
         expected_sessions = len(get_trading_days("XNYS", start, end))
         if expected_sessions:
             progress_ratio = len(raw_dates) / expected_sessions
+            if stage_symbols:
+                expected_datapoints = expected_sessions * len(stage_symbols)
+                if expected_datapoints:
+                    datapoint_progress_ratio = raw_datapoints / expected_datapoints
     host = _extract_share_host(settings.nas_share)
     data_readiness = _summarize_data_readiness(
         raw_dates=len(raw_dates),
@@ -692,6 +701,8 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "partition_summary": partition_summary,
         "raw_partitions": len(raw_dates),
         "curated_partitions": len(curated_dates),
+        "raw_datapoints": raw_datapoints,
+        "curated_datapoints": curated_datapoints,
         "latest_raw_date": max(raw_dates) if raw_dates else None,
         "latest_curated_date": max(curated_dates) if curated_dates else None,
         "reference_files": reference_files,
@@ -703,7 +714,9 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "stage_symbol_count": len(stage_symbols),
         "stage_years": stage_years,
         "expected_stage_sessions": expected_sessions,
+        "expected_stage_datapoints": expected_datapoints,
         "stage_progress_ratio": progress_ratio,
+        "stage_datapoint_progress_ratio": datapoint_progress_ratio,
         "data_readiness": data_readiness,
         "nas": {
             "share": settings.nas_share,
@@ -870,6 +883,18 @@ def _partition_dates(root: Path) -> list[str]:
         if value:
             dates.append(value)
     return sorted(set(dates))
+
+
+def _count_partition_rows(root: Path) -> int:
+    if not root.exists():
+        return 0
+    total = 0
+    for path in root.glob("date=*/data.parquet"):
+        try:
+            total += pq.ParquetFile(path).metadata.num_rows
+        except Exception:
+            continue
+    return total
 
 
 def _macro_series(root: Path) -> list[str]:

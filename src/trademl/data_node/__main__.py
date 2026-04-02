@@ -25,6 +25,19 @@ from trademl.data_node.service import DataNodePaths, DataNodeService
 from trademl.fleet.cluster import ClusterCoordinator
 
 
+DEFAULT_VENDOR_LIMITS = {
+    "alpaca": {"rpm": 150, "daily_cap": 10000},
+    "tiingo": {"rpm": 40, "daily_cap": 400},
+    "twelve_data": {"rpm": 6, "daily_cap": 600},
+    "massive": {"rpm": 4, "daily_cap": 300},
+    "finnhub": {"rpm": 50, "daily_cap": 10000},
+    "alpha_vantage": {"rpm": 4, "daily_cap": 400},
+    "fred": {"rpm": 80, "daily_cap": 5000},
+    "fmp": {"rpm": 3, "daily_cap": 200},
+    "sec_edgar": {"rpm": 8, "daily_cap": 5000},
+}
+
+
 def _load_dotenv(env_path: Path | None) -> None:
     if env_path is None or not env_path.exists():
         return
@@ -61,7 +74,7 @@ def main() -> int:
     with Path(args.config).open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
 
-    budgets = BudgetManager({vendor: {"rpm": values["rpm"], "daily_cap": values["daily_cap"]} for vendor, values in config["vendors"].items()})
+    budgets = BudgetManager(_resolve_vendor_budgets(config))
     connector = AlpacaConnector(
         base_url=os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
         trading_base_url=os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
@@ -252,6 +265,19 @@ def _load_stage_symbols(root: Path) -> list[str]:
     with stage_path.open("r", encoding="utf-8") as handle:
         stage = yaml.safe_load(handle) or {}
     return list(stage.get("symbols", []))
+
+
+def _resolve_vendor_budgets(config: dict[str, object]) -> dict[str, dict[str, int]]:
+    resolved = {name: limits.copy() for name, limits in DEFAULT_VENDOR_LIMITS.items()}
+    for vendor, values in (config.get("vendors", {}) or {}).items():
+        if not isinstance(values, dict):
+            continue
+        existing = resolved.get(str(vendor), {"rpm": 1, "daily_cap": 1})
+        resolved[str(vendor)] = {
+            "rpm": int(values.get("rpm", existing["rpm"])),
+            "daily_cap": int(values.get("daily_cap", existing["daily_cap"])),
+        }
+    return resolved
 
 
 if __name__ == "__main__":
