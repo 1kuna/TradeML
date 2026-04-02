@@ -25,6 +25,27 @@ vendors:
     datasets:
     - equities_eod
     role: primary_bars
+  tiingo:
+    rpm: 40
+    daily_cap: 400
+    datasets:
+    - equities_eod
+    - corp_actions_dividends
+    - corp_actions_splits
+    - fundamentals
+    - supported_tickers
+    role: deep_history_bars
+  twelve_data:
+    rpm: 6
+    daily_cap: 600
+    datasets:
+    - equities_eod
+    - dividends
+    - splits
+    - earnings_calendar
+    - financial_statements
+    - stocks
+    role: cross_validation
   massive:
     rpm: 4
     daily_cap: 300

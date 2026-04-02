@@ -14,6 +14,8 @@ from trademl.connectors.alpaca import AlpacaConnector
 from trademl.connectors.alpha_vantage import AlphaVantageConnector
 from trademl.connectors.fmp import FMPConnector
 from trademl.connectors.sec_edgar import SecEdgarConnector
+from trademl.connectors.tiingo import TiingoConnector
+from trademl.connectors.twelve_data import TwelveDataConnector
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.bootstrap import Stage0UniverseBuilder
 from trademl.data_node.budgets import BudgetManager
@@ -99,6 +101,18 @@ def main() -> int:
             api_key=os.environ["ALPHA_VANTAGE_API_KEY"],
             budget_manager=budgets,
         )
+    if os.getenv("TIINGO_API_KEY"):
+        connectors["tiingo"] = TiingoConnector(
+            base_url="https://api.tiingo.com",
+            api_key=os.environ["TIINGO_API_KEY"],
+            budget_manager=budgets,
+        )
+    if os.getenv("TWELVE_DATA_API_KEY"):
+        connectors["twelve_data"] = TwelveDataConnector(
+            base_url="https://api.twelvedata.com",
+            api_key=os.environ["TWELVE_DATA_API_KEY"],
+            budget_manager=budgets,
+        )
     if os.getenv("FMP_API_KEY"):
         connectors["fmp"] = FMPConnector(
             base_url="https://financialmodelingprep.com",
@@ -149,6 +163,25 @@ def main() -> int:
             [
                 {"source": "alpha_vantage", "dataset": "listings", "symbols": [], "output_name": "listings"},
                 {"source": "alpha_vantage", "dataset": "corp_actions", "symbols": symbols[:10], "output_name": "corp_actions"},
+            ]
+        )
+    if "tiingo" in connectors:
+        reference_jobs.extend(
+            [
+                {"source": "tiingo", "dataset": "supported_tickers", "symbols": [], "output_name": "tiingo_tickers"},
+                {"source": "tiingo", "dataset": "corp_actions_dividends", "symbols": symbols, "output_name": "corp_actions"},
+                {"source": "tiingo", "dataset": "corp_actions_splits", "symbols": symbols, "output_name": "corp_actions"},
+                {"source": "tiingo", "dataset": "fundamentals", "symbols": symbols, "output_name": "fundamentals_tiingo"},
+            ]
+        )
+    if "twelve_data" in connectors:
+        reference_jobs.extend(
+            [
+                {"source": "twelve_data", "dataset": "stocks", "symbols": [], "output_name": "twelve_data_stocks"},
+                {"source": "twelve_data", "dataset": "dividends", "symbols": symbols, "output_name": "corp_actions"},
+                {"source": "twelve_data", "dataset": "splits", "symbols": symbols, "output_name": "corp_actions"},
+                {"source": "twelve_data", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar_twelve_data"},
+                {"source": "twelve_data", "dataset": "financial_statements", "symbols": symbols, "output_name": "financial_statements_twelve_data"},
             ]
         )
     if "finnhub" in connectors:

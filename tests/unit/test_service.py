@@ -80,6 +80,34 @@ class _DelistingConnector:
         raise ValueError(dataset)
 
 
+class _BackfillConnector:
+    def __init__(self, vendor_name: str) -> None:
+        self.vendor_name = vendor_name
+        self.calls: list[tuple[str, list[str], str, str]] = []
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls.append((dataset, symbols, start_date, end_date))
+        return pd.DataFrame(
+            [
+                {
+                    "date": start_date,
+                    "symbol": symbols[0],
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.0,
+                    "close": 10.5,
+                    "vwap": pd.NA,
+                    "volume": 100,
+                    "trade_count": pd.NA,
+                    "ingested_at": pd.Timestamp.utcnow(),
+                    "source_name": self.vendor_name,
+                    "source_uri": "/bars",
+                    "vendor_ts": pd.Timestamp(start_date),
+                }
+            ]
+        )
+
+
 class _ClusterCoordinatorStub:
     def __init__(self) -> None:
         self._lease_calls: list[str] = []
@@ -348,3 +376,25 @@ def test_collect_reference_data_rebuilds_security_master_outputs(tmp_path: Path)
 
     assert tmp_path / "data" / "reference" / "listing_history.parquet" in outputs
     assert tmp_path / "data" / "reference" / "ticker_changes.parquet" in outputs
+
+
+def test_process_backfill_queue_prefers_tiingo_for_equities_history(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    db.enqueue_task("equities_eod", "AAPL", "2019-01-02", "2019-01-02", "BOOTSTRAP", 1)
+    alpaca = _NoopConnector()
+    tiingo = _BackfillConnector("tiingo")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": alpaca, "tiingo": tiingo},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+
+    changed = service.process_backfill_queue()
+
+    assert changed == ["2019-01-02"]
+    assert tiingo.calls == [("equities_eod", ["AAPL"], "2019-01-02", "2019-01-02")]
+    stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2019-01-02" / "data.parquet")
+    assert stored.iloc[0]["source_name"] == "tiingo"

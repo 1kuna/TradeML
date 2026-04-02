@@ -32,11 +32,15 @@ def test_build_listing_history_merges_free_sources() -> None:
     )
     delistings = pd.DataFrame([{"symbol": "OLD", "companyName": "Old Co", "delistedDate": "2024-01-05", "reason": "acquired"}])
     reference_tickers = pd.DataFrame([{"ticker": "AAPL", "name": "Apple Inc.", "primary_exchange": "NASDAQ", "type": "CS", "active": True}])
+    tiingo_tickers = pd.DataFrame([{"ticker": "AAPL", "name": "Apple Inc.", "exchangeCode": "NASDAQ", "assetType": "Stock", "startDate": "1980-12-12"}])
+    twelve_data_stocks = pd.DataFrame([{"symbol": "AAPL", "name": "Apple Inc.", "exchange": "NASDAQ", "type": "Common Stock"}])
 
     listing_history = build_listing_history(
         listings=listings,
         delistings=delistings,
         reference_tickers=reference_tickers,
+        tiingo_tickers=tiingo_tickers,
+        twelve_data_stocks=twelve_data_stocks,
         as_of="2026-04-01",
     )
 
@@ -45,6 +49,8 @@ def test_build_listing_history_merges_free_sources() -> None:
     assert aapl["asset_type"] == "common_stock"
     assert "alpha_vantage" in aapl["sources"]
     assert "massive" in aapl["sources"]
+    assert "tiingo" in aapl["sources"]
+    assert "twelve_data" in aapl["sources"]
     assert old["status"] == "delisted"
     assert old["delist_reason"] == "acquired"
 
@@ -75,6 +81,10 @@ def test_rebuild_derived_references_writes_listing_and_ticker_change_outputs(tmp
             }
         ]
     ).to_parquet(reference_root / "listings.parquet", index=False)
+    pd.DataFrame([{"ticker": "AAPL", "name": "Apple Inc.", "exchangeCode": "NASDAQ", "assetType": "Stock", "startDate": "1980-12-12"}]).to_parquet(
+        reference_root / "tiingo_tickers.parquet",
+        index=False,
+    )
     pd.DataFrame([{"oldSymbol": "FB", "newSymbol": "META", "date": "2022-06-09"}]).to_parquet(
         reference_root / "symbol_changes.parquet",
         index=False,

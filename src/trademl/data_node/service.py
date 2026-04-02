@@ -124,15 +124,22 @@ class DataNodeService:
         """Process queued backfill or gap tasks until the queue is drained."""
         changed_dates: list[str] = []
         while task := self.db.lease_next_task():
-            connector = self.connectors[self.source_name]
             symbols = [task.symbol] if task.symbol else self.default_symbols
-            try:
-                frame = connector.fetch(task.dataset, symbols, task.start_date, task.end_date)
-            except ConnectorError as exc:
-                self.db.mark_task_failed(task.id, str(exc), backoff_minutes=30)
-                continue
+            frame = pd.DataFrame()
+            errors: list[str] = []
+            for connector_name in self._backfill_connector_order(dataset=task.dataset):
+                connector = self.connectors[connector_name]
+                try:
+                    frame = connector.fetch(task.dataset, symbols, task.start_date, task.end_date)
+                except ConnectorError as exc:
+                    errors.append(f"{connector_name}: {exc}")
+                    continue
+                if frame.empty:
+                    errors.append(f"{connector_name}: empty backfill result")
+                    continue
+                break
             if frame.empty:
-                self.db.mark_task_failed(task.id, "empty backfill result", backoff_minutes=30)
+                self.db.mark_task_failed(task.id, " | ".join(errors) or "empty backfill result", backoff_minutes=30)
                 continue
             changed_dates.extend(self._write_raw_partition(frame))
             self.db.mark_task_done(task.id)
@@ -185,7 +192,7 @@ class DataNodeService:
         """Compare the primary source against backup vendors for a sample of symbols."""
         comparisons: list[pd.DataFrame] = []
         primary = self.connectors[self.source_name].fetch("equities_eod", sample_symbols, trading_date, trading_date)
-        for vendor in ["massive", "finnhub"]:
+        for vendor in ["massive", "finnhub", "twelve_data"]:
             if vendor not in self.connectors:
                 continue
             try:
@@ -643,3 +650,11 @@ class DataNodeService:
         if partition.exists():
             return
         self.collect_forward_shard(trading_date=trading_date, symbols=shard.symbols, shard_id=shard.shard_id)
+
+    def _backfill_connector_order(self, *, dataset: str) -> list[str]:
+        preferred: list[str] = []
+        if dataset == "equities_eod":
+            preferred.extend(["tiingo", self.source_name, "twelve_data", "massive", "finnhub"])
+        else:
+            preferred.append(self.source_name)
+        return [name for index, name in enumerate(preferred) if name in self.connectors and name not in preferred[:index]]

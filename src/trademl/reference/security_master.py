@@ -14,6 +14,8 @@ def build_listing_history(
     delistings: pd.DataFrame | None = None,
     reference_tickers: pd.DataFrame | None = None,
     company_profiles: pd.DataFrame | None = None,
+    tiingo_tickers: pd.DataFrame | None = None,
+    twelve_data_stocks: pd.DataFrame | None = None,
     as_of: str | None = None,
 ) -> pd.DataFrame:
     """Build a normalized free listing-history table from collected reference sources."""
@@ -65,6 +67,49 @@ def build_listing_history(
             }
         )
         frames.append(ticker_frame)
+
+    if tiingo_tickers is not None and not tiingo_tickers.empty:
+        tiingo_frame = pd.DataFrame(
+            {
+                "symbol": tiingo_tickers.get("symbol", tiingo_tickers.get("ticker", pd.Series(dtype="string")))
+                .astype("string")
+                .str.strip()
+                .str.upper(),
+                "name": tiingo_tickers.get("name", pd.Series(dtype="string")).astype("string"),
+                "exchange": tiingo_tickers.get("exchange", tiingo_tickers.get("exchangeCode", pd.Series(dtype="string")))
+                .astype("string")
+                .str.upper(),
+                "asset_type": tiingo_tickers.get("asset_type", tiingo_tickers.get("assetType", pd.Series(dtype="string"))).map(_normalize_asset_type),
+                "ipo_date": _normalize_date_series(tiingo_tickers.get("start_date", tiingo_tickers.get("startDate"))),
+                "delist_date": _normalize_date_series(tiingo_tickers.get("end_date", tiingo_tickers.get("endDate"))),
+                "delist_reason": pd.Series(pd.NA, index=tiingo_tickers.index, dtype="string"),
+                "sector": pd.Series(pd.NA, index=tiingo_tickers.index, dtype="string"),
+                "industry": pd.Series(pd.NA, index=tiingo_tickers.index, dtype="string"),
+                "status": _status_from_delist_dates(tiingo_tickers.get("end_date", tiingo_tickers.get("endDate"))),
+                "sources": pd.Series(["tiingo"] * len(tiingo_tickers), dtype="string"),
+                "last_verified": pd.Series([verified_at] * len(tiingo_tickers)),
+            }
+        )
+        frames.append(tiingo_frame)
+
+    if twelve_data_stocks is not None and not twelve_data_stocks.empty:
+        stock_frame = pd.DataFrame(
+            {
+                "symbol": twelve_data_stocks.get("symbol", pd.Series(dtype="string")).astype("string").str.strip().str.upper(),
+                "name": twelve_data_stocks.get("name", pd.Series(dtype="string")).astype("string"),
+                "exchange": twelve_data_stocks.get("exchange", pd.Series(dtype="string")).astype("string").str.upper(),
+                "asset_type": twelve_data_stocks.get("type", twelve_data_stocks.get("instrument_type", pd.Series(dtype="string"))).map(_normalize_asset_type),
+                "ipo_date": pd.Series(pd.NaT, index=twelve_data_stocks.index, dtype="datetime64[ns]"),
+                "delist_date": pd.Series(pd.NaT, index=twelve_data_stocks.index, dtype="datetime64[ns]"),
+                "delist_reason": pd.Series(pd.NA, index=twelve_data_stocks.index, dtype="string"),
+                "sector": pd.Series(pd.NA, index=twelve_data_stocks.index, dtype="string"),
+                "industry": pd.Series(pd.NA, index=twelve_data_stocks.index, dtype="string"),
+                "status": pd.Series(["active"] * len(twelve_data_stocks), dtype="string"),
+                "sources": pd.Series(["twelve_data"] * len(twelve_data_stocks), dtype="string"),
+                "last_verified": pd.Series([verified_at] * len(twelve_data_stocks)),
+            }
+        )
+        frames.append(stock_frame)
 
     if company_profiles is not None and not company_profiles.empty:
         profile_frame = pd.DataFrame(
@@ -173,8 +218,10 @@ def rebuild_derived_references(reference_root: Path) -> list[Path]:
         "delistings": _read_optional_parquet(reference_root / "delistings.parquet"),
         "reference_tickers": _read_optional_parquet(reference_root / "universe.parquet"),
         "company_profiles": _read_optional_parquet(reference_root / "company_profiles.parquet"),
+        "tiingo_tickers": _read_optional_parquet(reference_root / "tiingo_tickers.parquet"),
+        "twelve_data_stocks": _read_optional_parquet(reference_root / "twelve_data_stocks.parquet"),
     }
-    if not listing_inputs["listings"].empty or not listing_inputs["delistings"].empty or not listing_inputs["reference_tickers"].empty:
+    if any(not frame.empty for frame in listing_inputs.values()):
         listing_history = build_listing_history(**listing_inputs)
         output = reference_root / "listing_history.parquet"
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -207,6 +254,13 @@ def _normalize_asset_type(value: object) -> str | pd.NA:
     if "preferred" in raw:
         return "preferred"
     return raw.replace(" ", "_")
+
+
+def _status_from_delist_dates(values: pd.Series | None) -> pd.Series:
+    if values is None:
+        return pd.Series(dtype="string")
+    parsed = pd.to_datetime(values, errors="coerce")
+    return parsed.map(lambda value: "delisted" if pd.notna(value) else "active").astype("string")
 
 
 def _normalize_date_series(values: pd.Series | None) -> pd.Series:

@@ -13,6 +13,8 @@ from trademl.connectors.fmp import FMPConnector
 from trademl.connectors.fred import FredConnector
 from trademl.connectors.massive import MassiveConnector
 from trademl.connectors.sec_edgar import SecEdgarConnector
+from trademl.connectors.tiingo import TiingoConnector
+from trademl.connectors.twelve_data import TwelveDataConnector
 from trademl.data_node.budgets import BudgetManager
 
 
@@ -58,6 +60,8 @@ def _budget_manager() -> BudgetManager:
             "fred": {"rpm": 100, "daily_cap": 1000},
             "fmp": {"rpm": 100, "daily_cap": 1000},
             "sec_edgar": {"rpm": 100, "daily_cap": 1000},
+            "tiingo": {"rpm": 100, "daily_cap": 1000},
+            "twelve_data": {"rpm": 100, "daily_cap": 1000},
         }
     )
 
@@ -246,6 +250,150 @@ def test_fmp_and_sec_edgar_connectors() -> None:
     assert delistings.iloc[0]["symbol"] == "XYZ"
     assert symbol_changes.iloc[0]["newSymbol"] == "META"
     assert filings.iloc[0]["form"] == "8-K"
+
+
+def test_tiingo_connector_normalizes_prices_actions_and_fundamentals() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                [
+                    {
+                        "date": "2024-01-02T00:00:00.000Z",
+                        "open": 10.0,
+                        "high": 11.0,
+                        "low": 9.5,
+                        "close": 10.5,
+                        "adjClose": 10.4,
+                        "adjVolume": 95,
+                        "volume": 100,
+                        "divCash": 0.12,
+                        "splitFactor": 1.0,
+                    }
+                ],
+            ),
+            FakeResponse(
+                200,
+                [
+                    {
+                        "ticker": "AAPL",
+                        "exDate": "2024-01-05",
+                        "payDate": "2024-01-15",
+                        "distribution": 0.24,
+                    }
+                ],
+            ),
+            FakeResponse(
+                200,
+                [
+                    {
+                        "ticker": "AAPL",
+                        "exDate": "2024-02-01",
+                        "splitFrom": 1,
+                        "splitTo": 2,
+                        "splitFactor": 0.5,
+                    }
+                ],
+            ),
+            FakeResponse(
+                200,
+                [{"ticker": "AAPL", "date": "2024-01-02", "marketCap": 1000000}],
+            ),
+            FakeResponse(
+                200,
+                [{"ticker": "AAPL", "date": "2023-12-31", "statementType": "annual", "revenue": 1000}],
+            ),
+        ]
+    )
+    connector = TiingoConnector(
+        base_url="https://api.tiingo.com",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    bars = connector.fetch("equities_eod", ["AAPL"], "2024-01-02", "2024-01-02")
+    dividends = connector.fetch("corp_actions_dividends", ["AAPL"], "2024-01-01", "2024-01-31")
+    splits = connector.fetch("corp_actions_splits", ["AAPL"], "2024-02-01", "2024-02-01")
+    fundamentals = connector.fetch("fundamentals", ["AAPL"], "2024-01-01", "2024-01-31")
+
+    assert bars.iloc[0]["symbol"] == "AAPL"
+    assert bars.iloc[0]["adj_close"] == pytest.approx(10.4)
+    assert dividends.iloc[0]["symbol"] == "AAPL"
+    assert dividends.iloc[0]["event_type"] == "dividend"
+    assert dividends.iloc[0]["amount"] == pytest.approx(0.24)
+    assert splits.iloc[0]["ratio"] == pytest.approx(0.5)
+    assert fundamentals.iloc[0]["symbol"] == "AAPL"
+    assert set(fundamentals["statement_type"]) == {"daily", "statements"}
+    assert session.calls[0][3]["Authorization"] == "Token key"
+
+
+def test_twelve_data_connector_normalizes_prices_actions_and_statements() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "meta": {"symbol": "AAPL", "interval": "1day"},
+                    "values": [{"datetime": "2024-01-02", "open": "10", "high": "11", "low": "9", "close": "10.5", "volume": "100"}],
+                },
+            ),
+            FakeResponse(
+                200,
+                {"meta": {"symbol": "AAPL"}, "dividends": [{"ex_date": "2024-01-05", "amount": "0.24", "payment_date": "2024-01-15"}]},
+            ),
+            FakeResponse(
+                200,
+                {"meta": {"symbol": "AAPL"}, "splits": [{"date": "2024-02-01", "ratio": "2:1"}]},
+            ),
+            FakeResponse(
+                200,
+                {"earnings": [{"symbol": "AAPL", "date": "2024-01-25", "eps_estimate": "2.10"}]},
+            ),
+            FakeResponse(
+                200,
+                {
+                    "meta": {"symbol": "AAPL"},
+                    "income_statement": [{"fiscal_date": "2023-12-31", "period": "annual", "revenue": "1000"}],
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "meta": {"symbol": "AAPL"},
+                    "balance_sheet": [{"fiscal_date": "2023-12-31", "period": "annual", "total_assets": "2000"}],
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "meta": {"symbol": "AAPL"},
+                    "cash_flow": [{"fiscal_date": "2023-12-31", "period": "annual", "operating_cash_flow": "500"}],
+                },
+            ),
+        ]
+    )
+    connector = TwelveDataConnector(
+        base_url="https://api.twelvedata.com",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    bars = connector.fetch("equities_eod", ["AAPL"], "2024-01-02", "2024-01-02")
+    dividends = connector.fetch("dividends", ["AAPL"], "2024-01-01", "2024-01-31")
+    splits = connector.fetch("splits", ["AAPL"], "2024-02-01", "2024-02-01")
+    earnings = connector.fetch("earnings_calendar", [], "2024-01-01", "2024-01-31")
+    statements = connector.fetch("financial_statements", ["AAPL"], "2024-01-01", "2024-01-31")
+
+    assert bars.iloc[0]["symbol"] == "AAPL"
+    assert bars.iloc[0]["close"] == pytest.approx(10.5)
+    assert dividends.iloc[0]["symbol"] == "AAPL"
+    assert dividends.iloc[0]["amount"] == pytest.approx(0.24)
+    assert splits.iloc[0]["ratio"] == pytest.approx(0.5)
+    assert earnings.iloc[0]["symbol"] == "AAPL"
+    assert set(statements["statement_type"]) == {"income_statement", "balance_sheet", "cash_flow"}
+    assert session.calls[0][2]["apikey"] == "key"
 
 
 def test_retry_and_permanent_error_behavior() -> None:

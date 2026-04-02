@@ -24,7 +24,8 @@ import yaml
 
 from trademl.calendars.exchange import get_trading_days
 from trademl.connectors.alpaca import AlpacaConnector
-from trademl.connectors.base import ConnectorError
+from trademl.connectors.base import BaseConnector, ConnectorError
+from trademl.connectors.tiingo import TiingoConnector
 from trademl.data_node.bootstrap import Stage0UniverseBuilder
 from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
@@ -369,8 +370,9 @@ def advance_collection_stage(
         )
     else:
         raise RuntimeError(f"unsupported stage target: {target_stage}")
+    history_connector = _history_probe_connector(settings) or alpaca
     history_probe = _probe_available_history_years(
-        connector=alpaca,
+        connector=history_connector,
         sample_symbols=symbols[: min(5, len(symbols))],
         requested_years=stage_years,
         as_of_date=as_of,
@@ -447,8 +449,9 @@ def stage_one_universe_snapshot(settings: NodeSettings, *, top_n: int = 500) -> 
         symbol_count=top_n,
         as_of_date=as_of,
     )
+    history_connector = _history_probe_connector(settings) or alpaca
     history_probe = _probe_available_history_years(
-        connector=alpaca,
+        connector=history_connector,
         sample_symbols=symbols[: min(5, len(symbols))],
         requested_years=10,
         as_of_date=as_of,
@@ -761,6 +764,20 @@ def _alpaca_connector(settings: NodeSettings) -> AlpacaConnector | None:
     )
 
 
+def _history_probe_connector(settings: NodeSettings) -> BaseConnector | None:
+    env_values = _read_env_file(settings.env_path)
+    config = _read_yaml(settings.config_path)
+    vendors = config.get("vendors", {})
+    if env_values.get("TIINGO_API_KEY"):
+        tiingo_budget = vendors.get("tiingo", {"rpm": 40, "daily_cap": 400})
+        return TiingoConnector(
+            base_url="https://api.tiingo.com",
+            api_key=env_values.get("TIINGO_API_KEY", ""),
+            budget_manager=BudgetManager({"tiingo": tiingo_budget}),
+        )
+    return _alpaca_connector(settings)
+
+
 def _seed_stage_backfill(db_path: Path, *, symbols: list[str], years: int) -> int:
     db = DataNodeDB(db_path)
     end_date = datetime.now(tz=UTC).date().isoformat()
@@ -778,7 +795,7 @@ def _seed_stage_backfill(db_path: Path, *, symbols: list[str], years: int) -> in
 
 def _probe_available_history_years(
     *,
-    connector: AlpacaConnector,
+    connector: BaseConnector,
     sample_symbols: list[str],
     requested_years: int,
     as_of_date: str,
@@ -800,6 +817,7 @@ def _probe_available_history_years(
             return {
                 "requested_years": int(requested_years),
                 "effective_years": years,
+                "connector": getattr(connector, "vendor_name", "unknown"),
                 "probe_start": start,
                 "probe_end": probe_end,
                 "probe_symbol_count": len(sample_symbols),
@@ -809,6 +827,7 @@ def _probe_available_history_years(
     return {
         "requested_years": int(requested_years),
         "effective_years": 0,
+        "connector": getattr(connector, "vendor_name", "unknown"),
         "probe_symbol_count": len(sample_symbols),
         "sample_symbols": list(sample_symbols),
         "error": last_error,

@@ -299,6 +299,86 @@ def test_advance_collection_stage_updates_stage_manifest_and_queue(tmp_path: Pat
     assert queued >= 3
 
 
+def test_advance_collection_stage_prefers_tiingo_for_history_probe(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    local_state = workspace / "control"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(local_state),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                    "worker_id": "worker-a",
+                },
+                "stage": {
+                    "current": 0,
+                    "stage_0": {"symbols": 100, "eod_years": 5},
+                    "stage_1": {"symbols": 500, "eod_years": 10},
+                },
+                "vendors": {
+                    "alpaca": {"rpm": 150, "daily_cap": 10000},
+                    "tiingo": {"rpm": 40, "daily_cap": 400},
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text(
+        "\n".join(
+            [
+                f"NAS_MOUNT={nas_mount}",
+                "NAS_SHARE=//127.0.0.1/trademl",
+                f"LOCAL_STATE={local_state}",
+                "EDGE_NODE_ID=worker-a",
+                "ALPACA_API_KEY=test-key",
+                "ALPACA_API_SECRET=test-secret",
+                "TIINGO_API_KEY=tiingo-key",
+                "TRADEML_CLUSTER_PASSPHRASE=pass123",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 0, "symbols": ["AAPL", "MSFT"], "years": 5}, sort_keys=False),
+        encoding="utf-8",
+    )
+    reference_root = nas_mount / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {"symbol": "AAA", "exchange": "NASDAQ", "asset_type": "common_stock", "ipo_date": "2000-01-01", "delist_date": None},
+            {"symbol": "BBB", "exchange": "NASDAQ", "asset_type": "common_stock", "ipo_date": "2000-01-01", "delist_date": None},
+            {"symbol": "CCC", "exchange": "NASDAQ", "asset_type": "common_stock", "ipo_date": "2000-01-01", "delist_date": None},
+        ]
+    ).to_parquet(reference_root / "listing_history.parquet", index=False)
+
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    join_cluster(settings, passphrase="pass123")
+    monkeypatch.setattr(dashboard_controller, "build_stage1_universe", lambda **kwargs: ["AAA", "BBB", "CCC"])
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_probe_available_history_years",
+        lambda **kwargs: {
+            "requested_years": 10,
+            "effective_years": 10,
+            "probe_symbol_count": 3,
+            "connector": kwargs["connector"].vendor_name,
+        },
+    )
+
+    result = advance_collection_stage(settings, target_stage=1, symbol_count=3, years=10, passphrase="pass123")
+
+    assert result["history_probe"]["connector"] == "tiingo"
+
+
 def test_join_cluster_persists_cluster_passphrase(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     config_path = workspace / "node.yml"

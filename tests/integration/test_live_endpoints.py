@@ -15,6 +15,8 @@ from trademl.connectors.fmp import FMPConnector
 from trademl.connectors.fred import FredConnector
 from trademl.connectors.massive import MassiveConnector
 from trademl.connectors.sec_edgar import SecEdgarConnector
+from trademl.connectors.tiingo import TiingoConnector
+from trademl.connectors.twelve_data import TwelveDataConnector
 from trademl.data_node.budgets import BudgetManager
 
 
@@ -46,6 +48,8 @@ def _budgets() -> BudgetManager:
             "fred": {"rpm": 80, "daily_cap": 500},
             "fmp": {"rpm": 5, "daily_cap": 100},
             "sec_edgar": {"rpm": 5, "daily_cap": 100},
+            "tiingo": {"rpm": 10, "daily_cap": 100},
+            "twelve_data": {"rpm": 8, "daily_cap": 100},
         }
     )
 
@@ -125,6 +129,40 @@ def test_live_finnhub_bars_if_entitled() -> None:
     except PermanentConnectorError as exc:
         pytest.skip(f"Finnhub candle entitlement unavailable: {exc}")
     assert not frame.empty
+
+
+@pytest.mark.liveapi
+def test_live_tiingo_reference_and_bars() -> None:
+    _load_dotenv()
+    _require_env("TIINGO_API_KEY")
+    start_date, end_date = _recent_window()
+    connector = TiingoConnector(
+        base_url="https://api.tiingo.com",
+        api_key=os.environ["TIINGO_API_KEY"],
+        budget_manager=_budgets(),
+    )
+    bars = connector.fetch("equities_eod", ["AAPL"], start_date, end_date)
+    dividends = connector.fetch("corp_actions_dividends", ["AAPL"], start_date, end_date)
+    assert not bars.empty
+    assert bars.iloc[0]["symbol"] == "AAPL"
+    assert "event_type" in dividends.columns or dividends.empty
+
+
+@pytest.mark.liveapi
+def test_live_twelve_data_reference_endpoints() -> None:
+    _load_dotenv()
+    _require_env("TWELVE_DATA_API_KEY")
+    start_date, end_date = _recent_window()
+    connector = TwelveDataConnector(
+        base_url="https://api.twelvedata.com",
+        api_key=os.environ["TWELVE_DATA_API_KEY"],
+        budget_manager=_budgets(),
+    )
+    bars = connector.fetch("equities_eod", ["AAPL"], start_date, end_date)
+    dividends = connector.fetch("dividends", ["AAPL"], start_date, end_date)
+    assert not bars.empty
+    assert bars.iloc[0]["symbol"] == "AAPL"
+    assert "symbol" in dividends.columns or dividends.empty
 
 
 @pytest.mark.liveapi
