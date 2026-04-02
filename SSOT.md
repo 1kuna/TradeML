@@ -149,7 +149,7 @@ Source: FRED API (free, generous limits)
 
 **Reference — Corporate Actions**
 
-Sources: Alpha Vantage (splits/dividends), Massive/Polygon (`get_stock_splits`, `get_stock_dividends`), Alpaca (`/v2/stocks/{symbol}/corporate_actions/announcements`). Cross-reference across sources to improve coverage.
+Sources: Tiingo (`/tiingo/corporate-actions` — dividends + splits feeds), Alpha Vantage (splits/dividends), Twelve Data (`/dividends`, `/splits`), Massive/Polygon (`get_stock_splits`, `get_stock_dividends`), Alpaca (`/v2/stocks/{symbol}/corporate_actions/announcements`). Cross-reference across sources to improve coverage — with 5 vendors reporting the same split, confidence is high.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -171,8 +171,10 @@ This is the core of our survivorship-bias-free universe. Built by cross-referenc
 
 Sources:
 - **Alpha Vantage `LISTING_STATUS`**: returns both active AND delisted symbols with `ipoDate` and `delistingDate`
+- **Tiingo `/tiingo/daily`**: list of all supported tickers with `startDate` and `endDate` — if a ticker has an `endDate`, it's effectively delisted. Covers 65,000+ US securities.
 - **FMP `/api/v3/delisted-company`**: delisted companies with last trading date
 - **Polygon `get_tickers`**: ticker metadata including active/delisted status
+- **Twelve Data `/stocks`**: list of available symbols with exchange, type, and currency
 - **Finnhub `/stock/symbol`** and `/stock/profile2`: active symbols with exchange, industry, sector
 
 | Column | Type | Notes |
@@ -271,11 +273,13 @@ Same column schema as raw bars, with our own split/dividend adjustments applied.
 | Vendor | Datasets | Free Rate Limit | Daily Cap |
 |--------|----------|-----------------|-----------|
 | **Alpaca** | Equities EOD bars (primary) | ~200 req/min | Unpublished (generous) |
-| **Massive (Polygon.io)** | Equities EOD bars (secondary/cross-check), reference data (tickers, splits, dividends, financials) | 5 req/min | Unpublished (limited) |
+| **Tiingo** | Equities EOD (30+ years, splits/div adjusted), corporate actions (dividends, splits), US fundamentals (5,500+ tickers, 20+ years), IEX real-time, news | 50 symbols/hour on free; higher with token | 500 unique symbols/day (free) |
+| **Twelve Data** | Equities EOD/intraday (global, 50+ exchanges), fundamentals, earnings calendars, dividends, splits, financial statements, analyst estimates, insider transactions | 8 req/min | ~800/day |
+| **Massive (Polygon.io)** | Equities EOD bars (cross-check), reference data (tickers, splits, dividends, financials) | 5 req/min | Unpublished (limited) |
 | **Finnhub** | Equities daily candles (backup), earnings calendar, analyst estimates, company profiles, sector data, market news | 60 req/min overall | Unlimited |
 | **Alpha Vantage** | Corp actions, listing status, splits/dividends, historical options (limited) | 5 req/min | 500/day |
 | **FRED** | Macro, treasuries, economic data, ALFRED vintages | 120 req/min | Unlimited |
-| **FMP** | Delistings, fundamentals, historical prices (backup), earnings calendar, sector performance | ~3 req/min practical | 250/day |
+| **FMP** | Delistings, fundamentals, historical prices (backup), earnings calendar, sector performance, symbol changes | ~3 req/min practical | 250/day |
 | **SEC EDGAR** | Filing index (8-K, 10-K, 10-Q), authoritative event dates, company facts | 10 req/sec | Unlimited (be polite) |
 
 **Conservative Pi budgets** (~75% of published limits):
@@ -283,6 +287,8 @@ Same column schema as raw bars, with our own split/dividend adjustments applied.
 | Vendor | Pi RPM Cap | Pi Daily Cap |
 |--------|-----------|-------------|
 | Alpaca | 150 | 10,000 |
+| Tiingo | ~40 symbols/hour | 400 unique symbols/day |
+| Twelve Data | 6 | 600 |
 | Massive | 4 | 300 |
 | Finnhub | 50 | 10,000 |
 | Alpha Vantage | 4 | 400 |
@@ -291,18 +297,23 @@ Same column schema as raw bars, with our own split/dividend adjustments applied.
 | SEC EDGAR | 8 req/sec | 5,000 |
 
 **Vendor roles:**
-- **Price bars**: Alpaca (primary), Massive (cross-validation), Finnhub (backup)
-- **Corporate actions / reference**: Alpha Vantage + Massive (splits, dividends, listings), FMP (delistings), SEC EDGAR (authoritative filing dates)
-- **Events / calendar**: Finnhub (earnings calendar, analyst estimates), FMP (earnings calendar, economic calendar)
+- **Price bars**: Alpaca (primary daily collection), Tiingo (deep history + cross-validation — 30+ years), Twelve Data (additional cross-validation, global coverage), Massive (cross-validation), Finnhub (backup)
+- **Corporate actions / reference**: Tiingo (dividends + splits feeds), Alpha Vantage + Massive (splits, dividends, listings), FMP (delistings, symbol changes), Twelve Data (dividends, splits, rights issues), SEC EDGAR (authoritative filing dates)
+- **Fundamentals**: Tiingo (US fundamentals, 20+ years, 80+ indicators on free tier for 5,500+ tickers), Twelve Data (financial statements, earnings, analyst estimates), FMP (income statements, balance sheets), Finnhub (financial metrics, reported financials)
+- **Events / calendar**: Finnhub (earnings calendar, analyst estimates), FMP (earnings calendar, economic calendar), Twelve Data (earnings calendar, dividends calendar)
 - **Macro**: FRED / ALFRED (treasuries, macro time series, vintage dates for PIT)
+- **News**: Tiingo (financial news tagged by ticker), Finnhub (market + company news with sentiment)
 
-Having multiple sources for the same data enables cross-vendor validation — if Alpaca and Massive disagree on a close price, we flag it for review.
+**Why Tiingo matters:** Tiingo is the single most valuable free source for our use case. It provides 30+ years of clean US EOD data with splits and dividends, corporate actions feeds, and fundamentals — all free tier. For US-centric equity research with a focus on long backtesting history, this is better coverage than any other free API. It should be a primary data source alongside Alpaca, not just a backup.
+
+**Why Twelve Data matters:** Broader global coverage than Tiingo, plus structured corporate actions (dividends, splits, rights issues), financial statements, and analyst data. At 800 calls/day free tier it's a useful supplementary source for fundamentals and cross-validation, especially for data points that other free sources don't cover well.
+
+Having multiple sources for the same data enables cross-vendor validation — if Alpaca, Tiingo, and Massive disagree on a close price, we flag it for review. For corporate actions, cross-referencing Tiingo + AV + Massive + Twelve Data significantly reduces the chance of missing a split or dividend.
 
 **Optional paid data upgrades** (if free security master proves insufficient):
 - **Norgate Data**: survivorship-bias-free US stocks, delisted names, historical constituents, corporate actions. Gold standard for backtesting. ~$50–100/mo.
 - **Databento**: PIT security master, corporate actions, official closing prices. API-native. Pay-per-use.
 - **Sharadar / Nasdaq Data Link**: EOD prices + fundamentals + corporate actions with delisted coverage. ~$30–50/mo.
-- **Tiingo**: EOD data with splits/dividends, decent API. Free–$30/mo.
 
 ### 1.3 Completeness Model (GREEN / AMBER / RED)
 
@@ -907,6 +918,8 @@ LOCAL_STATE=~/trademl/control
 # API keys
 ALPACA_API_KEY=...
 ALPACA_BASE_URL=https://paper-api.alpaca.markets/v2
+TIINGO_API_KEY=...
+TWELVE_DATA_API_KEY=...
 FINNHUB_API_KEY=...
 ALPHA_VANTAGE_API_KEY=...
 FRED_API_KEY=...
@@ -1011,6 +1024,16 @@ vendors:
     daily_cap: 10000
     datasets: [equities_eod]
     role: primary_bars
+  tiingo:
+    rpm: 40                      # ~50 symbols/hour, paced conservatively
+    daily_cap: 400               # unique symbols/day on free tier
+    datasets: [equities_eod, corp_actions_dividends, corp_actions_splits, fundamentals]
+    role: deep_history_bars, corp_actions, fundamentals
+  twelve_data:
+    rpm: 6
+    daily_cap: 600
+    datasets: [equities_eod, dividends, splits, earnings_calendar, financial_statements]
+    role: cross_validation, fundamentals, events
   massive:
     rpm: 4
     daily_cap: 300
@@ -1034,7 +1057,7 @@ vendors:
   fmp:
     rpm: 3
     daily_cap: 200
-    datasets: [delistings, earnings_calendar, fundamentals]
+    datasets: [delistings, earnings_calendar, fundamentals, symbol_changes]
     role: reference, events
   sec_edgar:
     rpm: 8                       # requests per second, not per minute
@@ -1049,7 +1072,7 @@ vendors:
 
 ### What Exists
 
-- **Data connectors**: Alpaca, Massive, Finnhub, FRED, Alpha Vantage, FMP — basic versions exist with known bugs
+- **Data connectors**: Alpaca, Massive, Finnhub, FRED, Alpha Vantage, FMP — basic versions exist with known bugs. Tiingo and Twelve Data connectors are new (to be built).
 - **Data node**: Partially built; forward ingest works, backfill has critical bugs (see below)
 - **Feature store**: Basic 8-feature set (needs rework per §2)
 - **Labeling**: Horizon returns (needs switch to universe-relative per §2.3)
@@ -1077,7 +1100,7 @@ vendors:
 3. Set up NAS mount on Pi + workstation; verify read/write from both
 4. Generate and store exchange calendars (XNYS, XNAS) using `exchange_calendars`
 5. Build curation pipeline (raw → adjusted OHLCV with split/dividend handling)
-6. Wire all Phase 1 vendors: Alpaca (bars), Massive (cross-check + reference), Finnhub (backup bars + earnings), AV (corp actions), FRED (macro), FMP (delistings), SEC EDGAR (filing dates)
+6. Wire all Phase 1 vendors: Alpaca (bars), Tiingo (deep history + corp actions + fundamentals), Twelve Data (cross-validation + fundamentals), Massive (cross-check + reference), Finnhub (backup bars + earnings), AV (corp actions), FRED (macro), FMP (delistings + symbol changes), SEC EDGAR (filing dates)
 7. Build earnings calendar collection and storage
 8. Rework features: rank normalization, fix seasonality bug, add reversal + idiosyncratic vol + distance-to-earnings
 9. Switch labels to universe-relative forward returns
@@ -1168,6 +1191,32 @@ All connectors must implement:
 - Also available: `/v2/stocks/{symbol}/corporate_actions/announcements` for splits/dividends
 - Pagination: next-page token based
 
+**Tiingo** — Deep history + corporate actions + fundamentals
+- Base URL: `https://api.tiingo.com`
+- Auth: `Authorization: Token <api_key>` header
+- EOD prices: `/tiingo/daily/{ticker}/prices` — 30+ years of US stock data, split/dividend adjusted. Returns OHLCV + adjClose + divCash + splitFactor. This is our deepest free historical source.
+- Corporate actions: `/tiingo/corporate-actions` — dividends and distributions feed, plus splits feed. Separate endpoints for each. These are critical for our security master.
+- Fundamentals: `/tiingo/fundamentals/{ticker}/daily` and `/tiingo/fundamentals/{ticker}/statements` — 5,500+ US tickers, 20+ years, 80+ indicators. Free tier includes 5 years; deeper history on paid.
+- Ticker metadata: `/tiingo/daily` — list of supported tickers with start/end dates. Useful for building listing history.
+- News: `/tiingo/news` — financial news tagged by ticker.
+- Python library: `pip install tiingo` — official, wraps all endpoints.
+- Free tier limits: ~50 unique symbols/hour, 500 unique symbols/day. Generous for our 100–500 symbol universe.
+- Note: Tiingo's EOD data uses 3 exchange sources with proprietary data cleaning. Quality is well-regarded in the quant community for backtesting.
+
+**Twelve Data** — Cross-validation + fundamentals + global coverage
+- Base URL: `https://api.twelvedata.com`
+- Auth: `apikey` query parameter
+- Time series: `/time_series` — daily/weekly/monthly OHLCV for stocks, ETFs, forex, crypto across 50+ exchanges. Long history available.
+- Dividends: `/dividends` — historical dividend payments per symbol.
+- Splits: `/splits` — historical stock splits per symbol.
+- Earnings calendar: `/earnings` — upcoming and historical earnings dates.
+- Financial statements: `/income_statement`, `/balance_sheet`, `/cash_flow` — quarterly and annual.
+- Analyst data: `/price_target`, `/analyst_ratings/light` — consensus estimates and targets.
+- Insider transactions: `/insider_transactions` — insider buying/selling.
+- Reference: `/stocks` — list of available symbols with exchange, type, currency.
+- Free tier: 8 req/min, ~800 calls/day. Covers real-time US stocks, forex, and crypto.
+- Note: Broader global coverage than Tiingo. Good supplementary source for fundamentals and corporate actions data that we cross-reference with other vendors.
+
 **Massive (Polygon.io)** — Cross-validation bars + reference data
 - Bars: `/v2/aggs/ticker/{symbol}/range/1/day/{from}/{to}` (one symbol at a time on free tier)
 - Reference: `get_tickers` (active/delisted ticker metadata), `get_stock_dividends`, `get_stock_splits`, `get_stock_financials_vX`
@@ -1236,14 +1285,15 @@ See **Data_Sourcing_Playbook.md** for full vendor details and **Data_Sources_Det
 
 ## Appendix C: Optional Paid Data Vendor Comparison
 
-If the free security master (AV + FMP + Polygon + SEC EDGAR) proves too leaky — e.g., backtests show unexplained return jumps, phantom symbols, or missing corporate actions — consider upgrading to a paid vendor:
+If the free security master (AV + Tiingo + Twelve Data + FMP + Polygon + SEC EDGAR) proves too leaky — e.g., backtests show unexplained return jumps, phantom symbols, or missing corporate actions — consider upgrading to a paid vendor:
 
 | Vendor | PIT IDs | Delisted | Corp Actions | Constituents | EOD Prices | Fundamentals | Approx. Cost |
 |--------|---------|----------|-------------|--------------|------------|-------------|-------------|
 | **Norgate Data** | ✅ | ✅ | ✅ | ✅ (S&P, Russell) | ✅ | ❌ | ~$50–100/mo |
 | **Databento** | ✅ | ✅ | ✅ | Partial | ✅ | ❌ | Pay-per-use |
 | **Sharadar (Nasdaq Data Link)** | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ~$30–50/mo |
-| **Tiingo** | Partial | Partial | ✅ | ❌ | ✅ | ❌ | Free–$30/mo |
+
+Note: Tiingo is now part of our free-tier vendor stack (see §1.2), not a paid upgrade candidate.
 
 Also consider for Phase 2+:
 - **IBKR Stock Loan Dashboard**: indicative borrow fees and availability (free for IBKR clients). Useful for short-leg realism if/when we move beyond long-only + ETF hedge.
