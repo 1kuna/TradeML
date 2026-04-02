@@ -88,9 +88,10 @@ def test_training_readiness_requires_core_datasets() -> None:
         has_listing_history=True,
         has_delistings=True,
         has_sec_filings=False,
+        has_macro_vintages=False,
         macro_series_count=3,
         required_macro_series=7,
     )
 
     assert readiness["ready"] is False
-    assert readiness["blockers"] == ["sec_filings", "macro_pack"]
+    assert readiness["blockers"] == ["sec_filings", "macro_vintages", "macro_pack"]

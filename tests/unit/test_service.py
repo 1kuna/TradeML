@@ -27,6 +27,48 @@ class _BudgetFailConnector:
         raise TemporaryConnectorError("budget exhausted for vendor=massive")
 
 
+class _ForwardFailConnector:
+    def __init__(self, vendor_name: str) -> None:
+        self.vendor_name = vendor_name
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        raise TemporaryConnectorError(f"{self.vendor_name} unavailable")
+
+
+class _ForwardSuccessConnector:
+    def __init__(self, vendor_name: str) -> None:
+        self.vendor_name = vendor_name
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "date": end_date,
+                    "symbol": symbols[0],
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.0,
+                    "close": 10.5,
+                    "volume": 100,
+                    "source_name": self.vendor_name,
+                }
+            ]
+        )
+
+
+class _FredConnector:
+    vendor_name = "fred"
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        if dataset == "macros_treasury":
+            return pd.DataFrame(
+                [{"series_id": symbols[0], "observation_date": end_date, "value": 4.0, "vintage_date": end_date}]
+            )
+        if dataset == "vintagedates":
+            return pd.DataFrame([{"series_id": symbols[0], "vintage_date": end_date}])
+        raise ValueError(dataset)
+
+
 class _PartialReferenceConnector:
     vendor_name = "alpha_vantage"
 
@@ -99,7 +141,7 @@ class _BackfillConnector:
                     "vwap": pd.NA,
                     "volume": 100,
                     "trade_count": pd.NA,
-                    "ingested_at": pd.Timestamp.utcnow(),
+                    "ingested_at": pd.Timestamp.now(tz="UTC"),
                     "source_name": self.vendor_name,
                     "source_uri": "/bars",
                     "vendor_ts": pd.Timestamp(start_date),
@@ -187,6 +229,23 @@ def test_run_forever_executes_collection_cycle_and_stops(tmp_path: Path) -> None
     assert "collect_macro_data" in executed
     assert "collect_reference_data" in executed
     assert "run_cross_vendor_price_checks" in executed
+
+
+def test_collect_forward_falls_back_to_secondary_vendor(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _ForwardFailConnector("alpaca"), "tiingo": _ForwardSuccessConnector("tiingo")},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    changed = service.collect_forward(trading_date="2026-03-31", symbols=["AAPL"])
+
+    assert changed == ["2026-03-31"]
+    stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31" / "data.parquet")
+    assert stored["symbol"].tolist() == ["AAPL"]
 
 
 def test_materialize_job_rotates_symbol_subset_deterministically() -> None:
@@ -340,6 +399,46 @@ def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfil
     assert calls == ["macro", "reference", "price_checks"]
 
 
+def test_collect_macro_data_persists_vintage_reference(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"fred": _FredConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    outputs = service.collect_macro_data(["DGS10"], "2026-03-01", "2026-03-31")
+
+    assert tmp_path / "data" / "reference" / "fred_vintagedates.parquet" in outputs
+    vintages = pd.read_parquet(tmp_path / "data" / "reference" / "fred_vintagedates.parquet")
+    assert vintages["series_id"].tolist() == ["DGS10"]
+
+
+def test_planned_auxiliary_work_materializes_reference_and_macro_tasks(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    reference_root = tmp_path / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"ticker": "AAPL", "cik_str": "320193"}]).to_parquet(reference_root / "sec_company_tickers.parquet", index=False)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpha_vantage": _NoopConnector(), "fred": _FredConnector(), "sec_edgar": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        stage_years=5,
+    )
+    service.default_symbols = ["AAPL", "MSFT"]
+
+    macro_series, reference_jobs = service._planned_auxiliary_work(trading_date="2026-03-31")
+
+    assert "DGS10" in macro_series
+    datasets = {job["dataset"] for job in reference_jobs}
+    assert "listings" in datasets
+    assert "filing_index" in datasets
+
+
 def test_run_cluster_forever_reference_budget_failure_does_not_crash_worker(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     raw_partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31"
@@ -405,6 +504,36 @@ def test_run_cluster_auxiliary_tasks_uses_daily_reference_bucket_until_core_read
     )
 
     assert "reference:2026-03-31" in coordinator._lease_calls
+
+
+def test_run_cluster_forever_triggers_training_autopilot_when_backfill_clear(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    raw_partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31"
+    raw_partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"symbol": "AAPL", "date": "2026-03-31", "close": 100.0}]).to_parquet(raw_partition / "data.parquet", index=False)
+    calls: list[str] = []
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        training_autopilot=lambda: calls.append("training") or service.stop(),
+    )
+    coordinator = _ClusterCoordinatorStub()
+
+    service.run_cluster_forever(
+        coordinator=coordinator,  # type: ignore[arg-type]
+        symbols=["AAPL"],
+        exchange="XNYS",
+        collection_time_et="16:30",
+        maintenance_hour_local=23,
+        poll_seconds=0.0,
+        now_fn=lambda: datetime.fromisoformat("2026-03-31T18:00:00+00:00"),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert calls == ["training"]
 
 
 def test_collect_reference_data_persists_partial_results_before_budget_failure(tmp_path: Path) -> None:

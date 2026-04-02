@@ -32,7 +32,7 @@ class Curator:
         curated = curated.sort_values(["symbol", "date"]).reset_index(drop=True)
         actions = corp_actions.copy()
         if actions.empty:
-            curated["curated_at"] = pd.Timestamp.utcnow()
+            curated["curated_at"] = pd.Timestamp.now(tz="UTC")
             return CuratorResult(frame=curated, adjustment_log=pd.DataFrame(columns=["symbol", "date", "event_type", "ratio", "source"]))
 
         actions["ex_date"] = pd.to_datetime(actions["ex_date"])
@@ -74,7 +74,7 @@ class Curator:
             curated.loc[symbol_mask, symbol_frame.columns] = symbol_frame.values
 
         curated["date"] = curated["date"].dt.date
-        curated["curated_at"] = pd.Timestamp.utcnow()
+        curated["curated_at"] = pd.Timestamp.now(tz="UTC")
         return CuratorResult(frame=curated, adjustment_log=pd.DataFrame(adjustment_log))
 
     def write_curated(

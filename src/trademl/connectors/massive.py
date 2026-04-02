@@ -61,7 +61,7 @@ class MassiveConnector(HTTPConnector):
             return pd.DataFrame(columns=self._bar_columns())
         bars_frame = pd.concat(frames, ignore_index=True)
         bars_frame["date"] = pd.to_datetime(bars_frame["t"], unit="ms", utc=True).dt.date
-        bars_frame["ingested_at"] = pd.Timestamp.utcnow()
+        bars_frame["ingested_at"] = pd.Timestamp.now(tz="UTC")
         bars_frame["source_name"] = self.vendor_name
         bars_frame["source_uri"] = "/v2/aggs/ticker"
         bars_frame["vendor_ts"] = pd.to_datetime(bars_frame["t"], unit="ms", utc=True)

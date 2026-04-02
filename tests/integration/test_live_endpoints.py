@@ -55,7 +55,7 @@ def _budgets() -> BudgetManager:
 
 
 def _latest_session_date() -> str:
-    return (pd.Timestamp.utcnow().normalize() - pd.offsets.BDay(1)).strftime("%Y-%m-%d")
+    return (pd.Timestamp.now(tz="UTC").normalize() - pd.offsets.BDay(1)).strftime("%Y-%m-%d")
 
 
 def _recent_window(days: int = 5) -> tuple[str, str]:
@@ -143,7 +143,12 @@ def test_live_tiingo_reference_and_bars() -> None:
     )
     try:
         bars = connector.fetch("equities_eod", ["AAPL"], start_date, end_date)
+    except TemporaryConnectorError as exc:
+        pytest.skip(f"Tiingo temporary limit/unavailability: {exc}")
+    try:
         dividends = connector.fetch("corp_actions_dividends", ["AAPL"], start_date, end_date)
+    except PermanentConnectorError as exc:
+        pytest.skip(f"Tiingo corporate-actions entitlement/path unavailable: {exc}")
     except TemporaryConnectorError as exc:
         pytest.skip(f"Tiingo temporary limit/unavailability: {exc}")
     assert not bars.empty

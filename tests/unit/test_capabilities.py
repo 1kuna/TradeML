@@ -9,6 +9,7 @@ from trademl.data_node.capabilities import (
     capability_map,
     default_macro_series,
     effective_enable_status,
+    forward_capabilities,
 )
 
 
@@ -38,6 +39,21 @@ def test_backfill_capabilities_follow_priority_order() -> None:
     )
 
     assert [capability.vendor for capability in ordered] == ["tiingo", "alpaca", "twelve_data", "massive", "finnhub"]
+
+
+def test_forward_capabilities_follow_priority_order() -> None:
+    ordered = forward_capabilities(
+        dataset="equities_eod",
+        connectors={
+            "alpaca": object(),
+            "tiingo": object(),
+            "twelve_data": object(),
+            "massive": object(),
+            "finnhub": object(),
+        },
+    )
+
+    assert [capability.vendor for capability in ordered] == ["alpaca", "tiingo", "twelve_data", "massive", "finnhub"]
 
 
 def test_reference_jobs_only_include_enabled_verified_lanes() -> None:

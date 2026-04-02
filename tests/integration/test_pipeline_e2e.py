@@ -31,7 +31,7 @@ class MockConnector:
                     "vwap": 100.2 + idx,
                     "volume": 1000 + idx,
                     "trade_count": 10 + idx,
-                    "ingested_at": pd.Timestamp.utcnow(),
+                    "ingested_at": pd.Timestamp.now(tz="UTC"),
                     "source_name": "alpaca",
                     "source_uri": "/v2/stocks/bars",
                     "vendor_ts": pd.Timestamp(start_date),

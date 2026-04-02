@@ -9,6 +9,7 @@ import yaml
 import sqlite3
 
 import trademl.dashboard.controller as dashboard_controller
+from trademl.data_node.capabilities import default_macro_series
 from trademl.dashboard.controller import (
     advance_collection_stage,
     collect_dashboard_snapshot,
@@ -199,7 +200,7 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert snapshot["reference_file_count"] == 1
     assert snapshot["macro_series_count"] == 1
     assert snapshot["price_check_count"] == 1
-    assert snapshot["data_readiness"]["missing"] == ["equities EOD backfill"]
+    assert snapshot["data_readiness"]["missing"] == ["equities EOD backfill", "macro vintages"]
     assert snapshot["training_readiness"]["phase1"]["ready"] is False
     assert "corp_actions" in snapshot["training_readiness"]["phase1"]["blockers"]
     assert snapshot["vendor_attempt_summary"]["counts"] == {}
@@ -286,9 +287,9 @@ def test_start_phase_training_launches_background_process_when_ready(tmp_path: P
     )
     reference_root = nas_mount / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)
-    for name in ["corp_actions", "listing_history", "delistings", "sec_filings", "ticker_changes"]:
+    for name in ["corp_actions", "listing_history", "delistings", "sec_filings", "ticker_changes", "fred_vintagedates"]:
         pd.DataFrame([{"symbol": "AAPL"}]).to_parquet(reference_root / f"{name}.parquet", index=False)
-    for series in dashboard_controller.default_macro_series():
+    for series in default_macro_series():
         series_root = nas_mount / "data" / "raw" / "macros_fred" / f"series={series}"
         series_root.mkdir(parents=True, exist_ok=True)
         pd.DataFrame([{"date": "2025-01-02", "value": 1.0}]).to_parquet(series_root / "data.parquet", index=False)
@@ -306,22 +307,17 @@ def test_start_phase_training_launches_background_process_when_ready(tmp_path: P
 
     launched: dict[str, object] = {}
 
-    class _Process:
-        pid = 4321
+    def fake_launch_training_process(**kwargs):  # noqa: ANN003
+        launched["command"] = kwargs
+        return {"pid": 4321, "phase": kwargs["phase"], "report_date": "2026-04-02"}
 
-    def fake_popen(command, cwd, env, stdout, stderr, start_new_session):  # noqa: ANN001
-        launched["command"] = command
-        launched["cwd"] = cwd
-        return _Process()
-
-    monkeypatch.setattr(dashboard_controller.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(dashboard_controller, "launch_training_process", fake_launch_training_process)
     settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
 
     result = start_phase_training(settings, phase=1)
 
     assert result["pid"] == 4321
-    assert "train.py" in " ".join(str(part) for part in launched["command"])
-    assert (local_state / "training_phase_1.json").exists()
+    assert launched["command"]["phase"] == 1
 
 
 def test_start_and_stop_node_manage_runtime_metadata(tmp_path: Path) -> None:

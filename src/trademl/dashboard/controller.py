@@ -38,8 +38,13 @@ from trademl.data_node.audit import run_capability_audit
 from trademl.data_node.bootstrap import Stage0UniverseBuilder
 from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
-from trademl.data_node.capabilities import default_macro_series, load_audit_state
-from trademl.data_node.planner import plan_auxiliary_tasks, training_readiness
+from trademl.data_node.capabilities import load_audit_state
+from trademl.data_node.planner import plan_auxiliary_tasks
+from trademl.data_node.training_control import (
+    evaluate_training_gates,
+    launch_training_process,
+    read_training_runtime,
+)
 from trademl.fleet.cluster import (
     ClusterCoordinator,
     ClusterPaths,
@@ -736,55 +741,19 @@ def start_phase_training(settings: NodeSettings, *, phase: int) -> dict[str, Any
     readiness = snapshot["training_readiness"]["phase1" if phase == 1 else "phase2"]
     if not readiness["ready"]:
         raise RuntimeError(f"phase {phase} training blocked: {', '.join(readiness['blockers'])}")
-
-    preflight = _training_preflight(settings)
-    if not preflight["ok"]:
-        raise RuntimeError(f"phase {phase} training preflight failed: {preflight['reason']}")
-
-    log_path = settings.local_state / "logs" / f"training_phase_{phase}.log"
-    runtime_path = settings.local_state / f"training_phase_{phase}.json"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path = settings.repo_root / "configs" / "equities_xs.yml"
-    report_date = date.today().isoformat()
-    command = [
-        sys.executable,
-        str(settings.repo_root / "src" / "scripts" / "train.py"),
-        "--data-root",
-        str(settings.nas_mount),
-        "--config",
-        str(config_path),
-        "--output-root",
-        str(settings.nas_mount),
-        "--report-date",
-        report_date,
-    ]
-    env = os.environ.copy()
-    env.update(_read_env_file(settings.env_path))
-    with log_path.open("a", encoding="utf-8") as handle:
-        process = subprocess.Popen(  # noqa: S603
-            command,
-            cwd=settings.repo_root,
-            env=env,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    runtime_payload = {
-        "phase": phase,
-        "pid": process.pid,
-        "started_at": datetime.now(tz=UTC).isoformat(),
-        "command": command,
-        "log_path": str(log_path),
-        "config_path": str(config_path),
-        "report_date": report_date,
-        "running": True,
-        "preflight": preflight,
-    }
-    runtime_path.write_text(json.dumps(runtime_payload, indent=2, sort_keys=True), encoding="utf-8")
+    runtime_payload = launch_training_process(
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        local_state=settings.local_state,
+        env_path=settings.env_path,
+        phase=phase,
+        python_executable=sys.executable,
+        report_date=date.today().isoformat(),
+    )
     append_cluster_event(
         settings.cluster_paths,
         f"phase_{phase}_training_started",
-        {"worker_id": settings.worker_id, "pid": process.pid, "report_date": report_date},
+        {"worker_id": settings.worker_id, "pid": runtime_payload["pid"], "report_date": runtime_payload["report_date"]},
     )
     return runtime_payload
 
@@ -865,12 +834,10 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         macro_series=macro_series,
         price_check_files=price_check_files,
     )
-    readiness = _training_readiness_snapshot(
-        settings=settings,
-        stage=stage,
-        partition_summary=partition_summary,
-        reference_files=reference_files,
-        macro_series=macro_series,
+    readiness = evaluate_training_gates(
+        data_root=settings.nas_mount,
+        stage_symbol_count=len(stage_symbols),
+        stage_years=int(stage_years or 0),
     )
     snapshot = {
         "settings": asdict(settings),
@@ -934,11 +901,7 @@ def _read_optional_json(path: Path) -> dict[str, Any]:
 
 
 def _read_training_runtime(settings: NodeSettings, *, phase: int) -> dict[str, Any]:
-    path = settings.local_state / f"training_phase_{phase}.json"
-    payload = _read_optional_json(path)
-    pid = payload.get("pid")
-    payload["running"] = isinstance(pid, int) and _is_process_running(pid)
-    return payload
+    return read_training_runtime(local_state=settings.local_state, phase=phase)
 
 
 def _read_vendor_attempt_summary(db_path: Path) -> dict[str, Any]:
@@ -984,71 +947,6 @@ def _read_vendor_attempt_summary(db_path: Path) -> dict[str, Any]:
     }
 
 
-def _training_readiness_snapshot(
-    *,
-    settings: NodeSettings,
-    stage: dict[str, Any],
-    partition_summary: dict[str, Any],
-    reference_files: list[str],
-    macro_series: list[str],
-) -> dict[str, Any]:
-    has_reference = set(reference_files)
-    phase1 = training_readiness(
-        raw_green_ratio=partition_summary.get("coverage_green"),
-        has_corp_actions=("corp_actions.parquet" in has_reference) or {"dividends.parquet", "splits.parquet"}.issubset(has_reference),
-        has_listing_history="listing_history.parquet" in has_reference,
-        has_delistings="delistings.parquet" in has_reference,
-        has_sec_filings="sec_filings.parquet" in has_reference,
-        macro_series_count=len(macro_series),
-        required_macro_series=len(default_macro_series()),
-    )
-    phase2_blockers = list(phase1["blockers"])
-    stage_symbols = len(stage.get("symbols", []))
-    stage_years = int(stage.get("years", 0) or 0)
-    if "ticker_changes.parquet" not in has_reference:
-        phase2_blockers.append("ticker_changes")
-    if stage_symbols < 500:
-        phase2_blockers.append("expanded_universe")
-    if stage_years < 10:
-        phase2_blockers.append("history_depth")
-    if not _terminal_delisting_returns_present(settings):
-        phase2_blockers.append("terminal_delisting_returns")
-    phase2 = {"ready": not phase2_blockers, "blockers": phase2_blockers}
-    return {"phase1": phase1, "phase2": phase2}
-
-
-def _training_preflight(settings: NodeSettings) -> dict[str, Any]:
-    config_path = settings.repo_root / "configs" / "equities_xs.yml"
-    qc_path = settings.nas_mount / "data" / "qc" / "partition_status.parquet"
-    curated_root = settings.nas_mount / "data" / "curated" / "equities_ohlcv_adj"
-    if not config_path.exists():
-        return {"ok": False, "reason": f"missing config: {config_path}"}
-    if not qc_path.exists():
-        return {"ok": False, "reason": f"missing qc parquet: {qc_path}"}
-    curated_files = sorted(curated_root.glob("date=*/data.parquet"))
-    if not curated_files:
-        return {"ok": False, "reason": f"no curated parquet files under {curated_root}"}
-    sample = pd.read_parquet(curated_files[-1])
-    if sample.empty:
-        return {"ok": False, "reason": "latest curated partition is empty"}
-    return {
-        "ok": True,
-        "sample_rows": int(len(sample)),
-        "sample_date": curated_files[-1].parent.name.partition("=")[2],
-        "qc_path": str(qc_path),
-    }
-
-
-def _terminal_delisting_returns_present(settings: NodeSettings) -> bool:
-    report_path = settings.reference_root / "delistings.parquet"
-    if not report_path.exists():
-        return False
-    try:
-        frame = pd.read_parquet(report_path)
-    except Exception:
-        return False
-    lowered = {column.lower() for column in frame.columns}
-    return "delisteddate" in lowered or "delisted_date" in lowered
 
 
 def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
@@ -1317,6 +1215,8 @@ def _summarize_data_readiness(
         missing.append("reference datasets")
     if not macro_series:
         missing.append("macro series")
+    if "fred_vintagedates.parquet" not in reference_files:
+        missing.append("macro vintages")
     if not price_check_files:
         missing.append("cross-vendor price checks")
 

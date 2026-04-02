@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date as date_type
+from datetime import UTC, date as date_type
 from itertools import islice
 from typing import Iterator
 
@@ -85,7 +85,7 @@ class AlpacaConnector(HTTPConnector):
                 frame["amount"] = pd.to_numeric(frame.get("cash", frame.get("amount")), errors="coerce")
                 frame["source"] = self.vendor_name
                 frame["source_count"] = 1
-                frame["ingested_at"] = pd.Timestamp.utcnow()
+                frame["ingested_at"] = pd.Timestamp.now(tz=UTC)
                 frames.append(frame[["symbol", "event_type", "ex_date", "record_date", "pay_date", "ratio", "amount", "source", "source_count", "ingested_at"]])
             if not frames:
                 return pd.DataFrame(columns=["symbol", "event_type", "ex_date", "record_date", "pay_date", "ratio", "amount", "source", "source_count", "ingested_at"])
@@ -126,7 +126,7 @@ class AlpacaConnector(HTTPConnector):
             return pd.DataFrame(columns=self._columns())
         bars_frame = pd.concat(frames, ignore_index=True)
         bars_frame["date"] = pd.to_datetime(bars_frame["t"]).dt.date
-        bars_frame["ingested_at"] = pd.Timestamp.utcnow()
+        bars_frame["ingested_at"] = pd.Timestamp.now(tz=UTC)
         bars_frame["source_name"] = self.vendor_name
         bars_frame["source_uri"] = "/v2/stocks/bars"
         bars_frame["vendor_ts"] = pd.to_datetime(bars_frame["t"], utc=True)

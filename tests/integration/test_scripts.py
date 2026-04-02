@@ -50,7 +50,7 @@ def _write_training_dataset(root: Path) -> None:
             "expected_rows": len(symbols),
             "qc_code": "OK",
             "note": None,
-            "updated_at": pd.Timestamp.utcnow(),
+            "updated_at": pd.Timestamp.now(tz="UTC"),
         }
     )
     qc.to_parquet(qc_root / "partition_status.parquet", index=False)

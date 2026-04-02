@@ -63,5 +63,5 @@ class FredConnector(HTTPConnector):
         observations["observation_date"] = pd.to_datetime(observations["date"]).dt.date
         observations["value"] = pd.to_numeric(observations["value"], errors="coerce")
         observations["vintage_date"] = pd.to_datetime(observations.get("realtime_start"), errors="coerce").dt.date
-        observations["ingested_at"] = pd.Timestamp.utcnow()
+        observations["ingested_at"] = pd.Timestamp.now(tz="UTC")
         return observations[["series_id", "observation_date", "value", "vintage_date", "ingested_at"]]

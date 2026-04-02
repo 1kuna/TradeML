@@ -169,6 +169,7 @@ def training_readiness(
     has_listing_history: bool,
     has_delistings: bool,
     has_sec_filings: bool,
+    has_macro_vintages: bool,
     macro_series_count: int,
     required_macro_series: int,
 ) -> dict[str, Any]:
@@ -184,6 +185,8 @@ def training_readiness(
         blockers.append("delistings")
     if not has_sec_filings:
         blockers.append("sec_filings")
+    if not has_macro_vintages:
+        blockers.append("macro_vintages")
     if macro_series_count < required_macro_series:
         blockers.append("macro_pack")
     return {"ready": not blockers, "blockers": blockers}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -24,6 +25,7 @@ from trademl.data_node.capabilities import default_macro_series, load_audit_stat
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.service import DataNodePaths, DataNodeService
+from trademl.data_node.training_control import auto_launch_phase_training
 from trademl.fleet.cluster import ClusterCoordinator
 
 
@@ -154,6 +156,7 @@ def main() -> int:
     data_root = Path(args.data_root or os.getenv("NAS_MOUNT", config["node"]["nas_mount"])).expanduser()
     audit_state = load_audit_state(data_root / "control" / "cluster" / "state" / "vendor_audit.json")
     symbols = args.symbols or _load_stage_symbols(workspace_root)
+    stage_years = _load_stage_years(workspace_root)
     service = DataNodeService(
         db=db,
         connectors=connectors,
@@ -162,6 +165,15 @@ def main() -> int:
         paths=DataNodePaths(root=data_root),
         capability_audit_state=audit_state,
         worker_id=worker_id,
+        training_autopilot=lambda: auto_launch_phase_training(
+            repo_root=Path(__file__).resolve().parents[3],
+            data_root=data_root,
+            local_state=local_state,
+            env_path=env_path or (workspace_root / ".env"),
+            stage_path=workspace_root / "stage.yml",
+            python_executable=os.environ.get("TRADEML_PYTHON_EXECUTABLE", sys.executable),
+        ),
+        stage_years=stage_years,
     )
     service.install_signal_handlers()
     reference_jobs = build_reference_jobs_from_registry(connectors=connectors, symbols=symbols, audit_state=audit_state)
@@ -177,7 +189,7 @@ def main() -> int:
             audit_end=args.date,
         )
         if "fred" in connectors:
-            service.collect_macro_data(["DGS10"], args.date, args.date)
+            service.collect_macro_data(default_macro_series(), args.date, args.date)
         if reference_jobs:
             materialized = [service._materialize_job(job, args.date) for job in reference_jobs]
             service.collect_reference_data(materialized)
@@ -225,6 +237,15 @@ def _load_stage_symbols(root: Path) -> list[str]:
     with stage_path.open("r", encoding="utf-8") as handle:
         stage = yaml.safe_load(handle) or {}
     return list(stage.get("symbols", []))
+
+
+def _load_stage_years(root: Path) -> int:
+    stage_path = root / "stage.yml"
+    if not stage_path.exists():
+        return 5
+    with stage_path.open("r", encoding="utf-8") as handle:
+        stage = yaml.safe_load(handle) or {}
+    return int(stage.get("years", 5) or 5)
 
 
 def _resolve_vendor_budgets(config: dict[str, object]) -> dict[str, dict[str, int]]:
