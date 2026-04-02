@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from trademl.data_node.__main__ import _resolve_vendor_budgets
+from trademl.data_node.__main__ import _build_reference_jobs, _resolve_vendor_budgets
 
 
 def test_resolve_vendor_budgets_keeps_defaults_for_new_connectors() -> None:
@@ -15,3 +15,33 @@ def test_resolve_vendor_budgets_keeps_defaults_for_new_connectors() -> None:
     assert budgets["alpaca"] == {"rpm": 200, "daily_cap": 20000}
     assert budgets["tiingo"] == {"rpm": 40, "daily_cap": 400}
     assert budgets["twelve_data"] == {"rpm": 6, "daily_cap": 600}
+
+
+def test_build_reference_jobs_uses_verified_defaults_and_caps_symbol_fanout() -> None:
+    jobs = _build_reference_jobs(
+        connectors={
+            "alpaca": object(),
+            "massive": object(),
+            "alpha_vantage": object(),
+            "tiingo": object(),
+            "twelve_data": object(),
+            "finnhub": object(),
+            "fmp": object(),
+            "sec_edgar": object(),
+        },
+        symbols=["AAPL", "MSFT", "NVDA"],
+    )
+
+    assert all(job["dataset"] != "supported_tickers" for job in jobs)
+
+    tiingo_dividends = next(job for job in jobs if job["source"] == "tiingo" and job["dataset"] == "corp_actions_dividends")
+    assert tiingo_dividends["explode_symbols"] is False
+    assert tiingo_dividends["max_symbols_per_run"] == 50
+
+    finnhub_profiles = next(job for job in jobs if job["source"] == "finnhub" and job["dataset"] == "company_profile")
+    assert finnhub_profiles["max_symbols_per_run"] == 50
+
+    twelve_financials = next(
+        job for job in jobs if job["source"] == "twelve_data" and job["dataset"] == "financial_statements"
+    )
+    assert twelve_financials["max_symbols_per_run"] == 20

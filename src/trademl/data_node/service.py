@@ -547,6 +547,15 @@ class DataNodeService:
         materialized = dict(job)
         materialized.setdefault("start_date", trading_date)
         materialized.setdefault("end_date", trading_date)
+        symbols = list(materialized.get("symbols", []))
+        max_symbols = int(materialized.get("max_symbols_per_run", 0) or 0)
+        if max_symbols > 0 and len(symbols) > max_symbols:
+            materialized["symbols"] = DataNodeService._rotate_symbols(
+                symbols,
+                limit=max_symbols,
+                trading_date=trading_date,
+                rotation_key=str(materialized.get("rotation_key", f"{materialized.get('source', '')}:{materialized.get('dataset', '')}")),
+            )
         return materialized
 
     def _should_run_reference(self, current_et: datetime) -> bool:
@@ -628,7 +637,7 @@ class DataNodeService:
         expanded: list[dict[str, object]] = []
         for job in jobs:
             symbols = list(job.get("symbols", []))
-            if len(symbols) <= 1:
+            if not job.get("explode_symbols", True) or len(symbols) <= 1:
                 expanded.append(dict(job))
                 continue
             for symbol in symbols:
@@ -636,6 +645,20 @@ class DataNodeService:
                 item["symbols"] = [symbol]
                 expanded.append(item)
         return expanded
+
+    @staticmethod
+    def _rotate_symbols(symbols: list[str], *, limit: int, trading_date: str, rotation_key: str) -> list[str]:
+        ordered = list(dict.fromkeys(symbols))
+        if len(ordered) <= limit:
+            return ordered
+        iso = pd.Timestamp(trading_date).isocalendar()
+        bucket = iso.year * 53 + iso.week
+        offset_seed = sum(ord(char) for char in rotation_key)
+        start = ((bucket + offset_seed) * limit) % len(ordered)
+        window = ordered[start : start + limit]
+        if len(window) < limit:
+            window.extend(ordered[: limit - len(window)])
+        return window
 
     def _write_raw_shard_partition(self, frame: pd.DataFrame, *, shard_id: str) -> list[str]:
         changed_dates: list[str] = []

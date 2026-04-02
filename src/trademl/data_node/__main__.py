@@ -38,6 +38,134 @@ DEFAULT_VENDOR_LIMITS = {
 }
 
 
+def _build_reference_jobs(*, connectors: dict[str, object], symbols: list[str]) -> list[dict[str, object]]:
+    """Build the default weekly reference collection plan from verified connector lanes."""
+    reference_jobs: list[dict[str, object]] = []
+    if "massive" in connectors:
+        reference_jobs.extend(
+            [
+                {"source": "massive", "dataset": "reference_tickers", "symbols": [], "output_name": "universe"},
+                {
+                    "source": "massive",
+                    "dataset": "reference_splits",
+                    "symbols": symbols,
+                    "max_symbols_per_run": 10,
+                    "rotation_key": "massive:reference_splits",
+                    "output_name": "splits",
+                },
+                {
+                    "source": "massive",
+                    "dataset": "reference_dividends",
+                    "symbols": symbols,
+                    "max_symbols_per_run": 10,
+                    "rotation_key": "massive:reference_dividends",
+                    "output_name": "dividends",
+                },
+            ]
+        )
+    if "fmp" in connectors:
+        reference_jobs.extend(
+            [
+                {"source": "fmp", "dataset": "delistings", "symbols": [], "output_name": "delistings"},
+                {"source": "fmp", "dataset": "symbol_changes", "symbols": [], "output_name": "symbol_changes"},
+                {"source": "fmp", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar_fmp"},
+            ]
+        )
+    if "alpha_vantage" in connectors:
+        reference_jobs.extend(
+            [
+                {"source": "alpha_vantage", "dataset": "listings", "symbols": [], "output_name": "listings"},
+                {
+                    "source": "alpha_vantage",
+                    "dataset": "corp_actions",
+                    "symbols": symbols,
+                    "max_symbols_per_run": 10,
+                    "rotation_key": "alpha_vantage:corp_actions",
+                    "output_name": "corp_actions",
+                },
+            ]
+        )
+    if "tiingo" in connectors:
+        reference_jobs.extend(
+            [
+                {
+                    "source": "tiingo",
+                    "dataset": "corp_actions_dividends",
+                    "symbols": symbols,
+                    "max_symbols_per_run": 50,
+                    "rotation_key": "tiingo:corp_actions_dividends",
+                    "explode_symbols": False,
+                    "output_name": "corp_actions",
+                },
+                {
+                    "source": "tiingo",
+                    "dataset": "corp_actions_splits",
+                    "symbols": symbols,
+                    "max_symbols_per_run": 50,
+                    "rotation_key": "tiingo:corp_actions_splits",
+                    "explode_symbols": False,
+                    "output_name": "corp_actions",
+                },
+                {
+                    "source": "tiingo",
+                    "dataset": "fundamentals",
+                    "symbols": symbols,
+                    "max_symbols_per_run": 20,
+                    "rotation_key": "tiingo:fundamentals",
+                    "output_name": "fundamentals_tiingo",
+                },
+            ]
+        )
+    if "twelve_data" in connectors:
+        reference_jobs.extend(
+            [
+                {"source": "twelve_data", "dataset": "stocks", "symbols": [], "output_name": "twelve_data_stocks"},
+                {
+                    "source": "twelve_data",
+                    "dataset": "dividends",
+                    "symbols": symbols,
+                    "max_symbols_per_run": 50,
+                    "rotation_key": "twelve_data:dividends",
+                    "output_name": "corp_actions",
+                },
+                {
+                    "source": "twelve_data",
+                    "dataset": "splits",
+                    "symbols": symbols,
+                    "max_symbols_per_run": 50,
+                    "rotation_key": "twelve_data:splits",
+                    "output_name": "corp_actions",
+                },
+                {"source": "twelve_data", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar_twelve_data"},
+                {
+                    "source": "twelve_data",
+                    "dataset": "financial_statements",
+                    "symbols": symbols,
+                    "max_symbols_per_run": 20,
+                    "rotation_key": "twelve_data:financial_statements",
+                    "output_name": "financial_statements_twelve_data",
+                },
+            ]
+        )
+    if "finnhub" in connectors:
+        reference_jobs.extend(
+            [
+                {"source": "finnhub", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar"},
+                {
+                    "source": "finnhub",
+                    "dataset": "company_profile",
+                    "symbols": symbols,
+                    "max_symbols_per_run": 50,
+                    "rotation_key": "finnhub:company_profile",
+                    "output_name": "company_profiles",
+                },
+            ]
+        )
+    if "sec_edgar" in connectors:
+        reference_jobs.append({"source": "sec_edgar", "dataset": "filing_index", "symbols": ["320193"], "output_name": "sec_filings"})
+    return reference_jobs
+
+
 def _load_dotenv(env_path: Path | None) -> None:
     if env_path is None or not env_path.exists():
         return
@@ -154,57 +282,7 @@ def main() -> int:
         paths=DataNodePaths(root=data_root),
     )
     service.install_signal_handlers()
-    reference_jobs: list[dict[str, object]] = []
-    if "massive" in connectors:
-        reference_jobs.extend(
-            [
-                {"source": "massive", "dataset": "reference_tickers", "symbols": [], "output_name": "universe"},
-                {"source": "massive", "dataset": "reference_splits", "symbols": symbols[:10], "output_name": "splits"},
-                {"source": "massive", "dataset": "reference_dividends", "symbols": symbols[:10], "output_name": "dividends"},
-            ]
-        )
-    if "fmp" in connectors:
-        reference_jobs.extend(
-            [
-                {"source": "fmp", "dataset": "delistings", "symbols": [], "output_name": "delistings"},
-                {"source": "fmp", "dataset": "symbol_changes", "symbols": [], "output_name": "symbol_changes"},
-                {"source": "fmp", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar_fmp"},
-            ]
-        )
-    if "alpha_vantage" in connectors:
-        reference_jobs.extend(
-            [
-                {"source": "alpha_vantage", "dataset": "listings", "symbols": [], "output_name": "listings"},
-                {"source": "alpha_vantage", "dataset": "corp_actions", "symbols": symbols[:10], "output_name": "corp_actions"},
-            ]
-        )
-    if "tiingo" in connectors:
-        reference_jobs.extend(
-            [
-                {"source": "tiingo", "dataset": "supported_tickers", "symbols": [], "output_name": "tiingo_tickers"},
-                {"source": "tiingo", "dataset": "corp_actions_dividends", "symbols": symbols, "output_name": "corp_actions"},
-                {"source": "tiingo", "dataset": "corp_actions_splits", "symbols": symbols, "output_name": "corp_actions"},
-                {"source": "tiingo", "dataset": "fundamentals", "symbols": symbols, "output_name": "fundamentals_tiingo"},
-            ]
-        )
-    if "twelve_data" in connectors:
-        reference_jobs.extend(
-            [
-                {"source": "twelve_data", "dataset": "stocks", "symbols": [], "output_name": "twelve_data_stocks"},
-                {"source": "twelve_data", "dataset": "dividends", "symbols": symbols, "output_name": "corp_actions"},
-                {"source": "twelve_data", "dataset": "splits", "symbols": symbols, "output_name": "corp_actions"},
-                {"source": "twelve_data", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar_twelve_data"},
-                {"source": "twelve_data", "dataset": "financial_statements", "symbols": symbols, "output_name": "financial_statements_twelve_data"},
-            ]
-        )
-    if "finnhub" in connectors:
-        reference_jobs.extend(
-            [
-                {"source": "finnhub", "dataset": "earnings_calendar", "symbols": [], "output_name": "earnings_calendar"},
-                {"source": "finnhub", "dataset": "company_profile", "symbols": symbols, "output_name": "company_profiles"},
-            ]
-        )
-    reference_jobs.append({"source": "sec_edgar", "dataset": "filing_index", "symbols": ["320193"], "output_name": "sec_filings"})
+    reference_jobs = _build_reference_jobs(connectors=connectors, symbols=symbols)
 
     if args.once or args.date:
         if not args.date:

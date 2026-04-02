@@ -180,6 +180,38 @@ def test_run_forever_executes_collection_cycle_and_stops(tmp_path: Path) -> None
     assert "run_cross_vendor_price_checks" in executed
 
 
+def test_materialize_job_rotates_symbol_subset_deterministically() -> None:
+    job = {
+        "source": "finnhub",
+        "dataset": "company_profile",
+        "symbols": ["AAPL", "MSFT", "NVDA", "META", "TSLA"],
+        "max_symbols_per_run": 2,
+        "rotation_key": "finnhub:company_profile",
+    }
+
+    materialized = DataNodeService._materialize_job(job, "2026-04-01")
+
+    assert materialized["symbols"] == ["MSFT", "NVDA"]
+    assert materialized["start_date"] == "2026-04-01"
+    assert materialized["end_date"] == "2026-04-01"
+
+
+def test_expand_reference_jobs_respects_batch_jobs() -> None:
+    expanded = DataNodeService._expand_reference_jobs(
+        [
+            {
+                "source": "tiingo",
+                "dataset": "corp_actions_dividends",
+                "symbols": ["AAPL", "MSFT"],
+                "explode_symbols": False,
+            }
+        ]
+    )
+
+    assert len(expanded) == 1
+    assert expanded[0]["symbols"] == ["AAPL", "MSFT"]
+
+
 def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.enqueue_task("equities_eod", "AAPL", "2026-03-31", "2026-03-31", "GAP", 1)

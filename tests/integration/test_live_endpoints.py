@@ -9,7 +9,7 @@ import pytest
 
 from trademl.connectors.alpaca import AlpacaConnector
 from trademl.connectors.alpha_vantage import AlphaVantageConnector
-from trademl.connectors.base import PermanentConnectorError
+from trademl.connectors.base import PermanentConnectorError, TemporaryConnectorError
 from trademl.connectors.finnhub import FinnhubConnector
 from trademl.connectors.fmp import FMPConnector
 from trademl.connectors.fred import FredConnector
@@ -141,8 +141,11 @@ def test_live_tiingo_reference_and_bars() -> None:
         api_key=os.environ["TIINGO_API_KEY"],
         budget_manager=_budgets(),
     )
-    bars = connector.fetch("equities_eod", ["AAPL"], start_date, end_date)
-    dividends = connector.fetch("corp_actions_dividends", ["AAPL"], start_date, end_date)
+    try:
+        bars = connector.fetch("equities_eod", ["AAPL"], start_date, end_date)
+        dividends = connector.fetch("corp_actions_dividends", ["AAPL"], start_date, end_date)
+    except TemporaryConnectorError as exc:
+        pytest.skip(f"Tiingo temporary limit/unavailability: {exc}")
     assert not bars.empty
     assert bars.iloc[0]["symbol"] == "AAPL"
     assert "event_type" in dividends.columns or dividends.empty
