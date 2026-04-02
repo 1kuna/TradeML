@@ -313,26 +313,23 @@ def test_collect_reference_data_persists_partial_results_before_budget_failure(t
         paths=DataNodePaths(root=tmp_path),
     )
 
-    try:
-        service.collect_reference_data(
-            [
-                {
-                    "source": "alpha_vantage",
-                    "dataset": "corp_actions",
-                    "symbols": ["AAPL", "MSFT"],
-                    "start_date": "2025-01-07",
-                    "end_date": "2025-01-07",
-                    "output_name": "corp_actions",
-                }
-            ]
-        )
-    except TemporaryConnectorError as exc:
-        assert "reference collection incomplete" in str(exc)
-    else:
-        raise AssertionError("expected TemporaryConnectorError")
+    result = service.collect_reference_data(
+        [
+            {
+                "source": "alpha_vantage",
+                "dataset": "corp_actions",
+                "symbols": ["AAPL", "MSFT"],
+                "start_date": "2025-01-07",
+                "end_date": "2025-01-07",
+                "output_name": "corp_actions",
+            }
+        ]
+    )
 
     stored = pd.read_parquet(tmp_path / "data" / "reference" / "corp_actions.parquet")
     assert stored["symbol"].tolist() == ["AAPL"]
+    assert result.failures == []
+    assert result.deferred
 
 
 def test_collect_reference_data_rebuilds_security_master_outputs(tmp_path: Path) -> None:
@@ -345,7 +342,7 @@ def test_collect_reference_data_rebuilds_security_master_outputs(tmp_path: Path)
         paths=DataNodePaths(root=tmp_path),
     )
 
-    outputs = service.collect_reference_data(
+    result = service.collect_reference_data(
         [
             {
                 "source": "alpha_vantage",
@@ -374,8 +371,8 @@ def test_collect_reference_data_rebuilds_security_master_outputs(tmp_path: Path)
         ]
     )
 
-    assert tmp_path / "data" / "reference" / "listing_history.parquet" in outputs
-    assert tmp_path / "data" / "reference" / "ticker_changes.parquet" in outputs
+    assert tmp_path / "data" / "reference" / "listing_history.parquet" in result.outputs
+    assert tmp_path / "data" / "reference" / "ticker_changes.parquet" in result.outputs
 
 
 def test_process_backfill_queue_prefers_tiingo_for_equities_history(tmp_path: Path) -> None:

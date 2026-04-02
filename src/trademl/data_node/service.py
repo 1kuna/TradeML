@@ -50,6 +50,15 @@ class DataNodePaths:
         return self.root / "data" / "reference"
 
 
+@dataclass(slots=True)
+class ReferenceCollectionResult:
+    """Outcome of a reference-data collection pass."""
+
+    outputs: list[Path]
+    failures: list[str]
+    deferred: list[str]
+
+
 class DataNodeService:
     """Collect raw bars, audit completeness, curate data, and sync QC state."""
 
@@ -145,13 +154,24 @@ class DataNodeService:
             self.db.mark_task_done(task.id)
         return changed_dates
 
-    def collect_reference_data(self, jobs: list[dict[str, object]]) -> list[Path]:
+    def collect_reference_data(self, jobs: list[dict[str, object]]) -> ReferenceCollectionResult:
         """Collect reference datasets into parquet files."""
         outputs: list[Path] = []
         self.paths.reference_root.mkdir(parents=True, exist_ok=True)
         failures: list[str] = []
+        deferred: dict[str, int] = {}
+        exhausted_vendors: set[str] = set()
         for job in self._expand_reference_jobs(jobs):
-            connector = self.connectors[str(job["source"])]
+            vendor = str(job["source"])
+            if vendor in exhausted_vendors:
+                deferred[vendor] = deferred.get(vendor, 0) + 1
+                continue
+            connector = self.connectors[vendor]
+            budget_manager = getattr(connector, "budget_manager", None)
+            if budget_manager is not None and not budget_manager.can_spend(vendor, task_kind="OTHER"):
+                exhausted_vendors.add(vendor)
+                deferred[vendor] = deferred.get(vendor, 0) + 1
+                continue
             try:
                 frame = connector.fetch(
                     str(job["dataset"]),
@@ -160,7 +180,12 @@ class DataNodeService:
                     str(job["end_date"]),
                 )
             except ConnectorError as exc:
-                failures.append(f"{job['source']}:{job['dataset']}:{job.get('symbols', [])}:{exc}")
+                message = str(exc)
+                if "budget exhausted" in message:
+                    exhausted_vendors.add(vendor)
+                    deferred[vendor] = deferred.get(vendor, 0) + 1
+                    continue
+                failures.append(f"{vendor}:{job['dataset']}:{job.get('symbols', [])}:{message}")
                 continue
             output = self.paths.reference_root / f"{job['output_name']}.parquet"
             if output.exists():
@@ -171,9 +196,8 @@ class DataNodeService:
             frame.to_parquet(output, index=False)
             outputs.append(output)
         outputs.extend(rebuild_derived_references(self.paths.reference_root))
-        if failures:
-            raise TemporaryConnectorError(f"reference collection incomplete: {' | '.join(failures)}")
-        return outputs
+        deferred_messages = [f"{vendor}: deferred {count} jobs after budget exhaustion" for vendor, count in sorted(deferred.items())]
+        return ReferenceCollectionResult(outputs=outputs, failures=failures, deferred=deferred_messages)
 
     def collect_macro_data(self, series_ids: list[str], start_date: str, end_date: str) -> list[Path]:
         """Collect FRED macro series partitions."""
@@ -565,16 +589,31 @@ class DataNodeService:
         week_key = self._week_key(current_et)
         if reference_jobs and coordinator.acquire_singleton("reference", week_key):
             materialized_jobs = [self._materialize_job(job, trading_date) for job in reference_jobs]
-            try:
-                self.collect_reference_data(materialized_jobs)
-            except ConnectorError:
-                LOGGER.exception("reference collection failed for bucket=%s trading_date=%s", week_key, trading_date)
-            else:
-                if any(job.get("output_name") == "corp_actions" for job in materialized_jobs):
-                    corp_actions_path = self.paths.root / "data" / "reference" / "corp_actions.parquet"
-                    if corp_actions_path.exists():
-                        self.curate_dates(corp_actions=pd.read_parquet(corp_actions_path))
-                coordinator.mark_singleton_success("reference", week_key, {"job_count": len(materialized_jobs)})
+            result = self.collect_reference_data(materialized_jobs)
+            if isinstance(result, list):
+                result = ReferenceCollectionResult(outputs=result, failures=[], deferred=[])
+            if result.failures or result.deferred:
+                LOGGER.warning(
+                    "reference collection partial for bucket=%s trading_date=%s failures=%s deferred=%s",
+                    week_key,
+                    trading_date,
+                    " | ".join(result.failures) if result.failures else "-",
+                    " | ".join(result.deferred) if result.deferred else "-",
+                )
+            if any(job.get("output_name") == "corp_actions" for job in materialized_jobs):
+                corp_actions_path = self.paths.root / "data" / "reference" / "corp_actions.parquet"
+                if corp_actions_path.exists():
+                    self.curate_dates(corp_actions=pd.read_parquet(corp_actions_path))
+            coordinator.mark_singleton_success(
+                "reference",
+                week_key,
+                {
+                    "job_count": len(materialized_jobs),
+                    "output_count": len(result.outputs),
+                    "failure_count": len(result.failures),
+                    "deferred_count": len(result.deferred),
+                },
+            )
 
         if price_check_symbols and coordinator.acquire_singleton("price_checks", week_key):
             try:
