@@ -40,9 +40,20 @@ class BackfillTask:
 class DataNodeDB:
     """Small transactional wrapper around the local SQLite state store."""
 
+    REQUIRED_TABLES = frozenset({"backfill_queue", "partition_status"})
+
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
         self._initialize()
+
+    @classmethod
+    def recreate(cls, path: str | Path) -> "DataNodeDB":
+        """Replace the SQLite database and sidecars with a clean initialized store."""
+        db_path = Path(path)
+        for candidate in [db_path, db_path.with_name(f"{db_path.name}-wal"), db_path.with_name(f"{db_path.name}-shm")]:
+            if candidate.exists():
+                candidate.unlink()
+        return cls(db_path)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -104,6 +115,18 @@ class DataNodeDB:
                 )
                 """
             )
+        self._validate_schema()
+
+    def _validate_schema(self) -> None:
+        """Verify the required tables exist after initialization."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        existing = {str(row["name"]) for row in rows}
+        missing = self.REQUIRED_TABLES.difference(existing)
+        if missing:
+            raise sqlite3.OperationalError(f"missing sqlite tables: {', '.join(sorted(missing))}")
 
     def enqueue_task(
         self,

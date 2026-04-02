@@ -16,6 +16,7 @@ from trademl.fleet.cluster import (
     install_systemd_service,
     render_systemd_unit,
 )
+from trademl.data_node.db import DataNodeDB
 
 
 def _seed_workspace(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
@@ -122,6 +123,24 @@ def test_coordinator_bootstrap_and_rebuild_state(tmp_path: Path) -> None:
     assert rebuilt["gap_tasks"] >= 1
     assert (nas / "control" / "cluster" / "manifest.yml").exists()
     assert (nas / "control" / "cluster" / "shards" / "equities_eod.json").exists()
+
+
+def test_recreate_local_db_removes_sqlite_sidecars(tmp_path: Path) -> None:
+    db_path = tmp_path / "control" / "node.sqlite"
+    db = DataNodeDB(db_path)
+    db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-01", "GAP", 1)
+    wal_path = db_path.with_name(f"{db_path.name}-wal")
+    shm_path = db_path.with_name(f"{db_path.name}-shm")
+    wal_path.write_text("stale", encoding="utf-8")
+    shm_path.write_text("stale", encoding="utf-8")
+
+    recreated = DataNodeDB.recreate(db_path)
+
+    assert not wal_path.exists()
+    assert not shm_path.exists()
+    recreated.update_partition_status("alpaca", "equities_eod", "2025-01-01", "GREEN", 1, 1, "OK")
+    rows = recreated.fetch_partition_status()
+    assert len(rows) == 1
 
 
 def test_rebuild_local_state_requeues_underfilled_partitions_after_stage_promotion(tmp_path: Path) -> None:

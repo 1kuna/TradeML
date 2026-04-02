@@ -221,9 +221,7 @@ class ClusterCoordinator:
         manifest = self.load_manifest()
         current_ts = pd.Timestamp(current_date or datetime.now(tz=UTC).date())
         expected_rows = len(manifest["stage"]["symbols"])
-        if local_db_path.exists():
-            local_db_path.unlink()
-        db = DataNodeDB(local_db_path)
+        db = DataNodeDB.recreate(local_db_path)
         qc_path = self.paths.nas_root / "data" / "qc" / "partition_status.parquet"
         qc_rows = 0
         if qc_path.exists():
