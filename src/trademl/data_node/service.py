@@ -421,7 +421,7 @@ class DataNodeService:
             )
             should_drain_backlog = self.db.has_pending_backfill()
             if should_run_maintenance or should_drain_backlog:
-                if coordinator.acquire_singleton("backfill", local_day):
+                if self._acquire_backfill_singleton(coordinator=coordinator, bucket_key=local_day, pending_backfill=should_drain_backlog):
                     changed_dates = self.process_backfill_queue()
                     if changed_dates:
                         self.curate_dates(corp_actions=self.load_corp_actions_reference())
@@ -563,6 +563,33 @@ class DataNodeService:
 
     def _should_run_price_checks(self, current_et: datetime) -> bool:
         return self._week_key(current_et) not in self._price_check_history
+
+    def _acquire_backfill_singleton(self, *, coordinator: ClusterCoordinator, bucket_key: str, pending_backfill: bool) -> bool:
+        """Acquire backfill execution rights, reopening same-day buckets when new backlog was seeded later."""
+        if coordinator.acquire_singleton("backfill", bucket_key):
+            return True
+        if not pending_backfill:
+            return False
+        if not self._backfill_needs_rerun(coordinator=coordinator, bucket_key=bucket_key):
+            return False
+        renew = getattr(coordinator, "acquire_or_renew_lease", None)
+        if callable(renew):
+            return bool(renew(f"singleton::backfill::{bucket_key}"))
+        return False
+
+    def _backfill_needs_rerun(self, *, coordinator: ClusterCoordinator, bucket_key: str) -> bool:
+        """Return whether pending backlog was updated after the last successful backfill bucket."""
+        read_last_success = getattr(coordinator, "read_last_success", None)
+        if not callable(read_last_success):
+            return False
+        state = read_last_success().get("backfill", {})
+        if str(state.get("bucket")) != bucket_key:
+            return False
+        last_success = state.get("updated_at")
+        latest_queue_update = self.db.latest_queue_update(statuses=("PENDING", "FAILED"))
+        if not last_success or not latest_queue_update:
+            return False
+        return str(latest_queue_update) > str(last_success)
 
     @staticmethod
     def _week_key(current_et: datetime) -> str:

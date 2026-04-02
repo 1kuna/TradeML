@@ -264,4 +264,19 @@ class DataNodeDB:
                 """,
                 (utc_now().isoformat(),),
             ).fetchone()
-        return row is not None
+            return row is not None
+
+    def latest_queue_update(self, *, statuses: tuple[str, ...] | None = None) -> str | None:
+        """Return the most recent queue update timestamp, optionally filtered by status."""
+        with self._connect() as connection:
+            if statuses:
+                placeholders = ",".join("?" for _ in statuses)
+                row = connection.execute(
+                    f"SELECT MAX(updated_at) AS updated_at FROM backfill_queue WHERE status IN ({placeholders})",
+                    statuses,
+                ).fetchone()
+            else:
+                row = connection.execute("SELECT MAX(updated_at) AS updated_at FROM backfill_queue").fetchone()
+        if row is None:
+            return None
+        return row["updated_at"]

@@ -112,6 +112,7 @@ class _ClusterCoordinatorStub:
     def __init__(self) -> None:
         self._lease_calls: list[str] = []
         self.allowed: set[str] = {"backfill"}
+        self.last_success: dict[str, dict] = {}
 
     def heartbeat_worker(self) -> dict[str, str]:
         return {"worker_id": "worker-a"}
@@ -123,8 +124,16 @@ class _ClusterCoordinatorStub:
         self._lease_calls.append(f"{task_name}:{bucket_key}")
         return task_name in self.allowed
 
+    def acquire_or_renew_lease(self, lease_id: str) -> bool:
+        self._lease_calls.append(f"renew:{lease_id}")
+        return True
+
     def mark_singleton_success(self, task_name: str, bucket_key: str, metadata: dict | None = None) -> None:
         self._lease_calls.append(f"success:{task_name}:{bucket_key}:{metadata or {}}")
+        self.last_success[task_name] = {"bucket": bucket_key, "updated_at": "2026-03-31T18:00:00+00:00", "metadata": metadata or {}}
+
+    def read_last_success(self) -> dict[str, dict]:
+        return self.last_success
 
 
 def test_run_forever_executes_collection_cycle_and_stops(tmp_path: Path) -> None:
@@ -245,6 +254,44 @@ def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(tmp_
     )
 
     assert calls == ["process_backfill_queue"]
+
+
+def test_run_cluster_forever_reruns_backfill_when_same_day_queue_is_reseeded(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    db.enqueue_task("equities_eod", None, "2026-04-02", "2026-04-02", "GAP", 1)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    coordinator = _ClusterCoordinatorStub()
+    coordinator.allowed = set()
+    coordinator.last_success["backfill"] = {"bucket": "2026-04-02", "updated_at": "2026-04-02T16:11:09+00:00"}
+    calls: list[str] = []
+
+    def process_backfill_queue() -> list[str]:
+        calls.append("process_backfill_queue")
+        service.stop()
+        return []
+
+    service.process_backfill_queue = process_backfill_queue  # type: ignore[method-assign]
+    service.sync_partition_status = lambda: tmp_path / "data" / "qc" / "partition_status.parquet"  # type: ignore[method-assign]
+
+    service.run_cluster_forever(
+        coordinator=coordinator,  # type: ignore[arg-type]
+        symbols=["AAPL"],
+        exchange="XNYS",
+        collection_time_et="16:30",
+        maintenance_hour_local=23,
+        poll_seconds=0.0,
+        now_fn=lambda: datetime.fromisoformat("2026-04-02T20:35:00+00:00"),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert calls == ["process_backfill_queue"]
+    assert "renew:singleton::backfill::2026-04-02" in coordinator._lease_calls
 
 
 def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfill(tmp_path: Path) -> None:
