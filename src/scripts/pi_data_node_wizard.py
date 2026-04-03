@@ -17,6 +17,7 @@ from trademl.connectors.alpaca import AlpacaConnector
 from trademl.data_node.bootstrap import DEFAULT_STAGE0_SYMBOL_COUNT, Stage0UniverseBuilder
 from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
+from trademl.data_node.vendor_limits import DEFAULT_VENDOR_LIMITS
 
 
 def run_wizard(
@@ -138,7 +139,7 @@ def main() -> int:
                 base_url=os.getenv("ALPACA_DATA_BASE_URL", env_values["ALPACA_DATA_BASE_URL"]),
                 api_key=env_values["ALPACA_API_KEY"],
                 secret_key=env_values["ALPACA_API_SECRET"],
-                budget_manager=BudgetManager({"alpaca": {"rpm": 150, "daily_cap": 10000}}),
+                budget_manager=BudgetManager({"alpaca": DEFAULT_VENDOR_LIMITS["alpaca"]}),
             )
         )
         stage_symbols = builder.build(symbol_count=DEFAULT_STAGE0_SYMBOL_COUNT)

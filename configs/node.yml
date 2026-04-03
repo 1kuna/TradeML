@@ -20,14 +20,14 @@ stage:
     green_promote_threshold: 0.98
 vendors:
   alpaca:
-    rpm: 150
-    daily_cap: 10000
+    rpm: 190
+    daily_cap: 273600
     datasets:
     - equities_eod
     role: primary_bars
   tiingo:
-    rpm: 40
-    daily_cap: 400
+    rpm: 158
+    daily_cap: 95000
     datasets:
     - equities_eod
     - corp_actions_dividends
@@ -36,8 +36,8 @@ vendors:
     - supported_tickers
     role: deep_history_bars
   twelve_data:
-    rpm: 6
-    daily_cap: 600
+    rpm: 7
+    daily_cap: 760
     datasets:
     - equities_eod
     - dividends
@@ -48,7 +48,7 @@ vendors:
     role: cross_validation
   massive:
     rpm: 4
-    daily_cap: 300
+    daily_cap: 6840
     datasets:
     - equities_eod
     - reference_tickers
@@ -56,29 +56,29 @@ vendors:
     - reference_dividends
     role: cross_validation_bars
   finnhub:
-    rpm: 50
-    daily_cap: 10000
+    rpm: 57
+    daily_cap: 82080
     datasets:
     - equities_eod
     - earnings_calendar
     - company_profile
     role: backup_bars
   alpha_vantage:
-    rpm: 4
-    daily_cap: 400
+    rpm: 1
+    daily_cap: 23
     datasets:
     - corp_actions
     - listings
     role: reference
   fred:
-    rpm: 80
-    daily_cap: 5000
+    rpm: 114
+    daily_cap: 164160
     datasets:
     - macros_treasury
     role: macro
   fmp:
-    rpm: 3
-    daily_cap: 200
+    rpm: 1
+    daily_cap: 237
     datasets:
     - delistings
     - symbol_changes
@@ -86,8 +86,8 @@ vendors:
     - fundamentals
     role: reference
   sec_edgar:
-    rpm: 8
-    daily_cap: 5000
+    rpm: 570
+    daily_cap: 820800
     datasets:
     - filing_index
     role: authoritative_events

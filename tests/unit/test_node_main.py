@@ -13,8 +13,8 @@ def test_resolve_vendor_budgets_keeps_defaults_for_new_connectors() -> None:
     )
 
     assert budgets["alpaca"] == {"rpm": 200, "daily_cap": 20000}
-    assert budgets["tiingo"] == {"rpm": 40, "daily_cap": 400}
-    assert budgets["twelve_data"] == {"rpm": 6, "daily_cap": 600}
+    assert budgets["tiingo"] == {"rpm": 158, "daily_cap": 95000}
+    assert budgets["twelve_data"] == {"rpm": 7, "daily_cap": 760}
 
 
 def test_build_reference_jobs_uses_verified_defaults_and_caps_symbol_fanout() -> None:

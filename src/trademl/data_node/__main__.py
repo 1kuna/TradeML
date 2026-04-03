@@ -24,20 +24,8 @@ from trademl.data_node.capabilities import default_macro_series, load_audit_stat
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.service import DataNodePaths, DataNodeService
+from trademl.data_node.vendor_limits import DEFAULT_VENDOR_LIMITS
 from trademl.fleet.cluster import ClusterCoordinator
-
-
-DEFAULT_VENDOR_LIMITS = {
-    "alpaca": {"rpm": 150, "daily_cap": 10000},
-    "tiingo": {"rpm": 40, "daily_cap": 400},
-    "twelve_data": {"rpm": 6, "daily_cap": 600},
-    "massive": {"rpm": 4, "daily_cap": 300},
-    "finnhub": {"rpm": 50, "daily_cap": 10000},
-    "alpha_vantage": {"rpm": 4, "daily_cap": 400},
-    "fred": {"rpm": 80, "daily_cap": 5000},
-    "fmp": {"rpm": 3, "daily_cap": 200},
-    "sec_edgar": {"rpm": 8, "daily_cap": 5000},
-}
 
 
 def _build_reference_jobs(*, connectors: dict[str, object], symbols: list[str]) -> list[dict[str, object]]:

@@ -40,6 +40,7 @@ from trademl.data_node.db import DataNodeDB
 from trademl.data_node.capabilities import load_audit_state
 from trademl.data_node.planner import plan_auxiliary_tasks
 from trademl.data_node.training_control import evaluate_training_gates, read_training_runtime, shared_training_runtime_path
+from trademl.data_node.vendor_limits import DEFAULT_VENDOR_LIMITS
 from trademl.fleet.cluster import (
     ClusterCoordinator,
     ClusterPaths,
@@ -997,6 +998,8 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
         "checked_at": checked_at,
         "day_anchor": day_anchor,
     }
+
+
 def _read_vendor_attempt_summary(db_path: Path) -> dict[str, Any]:
     if not db_path.exists():
         return {"counts": {}, "by_vendor": [], "recent_failures": []}
@@ -1046,7 +1049,7 @@ def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
     env_values = _read_env_file(settings.env_path)
     config = _read_yaml(settings.config_path)
     vendors = config.get("vendors", {})
-    alpaca_budget = vendors.get("alpaca", {"rpm": 150, "daily_cap": 10000})
+    alpaca_budget = _vendor_budget(vendors, "alpaca")
     universe_builder = None
     if env_values.get("ALPACA_API_KEY"):
         universe_builder = Stage0UniverseBuilder(
@@ -1070,6 +1073,16 @@ def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
     )
 
 
+def _vendor_budget(vendors: dict[str, Any], vendor: str) -> dict[str, int]:
+    """Resolve a vendor budget from config with researched defaults as fallback."""
+
+    source = dict(vendors.get(vendor, DEFAULT_VENDOR_LIMITS[vendor]))
+    return {
+        "rpm": int(source.get("rpm", DEFAULT_VENDOR_LIMITS[vendor]["rpm"])),
+        "daily_cap": int(source.get("daily_cap", DEFAULT_VENDOR_LIMITS[vendor]["daily_cap"])),
+    }
+
+
 def _connectors_from_settings(settings: NodeSettings) -> dict[str, BaseConnector]:
     env_values = _read_env_file(settings.env_path)
     config = _read_yaml(settings.config_path)
@@ -1081,55 +1094,55 @@ def _connectors_from_settings(settings: NodeSettings) -> dict[str, BaseConnector
             trading_base_url=env_values.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
             api_key=env_values.get("ALPACA_API_KEY", ""),
             secret_key=env_values.get("ALPACA_API_SECRET", ""),
-            budget_manager=BudgetManager({"alpaca": vendors.get("alpaca", {"rpm": 150, "daily_cap": 10000})}),
+            budget_manager=BudgetManager({"alpaca": _vendor_budget(vendors, "alpaca")}),
         )
     if env_values.get("TIINGO_API_KEY"):
         connectors["tiingo"] = TiingoConnector(
             base_url="https://api.tiingo.com",
             api_key=env_values.get("TIINGO_API_KEY", ""),
-            budget_manager=BudgetManager({"tiingo": vendors.get("tiingo", {"rpm": 40, "daily_cap": 400})}),
+            budget_manager=BudgetManager({"tiingo": _vendor_budget(vendors, "tiingo")}),
         )
     if env_values.get("TWELVE_DATA_API_KEY"):
         connectors["twelve_data"] = TwelveDataConnector(
             base_url="https://api.twelvedata.com",
             api_key=env_values.get("TWELVE_DATA_API_KEY", ""),
-            budget_manager=BudgetManager({"twelve_data": vendors.get("twelve_data", {"rpm": 8, "daily_cap": 800})}),
+            budget_manager=BudgetManager({"twelve_data": _vendor_budget(vendors, "twelve_data")}),
         )
     if env_values.get("MASSIVE_API_KEY"):
         connectors["massive"] = MassiveConnector(
             base_url="https://api.massive.com",
             api_key=env_values.get("MASSIVE_API_KEY", ""),
-            budget_manager=BudgetManager({"massive": vendors.get("massive", {"rpm": 5, "daily_cap": 500})}),
+            budget_manager=BudgetManager({"massive": _vendor_budget(vendors, "massive")}),
         )
     if env_values.get("FINNHUB_API_KEY"):
         connectors["finnhub"] = FinnhubConnector(
             base_url="https://finnhub.io/api/v1",
             api_key=env_values.get("FINNHUB_API_KEY", ""),
-            budget_manager=BudgetManager({"finnhub": vendors.get("finnhub", {"rpm": 30, "daily_cap": 3000})}),
+            budget_manager=BudgetManager({"finnhub": _vendor_budget(vendors, "finnhub")}),
         )
     if env_values.get("ALPHA_VANTAGE_API_KEY"):
         connectors["alpha_vantage"] = AlphaVantageConnector(
             base_url="https://www.alphavantage.co",
             api_key=env_values.get("ALPHA_VANTAGE_API_KEY", ""),
-            budget_manager=BudgetManager({"alpha_vantage": vendors.get("alpha_vantage", {"rpm": 5, "daily_cap": 500})}),
+            budget_manager=BudgetManager({"alpha_vantage": _vendor_budget(vendors, "alpha_vantage")}),
         )
     if env_values.get("FRED_API_KEY"):
         connectors["fred"] = FredConnector(
             base_url="https://api.stlouisfed.org/fred",
             api_key=env_values.get("FRED_API_KEY", ""),
-            budget_manager=BudgetManager({"fred": vendors.get("fred", {"rpm": 120, "daily_cap": 20000})}),
+            budget_manager=BudgetManager({"fred": _vendor_budget(vendors, "fred")}),
         )
     if env_values.get("FMP_API_KEY"):
         connectors["fmp"] = FMPConnector(
             base_url="https://financialmodelingprep.com/api",
             api_key=env_values.get("FMP_API_KEY", ""),
-            budget_manager=BudgetManager({"fmp": vendors.get("fmp", {"rpm": 10, "daily_cap": 1000})}),
+            budget_manager=BudgetManager({"fmp": _vendor_budget(vendors, "fmp")}),
         )
     if env_values.get("SEC_EDGAR_USER_AGENT"):
         connectors["sec_edgar"] = SecEdgarConnector(
             base_url="https://data.sec.gov",
             user_agent=env_values.get("SEC_EDGAR_USER_AGENT", ""),
-            budget_manager=BudgetManager({"sec_edgar": vendors.get("sec_edgar", {"rpm": 5, "daily_cap": 1000})}),
+            budget_manager=BudgetManager({"sec_edgar": _vendor_budget(vendors, "sec_edgar")}),
         )
     return connectors
 
@@ -1138,7 +1151,7 @@ def _alpaca_connector(settings: NodeSettings) -> AlpacaConnector | None:
     env_values = _read_env_file(settings.env_path)
     config = _read_yaml(settings.config_path)
     vendors = config.get("vendors", {})
-    alpaca_budget = vendors.get("alpaca", {"rpm": 150, "daily_cap": 10000})
+    alpaca_budget = _vendor_budget(vendors, "alpaca")
     if not env_values.get("ALPACA_API_KEY"):
         return None
     return AlpacaConnector(
@@ -1155,7 +1168,7 @@ def _history_probe_connector(settings: NodeSettings) -> BaseConnector | None:
     config = _read_yaml(settings.config_path)
     vendors = config.get("vendors", {})
     if env_values.get("TIINGO_API_KEY"):
-        tiingo_budget = vendors.get("tiingo", {"rpm": 40, "daily_cap": 400})
+        tiingo_budget = _vendor_budget(vendors, "tiingo")
         return TiingoConnector(
             base_url="https://api.tiingo.com",
             api_key=env_values.get("TIINGO_API_KEY", ""),
