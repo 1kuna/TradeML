@@ -151,6 +151,41 @@ class _BackfillConnector:
         )
 
 
+class _SelectiveBackfillConnector:
+    def __init__(self, vendor_name: str, available_symbols: list[str], *, empty_for_unknown: bool = True) -> None:
+        self.vendor_name = vendor_name
+        self.available_symbols = {symbol.upper() for symbol in available_symbols}
+        self.empty_for_unknown = empty_for_unknown
+        self.calls: list[tuple[str, list[str], str, str]] = []
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls.append((dataset, list(symbols), start_date, end_date))
+        rows: list[dict[str, object]] = []
+        for symbol in symbols:
+            if symbol.upper() not in self.available_symbols:
+                continue
+            rows.append(
+                {
+                    "date": start_date,
+                    "symbol": symbol,
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.0,
+                    "close": 10.5,
+                    "vwap": pd.NA,
+                    "volume": 100,
+                    "trade_count": pd.NA,
+                    "ingested_at": pd.Timestamp.now(tz="UTC"),
+                    "source_name": self.vendor_name,
+                    "source_uri": "/bars",
+                    "vendor_ts": pd.Timestamp(start_date),
+                }
+            )
+        if not rows and self.empty_for_unknown:
+            return pd.DataFrame(columns=_BackfillConnector(self.vendor_name).fetch(dataset, ["AAPL"], start_date, end_date).columns)
+        return pd.DataFrame(rows)
+
+
 class _ClusterCoordinatorStub:
     def __init__(self) -> None:
         self._lease_calls: list[str] = []
@@ -292,6 +327,63 @@ def test_lease_next_task_for_vendor_skips_single_symbol_vendors_for_datewide_bac
     assert tiingo_task is None
     assert alpaca_task is not None
     assert alpaca_task.symbol is None
+
+
+def test_datewide_backfill_merges_parallel_vendor_results_and_marks_task_done(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    task_id = db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-01", "GAP", 1)
+    leased = db.lease_task_by_id(task_id)
+    assert leased is not None
+    alpaca = _SelectiveBackfillConnector("alpaca", ["AAPL", "MSFT"])
+    tiingo = _SelectiveBackfillConnector("tiingo", ["NVDA"])
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": alpaca, "tiingo": tiingo},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    service.default_symbols = ["AAPL", "MSFT", "NVDA"]
+
+    changed = service._process_backfill_task_for_vendor(leased, "alpaca")
+
+    assert changed == ["2025-01-01"]
+    stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-01" / "data.parquet")
+    assert sorted(stored["symbol"].tolist()) == ["AAPL", "MSFT", "NVDA"]
+    with sqlite3.connect(tmp_path / "control" / "node.sqlite") as connection:
+        status_row = connection.execute("SELECT status FROM backfill_queue WHERE id = ?", (task_id,)).fetchone()
+    assert status_row == ("DONE",)
+    assert alpaca.calls
+    assert tiingo.calls
+
+
+def test_datewide_backfill_keeps_partial_progress_and_defers_remaining_symbols(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    task_id = db.enqueue_task("equities_eod", None, "2025-01-02", "2025-01-02", "GAP", 1)
+    leased = db.lease_task_by_id(task_id)
+    assert leased is not None
+    alpaca = _SelectiveBackfillConnector("alpaca", ["AAPL"])
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": alpaca},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    service.default_symbols = ["AAPL", "MSFT"]
+
+    changed = service._process_backfill_task_for_vendor(leased, "alpaca")
+
+    assert changed == ["2025-01-02"]
+    stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-02" / "data.parquet")
+    assert stored["symbol"].tolist() == ["AAPL"]
+    with sqlite3.connect(tmp_path / "control" / "node.sqlite") as connection:
+        row = connection.execute("SELECT status, last_error FROM backfill_queue WHERE id = ?", (task_id,)).fetchone()
+    assert row is not None
+    assert row[0] == "PENDING"
+    assert "remaining_symbols=1" in (row[1] or "")
 
 
 def test_materialize_job_rotates_symbol_subset_deterministically() -> None:

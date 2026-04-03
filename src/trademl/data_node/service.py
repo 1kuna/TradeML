@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 import contextlib
 import logging
 import os
@@ -24,7 +25,6 @@ from trademl.data_node.capabilities import auxiliary_capabilities, backfill_capa
 from trademl.data_node.curator import Curator, CuratorResult
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.planner import canonical_task_key, choose_vendor_for_canonical_task, plan_auxiliary_tasks
-from trademl.data_node.capabilities import backfill_capabilities
 from trademl.fleet.cluster import ClusterCoordinator, ShardSpec
 from trademl.reference.security_master import rebuild_derived_references
 
@@ -140,16 +140,21 @@ class DataNodeService:
             day_value = pd.Timestamp(day).strftime("%Y-%m-%d")
             partition = self.paths.raw_equities / f"date={day_value}"
             partition.mkdir(parents=True, exist_ok=True)
-            day_frame.to_parquet(partition / "data.parquet", index=False)
+            merged = self._merge_partition_frame(partition=partition, frame=day_frame)
+            merged.to_parquet(partition / "data.parquet", index=False)
             changed_dates.append(day_value)
+            expected_rows = len(self.default_symbols) if self.default_symbols else len(merged)
+            row_count = len(merged)
+            status = "GREEN" if row_count >= expected_rows else "AMBER"
+            qc_code = "OK" if status == "GREEN" else "INCOMPLETE"
             self.db.update_partition_status(
                 source=source_name,
                 dataset="equities_eod",
                 date=day_value,
-                status="GREEN",
-                row_count=len(day_frame),
-                expected_rows=len(day_frame),
-                qc_code="OK",
+                status=status,
+                row_count=row_count,
+                expected_rows=expected_rows,
+                qc_code=qc_code,
             )
         return changed_dates
 
@@ -910,6 +915,8 @@ class DataNodeService:
             ),
             None,
         )
+        if task.symbol is None:
+            return self._process_parallel_datewide_backfill_task(task=task, coordinator_vendor=vendor)
         if task.symbol is None and capability is not None and capability.batching_mode == "single_symbol":
             self.db.mark_vendor_attempt_failed(
                 task_key=task_key,
@@ -961,6 +968,203 @@ class DataNodeService:
         self.db.mark_vendor_attempt_success(task_key=task_key, vendor=vendor, rows_returned=len(frame))
         self.db.mark_task_done(task.id)
         return changed
+
+    def _process_parallel_datewide_backfill_task(self, *, task, coordinator_vendor: str) -> list[str]:
+        """Fill a date-wide canonical partition by saturating all eligible vendors in parallel."""
+        existing = self._read_existing_partition(date=task.start_date)
+        existing_symbols = {
+            str(symbol).upper()
+            for symbol in existing.get("symbol", pd.Series(dtype="string")).dropna().astype("string").tolist()
+        }
+        remaining_symbols = [symbol for symbol in self.default_symbols if symbol.upper() not in existing_symbols]
+        if not remaining_symbols:
+            self.db.mark_task_done(task.id)
+            return []
+
+        capabilities = self._datewide_backfill_capabilities(dataset=task.dataset, preferred_vendor=coordinator_vendor)
+        if not capabilities:
+            self.db.defer_task(task.id, reason="no eligible date-wide backfill vendors", backoff_minutes=5)
+            return []
+
+        frames: list[pd.DataFrame] = []
+        remaining: set[str] = {symbol.upper() for symbol in remaining_symbols}
+        reserved: set[str] = set()
+        attempted_by_symbol: dict[str, set[str]] = defaultdict(set)
+        unavailable_vendors: set[str] = set()
+        state_lock = threading.Lock()
+
+        def claim_batch(vendor_name: str, batch_size: int) -> list[str]:
+            with state_lock:
+                available = [
+                    symbol
+                    for symbol in remaining_symbols
+                    if symbol.upper() in remaining
+                    and symbol.upper() not in reserved
+                    and vendor_name not in attempted_by_symbol[symbol.upper()]
+                ]
+                batch = available[:batch_size]
+                for symbol in batch:
+                    symbol_key = symbol.upper()
+                    reserved.add(symbol_key)
+                    attempted_by_symbol[symbol_key].add(vendor_name)
+                return batch
+
+        def release_batch(symbols: list[str], *, completed: list[str] | None = None) -> None:
+            completed_keys = {symbol.upper() for symbol in (completed or [])}
+            with state_lock:
+                for symbol in symbols:
+                    symbol_key = symbol.upper()
+                    reserved.discard(symbol_key)
+                    if symbol_key in completed_keys:
+                        remaining.discard(symbol_key)
+
+        def worker(capability):
+            connector = self.connectors[capability.vendor]
+            batch_size = self._capability_batch_size(capability)
+            vendor_frames: list[pd.DataFrame] = []
+            while not self._stop_event.is_set():
+                if capability.vendor in unavailable_vendors:
+                    return vendor_frames
+                batch = claim_batch(capability.vendor, batch_size)
+                if not batch:
+                    with state_lock:
+                        unresolved_for_vendor = any(
+                            symbol.upper() in remaining and capability.vendor not in attempted_by_symbol[symbol.upper()]
+                            for symbol in remaining_symbols
+                        )
+                        if not unresolved_for_vendor and not reserved:
+                            return vendor_frames
+                    sleep(0.01)
+                    continue
+                try:
+                    frame = connector.fetch(task.dataset, batch, task.start_date, task.end_date)
+                except PermanentConnectorError:
+                    unavailable_vendors.add(capability.vendor)
+                    release_batch(batch, completed=[])
+                    return vendor_frames
+                except ConnectorError as exc:
+                    if "budget exhausted" in str(exc):
+                        unavailable_vendors.add(capability.vendor)
+                    release_batch(batch, completed=[])
+                    return vendor_frames
+                if frame.empty:
+                    release_batch(batch, completed=[])
+                    continue
+                covered = (
+                    frame.get("symbol", pd.Series(dtype="string"))
+                    .dropna()
+                    .astype("string")
+                    .str.upper()
+                    .unique()
+                    .tolist()
+                )
+                release_batch(batch, completed=covered)
+                vendor_frames.append(frame)
+            return vendor_frames
+
+        futures: dict[object, str] = {}
+        with ThreadPoolExecutor(max_workers=max(1, sum(max(1, int(cap.lane_width or 1)) for cap in capabilities))) as executor:
+            for capability in capabilities:
+                for _ in range(max(1, int(capability.lane_width or 1))):
+                    futures[executor.submit(worker, capability)] = capability.vendor
+            for future in futures:
+                for frame in future.result():
+                    frames.append(frame)
+
+        changed_dates: list[str] = []
+        if frames:
+            changed_dates = self._write_raw_partition(pd.concat(frames, ignore_index=True), source_name=self.source_name)
+
+        merged = self._read_existing_partition(date=task.start_date)
+        merged_symbols = {
+            str(symbol).upper()
+            for symbol in merged.get("symbol", pd.Series(dtype="string")).dropna().astype("string").tolist()
+        }
+        expected_symbols = {symbol.upper() for symbol in self.default_symbols}
+        unresolved_count = len(expected_symbols.difference(merged_symbols))
+        if unresolved_count == 0:
+            self.db.mark_task_done(task.id)
+        else:
+            self.db.defer_task(task.id, reason=f"remaining_symbols={unresolved_count}", backoff_minutes=5)
+        return changed_dates
+
+    def _datewide_backfill_capabilities(self, *, dataset: str, preferred_vendor: str) -> list:
+        """Return eligible capabilities for a date-wide canonical task."""
+        capabilities = backfill_capabilities(
+            dataset=dataset,
+            connectors=self.connectors,
+            audit_state=self.capability_audit_state,
+        )
+        ordered = sorted(
+            capabilities,
+            key=lambda capability: (
+                0 if capability.vendor == preferred_vendor else 1,
+                capability.priority,
+                capability.vendor,
+            ),
+        )
+        return ordered
+
+    @staticmethod
+    def _capability_batch_size(capability) -> int:
+        """Return the batch size to use for a capability inside date-wide backfill dispatch."""
+        if capability.batching_mode == "multi_symbol":
+            return 100
+        return 1
+
+    def _read_existing_partition(self, *, date: str) -> pd.DataFrame:
+        """Read the existing canonical raw partition for a date if present."""
+        path = self.paths.raw_equities / f"date={date}" / "data.parquet"
+        if not path.exists():
+            return pd.DataFrame()
+        return pd.read_parquet(path)
+
+    def _merge_partition_frame(self, *, partition: Path, frame: pd.DataFrame) -> pd.DataFrame:
+        """Merge new rows into an existing raw partition without losing already collected symbols."""
+        existing_path = partition / "data.parquet"
+        existing = pd.read_parquet(existing_path) if existing_path.exists() else pd.DataFrame(columns=frame.columns)
+        combined = pd.concat([existing, frame], ignore_index=True)
+        if combined.empty:
+            return combined
+        if "vendor_ts" in combined.columns:
+            combined["vendor_ts"] = pd.to_datetime(combined["vendor_ts"], errors="coerce", utc=True)
+        if "ingested_at" in combined.columns:
+            combined["ingested_at"] = pd.to_datetime(combined["ingested_at"], errors="coerce", utc=True)
+        priority = self._canonical_vendor_priority()
+        combined["_vendor_priority"] = (
+            combined.get("source_name", pd.Series(dtype="string"))
+            .astype("string")
+            .map(priority)
+            .fillna(9999)
+            .astype(int)
+        )
+        sort_columns = ["date", "symbol", "_vendor_priority"]
+        ascending = [True, True, True]
+        if "vendor_ts" in combined.columns:
+            sort_columns.append("vendor_ts")
+            ascending.append(False)
+        if "ingested_at" in combined.columns:
+            sort_columns.append("ingested_at")
+            ascending.append(False)
+        combined = combined.sort_values(sort_columns, ascending=ascending)
+        combined = combined.drop_duplicates(subset=["date", "symbol"], keep="first")
+        return combined.drop(columns=["_vendor_priority"], errors="ignore").reset_index(drop=True)
+
+    def _canonical_vendor_priority(self) -> dict[str, int]:
+        """Return the canonical vendor preference ordering for equities backfill/forward rows."""
+        priorities: dict[str, int] = {}
+        for capability in forward_capabilities(
+            dataset="equities_eod",
+            connectors=self.connectors,
+            audit_state=self.capability_audit_state,
+        ) + backfill_capabilities(
+            dataset="equities_eod",
+            connectors=self.connectors,
+            audit_state=self.capability_audit_state,
+        ):
+            priorities[capability.vendor] = min(priorities.get(capability.vendor, capability.priority), capability.priority)
+        priorities.setdefault(self.source_name, 0)
+        return priorities
 
     def _run_reference_job(self, job: dict[str, object]) -> dict[str, object]:
         vendor = str(job["source"])
