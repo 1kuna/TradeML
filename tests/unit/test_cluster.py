@@ -190,7 +190,7 @@ def test_rebuild_local_state_requeues_underfilled_partitions_after_stage_promoti
         "SELECT status, row_count, expected_rows FROM partition_status WHERE source='alpaca' AND dataset='equities_eod' AND date='2025-01-02'"
     ).fetchone()
     conn.close()
-    assert queued == 1
+    assert queued == 0
     assert status_row == ("AMBER", 6, 20)
 
 

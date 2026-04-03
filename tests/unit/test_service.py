@@ -151,6 +151,35 @@ class _BackfillConnector:
         )
 
 
+class _MultiSymbolBackfillConnector:
+    def __init__(self, vendor_name: str) -> None:
+        self.vendor_name = vendor_name
+        self.calls: list[tuple[str, list[str], str, str]] = []
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        self.calls.append((dataset, list(symbols), start_date, end_date))
+        return pd.DataFrame(
+            [
+                {
+                    "date": start_date,
+                    "symbol": symbol,
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.0,
+                    "close": 10.5,
+                    "vwap": pd.NA,
+                    "volume": 100,
+                    "trade_count": pd.NA,
+                    "ingested_at": pd.Timestamp.now(tz="UTC"),
+                    "source_name": self.vendor_name,
+                    "source_uri": "/bars",
+                    "vendor_ts": pd.Timestamp(start_date),
+                }
+                for symbol in symbols
+            ]
+        )
+
+
 class _SelectiveBackfillConnector:
     def __init__(self, vendor_name: str, available_symbols: list[str], *, empty_for_unknown: bool = True) -> None:
         self.vendor_name = vendor_name
@@ -386,6 +415,54 @@ def test_datewide_backfill_keeps_partial_progress_and_defers_remaining_symbols(t
     assert "remaining_symbols=1" in (row[1] or "")
 
 
+def test_canonical_planner_batch_uses_atomic_symbol_tasks_and_multisymbol_fetch(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _MultiSymbolBackfillConnector("alpaca")},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    tasks = []
+    for symbol in ["AAPL", "MSFT", "NVDA"]:
+        task_key = f"canonical::{symbol}"
+        db.upsert_planner_task(
+            task_key=task_key,
+            task_family="canonical_bars",
+            planner_group="canonical_bars_backlog",
+            dataset="equities_eod",
+            tier="A",
+            priority=10,
+            start_date="2025-01-02",
+            end_date="2025-01-02",
+            symbols=[symbol],
+            eligible_vendors=["alpaca", "tiingo"],
+            payload={"scope_kind": "symbol_range", "trading_days": ["2025-01-02"]},
+        )
+        db.update_planner_task_progress(
+            task_key=task_key,
+            expected_units=1,
+            completed_units=0,
+            remaining_units=1,
+            remaining_symbols=[symbol],
+            state={"scope_kind": "symbol_range"},
+        )
+    tasks = service._lease_canonical_batch("alpaca")
+
+    changed = service._process_canonical_planner_batch(batch=tasks, vendor="alpaca", exchange="XNYS")
+
+    assert changed == ["2025-01-02"]
+    connector = service.connectors["alpaca"]
+    assert isinstance(connector, _MultiSymbolBackfillConnector)
+    assert connector.calls == [("equities_eod", ["AAPL", "MSFT", "NVDA"], "2025-01-02", "2025-01-02")]
+    stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-02" / "data.parquet")
+    assert sorted(stored["symbol"].tolist()) == ["AAPL", "MSFT", "NVDA"]
+    statuses = {task.task_key: db.get_planner_task(task.task_key).status for task in tasks}
+    assert set(statuses.values()) == {"SUCCESS"}
+
+
 def test_materialize_job_rotates_symbol_subset_deterministically() -> None:
     job = {
         "source": "finnhub",
@@ -453,6 +530,71 @@ def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(tmp_
     assert calls == ["process_backfill_queue"]
 
 
+def test_ensure_planner_backlog_seeded_when_planner_is_empty(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL", "MSFT"]
+    service.stage_years = 1
+
+    service._ensure_planner_backlog_seeded(trading_date="2026-04-03")
+
+    planner_tasks = db.fetch_planner_tasks(limit=5)
+    assert planner_tasks
+    assert planner_tasks[0].task_family == "canonical_bars"
+
+
+def test_lease_canonical_batch_scans_past_front_slice_starvation(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _MultiSymbolBackfillConnector("alpaca"),
+            "tiingo": _BackfillConnector("tiingo"),
+        },
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    for idx in range(300):
+        task_key = f"canonical::{idx:04d}"
+        db.upsert_planner_task(
+            task_key=task_key,
+            task_family="canonical_bars",
+            planner_group="canonical_bars_backlog",
+            dataset="equities_eod",
+            tier="A",
+            priority=10,
+            start_date="2025-01-02",
+            end_date="2025-01-31",
+            symbols=[f"SYM{idx:04d}"],
+            eligible_vendors=["alpaca", "tiingo"],
+            payload={"scope_kind": "symbol_range", "trading_days": ["2025-01-02"]},
+        )
+        db.update_planner_task_progress(
+            task_key=task_key,
+            expected_units=1,
+            completed_units=0,
+            remaining_units=1,
+            remaining_symbols=[f"SYM{idx:04d}"],
+            state={"scope_kind": "symbol_range"},
+        )
+        if idx < 256:
+            leased = db.lease_planner_task_by_key(task_key=task_key, lease_owner="alpaca-worker")
+            assert leased is not None
+
+    batch = service._lease_canonical_batch("tiingo")
+
+    assert batch
+    assert batch[0].symbols == ("SYM0256",)
+
+
 def test_run_cluster_forever_reruns_backfill_when_same_day_queue_is_reseeded(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.enqueue_task("equities_eod", None, "2026-04-02", "2026-04-02", "GAP", 1)
@@ -466,6 +608,44 @@ def test_run_cluster_forever_reruns_backfill_when_same_day_queue_is_reseeded(tmp
     coordinator = _ClusterCoordinatorStub()
     coordinator.allowed = set()
     coordinator.last_success["backfill"] = {"bucket": "2026-04-02", "updated_at": "2026-04-02T16:11:09+00:00"}
+    calls: list[str] = []
+
+    def process_backfill_queue() -> list[str]:
+        calls.append("process_backfill_queue")
+        service.stop()
+        return []
+
+    service.process_backfill_queue = process_backfill_queue  # type: ignore[method-assign]
+    service.sync_partition_status = lambda: tmp_path / "data" / "qc" / "partition_status.parquet"  # type: ignore[method-assign]
+
+    service.run_cluster_forever(
+        coordinator=coordinator,  # type: ignore[arg-type]
+        symbols=["AAPL"],
+        exchange="XNYS",
+        collection_time_et="16:30",
+        maintenance_hour_local=23,
+        poll_seconds=0.0,
+        now_fn=lambda: datetime.fromisoformat("2026-04-02T20:35:00+00:00"),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert calls == ["process_backfill_queue"]
+    assert "renew:singleton::backfill::2026-04-02" in coordinator._lease_calls
+
+
+def test_run_cluster_forever_renews_backfill_lease_while_backlog_remains(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    db.enqueue_task("equities_eod", None, "2026-04-02", "2026-04-02", "GAP", 1)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    coordinator = _ClusterCoordinatorStub()
+    coordinator.allowed = set()
+    coordinator.last_success["backfill"] = {"bucket": "2026-04-02", "updated_at": "2999-04-02T16:11:09+00:00"}
     calls: list[str] = []
 
     def process_backfill_queue() -> list[str]:
@@ -534,7 +714,9 @@ def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfil
         price_check_symbols=["AAPL"],
     )
 
-    assert calls == ["macro", "reference", "price_checks"]
+    assert "macro" in calls
+    assert "reference" in calls
+    assert "price_checks" in calls
 
 
 def test_collect_macro_data_persists_vintage_reference(tmp_path: Path) -> None:

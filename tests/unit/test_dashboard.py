@@ -241,6 +241,8 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert snapshot["budget_summary"]["day_capped_vendors"] == 1
     assert snapshot["budget_summary"]["rows"][0]["vendor"] == "alpaca"
     assert snapshot["budget_summary"]["rows"][1]["state"] == "day_capped"
+    assert snapshot["vendor_throughput"]["rows"][0]["vendor"] == "alpaca"
+    assert snapshot["planner_eta"] == {}
     assert "cycle done" in snapshot["log_tail"]
     assert snapshot["collection_status"]["coverage_percent"] > 0.0
     assert snapshot["collection_status"]["remaining_datapoints"] > 1
@@ -395,6 +397,46 @@ def test_start_node_persists_cluster_passphrase(tmp_path: Path) -> None:
 
     env_text = (workspace / ".env").read_text(encoding="utf-8")
     assert "TRADEML_CLUSTER_PASSPHRASE=pw123" in env_text
+
+
+def test_start_node_includes_stage_symbols_in_launch_command(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    stage_path = workspace / "stage.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    stage_path.write_text(yaml.safe_dump({"symbols": ["AAPL", "MSFT"]}, sort_keys=False), encoding="utf-8")
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    captured: dict[str, object] = {}
+
+    class _DummyProcess:
+        pid = 99999
+
+    def _fake_popen(command, **kwargs):
+        captured["command"] = command
+        return _DummyProcess()
+
+    monkeypatch.setattr(dashboard_controller.subprocess, "Popen", _fake_popen)
+
+    runtime = start_node(settings)
+
+    assert runtime["command"][-3:] == ["--symbols", "AAPL", "MSFT"] or runtime["command"][-4:] == ["--symbols", "AAPL", "MSFT"]
+    assert "--symbols" in captured["command"]
 
 
 def test_advance_collection_stage_updates_stage_manifest_and_queue(tmp_path: Path, monkeypatch) -> None:

@@ -17,14 +17,20 @@ from time import sleep
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pyarrow.dataset as ds
 
-from trademl.calendars.exchange import is_trading_day
+from trademl.calendars.exchange import get_trading_days, is_trading_day
 from trademl.connectors.base import BaseConnector, ConnectorError, PermanentConnectorError, TemporaryConnectorError
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.capabilities import auxiliary_capabilities, backfill_capabilities, default_macro_series, forward_capabilities
 from trademl.data_node.curator import Curator, CuratorResult
-from trademl.data_node.db import DataNodeDB
-from trademl.data_node.planner import canonical_task_key, choose_vendor_for_canonical_task, plan_auxiliary_tasks
+from trademl.data_node.db import DataNodeDB, PlannerTask
+from trademl.data_node.planner import (
+    canonical_task_key,
+    choose_vendor_for_canonical_task,
+    plan_auxiliary_tasks,
+    plan_coverage_tasks,
+)
 from trademl.fleet.cluster import ClusterCoordinator, ShardSpec
 from trademl.reference.security_master import rebuild_derived_references
 
@@ -175,7 +181,27 @@ class DataNodeService:
         return self._write_raw_shard_partition(frame, shard_id=shard_id, source_name=source_name)
 
     def process_backfill_queue(self) -> list[str]:
-        """Process queued backfill or gap tasks with vendor-parallel lanes."""
+        """Compatibility wrapper that now drains the planner-native queue."""
+        if len(self.default_symbols) > 1 and not self.db.has_pending_planner_tasks(task_families=("canonical_bars",)) and self.db.has_pending_backfill():
+            self._seed_planner_tasks()
+            if self.db.has_pending_planner_tasks(task_families=("canonical_bars",)):
+                migrated = self.db.mark_legacy_datewide_backfill_migrated()
+                if migrated:
+                    LOGGER.info("migrated_legacy_backfill_rows count=%s", migrated)
+                return self.process_planner_queue()
+        if self.default_symbols and self.db.has_pending_datewide_backfill():
+            self._seed_planner_tasks()
+            if self.db.has_pending_planner_tasks(task_families=("canonical_bars",)):
+                migrated = self.db.mark_legacy_datewide_backfill_migrated()
+                if migrated:
+                    LOGGER.info("migrated_legacy_datewide_backfill count=%s", migrated)
+                return self.process_planner_queue()
+        if self.db.has_pending_backfill():
+            return self._process_legacy_backfill_queue()
+        return self.process_planner_queue()
+
+    def _process_legacy_backfill_queue(self) -> list[str]:
+        """Drain legacy date/symbol backfill rows during the migration window."""
         lane_widths = self._backfill_lane_widths()
         if not lane_widths:
             return []
@@ -205,6 +231,177 @@ class DataNodeService:
             for future in list(futures):
                 changed_dates.extend(future.result())
         return sorted(set(changed_dates))
+
+    def process_planner_queue(self, *, trading_date: str | None = None, exchange: str = "XNYS") -> list[str]:
+        """Process planner-native canonical and auxiliary work."""
+        self._seed_planner_tasks(trading_date=trading_date)
+        changed_dates: list[str] = []
+        futures: dict[object, str] = {}
+        canonical_lane_widths = self._backfill_lane_widths()
+        aux_lane_widths = self._aux_lane_widths(task_kinds={"REFERENCE", "EVENT", "MACRO"})
+        max_workers = max(1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values()))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for vendor, width in canonical_lane_widths.items():
+                for _ in range(max(1, width)):
+                    futures[executor.submit(self._drain_canonical_lane, vendor, exchange)] = "canonical"
+            for vendor, width in aux_lane_widths.items():
+                for _ in range(max(1, width)):
+                    futures[executor.submit(self._drain_auxiliary_lane, vendor)] = "auxiliary"
+            for future, task_type in futures.items():
+                result = future.result()
+                if task_type == "canonical":
+                    changed_dates.extend(result)
+        return sorted(set(changed_dates))
+
+    def _seed_planner_tasks(self, *, trading_date: str | None = None) -> None:
+        """Seed or refresh planner tasks from the current stage definition."""
+        if not self.default_symbols:
+            return
+        as_of_date = trading_date or datetime.now(tz=UTC).date().isoformat()
+        planned = plan_coverage_tasks(
+            data_root=self.paths.root,
+            stage_symbols=self.default_symbols,
+            stage_years=self.stage_years,
+            connectors=self.connectors,
+            audit_state=self.capability_audit_state,
+            current_date=as_of_date,
+        )
+        coverage_index = self._build_canonical_coverage_index() if any(task.task_family == "canonical_bars" for task in planned) else {}
+        task_rows: list[dict[str, object]] = []
+        progress_rows: list[dict[str, object]] = []
+        for task in planned:
+            task_family = task.task_family
+            if task_family == "auxiliary":
+                task_family = self._planner_family_for_dataset(task.dataset)
+            task_rows.append(
+                {
+                    "task_key": task.task_key,
+                    "task_family": task_family,
+                    "planner_group": task.planner_group,
+                    "dataset": task.dataset,
+                    "tier": task.tier,
+                    "priority": task.priority,
+                    "start_date": task.start_date,
+                    "end_date": task.end_date,
+                    "symbols": list(task.symbols),
+                    "eligible_vendors": list(task.preferred_vendors),
+                    "output_name": task.output_name,
+                    "payload": task.payload,
+                }
+            )
+        self.db.bulk_upsert_planner_tasks(task_rows)
+        existing_progress_map = self.db.planner_task_progress_map()
+        for task in planned:
+            task_family = task.task_family
+            if task_family == "auxiliary":
+                task_family = self._planner_family_for_dataset(task.dataset)
+            if task_family == "canonical_bars":
+                existing_progress = existing_progress_map.get(task.task_key)
+                progress_payload = self._canonical_progress_for_scope(
+                    symbols=list(task.symbols),
+                    trading_days=list(task.payload.get("trading_days", [])),
+                    coverage_index=coverage_index,
+                )
+                if existing_progress is not None and existing_progress.completed_units == progress_payload["completed_units"] and existing_progress.remaining_units == progress_payload["remaining_units"]:
+                    continue
+                progress_rows.append(
+                    {
+                        "task_key": task.task_key,
+                        "expected_units": progress_payload["expected_units"],
+                        "completed_units": progress_payload["completed_units"],
+                        "remaining_units": progress_payload["remaining_units"],
+                        "completed_symbols": progress_payload["completed_symbols"],
+                        "remaining_symbols": progress_payload["remaining_symbols"],
+                        "state": {"scope_kind": task.scope_kind},
+                    }
+                )
+            else:
+                if task.task_key in existing_progress_map:
+                    continue
+                progress_rows.append(
+                    {
+                        "task_key": task.task_key,
+                        "expected_units": 1,
+                        "completed_units": 0,
+                        "remaining_units": 1,
+                        "state": {"scope_kind": task.scope_kind},
+                    }
+                )
+        self.db.bulk_update_planner_task_progress(progress_rows)
+
+    def _drain_canonical_lane(self, vendor: str, exchange: str) -> list[str]:
+        """Drain canonical planner tasks for a single vendor lane."""
+        changed_dates: list[str] = []
+        while not self._stop_event.is_set():
+            batch = self._lease_canonical_batch(vendor)
+            if not batch:
+                break
+            changed_dates.extend(self._process_canonical_planner_batch(batch=batch, vendor=vendor, exchange=exchange))
+        return changed_dates
+
+    def _drain_auxiliary_lane(self, vendor: str) -> list[str]:
+        """Drain auxiliary planner tasks for a single vendor lane."""
+        while not self._stop_event.is_set():
+            task = self.db.lease_next_planner_task(
+                lease_owner=self.worker_id,
+                task_families=("security_master", "corp_actions", "events_filings", "macro", "supplemental_research"),
+                vendor=vendor,
+            )
+            if task is None:
+                break
+            self._process_auxiliary_planner_task(task, vendor)
+        return []
+
+    def _lease_canonical_batch(self, vendor: str) -> list[PlannerTask]:
+        """Lease a vendor-compatible batch of canonical planner tasks."""
+        capability = self._canonical_capability(vendor)
+        if capability is None:
+            return []
+        batch_limit = self._capability_batch_size(capability)
+        now_iso = datetime.now(tz=UTC).isoformat()
+        base_task: PlannerTask | None = None
+        candidates: list[PlannerTask] = []
+        scan_limit = max(256, batch_limit * 8)
+        for page in range(16):
+            page_candidates = self.db.fetch_planner_tasks(
+                task_family="canonical_bars",
+                statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+                limit=scan_limit,
+                offset=page * scan_limit,
+            )
+            if not page_candidates:
+                break
+            candidates.extend(page_candidates)
+            for candidate in page_candidates:
+                if not self._planner_task_vendor_eligible(candidate, vendor=vendor, now_iso=now_iso):
+                    continue
+                leased = self.db.lease_planner_task_by_key(task_key=candidate.task_key, lease_owner=self.worker_id)
+                if leased is not None:
+                    base_task = leased
+                    break
+            if base_task is not None:
+                break
+        if base_task is None:
+            return []
+        batch = [base_task]
+        if capability.batching_mode != "multi_symbol":
+            return batch
+        symbol_count = sum(len(task.symbols) for task in batch)
+        for candidate in candidates:
+            if symbol_count >= batch_limit:
+                break
+            if candidate.task_key == base_task.task_key:
+                continue
+            if candidate.dataset != base_task.dataset or candidate.start_date != base_task.start_date or candidate.end_date != base_task.end_date:
+                continue
+            if not self._planner_task_vendor_eligible(candidate, vendor=vendor, now_iso=now_iso):
+                continue
+            leased = self.db.lease_planner_task_by_key(task_key=candidate.task_key, lease_owner=self.worker_id)
+            if leased is None:
+                continue
+            batch.append(leased)
+            symbol_count += len(leased.symbols)
+        return batch
 
     def collect_reference_data(self, jobs: list[dict[str, object]]) -> ReferenceCollectionResult:
         """Collect reference datasets into parquet files."""
@@ -256,6 +453,8 @@ class DataNodeService:
         connector = self.connectors["fred"]
         frame = connector.fetch("macros_treasury", series_ids, start_date, end_date)
         outputs: list[Path] = []
+        if frame.empty or "series_id" not in frame.columns:
+            return outputs
         for series_id, series_frame in frame.groupby("series_id"):
             partition = self.paths.root / "data" / "raw" / "macros_fred" / f"series={series_id}"
             partition.mkdir(parents=True, exist_ok=True)
@@ -263,7 +462,7 @@ class DataNodeService:
             series_frame.to_parquet(output, index=False)
             outputs.append(output)
         vintages = connector.fetch("vintagedates", series_ids, start_date, end_date)
-        if not vintages.empty:
+        if not vintages.empty and {"series_id", "vintage_date"}.issubset(vintages.columns):
             self.paths.reference_root.mkdir(parents=True, exist_ok=True)
             vintage_output = self.paths.reference_root / "fred_vintagedates.parquet"
             if vintage_output.exists():
@@ -443,6 +642,7 @@ class DataNodeService:
             current_local = current.astimezone()
             trading_date = current_et.date().isoformat()
             owned_shards = coordinator.sync_shard_leases()
+            self._ensure_planner_backlog_seeded(trading_date=trading_date)
 
             if self._should_run_collection(
                 trading_date=trading_date,
@@ -483,7 +683,7 @@ class DataNodeService:
                 current_local=current_local,
                 maintenance_hour_local=maintenance_hour_local,
             )
-            should_drain_backlog = self.db.has_pending_backfill()
+            should_drain_backlog = self.db.has_pending_planner_tasks() or self.db.has_pending_backfill()
             if should_run_maintenance or should_drain_backlog:
                 if self._acquire_backfill_singleton(coordinator=coordinator, bucket_key=local_day, pending_backfill=should_drain_backlog):
                     changed_dates = self.process_backfill_queue()
@@ -495,7 +695,7 @@ class DataNodeService:
 
             # Once EOD bars are fully present, opportunistically fill the slower
             # auxiliary datasets instead of waiting for the next scheduled lane.
-            if not self.db.has_pending_backfill():
+            if not self.db.has_pending_planner_tasks(task_families=("canonical_bars",)) and not self.db.has_pending_backfill():
                 anchor_date = self._latest_raw_date()
                 if anchor_date:
                     self._run_cluster_auxiliary_tasks(
@@ -540,6 +740,7 @@ class DataNodeService:
             current_et = current.astimezone(market_tz)
             current_local = current.astimezone()
             trading_date = current_et.date()
+            self._ensure_planner_backlog_seeded(trading_date=trading_date.isoformat())
 
             if self._should_run_collection(
                 trading_date=trading_date.isoformat(),
@@ -606,6 +807,14 @@ class DataNodeService:
             return False
         return True
 
+    def _ensure_planner_backlog_seeded(self, *, trading_date: str) -> None:
+        """Seed planner tasks when the local planner ledger is empty."""
+        if not self.default_symbols:
+            return
+        if self.db.fetch_planner_tasks(limit=1):
+            return
+        self._seed_planner_tasks(trading_date=trading_date)
+
     def _should_run_maintenance(self, *, local_day: str, current_local: datetime, maintenance_hour_local: int) -> bool:
         return local_day not in self._maintenance_history and current_local.hour >= maintenance_hour_local
 
@@ -638,6 +847,9 @@ class DataNodeService:
         if not pending_backfill:
             return False
         if not self._backfill_needs_rerun(coordinator=coordinator, bucket_key=bucket_key):
+            renew = getattr(coordinator, "acquire_or_renew_lease", None)
+            if callable(renew):
+                return bool(renew(f"singleton::backfill::{bucket_key}"))
             return False
         renew = getattr(coordinator, "acquire_or_renew_lease", None)
         if callable(renew):
@@ -653,10 +865,12 @@ class DataNodeService:
         if str(state.get("bucket")) != bucket_key:
             return False
         last_success = state.get("updated_at")
+        latest_planner_update = self.db.latest_planner_update(statuses=("PENDING", "PARTIAL", "FAILED"))
         latest_queue_update = self.db.latest_queue_update(statuses=("PENDING", "FAILED"))
-        if not last_success or not latest_queue_update:
+        latest_update = max(str(latest_planner_update or ""), str(latest_queue_update or ""))
+        if not last_success or not latest_update:
             return False
-        return str(latest_queue_update) > str(last_success)
+        return latest_update > str(last_success)
 
     @staticmethod
     def _week_key(current_et: datetime) -> str:
@@ -671,6 +885,267 @@ class DataNodeService:
                 latest = value
         return latest
 
+    @staticmethod
+    def _planner_family_for_dataset(dataset: str) -> str:
+        """Map auxiliary datasets into planner task families."""
+        if dataset in {"assets", "listings", "reference_tickers", "stocks", "delistings", "symbol_changes", "company_tickers"}:
+            return "security_master"
+        if dataset in {"corp_actions", "reference_dividends", "reference_splits", "dividends", "splits"}:
+            return "corp_actions"
+        if dataset in {"filing_index", "companyfacts", "earnings_calendar"}:
+            return "events_filings"
+        if dataset in {"macros_treasury", "vintagedates"}:
+            return "macro"
+        return "supplemental_research"
+
+    def _process_canonical_planner_task(self, task: PlannerTask, exchange: str) -> list[str]:
+        """Compatibility wrapper for a single planner task."""
+        vendor = next((name for name in task.eligible_vendors if self._canonical_capability(name) is not None), None)
+        if vendor is None:
+            self.db.mark_planner_task_failed(task.task_key, error="no eligible canonical vendors", backoff_minutes=5)
+            return []
+        return self._process_canonical_planner_batch(batch=[task], vendor=vendor, exchange=exchange)
+
+    def _process_canonical_planner_batch(self, *, batch: list[PlannerTask], vendor: str, exchange: str) -> list[str]:
+        """Process a vendor-compatible batch of atomic canonical tasks."""
+        if not batch:
+            return []
+        connector = self.connectors[vendor]
+        dataset = batch[0].dataset
+        start_date = batch[0].start_date
+        end_date = batch[0].end_date
+        leased_tasks: list[PlannerTask] = []
+        symbols: list[str] = []
+        for task in batch:
+            attempt = self.db.lease_vendor_attempt(
+                task_key=task.task_key,
+                task_family=task.task_family,
+                planner_group=task.planner_group,
+                vendor=vendor,
+                lease_owner=self.worker_id,
+                payload={"symbols": list(task.symbols), "start_date": task.start_date, "end_date": task.end_date},
+            )
+            if attempt is None:
+                self.db.mark_planner_task_partial(task.task_key, error=f"{vendor}: attempt unavailable", backoff_minutes=5)
+                continue
+            leased_tasks.append(task)
+            symbols.extend(list(task.symbols))
+        if not leased_tasks:
+            return []
+
+        try:
+            frame = connector.fetch(dataset, symbols, start_date, end_date)
+        except PermanentConnectorError as exc:
+            for task in leased_tasks:
+                self.db.mark_vendor_attempt_failed(task_key=task.task_key, vendor=vendor, error=str(exc), backoff_minutes=0, permanent=True)
+                self.db.mark_planner_task_failed(task.task_key, error=f"{vendor}: {exc}", backoff_minutes=15, permanent=True)
+            return []
+        except ConnectorError as exc:
+            message = str(exc)
+            backoff = 30 if "budget exhausted" in message else 15
+            for task in leased_tasks:
+                self.db.mark_vendor_attempt_failed(task_key=task.task_key, vendor=vendor, error=message, backoff_minutes=backoff)
+                self.db.mark_planner_task_partial(task.task_key, error=f"{vendor}: {message}", backoff_minutes=backoff)
+            return []
+
+        changed_dates: list[str] = []
+        if not frame.empty:
+            changed_dates = self._write_raw_partition(frame, source_name=vendor)
+        progress_map = self._canonical_batch_progress(tasks=leased_tasks, exchange=exchange)
+        normalized_symbols = (
+            frame.get("symbol", pd.Series(dtype="string")).dropna().astype("string").str.upper().tolist()
+            if not frame.empty
+            else []
+        )
+        for task in leased_tasks:
+            task_symbols = {symbol.upper() for symbol in task.symbols}
+            task_rows = int(sum(1 for symbol in normalized_symbols if symbol in task_symbols))
+            if task_rows > 0:
+                self.db.mark_vendor_attempt_success(task_key=task.task_key, vendor=vendor, rows_returned=task_rows)
+            else:
+                self.db.mark_vendor_attempt_failed(
+                    task_key=task.task_key,
+                    vendor=vendor,
+                    error="empty planner canonical result",
+                    backoff_minutes=15,
+                )
+            progress_payload = progress_map[task.task_key]
+            self.db.update_planner_task_progress(
+                task_key=task.task_key,
+                expected_units=progress_payload["expected_units"],
+                completed_units=progress_payload["completed_units"],
+                remaining_units=progress_payload["remaining_units"],
+                completed_symbols=progress_payload["completed_symbols"],
+                remaining_symbols=progress_payload["remaining_symbols"],
+                state={"trading_days": progress_payload["trading_days"], "scope_kind": task.payload.get("scope_kind", "symbol_range")},
+            )
+            if progress_payload["remaining_units"] == 0:
+                self.db.mark_planner_task_success(task.task_key)
+            else:
+                self.db.mark_planner_task_partial(
+                    task.task_key,
+                    error=f"remaining_units={progress_payload['remaining_units']}",
+                    backoff_minutes=5,
+                )
+        return changed_dates
+
+    def _canonical_task_progress(self, *, task: PlannerTask, exchange: str) -> dict[str, object]:
+        """Compute symbol-date coverage for a canonical planner task from raw partitions."""
+        trading_days = list(task.payload.get("trading_days", []))
+        if not trading_days:
+            trading_days = [day.isoformat() for day in get_trading_days(exchange, pd.Timestamp(task.start_date).date(), pd.Timestamp(task.end_date).date())]
+        return self._canonical_progress_for_scope(symbols=list(task.symbols), trading_days=trading_days)
+
+    def _canonical_progress_for_scope(
+        self,
+        *,
+        symbols: list[str],
+        trading_days: list[str],
+        coverage_index: dict[str, set[str]] | None = None,
+    ) -> dict[str, object]:
+        """Compute canonical symbol-date coverage for a given task scope."""
+        symbol_set = {symbol.upper() for symbol in symbols}
+        present_pairs: set[tuple[str, str]] = set()
+        counts_by_symbol = {symbol.upper(): 0 for symbol in symbols}
+        if coverage_index is None:
+            coverage_index = self._build_canonical_coverage_index(trading_days=trading_days)
+        for symbol in symbol_set:
+            present_days = coverage_index.get(symbol, set())
+            for day in trading_days:
+                if day not in present_days:
+                    continue
+                pair = (day, symbol)
+                if pair in present_pairs:
+                    continue
+                present_pairs.add(pair)
+                counts_by_symbol[symbol] = counts_by_symbol.get(symbol, 0) + 1
+        completed_symbols = sorted(symbol for symbol, count in counts_by_symbol.items() if count >= len(trading_days))
+        remaining_symbols = sorted(symbol for symbol, count in counts_by_symbol.items() if count < len(trading_days))
+        expected_units = len(symbol_set) * len(trading_days)
+        completed_units = len(present_pairs)
+        remaining_units = max(0, expected_units - completed_units)
+        return {
+            "trading_days": trading_days,
+            "completed_symbols": completed_symbols,
+            "remaining_symbols": remaining_symbols,
+            "expected_units": expected_units,
+            "completed_units": completed_units,
+            "remaining_units": remaining_units,
+        }
+
+    def _canonical_batch_progress(self, *, tasks: list[PlannerTask], exchange: str) -> dict[str, dict[str, object]]:
+        """Compute canonical progress for a homogeneous task batch."""
+        trading_days = list(tasks[0].payload.get("trading_days", []))
+        if not trading_days:
+            trading_days = [
+                day.isoformat()
+                for day in get_trading_days(exchange, pd.Timestamp(tasks[0].start_date).date(), pd.Timestamp(tasks[0].end_date).date())
+            ]
+        coverage_index = self._build_canonical_coverage_index(trading_days=trading_days)
+        return {
+            task.task_key: self._canonical_progress_for_scope(
+                symbols=list(task.symbols),
+                trading_days=trading_days,
+                coverage_index=coverage_index,
+            )
+            for task in tasks
+        }
+
+    def _build_canonical_coverage_index(self, *, trading_days: list[str] | None = None) -> dict[str, set[str]]:
+        """Return the existing canonical coverage index keyed by symbol."""
+        coverage: dict[str, set[str]] = defaultdict(set)
+        if not self.paths.raw_equities.exists():
+            return coverage
+        try:
+            dataset = ds.dataset(self.paths.raw_equities, format="parquet", partitioning="hive")
+            filter_expression = None
+            if trading_days:
+                filter_expression = ds.field("date").isin(list(trading_days))
+            table = dataset.to_table(columns=["symbol", "date"], filter=filter_expression)
+            if table.num_rows == 0:
+                return coverage
+            frame = table.to_pandas()
+            if frame.empty:
+                return coverage
+            normalized = frame.dropna(subset=["symbol", "date"]).copy()
+            normalized["symbol"] = normalized["symbol"].astype("string").str.upper()
+            normalized["date"] = normalized["date"].astype("string")
+            for row in normalized.drop_duplicates(subset=["symbol", "date"]).itertuples(index=False):
+                coverage[str(row.symbol)].add(str(row.date))
+            return coverage
+        except Exception:  # pragma: no cover - fallback for older pyarrow/dataset quirks
+            days = trading_days or [path.name.partition("=")[2] for path in sorted(self.paths.raw_equities.glob("date=*")) if "=" in path.name]
+            for day in days:
+                path = self.paths.raw_equities / f"date={day}" / "data.parquet"
+                if not path.exists():
+                    continue
+                frame = pd.read_parquet(path, columns=["symbol"])
+                if frame.empty:
+                    continue
+                for symbol in frame["symbol"].dropna().astype("string").str.upper().tolist():
+                    coverage[symbol].add(day)
+        return coverage
+
+    def _process_auxiliary_planner_task(self, task: PlannerTask, vendor: str) -> list[str]:
+        """Run a single planner-native auxiliary task."""
+        leased = self.db.lease_vendor_attempt(
+            task_key=task.task_key,
+            task_family=task.task_family,
+            planner_group=task.planner_group,
+            vendor=vendor,
+            lease_owner=self.worker_id,
+            payload={"symbols": list(task.symbols), "dataset": task.dataset},
+        )
+        if leased is None:
+            self.db.mark_planner_task_partial(task.task_key, error=f"{vendor}: attempt unavailable", backoff_minutes=5)
+            return []
+        if task.task_family == "macro":
+            try:
+                self.collect_macro_data(list(task.symbols), task.start_date, task.end_date)
+            except ConnectorError as exc:
+                self.db.mark_vendor_attempt_failed(task_key=task.task_key, vendor=vendor, error=str(exc), backoff_minutes=15)
+                self.db.mark_planner_task_failed(task.task_key, error=str(exc), backoff_minutes=15)
+                return []
+            self.db.mark_vendor_attempt_success(task_key=task.task_key, vendor=vendor, rows_returned=len(task.symbols))
+            self.db.update_planner_task_progress(
+                task_key=task.task_key,
+                expected_units=1,
+                completed_units=1,
+                remaining_units=0,
+                state={"dataset": task.dataset},
+            )
+            self.db.mark_planner_task_success(task.task_key)
+            return []
+
+        job = {
+            "source": vendor,
+            "dataset": task.dataset,
+            "symbols": list(task.symbols),
+            "start_date": task.start_date,
+            "end_date": task.end_date,
+            "output_name": task.output_name or task.dataset,
+            "planner_group": task.planner_group,
+            "explode_symbols": False,
+            "tier": task.tier,
+        }
+        result = self._run_reference_job(job)
+        if result["failures"]:
+            self.db.mark_planner_task_failed(task.task_key, error=" | ".join(result["failures"]), backoff_minutes=15)
+        elif result["deferred"]:
+            self.db.mark_planner_task_partial(task.task_key, error="deferred", backoff_minutes=30)
+        elif result["outputs"]:
+            self.db.update_planner_task_progress(
+                task_key=task.task_key,
+                expected_units=1,
+                completed_units=1,
+                remaining_units=0,
+                state={"outputs": result["outputs"]},
+            )
+            self.db.mark_planner_task_success(task.task_key)
+        else:
+            self.db.mark_planner_task_partial(task.task_key, error="empty result", backoff_minutes=15)
+        return []
+
     def _run_cluster_auxiliary_tasks(
         self,
         *,
@@ -681,10 +1156,13 @@ class DataNodeService:
         reference_jobs: list[dict[str, object]] | None,
         price_check_symbols: list[str] | None,
     ) -> None:
+        planner_managed_aux = self.db.has_pending_planner_tasks(
+            task_families=("security_master", "corp_actions", "events_filings", "macro", "supplemental_research")
+        )
         planned_macro_series, planned_reference_jobs = self._planned_auxiliary_work(trading_date=trading_date)
         effective_macro_series = planned_macro_series or list(macro_series_ids or [])
         effective_reference_jobs = planned_reference_jobs or list(reference_jobs or [])
-        if effective_macro_series and "fred" in self.connectors and coordinator.acquire_singleton("macro", trading_date):
+        if not planner_managed_aux and effective_macro_series and "fred" in self.connectors and coordinator.acquire_singleton("macro", trading_date):
             try:
                 self.collect_macro_data(effective_macro_series, trading_date, trading_date)
             except ConnectorError:
@@ -694,7 +1172,7 @@ class DataNodeService:
 
         week_key = self._week_key(current_et)
         reference_bucket = trading_date if self._core_auxiliary_incomplete() else week_key
-        if effective_reference_jobs and coordinator.acquire_singleton("reference", reference_bucket):
+        if not planner_managed_aux and effective_reference_jobs and coordinator.acquire_singleton("reference", reference_bucket):
             materialized_jobs = [self._materialize_job(job, trading_date) for job in effective_reference_jobs]
             result = self.collect_reference_data(materialized_jobs)
             if isinstance(result, list):
@@ -1104,6 +1582,41 @@ class DataNodeService:
             ),
         )
         return ordered
+
+    def _canonical_capability(self, vendor: str):
+        """Return the canonical bar capability for a specific vendor."""
+        for capability in backfill_capabilities(
+            dataset="equities_eod",
+            connectors=self.connectors,
+            audit_state=self.capability_audit_state,
+        ):
+            if capability.vendor == vendor:
+                return capability
+        return None
+
+    def _planner_task_vendor_eligible(self, task: PlannerTask, *, vendor: str, now_iso: str) -> bool:
+        """Return whether a planner task can be attempted by the given vendor now."""
+        capability = self._canonical_capability(vendor)
+        if capability is None:
+            return False
+        if vendor not in task.eligible_vendors:
+            return False
+        if task.status == "LEASED" and task.lease_expires_at and task.lease_expires_at > now_iso and task.lease_owner != self.worker_id:
+            return False
+        if task.next_eligible_at and task.next_eligible_at > now_iso:
+            return False
+        if capability.batching_mode == "single_symbol" and len(task.symbols) != 1:
+            return False
+        for attempt in self.db.vendor_attempts_for_task(task.task_key):
+            if attempt.vendor != vendor:
+                continue
+            if attempt.status in {"SUCCESS", "PERMANENT_FAILED"}:
+                return False
+            if attempt.status == "LEASED" and attempt.lease_expires_at and attempt.lease_expires_at > now_iso and attempt.lease_owner != self.worker_id:
+                return False
+            if attempt.status == "FAILED" and attempt.next_eligible_at and attempt.next_eligible_at > now_iso:
+                return False
+        return True
 
     @staticmethod
     def _capability_batch_size(capability) -> int:

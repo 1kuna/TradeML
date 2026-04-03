@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import UTC, datetime
 import os
 from pathlib import Path
 
@@ -197,16 +198,21 @@ def main() -> int:
     db = DataNodeDB(local_state / "node.sqlite")
     service.db = db
     service.auditor.db = db
+    active_symbols = symbols or manifest["stage"]["symbols"]
+    service.default_symbols = list(active_symbols)
+    service._ensure_planner_backlog_seeded(
+        trading_date=(args.date or datetime.now(tz=UTC).date().isoformat())
+    )
     service.run_cluster_forever(
         coordinator=coordinator,
-        symbols=symbols or manifest["stage"]["symbols"],
+        symbols=active_symbols,
         exchange=manifest["datasets"]["equities_eod"].get("exchange", "XNYS"),
         collection_time_et=os.getenv("COLLECTION_TIME_ET", manifest["schedule"]["collection_time_et"]),
         maintenance_hour_local=int(os.getenv("MAINTENANCE_HOUR_LOCAL", manifest["schedule"]["maintenance_hour_local"])),
         poll_seconds=args.poll_seconds,
         macro_series_ids=default_macro_series() if "fred" in connectors else [],
         reference_jobs=reference_jobs,
-        price_check_symbols=(symbols or manifest["stage"]["symbols"])[:5] if {"massive", "finnhub"}.issubset(connectors) else [],
+        price_check_symbols=active_symbols[:5] if {"massive", "finnhub"}.issubset(connectors) else [],
     )
     return 0
 

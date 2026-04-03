@@ -80,8 +80,11 @@ def main() -> None:
     training_status = snapshot["training_status"]
     train_operational_status = snapshot["train_operational_status"]
     suggested_training_commands = snapshot["suggested_training_commands"]
+    dataset_coverage = snapshot["dataset_coverage"]
     vendor_attempt_summary = snapshot["vendor_attempt_summary"]
+    vendor_throughput = snapshot["vendor_throughput"]
     budget_summary = snapshot["budget_summary"]
+    planner_eta = snapshot["planner_eta"]
     cluster = snapshot["cluster"]
     audit = snapshot["audit"]
     coverage_plan = snapshot["coverage_plan"]
@@ -99,11 +102,13 @@ def main() -> None:
         st.rerun()
     controls[3].metric("Node Status", "Running" if running else "Stopped", f"PID {runtime.get('pid', '-')}")
 
-    summary_cols = st.columns(4)
+    summary_cols = st.columns(5)
     summary_cols[0].metric("Collected", f"{collection_status['coverage_percent']:.1f}%")
     summary_cols[1].metric("Left To Collect", f"{collection_status['remaining_percent']:.1f}%")
     summary_cols[2].metric("Remaining Datapoints", f"{collection_status['remaining_datapoints']:,}")
-    summary_cols[3].metric("Train Status", train_operational_status.replace("_", " ").title())
+    summary_cols[3].metric("Train Ready", f"{collection_status['training_ready_percent']:.1f}%")
+    canonical_eta = planner_eta.get("canonical_bars", {}).get("eta_minutes")
+    summary_cols[4].metric("Bars ETA", _format_eta(canonical_eta))
 
     st.progress(collection_status["coverage_ratio"], text=f"Collection coverage: {collection_status['coverage_percent']:.1f}%")
 
@@ -120,6 +125,22 @@ def main() -> None:
         status_cols[0].metric("Queue Pending", collection_status["pending_tasks"])
         status_cols[1].metric("Queue Failed", collection_status["failed_tasks"])
         status_cols[2].metric("Latest Raw Date", snapshot["latest_raw_date"] or "-")
+
+        coverage_rows = [
+            {
+                "dataset": details["label"],
+                "coverage_percent": round(float(details["ratio"]) * 100.0, 1),
+                "remaining_units": int(details.get("remaining_units", 0)),
+                "eta": _format_eta(details.get("eta_minutes")),
+                "blocking": bool(details["blocking"]),
+            }
+            for details in dataset_coverage.values()
+        ]
+        st.subheader("Training-Critical Coverage")
+        st.dataframe(coverage_rows, use_container_width=True, hide_index=True)
+
+        st.subheader("Vendor Activity")
+        st.dataframe(vendor_throughput["rows"], use_container_width=True, hide_index=True)
 
         training_cols = st.columns(2)
         with training_cols[0]:
@@ -312,6 +333,19 @@ def _format_ratio(value: float | None) -> str:
     if value is None:
         return "-"
     return f"{value:.1%}"
+
+
+def _format_eta(value: float | None) -> str:
+    if value is None:
+        return "-"
+    minutes = max(0, int(round(float(value))))
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {remaining_minutes}m"
+    days, remaining_hours = divmod(hours, 24)
+    return f"{days}d {remaining_hours}h"
 
 
 if __name__ == "__main__":

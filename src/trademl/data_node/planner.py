@@ -9,6 +9,7 @@ from typing import Any
 
 import pandas as pd
 
+from trademl.calendars.exchange import get_trading_days
 from trademl.data_node.capabilities import (
     VendorCapability,
     auxiliary_capabilities,
@@ -34,6 +35,11 @@ class PlannedTask:
     output_name: str | None
     preferred_vendors: tuple[str, ...]
     payload: dict[str, Any]
+
+    @property
+    def scope_kind(self) -> str:
+        """Return the planner task scope kind."""
+        return str(self.payload.get("scope_kind", "generic"))
 
 
 def canonical_task_key(task: BackfillTask) -> str:
@@ -105,6 +111,109 @@ def plan_auxiliary_tasks(
         )
         tasks.extend(task_specs)
     return sorted(tasks, key=lambda task: (task.priority, task.task_key))
+
+
+def plan_canonical_bar_tasks(
+    *,
+    stage_symbols: list[str],
+    stage_years: int,
+    connectors: dict[str, object],
+    audit_state: dict[str, Any] | None = None,
+    current_date: str | None = None,
+    symbol_batch_size: int = 1,
+    trading_day_chunk_size: int = 20,
+) -> list[PlannedTask]:
+    """Build atomic symbol-range/date-range canonical bar tasks decoupled from storage partitions."""
+    if not stage_symbols or stage_years <= 0:
+        return []
+    as_of = pd.Timestamp(current_date or datetime.now(tz=UTC).date().isoformat()).normalize()
+    start = (as_of - pd.DateOffset(years=max(1, int(stage_years)))).date()
+    end = as_of.date()
+    trading_days = [day.isoformat() for day in get_trading_days("XNYS", start, end)]
+    if not trading_days:
+        return []
+    canonical_vendors = tuple(
+        capability.vendor
+        for capability in backfill_capabilities(
+            dataset="equities_eod",
+            connectors=connectors,
+            audit_state=audit_state,
+        )
+    )
+    if not canonical_vendors:
+        return []
+
+    tasks: list[PlannedTask] = []
+    ordered_symbols = list(dict.fromkeys(str(symbol).upper() for symbol in stage_symbols))
+    for symbol_index in range(0, len(ordered_symbols), max(1, symbol_batch_size)):
+        symbol_chunk = tuple(ordered_symbols[symbol_index : symbol_index + max(1, symbol_batch_size)])
+        if not symbol_chunk:
+            continue
+        symbol_chunk_id = f"{symbol_index // max(1, symbol_batch_size):05d}"
+        for date_index in range(0, len(trading_days), max(1, trading_day_chunk_size)):
+            window = trading_days[date_index : date_index + max(1, trading_day_chunk_size)]
+            if not window:
+                continue
+            date_chunk_id = f"{date_index // max(1, trading_day_chunk_size):04d}"
+            start_date = window[0]
+            end_date = window[-1]
+            tasks.append(
+                PlannedTask(
+                    task_key=f"canonical_bars::equities_eod::{symbol_chunk_id}::{date_chunk_id}::{start_date}::{end_date}",
+                    task_family="canonical_bars",
+                    planner_group="canonical_bars_backlog",
+                    dataset="equities_eod",
+                    tier="A",
+                    priority=10,
+                    start_date=start_date,
+                    end_date=end_date,
+                    symbols=symbol_chunk,
+                    output_name="equities_bars",
+                    preferred_vendors=canonical_vendors,
+                    payload={
+                        "scope_kind": "symbol_range",
+                        "symbol_chunk_id": symbol_chunk_id,
+                        "date_chunk_id": date_chunk_id,
+                        "symbol_batch_size": len(symbol_chunk),
+                        "trading_days": list(window),
+                    },
+                )
+            )
+    return tasks
+
+
+def plan_coverage_tasks(
+    *,
+    data_root: Path,
+    stage_symbols: list[str],
+    stage_years: int,
+    connectors: dict[str, object],
+    audit_state: dict[str, Any] | None = None,
+    include_research: bool = False,
+    current_date: str | None = None,
+    symbol_batch_size: int = 1,
+    trading_day_chunk_size: int = 20,
+) -> list[PlannedTask]:
+    """Return the full planner backlog ordered by core-first priority."""
+    canonical = plan_canonical_bar_tasks(
+        stage_symbols=stage_symbols,
+        stage_years=stage_years,
+        connectors=connectors,
+        audit_state=audit_state,
+        current_date=current_date,
+        symbol_batch_size=symbol_batch_size,
+        trading_day_chunk_size=trading_day_chunk_size,
+    )
+    auxiliary = plan_auxiliary_tasks(
+        data_root=data_root,
+        stage_symbols=stage_symbols,
+        stage_years=stage_years,
+        connectors=connectors,
+        audit_state=audit_state,
+        include_research=include_research,
+        current_date=current_date,
+    )
+    return sorted([*canonical, *auxiliary], key=lambda task: (task.priority, task.task_key))
 
 
 def _materialize_capability_tasks(

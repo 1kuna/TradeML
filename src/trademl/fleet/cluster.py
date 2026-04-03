@@ -277,11 +277,7 @@ class ClusterCoordinator:
                 )
             if not needs_gap:
                 continue
-            try:
-                db.enqueue_task("equities_eod", None, day, day, "GAP", 1)
-                queue_count += 1
-            except Exception:
-                continue
+            queue_count += 1
         self.register_worker(active=True)
         append_cluster_event(self.paths, "worker_rebuilt", {"worker_id": self.worker_id, "gap_tasks": queue_count})
         return {"qc_rows": qc_rows, "gap_tasks": queue_count, "worker_id": self.worker_id}

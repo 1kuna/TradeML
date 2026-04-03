@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from datetime import UTC, date, datetime
@@ -52,8 +53,10 @@ def evaluate_training_gates(*, data_root: Path, stage_symbol_count: int, stage_y
     reference_files = {path.name for path in reference_root.glob("*.parquet")} if reference_root.exists() else set()
     macro_root = data_root / "data" / "raw" / "macros_fred"
     macro_series = {path.name.partition("=")[2] for path in macro_root.glob("series=*")} if macro_root.exists() else set()
+    raw_green_ratio = _raw_green_ratio(data_root / "data" / "qc" / "partition_status.parquet")
+    planner_ratio = _planner_bars_ratio(data_root / "control" / "node.sqlite")
     phase1 = training_readiness(
-        raw_green_ratio=_raw_green_ratio(data_root / "data" / "qc" / "partition_status.parquet"),
+        raw_green_ratio=max(raw_green_ratio or 0.0, planner_ratio or 0.0),
         has_corp_actions=("corp_actions.parquet" in reference_files) or {"dividends.parquet", "splits.parquet"}.issubset(reference_files),
         has_listing_history="listing_history.parquet" in reference_files,
         has_delistings="delistings.parquet" in reference_files,
@@ -205,6 +208,32 @@ def _terminal_delisting_returns_present(path: Path) -> bool:
         return False
     lowered = {column.lower() for column in frame.columns}
     return "delisteddate" in lowered or "delisted_date" in lowered
+
+
+def _planner_bars_ratio(db_path: Path) -> float | None:
+    if not db_path.exists():
+        return None
+    try:
+        with sqlite3.connect(db_path, timeout=5.0) as connection:
+            row = connection.execute(
+                """
+                SELECT SUM(planner_task_progress.expected_units) AS expected_units,
+                       SUM(planner_task_progress.completed_units) AS completed_units
+                FROM planner_tasks
+                LEFT JOIN planner_task_progress
+                  ON planner_tasks.task_key = planner_task_progress.task_key
+                WHERE planner_tasks.task_family = 'canonical_bars'
+                """
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    expected_units = int(row[0] or 0)
+    completed_units = int(row[1] or 0)
+    if expected_units <= 0:
+        return None
+    return min(1.0, completed_units / expected_units)
 
 
 def _read_env_file(path: Path) -> dict[str, str]:

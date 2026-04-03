@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +37,8 @@ from trademl.data_node.audit import run_capability_audit
 from trademl.data_node.bootstrap import Stage0UniverseBuilder
 from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
-from trademl.data_node.capabilities import load_audit_state
-from trademl.data_node.planner import plan_auxiliary_tasks
+from trademl.data_node.capabilities import default_macro_series, load_audit_state
+from trademl.data_node.planner import plan_coverage_tasks
 from trademl.data_node.training_control import evaluate_training_gates, read_training_runtime, shared_training_runtime_path
 from trademl.data_node.vendor_limits import DEFAULT_VENDOR_LIMITS
 from trademl.fleet.cluster import (
@@ -296,6 +296,7 @@ def start_node(
     settings.local_state.mkdir(parents=True, exist_ok=True)
     settings.log_path.parent.mkdir(parents=True, exist_ok=True)
     _rotate_runtime_log(settings.log_path)
+    stage_symbols = [str(symbol) for symbol in (_read_yaml(settings.stage_path).get("symbols", []) or []) if str(symbol).strip()]
     launch_command = command or [
         sys.executable,
         "-m",
@@ -307,6 +308,8 @@ def start_node(
         "--env-file",
         str(settings.env_path),
     ]
+    if command is None and stage_symbols:
+        launch_command.extend(["--symbols", *stage_symbols])
     env = os.environ.copy()
     env.update(_read_env_file(settings.env_path))
     with settings.log_path.open("a", encoding="utf-8") as log_handle:
@@ -700,7 +703,7 @@ def replan_coverage(settings: NodeSettings) -> dict[str, Any]:
     stage_symbols = list(stage.get("symbols", []))
     stage_years = int(stage.get("years", 5) or 5)
     audit_state = load_audit_state(_audit_report_path(settings))
-    plan = plan_auxiliary_tasks(
+    plan = plan_coverage_tasks(
         data_root=settings.nas_mount,
         stage_symbols=stage_symbols,
         stage_years=stage_years,
@@ -781,7 +784,10 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
     audit = load_audit_state(_audit_report_path(settings))
     coverage_plan = _read_optional_json(_coverage_plan_path(settings))
     vendor_attempt_summary = _read_vendor_attempt_summary(settings.db_path)
+    planner_summary = _read_planner_summary(settings.db_path)
     budget_summary = _read_budget_summary(settings)
+    vendor_throughput = _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
+    planner_eta = _summarize_planner_eta(settings.db_path, planner_summary=planner_summary, vendor_throughput=vendor_throughput)
     stage = _read_yaml(settings.stage_path)
     stage_symbols = stage.get("symbols", [])
     stage_years = stage.get("years")
@@ -800,6 +806,12 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
                 if expected_datapoints:
                     datapoint_progress_ratio = raw_datapoints / expected_datapoints
     host = _extract_share_host(settings.nas_share)
+    dataset_coverage = _dataset_coverage(
+        planner_summary=planner_summary,
+        reference_files=reference_files,
+        macro_series=macro_series,
+        planner_eta=planner_eta,
+    )
     data_readiness = _summarize_data_readiness(
         raw_dates=len(raw_dates),
         expected_sessions=expected_sessions,
@@ -817,6 +829,8 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         raw_datapoints=raw_datapoints,
         expected_datapoints=expected_datapoints,
         queue_counts=queue_counts,
+        planner_summary=planner_summary,
+        dataset_coverage=dataset_coverage,
     )
     training_status = {
         "phase1": read_training_runtime(path=shared_training_runtime_path(data_root=settings.nas_mount, phase=1)),
@@ -828,6 +842,9 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "runtime": runtime,
         "queue_counts": queue_counts,
         "vendor_attempt_summary": vendor_attempt_summary,
+        "vendor_throughput": vendor_throughput,
+        "planner_summary": planner_summary,
+        "planner_eta": planner_eta,
         "budget_summary": budget_summary,
         "partition_summary": partition_summary,
         "raw_partitions": len(raw_dates),
@@ -849,6 +866,7 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "stage_progress_ratio": progress_ratio,
         "stage_datapoint_progress_ratio": datapoint_progress_ratio,
         "collection_status": collection_status,
+        "dataset_coverage": dataset_coverage,
         "data_readiness": data_readiness,
         "training_readiness": readiness,
         "training_status": training_status,
@@ -1040,6 +1058,183 @@ def _read_vendor_attempt_summary(db_path: Path) -> dict[str, Any]:
         "counts": count_by_status,
         "by_vendor": sorted(vendor_rows.values(), key=lambda item: item["vendor"]),
         "recent_failures": recent_failures[:20],
+    }
+
+
+def _read_planner_summary(db_path: Path) -> dict[str, Any]:
+    if not db_path.exists():
+        return {"counts": {}, "progress": {}}
+    try:
+        return DataNodeDB(db_path).planner_summary()
+    except sqlite3.OperationalError:
+        return {"counts": {}, "progress": {}}
+
+
+def _summarize_vendor_throughput(db_path: Path, *, budget_summary: dict[str, Any], window_minutes: int = 15) -> dict[str, Any]:
+    if not db_path.exists():
+        return {"rows": [], "checked_at": None}
+    try:
+        attempts = DataNodeDB(db_path).fetch_vendor_attempts()
+    except sqlite3.OperationalError:
+        return {"rows": [], "checked_at": None}
+    now = datetime.now(tz=UTC)
+    cutoff = now - timedelta(minutes=window_minutes)
+    budget_rows = {str(row["vendor"]): row for row in budget_summary.get("rows", [])}
+    grouped: dict[str, dict[str, Any]] = {}
+    for attempt in attempts:
+        vendor = attempt.vendor
+        row = grouped.setdefault(
+            vendor,
+            {
+                "vendor": vendor,
+                "state": str(budget_rows.get(vendor, {}).get("state", "no_data")),
+                "requests_per_min": float(budget_rows.get(vendor, {}).get("rpm_used", 0)),
+                "symbols_per_min": 0.0,
+                "rows_per_min": 0.0,
+                "success_15m": 0,
+                "failed_15m": 0,
+                "reason": str(budget_rows.get(vendor, {}).get("reason", "no planner data")),
+            },
+        )
+        updated_at = datetime.fromisoformat(attempt.updated_at)
+        if updated_at < cutoff:
+            continue
+        if attempt.status == "SUCCESS":
+            row["success_15m"] += 1
+            row["rows_per_min"] += float(attempt.rows_returned or 0) / window_minutes
+            row["symbols_per_min"] += float(len(attempt.payload.get("symbols", [])) or 1) / window_minutes
+        elif attempt.status in {"FAILED", "PERMANENT_FAILED"}:
+            row["failed_15m"] += 1
+            if row["state"] == "available" and attempt.next_eligible_at and attempt.next_eligible_at > now.isoformat():
+                row["state"] = "backoff"
+                row["reason"] = "temporary backoff"
+    for vendor, budget_row in budget_rows.items():
+        grouped.setdefault(
+            vendor,
+            {
+                "vendor": vendor,
+                "state": str(budget_row.get("state", "no_data")),
+                "requests_per_min": float(budget_row.get("rpm_used", 0)),
+                "symbols_per_min": 0.0,
+                "rows_per_min": 0.0,
+                "success_15m": 0,
+                "failed_15m": 0,
+                "reason": str(budget_row.get("reason", "no planner data")),
+            },
+        )
+    rows = sorted(grouped.values(), key=lambda item: item["vendor"])
+    for row in rows:
+        row["requests_per_min"] = round(float(row["requests_per_min"]), 2)
+        row["symbols_per_min"] = round(float(row["symbols_per_min"]), 2)
+        row["rows_per_min"] = round(float(row["rows_per_min"]), 2)
+    return {"rows": rows, "checked_at": now.isoformat()}
+
+
+def _summarize_planner_eta(
+    db_path: Path,
+    *,
+    planner_summary: dict[str, Any],
+    vendor_throughput: dict[str, Any],
+    window_minutes: int = 15,
+) -> dict[str, Any]:
+    progress = planner_summary.get("progress", {})
+    rows = vendor_throughput.get("rows", [])
+    canonical_rate = sum(float(row.get("rows_per_min", 0.0)) for row in rows)
+    eta: dict[str, Any] = {}
+    try:
+        completed_tasks = DataNodeDB(db_path).fetch_planner_tasks(statuses=("SUCCESS",))
+    except sqlite3.OperationalError:
+        completed_tasks = []
+    now = datetime.now(tz=UTC)
+    cutoff = now - timedelta(minutes=window_minutes)
+    family_completion_rate: dict[str, float] = {}
+    for task in completed_tasks:
+        updated_at = datetime.fromisoformat(task.updated_at)
+        if updated_at < cutoff:
+            continue
+        family_completion_rate[task.task_family] = family_completion_rate.get(task.task_family, 0.0) + (1.0 / window_minutes)
+    for family, payload in progress.items():
+        remaining = int(payload.get("remaining_units", 0))
+        if remaining <= 0:
+            eta[family] = {"remaining_units": 0, "eta_minutes": 0.0}
+            continue
+        if family == "canonical_bars":
+            rate = canonical_rate
+        else:
+            rate = family_completion_rate.get(family, 0.0)
+        eta_minutes = (remaining / rate) if rate > 0 else None
+        eta[family] = {"remaining_units": remaining, "eta_minutes": eta_minutes}
+    return eta
+
+
+def _dataset_coverage(
+    *,
+    planner_summary: dict[str, Any],
+    reference_files: list[str],
+    macro_series: list[str],
+    planner_eta: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    progress = planner_summary.get("progress", {})
+    bars_progress = progress.get("canonical_bars", {})
+    bars_expected = int(bars_progress.get("expected_units", 0))
+    bars_completed = int(bars_progress.get("completed_units", 0))
+    bars_ratio = min(1.0, bars_completed / bars_expected) if bars_expected else 0.0
+
+    def _bool_ratio(value: bool) -> float:
+        return 1.0 if value else 0.0
+
+    macro_required = set(default_macro_series())
+    macro_ratio = (len(macro_required.intersection(macro_series)) / len(macro_required)) if macro_required else 1.0
+    return {
+        "canonical_bars": {
+            "ratio": bars_ratio,
+            "label": "Bars",
+            "blocking": bars_ratio < 0.98,
+            "remaining_units": int(bars_progress.get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("canonical_bars", {}).get("eta_minutes"),
+        },
+        "corp_actions": {
+            "ratio": _bool_ratio("corp_actions.parquet" in reference_files or {"dividends.parquet", "splits.parquet"}.issubset(reference_files)),
+            "label": "Corp Actions",
+            "blocking": "corp_actions.parquet" not in reference_files and not {"dividends.parquet", "splits.parquet"}.issubset(reference_files),
+            "remaining_units": int(planner_eta.get("corp_actions", {}).get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("corp_actions", {}).get("eta_minutes"),
+        },
+        "listing_history": {
+            "ratio": _bool_ratio("listing_history.parquet" in reference_files),
+            "label": "Listings",
+            "blocking": "listing_history.parquet" not in reference_files,
+            "remaining_units": int(planner_eta.get("security_master", {}).get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("security_master", {}).get("eta_minutes"),
+        },
+        "delistings": {
+            "ratio": _bool_ratio("delistings.parquet" in reference_files),
+            "label": "Delistings",
+            "blocking": "delistings.parquet" not in reference_files,
+            "remaining_units": int(planner_eta.get("security_master", {}).get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("security_master", {}).get("eta_minutes"),
+        },
+        "sec_filings": {
+            "ratio": _bool_ratio("sec_filings.parquet" in reference_files),
+            "label": "SEC Filings",
+            "blocking": "sec_filings.parquet" not in reference_files,
+            "remaining_units": int(planner_eta.get("events_filings", {}).get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("events_filings", {}).get("eta_minutes"),
+        },
+        "macro": {
+            "ratio": min(1.0, macro_ratio) if "fred_vintagedates.parquet" in reference_files else 0.0,
+            "label": "Macro",
+            "blocking": "fred_vintagedates.parquet" not in reference_files or macro_ratio < 1.0,
+            "remaining_units": int(planner_eta.get("macro", {}).get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("macro", {}).get("eta_minutes"),
+        },
+        "earnings": {
+            "ratio": _bool_ratio("earnings_calendar.parquet" in reference_files),
+            "label": "Earnings",
+            "blocking": False,
+            "remaining_units": int(planner_eta.get("supplemental_research", {}).get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("supplemental_research", {}).get("eta_minutes"),
+        },
     }
 
 
@@ -1237,6 +1432,16 @@ def _read_queue_counts(db_path: Path) -> dict[str, int]:
     if not db_path.exists():
         return {"PENDING": 0, "LEASED": 0, "FAILED": 0, "DONE": 0, "BOOTSTRAP": 0, "FORWARD": 0, "GAP": 0}
     try:
+        planner_summary = DataNodeDB(db_path).planner_summary()
+    except sqlite3.OperationalError:
+        return {"PENDING": 0, "LEASED": 0, "FAILED": 0, "DONE": 0, "BOOTSTRAP": 0, "FORWARD": 0, "GAP": 0}
+    counts: dict[str, int] = {}
+    for family_counts in planner_summary.get("counts", {}).values():
+        for status, count in family_counts.items():
+            counts[str(status)] = counts.get(str(status), 0) + int(count)
+    if counts:
+        return counts
+    try:
         with sqlite3.connect(db_path, timeout=5.0) as connection:
             connection.execute("PRAGMA busy_timeout = 5000")
             status_rows = connection.execute("SELECT status, COUNT(*) FROM backfill_queue GROUP BY status").fetchall()
@@ -1365,24 +1570,34 @@ def _summarize_collection_status(
     raw_datapoints: int,
     expected_datapoints: int | None,
     queue_counts: dict[str, int],
+    planner_summary: dict[str, Any],
+    dataset_coverage: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    expected = int(expected_datapoints or 0)
-    collected = int(raw_datapoints)
-    if expected > 0:
-        coverage_ratio = min(1.0, collected / expected)
-        remaining = max(0, expected - collected)
-    else:
-        coverage_ratio = 0.0
-        remaining = 0
+    canonical = planner_summary.get("progress", {}).get("canonical_bars", {})
+    expected = int(canonical.get("expected_units") or expected_datapoints or 0)
+    collected = int(canonical.get("completed_units") or raw_datapoints)
+    coverage_ratio = min(1.0, collected / expected) if expected > 0 else 0.0
+    remaining = max(0, expected - collected)
+    training_critical = [
+        dataset_coverage.get("canonical_bars", {}).get("ratio", 0.0),
+        dataset_coverage.get("corp_actions", {}).get("ratio", 0.0),
+        dataset_coverage.get("listing_history", {}).get("ratio", 0.0),
+        dataset_coverage.get("delistings", {}).get("ratio", 0.0),
+        dataset_coverage.get("sec_filings", {}).get("ratio", 0.0),
+        dataset_coverage.get("macro", {}).get("ratio", 0.0),
+    ]
+    readiness_ratio = sum(training_critical) / len(training_critical) if training_critical else 0.0
     return {
         "coverage_ratio": coverage_ratio,
         "coverage_percent": round(coverage_ratio * 100.0, 1),
         "remaining_ratio": max(0.0, 1.0 - coverage_ratio),
         "remaining_percent": round(max(0.0, 1.0 - coverage_ratio) * 100.0, 1),
+        "training_ready_ratio": readiness_ratio,
+        "training_ready_percent": round(readiness_ratio * 100.0, 1),
         "collected_datapoints": collected,
         "expected_datapoints": expected,
         "remaining_datapoints": remaining,
-        "pending_tasks": int(queue_counts.get("PENDING", 0)),
+        "pending_tasks": int(queue_counts.get("PENDING", 0)) + int(queue_counts.get("PARTIAL", 0)) + int(queue_counts.get("LEASED", 0)),
         "failed_tasks": int(queue_counts.get("FAILED", 0)),
     }
 

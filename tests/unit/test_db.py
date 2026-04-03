@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from datetime import timedelta
 from pathlib import Path
 
@@ -135,6 +136,38 @@ def test_vendor_attempt_success_is_terminal(tmp_path: Path) -> None:
     ) is None
 
 
+def test_vendor_attempt_leasing_is_race_safe(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+
+    def worker(name: str) -> None:
+        barrier.wait()
+        try:
+            leased = database.lease_vendor_attempt(
+                task_key="canonical::equities_eod::AAPL::2024-01-01::2024-01-31::GAP",
+                task_family="canonical",
+                planner_group="canonical_bars_backlog",
+                vendor="alpaca",
+                lease_owner=name,
+            )
+            results.append(leased)
+        except Exception as exc:  # pragma: no cover - assertion after join
+            results.append(exc)
+
+    first = threading.Thread(target=worker, args=("worker-a",))
+    second = threading.Thread(target=worker, args=("worker-b",))
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    assert not any(isinstance(result, Exception) for result in results)
+    attempts = database.fetch_vendor_attempts()
+    assert len(attempts) == 1
+    assert attempts[0].vendor == "alpaca"
+
+
 def test_requeue_retryable_failures_moves_rate_limited_rows_back_to_pending(tmp_path: Path) -> None:
     database = DataNodeDB(tmp_path / "node.sqlite")
     retryable_id = database.enqueue_task("equities_eod", None, "2024-01-01", "2024-01-01", "GAP", 1)
@@ -149,3 +182,71 @@ def test_requeue_retryable_failures_moves_rate_limited_rows_back_to_pending(tmp_
         statuses = dict(connection.execute("SELECT id, status FROM backfill_queue").fetchall())
     assert statuses[retryable_id] == "PENDING"
     assert statuses[permanent_id] == "FAILED"
+
+
+def test_planner_task_lifecycle_and_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    now = db_module.utc_now()
+    monkeypatch.setattr(db_module, "utc_now", lambda: now)
+
+    database.upsert_planner_task(
+        task_key="canonical::equities_eod::chunk000::2025-01-01::2025-01-31",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=10,
+        start_date="2025-01-01",
+        end_date="2025-01-31",
+        symbols=["AAPL", "MSFT"],
+        eligible_vendors=["alpaca", "tiingo"],
+        payload={"scope_kind": "symbol_range"},
+    )
+    leased = database.lease_next_planner_task(
+        lease_owner="worker-a",
+        task_families=("canonical_bars",),
+    )
+
+    assert leased is not None
+    assert leased.task_family == "canonical_bars"
+    assert leased.symbols == ("AAPL", "MSFT")
+    assert leased.eligible_vendors == ("alpaca", "tiingo")
+
+    database.update_planner_task_progress(
+        task_key=leased.task_key,
+        expected_units=40,
+        completed_units=20,
+        remaining_units=20,
+        completed_symbols=["AAPL"],
+        remaining_symbols=["MSFT"],
+        state={"trading_days": 20},
+    )
+    database.mark_planner_task_partial(leased.task_key, error="remaining_symbols=1", backoff_minutes=30)
+
+    assert database.lease_next_planner_task(
+        lease_owner="worker-a",
+        task_families=("canonical_bars",),
+        now=now + timedelta(minutes=29),
+    ) is None
+    leased_again = database.lease_next_planner_task(
+        lease_owner="worker-a",
+        task_families=("canonical_bars",),
+        now=now + timedelta(minutes=31),
+    )
+    assert leased_again is not None
+    direct_lease = database.lease_planner_task_by_key(
+        task_key=leased.task_key,
+        lease_owner="worker-b",
+        now=now + timedelta(minutes=31),
+    )
+    assert direct_lease is None
+    progress = database.fetch_planner_task_progress(leased.task_key)
+    assert progress is not None
+    assert progress.completed_symbols == ("AAPL",)
+    assert progress.remaining_symbols == ("MSFT",)
+    assert progress.state["trading_days"] == 20
+
+    database.mark_planner_task_success(leased.task_key)
+    summary = database.planner_summary()
+    assert summary["counts"]["canonical_bars"]["SUCCESS"] == 1
+    assert summary["progress"]["canonical_bars"]["completed_units"] == 20

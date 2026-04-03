@@ -10,6 +10,8 @@ from trademl.data_node.planner import (
     canonical_task_key,
     choose_vendor_for_canonical_task,
     plan_auxiliary_tasks,
+    plan_canonical_bar_tasks,
+    plan_coverage_tasks,
     training_readiness,
 )
 
@@ -152,6 +154,45 @@ def test_plan_auxiliary_tasks_includes_macro_and_reference_chunks(tmp_path: Path
     assert "vintagedates" in datasets
     macro_tasks = [task for task in tasks if task.dataset == "macros_treasury"]
     assert len(macro_tasks) == len(default_macro_series())
+
+
+def test_plan_canonical_bar_tasks_uses_symbol_range_windows() -> None:
+    tasks = plan_canonical_bar_tasks(
+        stage_symbols=["AAPL", "MSFT", "NVDA"],
+        stage_years=1,
+        connectors={"alpaca": object(), "tiingo": object()},
+        current_date="2026-04-02",
+        symbol_batch_size=2,
+        trading_day_chunk_size=10,
+    )
+
+    assert tasks
+    first = tasks[0]
+    assert first.task_family == "canonical_bars"
+    assert first.scope_kind == "symbol_range"
+    assert first.preferred_vendors == ("tiingo", "alpaca")
+    assert len(first.symbols) <= 2
+    assert len(first.payload["trading_days"]) <= 10
+
+
+def test_plan_coverage_tasks_orders_canonical_before_auxiliary(tmp_path: Path) -> None:
+    reference_root = tmp_path / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"ticker": "AAPL", "cik_str": "320193"}]).to_parquet(reference_root / "sec_company_tickers.parquet", index=False)
+
+    tasks = plan_coverage_tasks(
+        data_root=tmp_path,
+        stage_symbols=["AAPL", "MSFT"],
+        stage_years=1,
+        connectors={"alpaca": object(), "tiingo": object(), "alpha_vantage": object(), "fred": object(), "sec_edgar": object()},
+        current_date="2026-04-02",
+        symbol_batch_size=2,
+        trading_day_chunk_size=10,
+    )
+
+    assert tasks
+    assert tasks[0].task_family == "canonical_bars"
+    assert any(task.task_family == "auxiliary" for task in tasks)
 
 
 def test_training_readiness_requires_core_datasets() -> None:
