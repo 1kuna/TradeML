@@ -938,6 +938,7 @@ class DataNodeDB:
         self,
         *,
         task_family: str | None = None,
+        task_families: tuple[str, ...] | None = None,
         planner_group: str | None = None,
         statuses: tuple[str, ...] | None = None,
         limit: int | None = None,
@@ -950,6 +951,10 @@ class DataNodeDB:
         if task_family:
             clauses.append("task_family = ?")
             params.append(task_family)
+        if task_families:
+            placeholders = ",".join("?" for _ in task_families)
+            clauses.append(f"task_family IN ({placeholders})")
+            params.extend(task_families)
         if planner_group:
             clauses.append("planner_group = ?")
             params.append(planner_group)
@@ -986,6 +991,7 @@ class DataNodeDB:
         lease_time_iso = lease_time.isoformat()
         for page in range(max(1, scan_pages)):
             candidates = self.fetch_planner_tasks(
+                task_families=task_families,
                 statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
                 limit=limit,
                 offset=page * limit,

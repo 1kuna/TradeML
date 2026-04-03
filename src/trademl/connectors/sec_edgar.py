@@ -19,7 +19,7 @@ class SecEdgarConnector(HTTPConnector):
         self.user_agent = user_agent
 
     def _headers(self) -> dict[str, str]:
-        return {"User-Agent": self.user_agent, "Accept-Encoding": "gzip, deflate", "Host": "data.sec.gov"}
+        return {"User-Agent": self.user_agent, "Accept-Encoding": "gzip, deflate"}
 
     def fetch(
         self,

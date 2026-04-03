@@ -250,3 +250,45 @@ def test_planner_task_lifecycle_and_progress(tmp_path: Path, monkeypatch: pytest
     summary = database.planner_summary()
     assert summary["counts"]["canonical_bars"]["SUCCESS"] == 1
     assert summary["progress"]["canonical_bars"]["completed_units"] == 20
+
+
+def test_lease_next_planner_task_filters_task_family_before_scan_window(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    for index in range(300):
+        database.upsert_planner_task(
+            task_key=f"canonical::{index:04d}",
+            task_family="canonical_bars",
+            planner_group="canonical_bars_backlog",
+            dataset="equities_eod",
+            tier="A",
+            priority=10,
+            start_date="2025-01-01",
+            end_date="2025-01-31",
+            symbols=[f"SYM{index:04d}"],
+            eligible_vendors=["alpaca"],
+            payload={"scope_kind": "symbol_range"},
+        )
+    database.upsert_planner_task(
+        task_key="macro::DGS10",
+        task_family="macro",
+        planner_group="macro_backlog",
+        dataset="macros_treasury",
+        tier="A",
+        priority=20,
+        start_date="2025-01-01",
+        end_date="2025-01-31",
+        symbols=["DGS10"],
+        eligible_vendors=["fred"],
+        payload={"scope_kind": "series_range"},
+    )
+
+    leased = database.lease_next_planner_task(
+        lease_owner="worker-a",
+        task_families=("macro",),
+        vendor="fred",
+        limit=64,
+        scan_pages=2,
+    )
+
+    assert leased is not None
+    assert leased.task_key == "macro::DGS10"

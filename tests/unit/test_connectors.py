@@ -261,6 +261,36 @@ def test_fmp_and_sec_edgar_connectors() -> None:
     assert delistings.iloc[0]["symbol"] == "XYZ"
     assert symbol_changes.iloc[0]["newSymbol"] == "META"
     assert filings.iloc[0]["form"] == "8-K"
+    assert sec_session.calls[0][3]["User-Agent"] == "TradeML/0.1 test@example.com"
+    assert "Host" not in sec_session.calls[0][3]
+
+
+def test_sec_edgar_company_tickers_uses_sec_host_without_forced_data_host() -> None:
+    sec_session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "0": {"ticker": "AAPL", "cik_str": 320193, "title": "Apple Inc."},
+                },
+            )
+        ]
+    )
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=sec_session,
+    )
+
+    frame = sec.fetch("company_tickers", [], "2024-01-01", "2024-01-31")
+
+    assert frame.iloc[0]["ticker"] == "AAPL"
+    method, url, _params, headers = sec_session.calls[0]
+    assert method == "GET"
+    assert url == "https://www.sec.gov/files/company_tickers.json"
+    assert headers["User-Agent"] == "TradeML/0.1 test@example.com"
+    assert "Host" not in headers
 
 
 def test_tiingo_connector_normalizes_prices_actions_and_fundamentals() -> None:

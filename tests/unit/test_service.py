@@ -7,7 +7,7 @@ import pandas as pd
 import sqlite3
 
 from trademl.calendars.exchange import ExchangeCalendarStore
-from trademl.connectors.base import TemporaryConnectorError
+from trademl.connectors.base import PermanentConnectorError, TemporaryConnectorError
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
@@ -213,6 +213,15 @@ class _SelectiveBackfillConnector:
         if not rows and self.empty_for_unknown:
             return pd.DataFrame(columns=_BackfillConnector(self.vendor_name).fetch(dataset, ["AAPL"], start_date, end_date).columns)
         return pd.DataFrame(rows)
+
+
+class _PermanentFailBackfillConnector:
+    def __init__(self, vendor_name: str, message: str = "403 forbidden") -> None:
+        self.vendor_name = vendor_name
+        self.message = message
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        raise PermanentConnectorError(self.message)
 
 
 class _ClusterCoordinatorStub:
@@ -593,6 +602,53 @@ def test_lease_canonical_batch_scans_past_front_slice_starvation(tmp_path: Path)
 
     assert batch
     assert batch[0].symbols == ("SYM0256",)
+
+
+def test_permanent_vendor_failure_does_not_terminally_poison_task_when_alternatives_remain(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _PermanentFailBackfillConnector("alpaca", "alpaca request failed: 403 forbidden"),
+            "tiingo": _BackfillConnector("tiingo"),
+        },
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::AAPL",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=10,
+        start_date="2025-01-02",
+        end_date="2025-01-02",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca", "tiingo"],
+        payload={"scope_kind": "symbol_range", "trading_days": ["2025-01-02"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::AAPL",
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=["AAPL"],
+        state={"scope_kind": "symbol_range"},
+    )
+    task = db.lease_planner_task_by_key(task_key="canonical::AAPL", lease_owner=service.worker_id)
+
+    assert task is not None
+    changed = service._process_canonical_planner_batch(batch=[task], vendor="alpaca", exchange="XNYS")
+
+    assert changed == []
+    refreshed = db.get_planner_task("canonical::AAPL")
+    assert refreshed is not None
+    assert refreshed.status == "PARTIAL"
+    attempts = {(attempt.vendor, attempt.status) for attempt in db.vendor_attempts_for_task("canonical::AAPL")}
+    assert ("alpaca", "PERMANENT_FAILED") in attempts
 
 
 def test_run_cluster_forever_reruns_backfill_when_same_day_queue_is_reseeded(tmp_path: Path) -> None:

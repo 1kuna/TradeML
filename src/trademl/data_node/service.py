@@ -938,7 +938,10 @@ class DataNodeService:
         except PermanentConnectorError as exc:
             for task in leased_tasks:
                 self.db.mark_vendor_attempt_failed(task_key=task.task_key, vendor=vendor, error=str(exc), backoff_minutes=0, permanent=True)
-                self.db.mark_planner_task_failed(task.task_key, error=f"{vendor}: {exc}", backoff_minutes=15, permanent=True)
+                if self._canonical_task_has_remaining_vendors(task, failed_vendor=vendor):
+                    self.db.mark_planner_task_partial(task.task_key, error=f"{vendor}: {exc}", backoff_minutes=1)
+                else:
+                    self.db.mark_planner_task_failed(task.task_key, error=f"{vendor}: {exc}", backoff_minutes=15, permanent=True)
             return []
         except ConnectorError as exc:
             message = str(exc)
@@ -967,8 +970,19 @@ class DataNodeService:
                     task_key=task.task_key,
                     vendor=vendor,
                     error="empty planner canonical result",
-                    backoff_minutes=15,
+                    backoff_minutes=0,
+                    permanent=True,
                 )
+                if self._canonical_task_has_remaining_vendors(task, failed_vendor=vendor):
+                    self.db.mark_planner_task_partial(task.task_key, error=f"{vendor}: empty planner canonical result", backoff_minutes=1)
+                    continue
+                self.db.mark_planner_task_failed(
+                    task.task_key,
+                    error=f"{vendor}: empty planner canonical result",
+                    backoff_minutes=15,
+                    permanent=True,
+                )
+                continue
             progress_payload = progress_map[task.task_key]
             self.db.update_planner_task_progress(
                 task_key=task.task_key,
@@ -1050,6 +1064,22 @@ class DataNodeService:
             )
             for task in tasks
         }
+
+    def _canonical_task_has_remaining_vendors(self, task: PlannerTask, *, failed_vendor: str) -> bool:
+        """Return whether another eligible vendor could still complete this canonical task."""
+        attempts = {attempt.vendor: attempt for attempt in self.db.vendor_attempts_for_task(task.task_key)}
+        for candidate in task.eligible_vendors:
+            if candidate == failed_vendor:
+                continue
+            if self._canonical_capability(candidate) is None:
+                continue
+            attempt = attempts.get(candidate)
+            if attempt is None:
+                return True
+            if attempt.status in {"SUCCESS", "PERMANENT_FAILED"}:
+                continue
+            return True
+        return False
 
     def _build_canonical_coverage_index(self, *, trading_days: list[str] | None = None) -> dict[str, set[str]]:
         """Return the existing canonical coverage index keyed by symbol."""
