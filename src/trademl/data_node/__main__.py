@@ -81,7 +81,15 @@ def main() -> int:
     with Path(args.config).open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
 
-    budgets = BudgetManager(_resolve_vendor_budgets(config))
+    workspace_root = Path(args.root).expanduser() if args.root else Path(
+        os.getenv("LOCAL_STATE", config["node"]["local_state"])
+    ).expanduser().parent
+    local_state_default = workspace_root / "control" if args.root else Path(config["node"]["local_state"]).expanduser()
+    local_state = Path(os.getenv("LOCAL_STATE", str(local_state_default))).expanduser()
+    budgets = BudgetManager(
+        _resolve_vendor_budgets(config),
+        snapshot_path=local_state / "budget_state.json",
+    )
     connector = AlpacaConnector(
         base_url=os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
         trading_base_url=os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
@@ -144,11 +152,6 @@ def main() -> int:
         user_agent=os.getenv("SEC_EDGAR_USER_AGENT", "TradeML/0.1 test@example.com"),
         budget_manager=budgets,
     )
-    workspace_root = Path(args.root).expanduser() if args.root else Path(
-        os.getenv("LOCAL_STATE", config["node"]["local_state"])
-    ).expanduser().parent
-    local_state_default = workspace_root / "control" if args.root else Path(config["node"]["local_state"]).expanduser()
-    local_state = Path(os.getenv("LOCAL_STATE", str(local_state_default))).expanduser()
     worker_id = os.getenv("EDGE_NODE_ID", config.get("node", {}).get("worker_id", os.uname().nodename if hasattr(os, "uname") else "worker"))
     db = DataNodeDB(local_state / "node.sqlite")
     data_root = Path(args.data_root or os.getenv("NAS_MOUNT", config["node"]["nas_mount"])).expanduser()

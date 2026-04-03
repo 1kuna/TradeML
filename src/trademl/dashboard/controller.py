@@ -78,6 +78,10 @@ class NodeSettings:
         return self.local_state / "node_runtime.json"
 
     @property
+    def budget_path(self) -> Path:
+        return self.local_state / "budget_state.json"
+
+    @property
     def log_path(self) -> Path:
         return self.local_state / "logs" / "node.log"
 
@@ -776,6 +780,7 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
     audit = load_audit_state(_audit_report_path(settings))
     coverage_plan = _read_optional_json(_coverage_plan_path(settings))
     vendor_attempt_summary = _read_vendor_attempt_summary(settings.db_path)
+    budget_summary = _read_budget_summary(settings)
     stage = _read_yaml(settings.stage_path)
     stage_symbols = stage.get("symbols", [])
     stage_years = stage.get("years")
@@ -822,6 +827,7 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "runtime": runtime,
         "queue_counts": queue_counts,
         "vendor_attempt_summary": vendor_attempt_summary,
+        "budget_summary": budget_summary,
         "partition_summary": partition_summary,
         "raw_partitions": len(raw_dates),
         "curated_partitions": len(curated_dates),
@@ -882,6 +888,115 @@ def _read_optional_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
+
+
+def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
+    config = _read_yaml(settings.config_path)
+    vendor_limits = {
+        vendor: {
+            "rpm": int(values.get("rpm", 0)),
+            "daily_cap": int(values.get("daily_cap", 0)),
+        }
+        for vendor, values in (config.get("vendors", {}) or {}).items()
+        if isinstance(values, dict)
+    }
+    if not settings.budget_path.exists():
+        rows = [
+            {
+                "vendor": vendor,
+                "state": "no_data",
+                "day_used": 0,
+                "day_cap": limits["daily_cap"],
+                "day_remaining": limits["daily_cap"],
+                "day_used_percent": 0.0,
+                "rpm_used": 0,
+                "rpm_limit": limits["rpm"],
+                "minute_available": True,
+                "day_available": True,
+                "forward_available": True,
+                "other_available": True,
+                "reason": "worker has not written budget data yet",
+            }
+            for vendor, limits in sorted(vendor_limits.items())
+        ]
+        return {
+            "available_vendors": len(rows),
+            "day_capped_vendors": 0,
+            "minute_capped_vendors": 0,
+            "rows": rows,
+            "checked_at": None,
+            "day_anchor": None,
+        }
+    try:
+        payload = json.loads(settings.budget_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {
+            "available_vendors": 0,
+            "day_capped_vendors": 0,
+            "minute_capped_vendors": 0,
+            "rows": [],
+            "checked_at": None,
+            "day_anchor": None,
+        }
+    checked_at = payload.get("checked_at")
+    day_anchor = payload.get("day_anchor")
+    current = datetime.now(tz=UTC)
+    rows: list[dict[str, Any]] = []
+    available_vendors = 0
+    day_capped_vendors = 0
+    minute_capped_vendors = 0
+    for vendor, limits in sorted(vendor_limits.items()):
+        snapshot = (payload.get("vendors") or {}).get(vendor, {})
+        rpm_limit = int(snapshot.get("rpm", limits["rpm"]))
+        daily_cap = int(snapshot.get("daily_cap", limits["daily_cap"]))
+        window_timestamps = [datetime.fromisoformat(value) for value in snapshot.get("window_timestamps", [])]
+        minute_window = [stamp for stamp in window_timestamps if (current - stamp).total_seconds() < 60]
+        daily_spend = snapshot.get("daily_spend", {})
+        day_used = int(daily_spend.get("TOTAL", 0))
+        reserved_units = int(snapshot.get("reserved_units", max(1, int(daily_cap * 0.10)))) if daily_cap else 0
+        non_forward_ceiling = int(snapshot.get("non_forward_ceiling", max(0, daily_cap - reserved_units)))
+        other_used = int(daily_spend.get("OTHER", 0))
+        minute_available = len(minute_window) < rpm_limit if rpm_limit else False
+        day_available = day_used < daily_cap if daily_cap else False
+        other_available = minute_available and other_used < non_forward_ceiling and day_available
+        forward_available = minute_available and day_available
+        if day_available and minute_available:
+            available_vendors += 1
+            state = "available"
+            reason = "available now"
+        elif not day_available:
+            day_capped_vendors += 1
+            state = "day_capped"
+            reason = "daily cap exhausted"
+        else:
+            minute_capped_vendors += 1
+            state = "minute_capped"
+            reason = "rpm window exhausted"
+        rows.append(
+            {
+                "vendor": vendor,
+                "state": state,
+                "day_used": day_used,
+                "day_cap": daily_cap,
+                "day_remaining": max(0, daily_cap - day_used),
+                "day_used_percent": round((day_used / daily_cap) * 100.0, 1) if daily_cap else 0.0,
+                "rpm_used": len(minute_window),
+                "rpm_limit": rpm_limit,
+                "minute_available": minute_available,
+                "day_available": day_available,
+                "forward_available": forward_available,
+                "other_available": other_available,
+                "reason": reason,
+            }
+        )
+    return {
+        "available_vendors": available_vendors,
+        "day_capped_vendors": day_capped_vendors,
+        "minute_capped_vendors": minute_capped_vendors,
+        "rows": rows,
+        "checked_at": checked_at,
+        "day_anchor": day_anchor,
+    }
 def _read_vendor_attempt_summary(db_path: Path) -> dict[str, Any]:
     if not db_path.exists():
         return {"counts": {}, "by_vendor": [], "recent_failures": []}

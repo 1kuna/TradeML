@@ -81,6 +81,7 @@ def main() -> None:
     train_operational_status = snapshot["train_operational_status"]
     suggested_training_commands = snapshot["suggested_training_commands"]
     vendor_attempt_summary = snapshot["vendor_attempt_summary"]
+    budget_summary = snapshot["budget_summary"]
     cluster = snapshot["cluster"]
     audit = snapshot["audit"]
     coverage_plan = snapshot["coverage_plan"]
@@ -106,7 +107,7 @@ def main() -> None:
 
     st.progress(collection_status["coverage_ratio"], text=f"Collection coverage: {collection_status['coverage_percent']:.1f}%")
 
-    tabs = st.tabs(["Status", "Setup", "Logs"])
+    tabs = st.tabs(["Status", "Budgets", "Setup", "Logs"])
 
     with tabs[0]:
         if data_readiness["state"] == "complete":
@@ -167,6 +168,19 @@ def main() -> None:
                 st.dataframe(vendor_attempt_summary["recent_failures"], use_container_width=True)
 
     with tabs[1]:
+        st.subheader("API Budgets")
+        budget_cols = st.columns(3)
+        budget_cols[0].metric("Vendors Available", budget_summary["available_vendors"])
+        budget_cols[1].metric("Day Capped", budget_summary["day_capped_vendors"])
+        budget_cols[2].metric("Minute Capped", budget_summary["minute_capped_vendors"])
+        if budget_summary["checked_at"]:
+            st.caption(f"Budget snapshot: {budget_summary['checked_at']} UTC")
+        if budget_summary["rows"]:
+            st.dataframe(budget_summary["rows"], use_container_width=True, hide_index=True)
+        else:
+            st.info("No budget snapshot has been written yet. Start the worker and let it issue requests first.")
+
+    with tabs[2]:
         cluster_actions = st.columns(3)
         if cluster_actions[0].button("Join Cluster", use_container_width=True):
             join_cluster(settings, passphrase=cluster_passphrase or None)
@@ -278,7 +292,7 @@ def main() -> None:
                 force_release_lease(settings, selected)
                 st.rerun()
 
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("Node Log")
         st.text_area("Recent log lines", value=snapshot["log_tail"], height=500)
         if snapshot["journal_tail"]:

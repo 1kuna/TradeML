@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -140,7 +141,11 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
                     "local_state": str(local_state),
                     "collection_time_et": "16:30",
                     "maintenance_hour_local": 2,
-                }
+                },
+                "vendors": {
+                    "alpaca": {"rpm": 150, "daily_cap": 10000},
+                    "tiingo": {"rpm": 40, "daily_cap": 400},
+                },
             },
             sort_keys=False,
         ),
@@ -187,6 +192,33 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     )
     (local_state / "logs").mkdir(parents=True, exist_ok=True)
     (local_state / "logs" / "node.log").write_text("node booted\ncycle done\n", encoding="utf-8")
+    (local_state / "budget_state.json").write_text(
+        json.dumps(
+            {
+                "day_anchor": "2026-03-31",
+                "checked_at": "2026-03-31T20:05:00+00:00",
+                "vendors": {
+                    "alpaca": {
+                        "rpm": 150,
+                        "daily_cap": 10000,
+                        "reserved_units": 1000,
+                        "non_forward_ceiling": 9000,
+                        "window_timestamps": ["2026-03-31T20:04:50+00:00"],
+                        "daily_spend": {"FORWARD": 2, "OTHER": 3, "TOTAL": 5},
+                    },
+                    "tiingo": {
+                        "rpm": 40,
+                        "daily_cap": 400,
+                        "reserved_units": 40,
+                        "non_forward_ceiling": 360,
+                        "window_timestamps": [f"2026-03-31T20:04:{value:02d}+00:00" for value in range(40)],
+                        "daily_spend": {"FORWARD": 0, "OTHER": 400, "TOTAL": 400},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
     snapshot = collect_dashboard_snapshot(settings)
@@ -205,6 +237,10 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert snapshot["training_readiness"]["phase1"]["ready"] is False
     assert "corp_actions" in snapshot["training_readiness"]["phase1"]["blockers"]
     assert snapshot["vendor_attempt_summary"]["counts"] == {}
+    assert snapshot["budget_summary"]["available_vendors"] == 1
+    assert snapshot["budget_summary"]["day_capped_vendors"] == 1
+    assert snapshot["budget_summary"]["rows"][0]["vendor"] == "alpaca"
+    assert snapshot["budget_summary"]["rows"][1]["state"] == "day_capped"
     assert "cycle done" in snapshot["log_tail"]
     assert snapshot["collection_status"]["coverage_percent"] > 0.0
     assert snapshot["collection_status"]["remaining_datapoints"] > 1

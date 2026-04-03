@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 
 from trademl.data_node.budgets import BudgetManager
 
@@ -41,3 +42,22 @@ def test_forward_reserve_allows_forward_when_other_tasks_are_blocked() -> None:
 
     assert not manager.can_spend("massive", task_kind="GAP", now=now + timedelta(minutes=10))
     assert manager.can_spend("massive", task_kind="FORWARD", now=now + timedelta(minutes=10))
+
+
+def test_budget_manager_persists_snapshot(tmp_path) -> None:
+    snapshot_path = tmp_path / "budget_state.json"
+    manager = BudgetManager(
+        {"alpaca": {"rpm": 2, "daily_cap": 10}},
+        snapshot_path=snapshot_path,
+    )
+    now = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+
+    manager.record_spend("alpaca", task_kind="FORWARD", now=now)
+    manager.record_spend("alpaca", task_kind="OTHER", now=now + timedelta(seconds=1))
+
+    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert payload["day_anchor"] == "2026-01-02"
+    assert payload["vendors"]["alpaca"]["daily_spend"]["FORWARD"] == 1
+    assert payload["vendors"]["alpaca"]["daily_spend"]["OTHER"] == 1
+    assert payload["vendors"]["alpaca"]["daily_spend"]["TOTAL"] == 2
+    assert len(payload["vendors"]["alpaca"]["window_timestamps"]) == 2

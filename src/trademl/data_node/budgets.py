@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
+from pathlib import Path
 
 
 UTC = timezone.utc
@@ -21,7 +23,12 @@ class VendorBudget:
 class BudgetManager:
     """Track per-vendor RPM and daily caps with FORWARD-task reserve support."""
 
-    def __init__(self, config: dict[str, dict[str, int]], reserve_fraction: float = 0.10) -> None:
+    def __init__(
+        self,
+        config: dict[str, dict[str, int]],
+        reserve_fraction: float = 0.10,
+        snapshot_path: str | Path | None = None,
+    ) -> None:
         self.reserve_fraction = reserve_fraction
         self.vendor_limits = {
             vendor: VendorBudget(rpm=values["rpm"], daily_cap=values["daily_cap"]) for vendor, values in config.items()
@@ -29,6 +36,8 @@ class BudgetManager:
         self.request_windows: dict[str, deque[datetime]] = defaultdict(deque)
         self.daily_spend: dict[str, dict[str, int]] = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
         self.day_anchor = datetime.now(tz=UTC).date()
+        self.snapshot_path = Path(snapshot_path).expanduser() if snapshot_path else None
+        self._persist_snapshot()
 
     def _normalize(self, now: datetime | None) -> datetime:
         current = now or datetime.now(tz=UTC)
@@ -68,6 +77,7 @@ class BudgetManager:
         self.request_windows[vendor].append(current)
         bucket = "FORWARD" if task_kind == "FORWARD" else "OTHER"
         self.daily_spend[vendor][bucket] += 1
+        self._persist_snapshot(now=current)
 
     def reset_daily(self, now: datetime | None = None) -> None:
         """Reset all daily counters, typically at midnight local-to-UTC boundary."""
@@ -76,3 +86,44 @@ class BudgetManager:
             current = current.replace(tzinfo=UTC)
         self.day_anchor = current.date()
         self.daily_spend = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
+        self._persist_snapshot(now=current)
+
+    def snapshot(self, now: datetime | None = None) -> dict[str, object]:
+        """Return a JSON-serializable view of current budget usage."""
+        current = self._normalize(now)
+        vendors: dict[str, dict[str, object]] = {}
+        for vendor, limits in self.vendor_limits.items():
+            self._trim_window(vendor, current)
+            spend = self.daily_spend[vendor]
+            total_spend = spend["FORWARD"] + spend["OTHER"]
+            reserved_units = max(1, int(limits.daily_cap * self.reserve_fraction))
+            non_forward_ceiling = max(0, limits.daily_cap - reserved_units)
+            vendors[vendor] = {
+                "rpm": limits.rpm,
+                "daily_cap": limits.daily_cap,
+                "reserve_fraction": self.reserve_fraction,
+                "reserved_units": reserved_units,
+                "non_forward_ceiling": non_forward_ceiling,
+                "window_used": len(self.request_windows[vendor]),
+                "window_timestamps": [stamp.isoformat() for stamp in self.request_windows[vendor]],
+                "daily_spend": {
+                    "FORWARD": int(spend["FORWARD"]),
+                    "OTHER": int(spend["OTHER"]),
+                    "TOTAL": int(total_spend),
+                },
+            }
+        return {
+            "day_anchor": self.day_anchor.isoformat(),
+            "checked_at": current.isoformat(),
+            "vendors": vendors,
+        }
+
+    def _persist_snapshot(self, now: datetime | None = None) -> None:
+        """Persist the current budget snapshot for the external dashboard process."""
+        if self.snapshot_path is None:
+            return
+        payload = self.snapshot(now=now)
+        self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.snapshot_path.with_suffix(self.snapshot_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(self.snapshot_path)
