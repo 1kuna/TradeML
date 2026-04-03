@@ -17,9 +17,17 @@ from trademl.data_node.capabilities import default_macro_series
 from trademl.data_node.planner import training_readiness
 
 
-def read_training_runtime(*, local_state: Path, phase: int) -> dict[str, Any]:
-    """Read the persisted training runtime state and refresh process liveness."""
-    path = local_state / f"training_phase_{phase}.json"
+def read_training_runtime(
+    *,
+    path: Path | None = None,
+    local_state: Path | None = None,
+    phase: int | None = None,
+) -> dict[str, Any]:
+    """Read persisted training runtime state and refresh local-process liveness when possible."""
+    if path is None:
+        if local_state is None or phase is None:
+            raise ValueError("either path or local_state+phase must be provided")
+        path = local_state / f"training_phase_{phase}.json"
     if not path.exists():
         return {}
     try:
@@ -27,7 +35,14 @@ def read_training_runtime(*, local_state: Path, phase: int) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     pid = payload.get("pid")
-    payload["running"] = isinstance(pid, int) and _is_process_running(pid)
+    host = payload.get("host")
+    status = str(payload.get("status", "")).lower()
+    if isinstance(pid, int) and host == _hostname():
+        payload["running"] = _is_process_running(pid)
+        if status == "running" and not payload["running"]:
+            payload["status"] = "unknown"
+    else:
+        payload["running"] = status in {"starting", "running"}
     return payload
 
 
@@ -107,10 +122,28 @@ def launch_training_process(
 
     log_path = local_state / "logs" / f"training_phase_{phase}.log"
     runtime_path = local_state / f"training_phase_{phase}.json"
+    shared_runtime_path = shared_training_runtime_path(data_root=data_root, phase=phase)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_payload = {
+        "phase": phase,
+        "pid": None,
+        "host": _hostname(),
+        "status": "starting",
+        "started_at": datetime.now(tz=UTC).isoformat(),
+        "config_path": str(config_path),
+        "data_root": str(data_root),
+        "report_date": report_date or date.today().isoformat(),
+        "model_suite": model_suite or ("ridge_only" if phase == 1 else "full"),
+        "log_path": str(log_path),
+        "shared_runtime_path": str(shared_runtime_path),
+        "running": True,
+        "preflight": preflight,
+    }
+    _write_runtime_payload(runtime_path, runtime_payload)
+    _write_runtime_payload(shared_runtime_path, runtime_payload)
     command = [
         python_executable,
-        str(repo_root / "src" / "scripts" / "train.py"),
+        str(repo_root / "src" / "scripts" / "training_job.py"),
         "--data-root",
         str(data_root),
         "--config",
@@ -121,6 +154,12 @@ def launch_training_process(
         report_date or date.today().isoformat(),
         "--model-suite",
         model_suite or ("ridge_only" if phase == 1 else "full"),
+        "--phase",
+        str(phase),
+        "--local-runtime-path",
+        str(runtime_path),
+        "--shared-runtime-path",
+        str(shared_runtime_path),
     ]
     env = os.environ.copy()
     env.update(_read_env_file(env_path))
@@ -133,20 +172,16 @@ def launch_training_process(
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-    payload = {
-        "phase": phase,
-        "pid": process.pid,
-        "started_at": datetime.now(tz=UTC).isoformat(),
-        "command": command,
-        "log_path": str(log_path),
-        "config_path": str(config_path),
-        "report_date": report_date or date.today().isoformat(),
-        "model_suite": model_suite or ("ridge_only" if phase == 1 else "full"),
-        "running": True,
-        "preflight": preflight,
-    }
-    runtime_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    return payload
+    runtime_payload["pid"] = process.pid
+    runtime_payload["command"] = command
+    _write_runtime_payload(runtime_path, runtime_payload)
+    _write_runtime_payload(shared_runtime_path, runtime_payload)
+    return runtime_payload
+
+
+def shared_training_runtime_path(*, data_root: Path, phase: int) -> Path:
+    """Return the NAS-visible runtime state path for a training phase."""
+    return data_root / "control" / "cluster" / "state" / f"training_phase_{phase}.json"
 
 
 def _raw_green_ratio(qc_path: Path) -> float | None:
@@ -198,3 +233,12 @@ def _is_process_running(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _write_runtime_payload(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _hostname() -> str:
+    return os.getenv("HOSTNAME") or os.uname().nodename

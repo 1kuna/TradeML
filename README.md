@@ -36,18 +36,18 @@ trademl dashboard
 The dashboard provides:
 
 - Node start / stop / restart controls
-- Live queue and partition-status metrics
-- NAS-backed fleet view for workers, shard leases, and recent events
+- One-screen collection coverage and "left to collect" progress
+- "Can we train yet?" readiness with blockers
+- DGX/workstation training command hints once the corpus is ready
 - NAS reachability and mount write checks
-- Editable NAS share / mount and schedule settings
-- Log tailing and restart-safe progress inspection from SQLite + parquet state
 - Cluster join / rebuild / leave controls and systemd install integration
 - Local worker lifecycle controls for update / reset / uninstall
+- Logs plus advanced audit / lease / vendor detail behind collapsible sections
 
 The intended operator flow is:
 
 - Use `trademl dashboard` to configure the worker, join the cluster, monitor progress, and run the node day to day.
-- Use the CLI only for install/update/reset/uninstall and launching the dashboard.
+- Use the CLI for install/update/reset/uninstall, launching the dashboard, and off-node training on the workstation or DGX.
 
 Minimal lifecycle commands:
 
@@ -58,6 +58,25 @@ trademl node reset --passphrase 'your-passphrase'
 trademl node uninstall
 trademl node install-service
 ```
+
+## Off-Node Training
+
+The Raspberry Pi only collects and curates data. Training should run on your workstation or DGX against the same NAS-backed corpus.
+
+Minimal training commands:
+
+```bash
+trademl train --data-root /mnt/trademl preflight
+trademl train --data-root /mnt/trademl start --phase 1
+trademl train --data-root /mnt/trademl status --phase 1
+```
+
+Defaults:
+
+- training state/logs go to `~/.trademl-training`
+- phase 1 uses the Ridge-only baseline
+- phase 2 uses the full Ridge + LightGBM suite
+- shared training runtime is written onto the NAS so the Pi dashboard can report readiness and latest training status without launching anything locally
 
 The dashboard now exposes the rest of the worker lifecycle:
 

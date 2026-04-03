@@ -40,7 +40,7 @@ from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.capabilities import load_audit_state
 from trademl.data_node.planner import plan_auxiliary_tasks
-from trademl.data_node.training_control import evaluate_training_gates
+from trademl.data_node.training_control import evaluate_training_gates, read_training_runtime, shared_training_runtime_path
 from trademl.fleet.cluster import (
     ClusterCoordinator,
     ClusterPaths,
@@ -808,6 +808,16 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         stage_symbol_count=len(stage_symbols),
         stage_years=int(stage_years or 0),
     )
+    collection_status = _summarize_collection_status(
+        raw_datapoints=raw_datapoints,
+        expected_datapoints=expected_datapoints,
+        queue_counts=queue_counts,
+    )
+    training_status = {
+        "phase1": read_training_runtime(path=shared_training_runtime_path(data_root=settings.nas_mount, phase=1)),
+        "phase2": read_training_runtime(path=shared_training_runtime_path(data_root=settings.nas_mount, phase=2)),
+    }
+    train_operational_status = _summarize_train_operational_status(training_status=training_status, readiness=readiness)
     snapshot = {
         "settings": asdict(settings),
         "runtime": runtime,
@@ -832,8 +842,15 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "expected_stage_datapoints": expected_datapoints,
         "stage_progress_ratio": progress_ratio,
         "stage_datapoint_progress_ratio": datapoint_progress_ratio,
+        "collection_status": collection_status,
         "data_readiness": data_readiness,
         "training_readiness": readiness,
+        "training_status": training_status,
+        "train_operational_status": train_operational_status,
+        "suggested_training_commands": {
+            "phase1": f"trademl train --data-root {settings.nas_mount} start --phase 1",
+            "phase2": f"trademl train --data-root {settings.nas_mount} start --phase 2",
+        },
         "audit": audit,
         "coverage_plan": coverage_plan,
         "nas": {
@@ -1197,6 +1214,43 @@ def _summarize_data_readiness(
         "missing": missing,
         "eod_complete": eod_complete,
     }
+
+
+def _summarize_collection_status(
+    *,
+    raw_datapoints: int,
+    expected_datapoints: int | None,
+    queue_counts: dict[str, int],
+) -> dict[str, Any]:
+    expected = int(expected_datapoints or 0)
+    collected = int(raw_datapoints)
+    if expected > 0:
+        coverage_ratio = min(1.0, collected / expected)
+        remaining = max(0, expected - collected)
+    else:
+        coverage_ratio = 0.0
+        remaining = 0
+    return {
+        "coverage_ratio": coverage_ratio,
+        "coverage_percent": round(coverage_ratio * 100.0, 1),
+        "remaining_ratio": max(0.0, 1.0 - coverage_ratio),
+        "remaining_percent": round(max(0.0, 1.0 - coverage_ratio) * 100.0, 1),
+        "collected_datapoints": collected,
+        "expected_datapoints": expected,
+        "remaining_datapoints": remaining,
+        "pending_tasks": int(queue_counts.get("PENDING", 0)),
+        "failed_tasks": int(queue_counts.get("FAILED", 0)),
+    }
+
+
+def _summarize_train_operational_status(*, training_status: dict[str, dict[str, Any]], readiness: dict[str, Any]) -> str:
+    for phase in ("phase2", "phase1"):
+        status = str(training_status.get(phase, {}).get("status", "")).lower()
+        if status in {"starting", "running", "completed", "failed"}:
+            return status
+    if readiness["phase1"]["ready"]:
+        return "ready"
+    return "blocked"
 
 
 def _extract_share_host(nas_share: str) -> str | None:

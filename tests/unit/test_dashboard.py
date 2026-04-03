@@ -204,6 +204,9 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert "corp_actions" in snapshot["training_readiness"]["phase1"]["blockers"]
     assert snapshot["vendor_attempt_summary"]["counts"] == {}
     assert "cycle done" in snapshot["log_tail"]
+    assert snapshot["collection_status"]["coverage_percent"] > 0.0
+    assert snapshot["collection_status"]["remaining_datapoints"] > 1
+    assert snapshot["train_operational_status"] == "blocked"
 
 
 def test_run_vendor_audit_and_replan_coverage_persist_outputs(tmp_path: Path, monkeypatch) -> None:

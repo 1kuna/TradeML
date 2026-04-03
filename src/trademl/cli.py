@@ -28,6 +28,12 @@ from trademl.dashboard.controller import (
     update_worker,
     update_cluster_secrets,
 )
+from trademl.data_node.training_control import (
+    launch_training_process,
+    read_training_runtime,
+    shared_training_runtime_path,
+    training_preflight,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,6 +48,20 @@ def main(argv: list[str] | None = None) -> int:
     dashboard_parser.add_argument("--host", default="127.0.0.1")
     dashboard_parser.add_argument("--port", type=int, default=8501)
     dashboard_parser.add_argument("--no-browser", action="store_true")
+
+    train_parser = subparsers.add_parser("train", help="Launch or inspect off-node NAS-backed training.")
+    train_parser.add_argument("--data-root", default=None)
+    train_parser.add_argument("--local-state", default=None)
+    train_parser.add_argument("--env-file", default=None)
+    train_subparsers = train_parser.add_subparsers(dest="train_command", required=True)
+    train_status_parser = train_subparsers.add_parser("status", help="Show local and NAS-visible training runtime.")
+    train_status_parser.add_argument("--phase", type=int, default=1)
+    train_preflight_parser = train_subparsers.add_parser("preflight", help="Run the training preflight against NAS data.")
+    train_preflight_parser.add_argument("--phase", type=int, default=1)
+    train_start_parser = train_subparsers.add_parser("start", help="Start a detached DGX/workstation training run.")
+    train_start_parser.add_argument("--phase", type=int, default=1)
+    train_start_parser.add_argument("--report-date", default=None)
+    train_start_parser.add_argument("--python-executable", default=sys.executable)
 
     node_parser = subparsers.add_parser("node", help="Control the data-node service.")
     node_parser.add_argument("--workspace-root", default=None)
@@ -77,6 +97,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "dashboard":
         return _launch_dashboard(args)
+    if args.command == "train":
+        return _dispatch_train(args)
     settings = resolve_node_settings(
         workspace_root=args.workspace_root,
         config_path=args.config,
@@ -180,6 +202,38 @@ def _launch_dashboard(args: argparse.Namespace) -> int:
         ]
     )
     return subprocess.run(command, check=False).returncode
+
+
+def _dispatch_train(args: argparse.Namespace) -> int:
+    data_root = Path(args.data_root or os.getenv("TRADEML_DATA_ROOT") or os.getenv("NAS_MOUNT") or ".").expanduser()
+    local_state = Path(args.local_state or os.getenv("TRADEML_TRAIN_STATE") or "~/.trademl-training").expanduser()
+    env_path = Path(args.env_file).expanduser() if args.env_file else Path(".env")
+    repo_root = Path(__file__).resolve().parents[2]
+    config_path = repo_root / "configs" / "equities_xs.yml"
+    if args.train_command == "status":
+        payload = {
+            "local": read_training_runtime(local_state=local_state, phase=args.phase),
+            "shared": read_training_runtime(path=shared_training_runtime_path(data_root=data_root, phase=args.phase)),
+        }
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.train_command == "preflight":
+        print(json.dumps(training_preflight(data_root=data_root, config_path=config_path), indent=2, default=str))
+        return 0
+    if args.train_command == "start":
+        payload = launch_training_process(
+            repo_root=repo_root,
+            data_root=data_root,
+            local_state=local_state,
+            env_path=env_path,
+            phase=args.phase,
+            model_suite="ridge_only" if args.phase == 1 else "full",
+            python_executable=args.python_executable,
+            report_date=args.report_date,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    raise SystemExit(f"unsupported train command: {args.train_command}")
 
 
 if __name__ == "__main__":

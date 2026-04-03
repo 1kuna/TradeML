@@ -183,3 +183,57 @@ def test_audit_and_replan_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> N
     assert json.loads(capsys.readouterr().out)["action"] == "audit"
     assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "replan-coverage"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "replan"
+
+
+def test_train_start_and_status_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "train-state"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "launch_training_process",
+        lambda **kwargs: {"action": "start", "phase": kwargs["phase"], "data_root": str(kwargs["data_root"])},
+    )
+    monkeypatch.setattr(
+        cli,
+        "read_training_runtime",
+        lambda *, path=None, local_state=None, phase=None: {"status": "running", "phase": phase or 1, "path": str(path) if path else str(local_state)},
+    )
+
+    assert (
+        cli.main(
+            [
+                "train",
+                "--data-root",
+                str(data_root),
+                "--local-state",
+                str(local_state),
+                "--env-file",
+                str(env_path),
+                "start",
+                "--phase",
+                "1",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["action"] == "start"
+
+    assert (
+        cli.main(
+            [
+                "train",
+                "--data-root",
+                str(data_root),
+                "--local-state",
+                str(local_state),
+                "status",
+                "--phase",
+                "1",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["shared"]["status"] == "running"
