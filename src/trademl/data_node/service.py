@@ -24,6 +24,7 @@ from trademl.data_node.capabilities import auxiliary_capabilities, backfill_capa
 from trademl.data_node.curator import Curator, CuratorResult
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.planner import canonical_task_key, choose_vendor_for_canonical_task, plan_auxiliary_tasks
+from trademl.data_node.capabilities import backfill_capabilities
 from trademl.fleet.cluster import ClusterCoordinator, ShardSpec
 from trademl.reference.security_master import rebuild_derived_references
 
@@ -897,6 +898,27 @@ class DataNodeService:
 
     def _process_backfill_task_for_vendor(self, task, vendor: str) -> list[str]:
         task_key = canonical_task_key(task)
+        capability = next(
+            (
+                candidate
+                for candidate in backfill_capabilities(
+                    dataset=task.dataset,
+                    connectors=self.connectors,
+                    audit_state=self.capability_audit_state,
+                )
+                if candidate.vendor == vendor
+            ),
+            None,
+        )
+        if task.symbol is None and capability is not None and capability.batching_mode == "single_symbol":
+            self.db.mark_vendor_attempt_failed(
+                task_key=task_key,
+                vendor=vendor,
+                error="unsupported canonical task shape for single-symbol vendor",
+                backoff_minutes=60,
+            )
+            self.db.defer_task(task.id, reason=f"{vendor}: unsupported canonical task shape", backoff_minutes=5)
+            return []
         symbols = [task.symbol] if task.symbol else self.default_symbols
         attempt = self.db.lease_vendor_attempt(
             task_key=task_key,

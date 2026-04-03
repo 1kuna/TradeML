@@ -63,9 +63,18 @@ def choose_vendor_for_canonical_task(
         if attempt.status == "FAILED" and attempt.next_eligible_at and attempt.next_eligible_at > current_time:
             blocked.add(attempt.vendor)
     for capability in backfill_capabilities(dataset=task.dataset, connectors=connectors, audit_state=audit_state):
+        if not _capability_supports_canonical_task(capability, task):
+            continue
         if capability.vendor not in blocked:
             return capability.vendor
     return None
+
+
+def _capability_supports_canonical_task(capability: VendorCapability, task: BackfillTask) -> bool:
+    """Return whether a capability can safely execute the leased canonical task shape."""
+    if task.symbol is None and capability.batching_mode == "single_symbol":
+        return False
+    return True
 
 
 def plan_auxiliary_tasks(

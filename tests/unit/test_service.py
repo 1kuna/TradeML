@@ -274,6 +274,26 @@ def test_backfill_budget_exhaustion_defers_task_instead_of_marking_failed(tmp_pa
     assert row[2] is not None
 
 
+def test_lease_next_task_for_vendor_skips_single_symbol_vendors_for_datewide_backfill(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-02", "GAP", 1)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _BackfillConnector("alpaca"), "tiingo": _BackfillConnector("tiingo")},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+
+    tiingo_task = service._lease_next_task_for_vendor("tiingo")
+    alpaca_task = service._lease_next_task_for_vendor("alpaca")
+
+    assert tiingo_task is None
+    assert alpaca_task is not None
+    assert alpaca_task.symbol is None
+
+
 def test_materialize_job_rotates_symbol_subset_deterministically() -> None:
     job = {
         "source": "finnhub",

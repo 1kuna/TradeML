@@ -14,7 +14,7 @@ from trademl.data_node.planner import (
 )
 
 
-def test_choose_vendor_for_canonical_task_uses_fallback_order_and_skips_failed_attempts() -> None:
+def test_choose_vendor_for_canonical_task_uses_priority_order_and_skips_failed_attempts() -> None:
     task = BackfillTask(
         id=1,
         dataset="equities_eod",
@@ -54,6 +54,33 @@ def test_choose_vendor_for_canonical_task_uses_fallback_order_and_skips_failed_a
         connectors={"alpaca": object(), "tiingo": object(), "twelve_data": object()},
         audit_state=None,
         attempts=attempts,
+    )
+
+    assert chosen == "alpaca"
+
+
+def test_choose_vendor_for_canonical_task_skips_single_symbol_vendors_for_datewide_tasks() -> None:
+    task = BackfillTask(
+        id=1,
+        dataset="equities_eod",
+        symbol=None,
+        start_date="2020-01-01",
+        end_date="2020-01-31",
+        kind="GAP",
+        priority=1,
+        status="PENDING",
+        attempts=0,
+        next_not_before=None,
+        last_error=None,
+        created_at="2026-04-02T00:00:00+00:00",
+        updated_at="2026-04-02T00:00:00+00:00",
+    )
+
+    chosen = choose_vendor_for_canonical_task(
+        task=task,
+        connectors={"alpaca": object(), "tiingo": object(), "twelve_data": object(), "finnhub": object()},
+        audit_state=None,
+        attempts=[],
     )
 
     assert chosen == "alpaca"
