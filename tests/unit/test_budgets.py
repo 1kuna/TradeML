@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 import json
 
 from trademl.data_node.budgets import BudgetManager
@@ -61,3 +62,21 @@ def test_budget_manager_persists_snapshot(tmp_path) -> None:
     assert payload["vendors"]["alpaca"]["daily_spend"]["OTHER"] == 1
     assert payload["vendors"]["alpaca"]["daily_spend"]["TOTAL"] == 2
     assert len(payload["vendors"]["alpaca"]["window_timestamps"]) == 2
+
+
+def test_budget_manager_snapshot_persistence_is_thread_safe(tmp_path) -> None:
+    snapshot_path = tmp_path / "budget_state.json"
+    manager = BudgetManager(
+        {"alpaca": {"rpm": 1000, "daily_cap": 1000}},
+        snapshot_path=snapshot_path,
+    )
+    now = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+
+    def _spend(offset: int) -> None:
+        manager.record_spend("alpaca", task_kind="OTHER", now=now + timedelta(seconds=offset))
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        list(executor.map(_spend, range(64)))
+
+    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert payload["vendors"]["alpaca"]["daily_spend"]["TOTAL"] == 64
