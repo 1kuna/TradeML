@@ -109,6 +109,10 @@ class HTTPConnector:
         )
         return delay + self.rng.uniform(0, delay / 4 if delay else 0.01)
 
+    def _rate_limit_error(self) -> TemporaryConnectorError:
+        """Return the normalized retryable error for vendor budget/rate exhaustion."""
+        return TemporaryConnectorError(f"budget exhausted for vendor={self.vendor_name}")
+
     def _request(
         self,
         *,
@@ -156,7 +160,9 @@ class HTTPConnector:
             if response.status_code in {429, 500, 502, 503, 504} and attempt < self.retry_config.max_attempts:
                 self.sleep_fn(self._sleep_duration(attempt))
                 continue
-            if response.status_code in {429, 500, 502, 503, 504}:
+            if response.status_code == 429:
+                raise self._rate_limit_error()
+            if response.status_code in {500, 502, 503, 504}:
                 raise TemporaryConnectorError(f"{self.vendor_name} request failed: {response.status_code} {response_text}")
             raise PermanentConnectorError(f"{self.vendor_name} request failed: {response.status_code} {response_text}")
 

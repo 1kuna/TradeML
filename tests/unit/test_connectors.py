@@ -445,3 +445,17 @@ def test_http_connector_wraps_request_exception_as_temporary_error() -> None:
 
     with pytest.raises(TemporaryConnectorError):
         connector.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-02")
+
+
+def test_http_connector_normalizes_exhausted_429_as_budget_error() -> None:
+    connector = MassiveConnector(
+        base_url="https://api.polygon.io",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=FakeSession([FakeResponse(429, {"error": "too many requests"})]),
+        retry_config=RetryConfig(max_attempts=1, base_delay_seconds=0.0, max_delay_seconds=0.0),
+        sleep_fn=lambda _: None,
+    )
+
+    with pytest.raises(TemporaryConnectorError, match="budget exhausted for vendor=massive"):
+        connector.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-02")

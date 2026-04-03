@@ -296,6 +296,46 @@ class DataNodeDB:
                 (error, next_not_before.isoformat(), utc_now().isoformat(), task_id),
             )
 
+    def defer_task(self, task_id: int, *, reason: str, backoff_minutes: int) -> None:
+        """Return a leased task to pending state with a future eligibility time."""
+        next_not_before = utc_now() + timedelta(minutes=backoff_minutes)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE backfill_queue
+                SET status = 'PENDING',
+                    last_error = ?,
+                    next_not_before = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (reason, next_not_before.isoformat(), utc_now().isoformat(), task_id),
+            )
+
+    def requeue_retryable_failures(self) -> int:
+        """Move retryable failed tasks back to pending without discarding backoff."""
+        patterns = (
+            "%budget exhausted%",
+            "%request failed: 429%",
+            "%hourly request allocation%",
+            "%daily request allocation%",
+            "%too many requests%",
+            "%rate limit%",
+        )
+        where_clause = " OR ".join("lower(coalesce(last_error, '')) LIKE ?" for _ in patterns)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE backfill_queue
+                SET status = 'PENDING',
+                    updated_at = ?
+                WHERE status = 'FAILED'
+                  AND ({where_clause})
+                """,
+                (utc_now().isoformat(), *patterns),
+            )
+        return int(cursor.rowcount)
+
     def update_partition_status(
         self,
         source: str,

@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import sqlite3
 
 from trademl.calendars.exchange import ExchangeCalendarStore
 from trademl.connectors.base import TemporaryConnectorError
@@ -246,6 +247,31 @@ def test_collect_forward_falls_back_to_secondary_vendor(tmp_path: Path) -> None:
     assert changed == ["2026-03-31"]
     stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31" / "data.parquet")
     assert stored["symbol"].tolist() == ["AAPL"]
+
+
+def test_backfill_budget_exhaustion_defers_task_instead_of_marking_failed(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    task_id = db.enqueue_task("equities_eod", "AAPL", "2025-01-01", "2025-01-02", "GAP", 1)
+    leased = db.lease_task_by_id(task_id)
+    assert leased is not None
+    service = DataNodeService(
+        db=db,
+        connectors={"finnhub": _BudgetFailConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="finnhub",
+    )
+
+    changed = service._process_backfill_task_for_vendor(leased, "finnhub")
+    with sqlite3.connect(tmp_path / "control" / "node.sqlite") as connection:
+        row = connection.execute("SELECT status, last_error, next_not_before FROM backfill_queue WHERE id = ?", (task_id,)).fetchone()
+
+    assert changed == []
+    assert row is not None
+    assert row[0] == "PENDING"
+    assert "budget exhausted" in (row[1] or "")
+    assert row[2] is not None
 
 
 def test_materialize_job_rotates_symbol_subset_deterministically() -> None:

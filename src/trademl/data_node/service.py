@@ -424,6 +424,9 @@ class DataNodeService:
         market_tz = ZoneInfo("America/New_York")
         collection_hour, collection_minute = (int(part) for part in collection_time_et.split(":", 1))
         self.default_symbols = symbols
+        requeued_failures = self.db.requeue_retryable_failures()
+        if requeued_failures:
+            LOGGER.info("requeued_retryable_failures count=%s", requeued_failures)
 
         while not self._stop_event.is_set():
             coordinator.heartbeat_worker()
@@ -520,6 +523,9 @@ class DataNodeService:
         """Run the scheduled data-node loop until a stop signal is received."""
         market_tz = ZoneInfo("America/New_York")
         collection_hour, collection_minute = (int(part) for part in collection_time_et.split(":", 1))
+        requeued_failures = self.db.requeue_retryable_failures()
+        if requeued_failures:
+            LOGGER.info("requeued_retryable_failures count=%s", requeued_failures)
 
         while not self._stop_event.is_set():
             current = now_fn()
@@ -917,8 +923,13 @@ class DataNodeService:
             self.db.mark_task_failed(task.id, f"{vendor}: {exc}", backoff_minutes=1)
             return []
         except ConnectorError as exc:
-            self.db.mark_vendor_attempt_failed(task_key=task_key, vendor=vendor, error=str(exc), backoff_minutes=15)
-            self.db.mark_task_failed(task.id, f"{vendor}: {exc}", backoff_minutes=1)
+            message = str(exc)
+            if "budget exhausted" in message:
+                self.db.mark_vendor_attempt_failed(task_key=task_key, vendor=vendor, error=message, backoff_minutes=30)
+                self.db.defer_task(task.id, reason=f"{vendor}: {message}", backoff_minutes=5)
+                return []
+            self.db.mark_vendor_attempt_failed(task_key=task_key, vendor=vendor, error=message, backoff_minutes=15)
+            self.db.mark_task_failed(task.id, f"{vendor}: {message}", backoff_minutes=1)
             return []
         if frame.empty:
             self.db.mark_vendor_attempt_failed(task_key=task_key, vendor=vendor, error="empty backfill result", backoff_minutes=30)

@@ -48,9 +48,20 @@ def choose_vendor_for_canonical_task(
     connectors: dict[str, object],
     audit_state: dict[str, Any] | None,
     attempts: list[VendorAttempt],
+    now: datetime | None = None,
 ) -> str | None:
     """Choose the next eligible vendor for a canonical task."""
-    blocked = {attempt.vendor for attempt in attempts if attempt.status in {"SUCCESS", "PERMANENT_FAILED", "FAILED", "LEASED"}}
+    current_time = (now or datetime.now(tz=UTC)).isoformat()
+    blocked: set[str] = set()
+    for attempt in attempts:
+        if attempt.status in {"SUCCESS", "PERMANENT_FAILED"}:
+            blocked.add(attempt.vendor)
+            continue
+        if attempt.status == "LEASED" and attempt.lease_expires_at and attempt.lease_expires_at > current_time:
+            blocked.add(attempt.vendor)
+            continue
+        if attempt.status == "FAILED" and attempt.next_eligible_at and attempt.next_eligible_at > current_time:
+            blocked.add(attempt.vendor)
     for capability in backfill_capabilities(dataset=task.dataset, connectors=connectors, audit_state=audit_state):
         if capability.vendor not in blocked:
             return capability.vendor

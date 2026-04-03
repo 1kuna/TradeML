@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import pyarrow.parquet as pq
 import yaml
 
 from trademl.calendars.exchange import get_trading_days
@@ -767,10 +766,10 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         runtime["uptime_seconds"] = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
     queue_counts = _read_queue_counts(settings.db_path)
     partition_summary = _read_partition_summary(settings.qc_path)
-    raw_dates = _partition_dates(settings.raw_equities_root)
+    raw_dates = _partition_dates_from_qc(partition_summary)
     curated_dates = _partition_dates(settings.curated_equities_root)
-    raw_datapoints = _count_partition_rows(settings.raw_equities_root)
-    curated_datapoints = _count_partition_rows(settings.curated_equities_root)
+    raw_datapoints = _raw_datapoints_from_qc(partition_summary)
+    curated_datapoints = _curated_datapoints_estimate(settings, raw_datapoints)
     reference_files = sorted(path.name for path in settings.reference_root.glob("*.parquet")) if settings.reference_root.exists() else []
     macro_series = _macro_series(settings.macro_root)
     price_check_files = _price_check_files(settings.price_checks_root)
@@ -1123,14 +1122,26 @@ def _read_queue_counts(db_path: Path) -> dict[str, int]:
 
 def _read_partition_summary(qc_path: Path) -> dict[str, Any]:
     if not qc_path.exists():
-        return {"counts": {}, "coverage_green": None, "latest_date": None}
+        return {"counts": {}, "coverage_green": None, "latest_date": None, "raw_dates": [], "raw_datapoints": 0}
     frame = pd.read_parquet(qc_path)
     if frame.empty:
-        return {"counts": {}, "coverage_green": None, "latest_date": None}
-    counts = {str(key): int(value) for key, value in frame["status"].value_counts().to_dict().items()}
-    coverage_green = float(counts.get("GREEN", 0) / len(frame))
-    latest_date = pd.to_datetime(frame["date"]).max().date().isoformat()
-    return {"counts": counts, "coverage_green": coverage_green, "latest_date": latest_date}
+        return {"counts": {}, "coverage_green": None, "latest_date": None, "raw_dates": [], "raw_datapoints": 0}
+    equities = frame.loc[frame["dataset"] == "equities_eod"].copy()
+    counts = {str(key): int(value) for key, value in equities["status"].value_counts().to_dict().items()} if not equities.empty else {}
+    coverage_green = float(counts.get("GREEN", 0) / len(equities)) if not equities.empty else None
+    latest_date = pd.to_datetime(equities["date"]).max().date().isoformat() if not equities.empty else None
+    raw_dates = sorted(pd.to_datetime(equities["date"]).dt.date.astype(str).unique().tolist()) if not equities.empty else []
+    if not equities.empty and "row_count" in equities.columns:
+        raw_datapoints = int(pd.to_numeric(equities["row_count"], errors="coerce").fillna(0).sum())
+    else:
+        raw_datapoints = 0
+    return {
+        "counts": counts,
+        "coverage_green": coverage_green,
+        "latest_date": latest_date,
+        "raw_dates": raw_dates,
+        "raw_datapoints": raw_datapoints,
+    }
 
 
 def _partition_dates(root: Path) -> list[str]:
@@ -1144,16 +1155,21 @@ def _partition_dates(root: Path) -> list[str]:
     return sorted(set(dates))
 
 
-def _count_partition_rows(root: Path) -> int:
-    if not root.exists():
-        return 0
-    total = 0
-    for path in root.glob("date=*/data.parquet"):
-        try:
-            total += pq.ParquetFile(path).metadata.num_rows
-        except Exception:
-            continue
-    return total
+def _partition_dates_from_qc(partition_summary: dict[str, Any]) -> list[str]:
+    return list(partition_summary.get("raw_dates", []))
+
+
+def _raw_datapoints_from_qc(partition_summary: dict[str, Any]) -> int:
+    return int(partition_summary.get("raw_datapoints", 0))
+
+
+def _curated_datapoints_estimate(settings: NodeSettings, raw_datapoints: int) -> int:
+    if settings.curated_equities_root.exists():
+        curated_dates = _partition_dates(settings.curated_equities_root)
+        raw_dates = _partition_dates(settings.raw_equities_root)
+        if curated_dates and len(curated_dates) == len(raw_dates):
+            return raw_datapoints
+    return 0
 
 
 def _macro_series(root: Path) -> list[str]:

@@ -133,3 +133,19 @@ def test_vendor_attempt_success_is_terminal(tmp_path: Path) -> None:
         vendor="tiingo",
         lease_owner="worker-a",
     ) is None
+
+
+def test_requeue_retryable_failures_moves_rate_limited_rows_back_to_pending(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    retryable_id = database.enqueue_task("equities_eod", None, "2024-01-01", "2024-01-01", "GAP", 1)
+    permanent_id = database.enqueue_task("equities_eod", None, "2024-01-02", "2024-01-02", "GAP", 1)
+    database.mark_task_failed(retryable_id, 'tiingo request failed: 429 {"detail":"hourly request allocation"}', backoff_minutes=30)
+    database.mark_task_failed(permanent_id, "alpaca: permanent data schema failure", backoff_minutes=30)
+
+    moved = database.requeue_retryable_failures()
+
+    assert moved == 1
+    with sqlite3.connect(tmp_path / "node.sqlite") as connection:
+        statuses = dict(connection.execute("SELECT id, status FROM backfill_queue").fetchall())
+    assert statuses[retryable_id] == "PENDING"
+    assert statuses[permanent_id] == "FAILED"

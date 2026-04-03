@@ -159,7 +159,9 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
 
     qc_root = nas_mount / "data" / "qc"
     qc_root.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{"source": "alpaca", "dataset": "equities_eod", "date": "2025-01-02", "status": "GREEN"}]).to_parquet(
+    pd.DataFrame(
+        [{"source": "alpaca", "dataset": "equities_eod", "date": "2025-01-02", "status": "GREEN", "row_count": 1, "expected_rows": 2}]
+    ).to_parquet(
         qc_root / "partition_status.parquet",
         index=False,
     )

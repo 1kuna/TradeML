@@ -59,6 +59,52 @@ def test_choose_vendor_for_canonical_task_uses_fallback_order_and_skips_failed_a
     assert chosen == "alpaca"
 
 
+def test_choose_vendor_for_canonical_task_retries_vendor_after_backoff_expires() -> None:
+    task = BackfillTask(
+        id=1,
+        dataset="equities_eod",
+        symbol="AAPL",
+        start_date="2020-01-01",
+        end_date="2020-01-31",
+        kind="GAP",
+        priority=1,
+        status="PENDING",
+        attempts=0,
+        next_not_before=None,
+        last_error=None,
+        created_at="2026-04-02T00:00:00+00:00",
+        updated_at="2026-04-02T00:00:00+00:00",
+    )
+    attempts = [
+        VendorAttempt(
+            task_key=canonical_task_key(task),
+            task_family="canonical",
+            planner_group="canonical_bars_backlog",
+            vendor="tiingo",
+            lease_owner=None,
+            status="FAILED",
+            attempts=1,
+            last_error="budget exhausted",
+            next_eligible_at="2026-04-02T00:00:00+00:00",
+            leased_at=None,
+            lease_expires_at=None,
+            rows_returned=None,
+            payload_json=None,
+            updated_at="2026-04-02T00:00:00+00:00",
+        )
+    ]
+
+    chosen = choose_vendor_for_canonical_task(
+        task=task,
+        connectors={"tiingo": object(), "alpaca": object()},
+        audit_state=None,
+        attempts=attempts,
+        now=pd.Timestamp("2026-04-02T01:00:00+00:00").to_pydatetime(),
+    )
+
+    assert chosen == "tiingo"
+
+
 def test_plan_auxiliary_tasks_includes_macro_and_reference_chunks(tmp_path: Path) -> None:
     reference_root = tmp_path / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)
