@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from trademl.data_node.__main__ import _build_reference_jobs, _resolve_vendor_budgets
+from pathlib import Path
+
+from trademl.data_node.__main__ import _build_reference_jobs, _resolve_vendor_budgets, _should_rebuild_local_state
 
 
 def test_resolve_vendor_budgets_keeps_defaults_for_new_connectors() -> None:
@@ -43,3 +45,15 @@ def test_build_reference_jobs_uses_verified_defaults_and_caps_symbol_fanout() ->
         job for job in jobs if job["source"] == "twelve_data" and job["dataset"] == "financial_statements"
     )
     assert twelve_financials["max_symbols_per_run"] == 20
+
+
+def test_should_rebuild_local_state_only_when_missing_or_forced(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "node.sqlite"
+
+    assert _should_rebuild_local_state(local_db_path=db_path) is True
+
+    db_path.write_text("sqlite-placeholder", encoding="utf-8")
+    assert _should_rebuild_local_state(local_db_path=db_path) is False
+
+    monkeypatch.setenv("TRADEML_FORCE_REBUILD", "1")
+    assert _should_rebuild_local_state(local_db_path=db_path) is True

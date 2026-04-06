@@ -11,6 +11,7 @@ from trademl.connectors.base import PermanentConnectorError, TemporaryConnectorE
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
+from trademl.data_node import service as service_module
 from trademl.data_node.service import DataNodePaths, DataNodeService
 
 
@@ -855,6 +856,69 @@ def test_run_cluster_forever_reference_budget_failure_does_not_crash_worker(tmp_
     )
 
     assert calls == ["price_checks"]
+
+
+def test_build_canonical_coverage_index_skips_unreadable_partition_in_fallback(tmp_path: Path, monkeypatch) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    good_partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31"
+    bad_partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-04-01"
+    good_partition.mkdir(parents=True, exist_ok=True)
+    bad_partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"symbol": "AAPL", "date": "2026-03-31", "close": 100.0}]).to_parquet(
+        good_partition / "data.parquet",
+        index=False,
+    )
+    (bad_partition / "data.parquet").write_text("not parquet", encoding="utf-8")
+
+    monkeypatch.setattr(service_module.ds, "dataset", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("schema mismatch")))
+
+    coverage = service._build_canonical_coverage_index(trading_days=["2026-03-31", "2026-04-01"])
+
+    assert coverage == {"AAPL": {"2026-03-31"}}
+
+
+def test_merge_partition_frame_quarantines_zero_byte_existing_partition(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-04-01"
+    partition.mkdir(parents=True, exist_ok=True)
+    existing_path = partition / "data.parquet"
+    existing_path.write_bytes(b"")
+    incoming = pd.DataFrame(
+        [
+            {
+                "date": "2026-04-01",
+                "symbol": "AAPL",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "volume": 100,
+                "source_name": "alpaca",
+            }
+        ]
+    )
+
+    merged = service._merge_partition_frame(partition=partition, frame=incoming)
+
+    assert len(merged) == 1
+    assert merged.iloc[0]["symbol"] == "AAPL"
+    assert not existing_path.exists()
+    quarantined = list(partition.glob("data.corrupt.*.parquet"))
+    assert quarantined
 
 
 def test_run_cluster_auxiliary_tasks_uses_daily_reference_bucket_until_core_ready(tmp_path: Path) -> None:

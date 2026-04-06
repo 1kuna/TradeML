@@ -1109,7 +1109,11 @@ class DataNodeService:
                 path = self.paths.raw_equities / f"date={day}" / "data.parquet"
                 if not path.exists():
                     continue
-                frame = pd.read_parquet(path, columns=["symbol"])
+                try:
+                    frame = pd.read_parquet(path, columns=["symbol"])
+                except Exception as exc:  # pragma: no cover - exercised via service tests
+                    LOGGER.warning("skipping_unreadable_raw_partition path=%s error=%s", path, exc)
+                    continue
                 if frame.empty:
                     continue
                 for symbol in frame["symbol"].dropna().astype("string").str.upper().tolist():
@@ -1660,12 +1664,12 @@ class DataNodeService:
         path = self.paths.raw_equities / f"date={date}" / "data.parquet"
         if not path.exists():
             return pd.DataFrame()
-        return pd.read_parquet(path)
+        return self._read_partition_frame(path)
 
     def _merge_partition_frame(self, *, partition: Path, frame: pd.DataFrame) -> pd.DataFrame:
         """Merge new rows into an existing raw partition without losing already collected symbols."""
         existing_path = partition / "data.parquet"
-        existing = pd.read_parquet(existing_path) if existing_path.exists() else pd.DataFrame(columns=frame.columns)
+        existing = self._read_partition_frame(existing_path, empty_columns=frame.columns) if existing_path.exists() else pd.DataFrame(columns=frame.columns)
         combined = pd.concat([existing, frame], ignore_index=True)
         if combined.empty:
             return combined
@@ -1692,6 +1696,19 @@ class DataNodeService:
         combined = combined.sort_values(sort_columns, ascending=ascending)
         combined = combined.drop_duplicates(subset=["date", "symbol"], keep="first")
         return combined.drop(columns=["_vendor_priority"], errors="ignore").reset_index(drop=True)
+
+    def _read_partition_frame(self, path: Path, *, empty_columns: object | None = None) -> pd.DataFrame:
+        """Read a parquet partition, quarantining unreadable files instead of crashing the worker."""
+        try:
+            return pd.read_parquet(path)
+        except Exception as exc:
+            quarantine = path.with_name(f"{path.stem}.corrupt.{uuid.uuid4().hex}{path.suffix}")
+            LOGGER.warning("quarantining_unreadable_partition path=%s quarantine=%s error=%s", path, quarantine, exc)
+            with contextlib.suppress(OSError):
+                os.replace(path, quarantine)
+            if empty_columns is None:
+                return pd.DataFrame()
+            return pd.DataFrame(columns=list(empty_columns))
 
     def _canonical_vendor_priority(self) -> dict[str, int]:
         """Return the canonical vendor preference ordering for equities backfill/forward rows."""

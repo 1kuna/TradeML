@@ -194,7 +194,9 @@ def main() -> int:
         universe_builder=stage0_universe_builder,
     )
     manifest = coordinator.ensure_cluster_ready(passphrase=args.passphrase)
-    rebuilt = coordinator.rebuild_local_state(local_db_path=local_state / "node.sqlite")
+    local_db_path = local_state / "node.sqlite"
+    if _should_rebuild_local_state(local_db_path=local_db_path):
+        coordinator.rebuild_local_state(local_db_path=local_db_path)
     db = DataNodeDB(local_state / "node.sqlite")
     service.db = db
     service.auditor.db = db
@@ -215,6 +217,13 @@ def main() -> int:
         price_check_symbols=active_symbols[:5] if {"massive", "finnhub"}.issubset(connectors) else [],
     )
     return 0
+
+
+def _should_rebuild_local_state(*, local_db_path: Path) -> bool:
+    """Return whether startup should rebuild the disposable local DB from NAS."""
+    if os.getenv("TRADEML_FORCE_REBUILD", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    return not local_db_path.exists()
 
 
 def _load_stage_symbols(root: Path) -> list[str]:
