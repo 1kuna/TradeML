@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 import requests
 
+import trademl.connectors.base as base_module
 from trademl.connectors.alpaca import AlpacaConnector
 from trademl.connectors.alpha_vantage import AlphaVantageConnector
 from trademl.connectors.base import BaseConnector, PermanentConnectorError, RetryConfig, TemporaryConnectorError
@@ -20,10 +21,11 @@ from trademl.data_node.budgets import BudgetManager
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload: object, text: str | None = None) -> None:
+    def __init__(self, status_code: int, payload: object, text: str | None = None, headers: dict[str, str] | None = None) -> None:
         self.status_code = status_code
         self.payload = payload
         self._text = text
+        self.headers = headers or {}
 
     def json(self) -> object:
         if isinstance(self.payload, Exception):
@@ -177,6 +179,53 @@ def test_massive_connector_normalizes_bars() -> None:
 
     assert frame.iloc[0]["symbol"] == "MSFT"
     assert frame.iloc[0]["trade_count"] == 4
+
+
+def test_massive_connector_paginates_bars_via_next_url() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "results": [{"t": 1704153600000, "o": 10, "h": 11, "l": 9, "c": 10.5, "vw": 10.2, "v": 20, "n": 4}],
+                    "next_url": "https://api.massive.com/v2/aggs/ticker/MSFT/range/1/day/2024-01-02/2024-01-03?cursor=abc",
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "results": [{"t": 1704240000000, "o": 11, "h": 12, "l": 10, "c": 11.5, "vw": 11.2, "v": 21, "n": 5}],
+                },
+            ),
+        ]
+    )
+    connector = MassiveConnector(base_url="https://api.polygon.io", api_key="key", budget_manager=_budget_manager(), session=session)
+
+    frame = connector.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-03")
+
+    assert frame["date"].astype(str).tolist() == ["2024-01-02", "2024-01-03"]
+    assert session.calls[1][1] == "https://api.massive.com/v2/aggs/ticker/MSFT/range/1/day/2024-01-02/2024-01-03?cursor=abc"
+
+
+def test_massive_connector_paginates_reference_tickers_via_next_url() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "results": [{"ticker": "AAPL"}],
+                    "next_url": "https://api.massive.com/v3/reference/tickers?cursor=abc",
+                },
+            ),
+            FakeResponse(200, {"results": [{"ticker": "MSFT"}]}),
+        ]
+    )
+    connector = MassiveConnector(base_url="https://api.polygon.io", api_key="key", budget_manager=_budget_manager(), session=session)
+
+    frame = connector.fetch("reference_tickers", [], "2024-01-02", "2024-01-03")
+
+    assert frame["ticker"].tolist() == ["AAPL", "MSFT"]
+    assert session.calls[1][1] == "https://api.massive.com/v3/reference/tickers?cursor=abc"
 
 
 def test_finnhub_connector_normalizes_equities_and_earnings() -> None:
@@ -532,6 +581,44 @@ def test_retry_and_permanent_error_behavior() -> None:
 
     with pytest.raises(PermanentConnectorError):
         permanent.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-02")
+
+
+def test_http_connector_uses_documented_reset_header_for_retry_delay() -> None:
+    sleep_calls: list[float] = []
+    session = FakeSession(
+        [
+            FakeResponse(429, {"error": "too many requests"}, headers={"X-RateLimit-Reset": "103"}),
+            FakeResponse(
+                200,
+                {
+                    "bars": {
+                        "AAPL": [{"t": "2026-01-02T00:00:00Z", "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "vw": 1.4, "v": 10, "n": 2}]
+                    },
+                    "next_page_token": None,
+                },
+            ),
+        ]
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(base_module.time, "time", lambda: 100.0)
+    connector = AlpacaConnector(
+        base_url="https://data.alpaca.markets",
+        trading_base_url="https://paper-api.alpaca.markets/v2",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+        retry_config=RetryConfig(max_attempts=2, base_delay_seconds=0.0, max_delay_seconds=0.0),
+        sleep_fn=lambda seconds: sleep_calls.append(seconds),
+    )
+    try:
+        frame = connector.fetch("equities_eod", ["AAPL"], "2026-01-02", "2026-01-02")
+    finally:
+        monkeypatch.undo()
+
+    telemetry = connector.budget_manager.snapshot()["vendors"]["alpaca"]["telemetry"]
+    assert not frame.empty
+    assert sleep_calls == [3.0]
+    assert telemetry["totals"]["remote_rate_limits"] == 1
 
 
 def test_http_connector_wraps_request_exception_as_temporary_error() -> None:

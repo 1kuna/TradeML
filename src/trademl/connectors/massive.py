@@ -32,8 +32,21 @@ class MassiveConnector(HTTPConnector):
         if dataset == "reference_dividends":
             return self._fetch_reference(symbols=symbols, endpoint_template="/v3/reference/dividends")
         if dataset == "reference_tickers":
-            payload = self.request_json(endpoint="/v3/reference/tickers", endpoint_key="reference_tickers", params={"active": "true", "limit": 1000})
-            return pd.DataFrame(payload.get("results", []))
+            payload = self.request_json(
+                endpoint="/v3/reference/tickers",
+                endpoint_key="reference_tickers",
+                params={"active": "true", "sort": "ticker", "order": "asc", "limit": 1000},
+            )
+            frames: list[pd.DataFrame] = []
+            while True:
+                frame = pd.DataFrame(payload.get("results", []))
+                if not frame.empty:
+                    frames.append(frame)
+                next_url = payload.get("next_url")
+                if not next_url:
+                    break
+                payload = self.request_json_url(url=str(next_url), endpoint_key="reference_tickers")
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         raise ValueError(f"unsupported dataset for massive: {dataset}")
 
     def _fetch_equities_bars(
@@ -53,12 +66,21 @@ class MassiveConnector(HTTPConnector):
                 params={"adjusted": "false", "sort": "asc", "limit": 50000},
                 logical_units=1,
             )
-            rows = payload.get("results", [])
-            if not rows:
-                continue
-            frame = pd.DataFrame(rows)
-            frame["symbol"] = symbol
-            frames.append(frame)
+            while True:
+                rows = payload.get("results", [])
+                if rows:
+                    frame = pd.DataFrame(rows)
+                    frame["symbol"] = symbol
+                    frames.append(frame)
+                next_url = payload.get("next_url")
+                if not next_url:
+                    break
+                payload = self.request_json_url(
+                    url=str(next_url),
+                    endpoint_key="equities_eod",
+                    task_kind="FORWARD",
+                    logical_units=1,
+                )
         if not frames:
             self.budget_manager.record_empty_success(self.vendor_name, endpoint="equities_eod")
             return pd.DataFrame(columns=self._bar_columns())

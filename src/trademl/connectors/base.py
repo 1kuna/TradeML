@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import email.utils
 import io
 import logging
 import random
@@ -132,12 +133,46 @@ class HTTPConnector:
             return contract.retryable_statuses
         return (429, 500, 502, 503, 504)
 
+    def _retry_after_header(self, endpoint_key: str | None = None) -> str | None:
+        """Return the documented retry-after or reset header for an endpoint."""
+        contract = dataset_contract(self.vendor_name, endpoint_key or "")
+        if contract is not None:
+            return contract.retry_after_header
+        return "Retry-After"
+
+    def _retry_after_seconds(self, response: requests.Response, endpoint_key: str | None = None) -> float | None:
+        """Parse a documented retry-after/reset header into seconds."""
+        header_name = self._retry_after_header(endpoint_key)
+        if not header_name:
+            return None
+        raw_value = response.headers.get(header_name)
+        if raw_value is None:
+            return None
+        text = str(raw_value).strip()
+        if not text:
+            return None
+        if header_name.lower() == "x-ratelimit-reset":
+            try:
+                reset_epoch = float(text)
+            except ValueError:
+                return None
+            return max(0.0, reset_epoch - time.time())
+        try:
+            return max(0.0, float(text))
+        except ValueError:
+            try:
+                parsed = email.utils.parsedate_to_datetime(text)
+            except (TypeError, ValueError, IndexError):
+                return None
+            return max(0.0, parsed.timestamp() - time.time())
+
     def _request(
         self,
         *,
         method: str,
         endpoint: str,
         endpoint_key: str | None = None,
+        absolute_url: str | None = None,
         base_url: str | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
@@ -163,7 +198,7 @@ class HTTPConnector:
             try:
                 response = self.session.request(
                     method=method,
-                    url=f"{(base_url or self.base_url).rstrip('/')}{endpoint}",
+                    url=absolute_url or f"{(base_url or self.base_url).rstrip('/')}{endpoint}",
                     params=params,
                     headers=request_headers,
                     timeout=timeout,
@@ -198,12 +233,15 @@ class HTTPConnector:
                 self._log_request(endpoint=endpoint, symbols=[], rows=0, elapsed_ms=elapsed_ms)
                 return response
 
-            if response.status_code in retryable_statuses and attempt < self.retry_config.max_attempts:
-                self.sleep_fn(self._sleep_duration(attempt))
-                continue
             if response.status_code == 429:
                 self.budget_manager.record_remote_rate_limit(self.vendor_name, endpoint=telemetry_key)
+                if attempt < self.retry_config.max_attempts:
+                    self.sleep_fn(self._retry_after_seconds(response, endpoint_key) or self._sleep_duration(attempt))
+                    continue
                 raise self._rate_limit_error()
+            if response.status_code in retryable_statuses and attempt < self.retry_config.max_attempts:
+                self.sleep_fn(self._retry_after_seconds(response, endpoint_key) or self._sleep_duration(attempt))
+                continue
             if response.status_code in retryable_statuses:
                 raise TemporaryConnectorError(f"{self.vendor_name} request failed: {response.status_code} {response_text}")
             self.budget_manager.record_permanent_failure(self.vendor_name, endpoint=telemetry_key)
@@ -216,6 +254,7 @@ class HTTPConnector:
         *,
         endpoint: str,
         endpoint_key: str | None = None,
+        absolute_url: str | None = None,
         base_url: str | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
@@ -228,6 +267,7 @@ class HTTPConnector:
             method="GET",
             endpoint=endpoint,
             endpoint_key=endpoint_key,
+            absolute_url=absolute_url,
             base_url=base_url,
             params=params,
             headers=headers,
@@ -242,6 +282,7 @@ class HTTPConnector:
         *,
         endpoint: str,
         endpoint_key: str | None = None,
+        absolute_url: str | None = None,
         base_url: str | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
@@ -254,6 +295,7 @@ class HTTPConnector:
             method="GET",
             endpoint=endpoint,
             endpoint_key=endpoint_key,
+            absolute_url=absolute_url,
             base_url=base_url,
             params=params,
             headers=headers,
@@ -263,3 +305,26 @@ class HTTPConnector:
         )
         reader = csv.DictReader(io.StringIO(response.text))
         return pd.DataFrame(reader)
+
+    def request_json_url(
+        self,
+        *,
+        url: str,
+        endpoint_key: str | None = None,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        task_kind: str = "OTHER",
+        budget_units: int = 1,
+        logical_units: int = 1,
+    ) -> dict[str, Any] | list[Any]:
+        """Issue a JSON request against an absolute URL."""
+        return self.request_json(
+            endpoint="",
+            endpoint_key=endpoint_key,
+            absolute_url=url,
+            params=params,
+            headers=headers,
+            task_kind=task_kind,
+            budget_units=budget_units,
+            logical_units=logical_units,
+        )

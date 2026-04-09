@@ -12,6 +12,7 @@ This ledger is the docs-backed source note for the provider contract table in
 - Runtime decisions:
   - canonical critical path enabled
   - multi-symbol bars with `page_token` pagination
+  - follow documented `X-RateLimit-*` reset headers on throttles
   - safe batch size held at `100`
   - treat entitlement-plan markers as permanent
 
@@ -32,6 +33,8 @@ This ledger is the docs-backed source note for the provider contract table in
 - Runtime decisions:
   - keep off frozen-window critical path
   - aggregate bars remain ticker-scoped
+  - both aggregate bars and reference tickers follow documented `next_url` pagination
+  - bars use documented `limit <= 50000`; reference tickers use `limit <= 1000`
   - classify plan/authorization failures as permanent
 
 ### Twelve Data
@@ -41,7 +44,9 @@ This ledger is the docs-backed source note for the provider contract table in
   - `https://support.twelvedata.com/en/articles/9935903-us-equities-market-data`
 - Runtime decisions:
   - keep off frozen-window critical path
-  - batch cost is accounted per requested symbol
+  - comma-separated symbol requests remain enabled on the time-series lane
+  - batch cost is accounted per requested symbol / endpoint credit
+  - treat documented partial batch responses under quota exhaustion as valid telemetry, not transport failure
   - batch size held at `8`
 
 ## Auxiliary / Reference Vendors
