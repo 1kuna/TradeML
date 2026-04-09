@@ -103,7 +103,7 @@ HTML_PAGE = """<!doctype html>
       gap: 18px;
       align-items: stretch;
     }
-    .hero-copy, .actions-panel, .summary-strip {
+    .hero-copy, .actions-panel {
       background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
       border: 1px solid var(--line);
       border-radius: 18px;
@@ -167,17 +167,17 @@ HTML_PAGE = """<!doctype html>
       line-height: 1.55;
     }
     .actions, .nav { margin-top: 0; }
-    .summary-strip {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 14px;
-      padding: 16px;
-    }
     .summary-meta {
       justify-content: space-between;
     }
     .summary-meta .badge {
       background: rgba(32, 201, 151, 0.12);
+    }
+    .hero-status-line {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
     }
     input, select, button, textarea {
       font: inherit;
@@ -385,7 +385,6 @@ HTML_PAGE = """<!doctype html>
         padding: 14px;
       }
       .detail-grid { grid-template-columns: 1fr; }
-      .summary-strip { grid-template-columns: 1fr; }
       .kv { grid-template-columns: 1fr; }
     }
     @media (max-width: 860px) {
@@ -439,20 +438,10 @@ HTML_PAGE = """<!doctype html>
             </div>
             <div class="badge" id="connection-badge">Connecting</div>
           </div>
-          <p>Live node metrics update in-place over a persistent event stream. No page reruns, no Streamlit repaint loop, and the top-line state stays visible while the heavier sections refresh independently.</p>
-          <div class="summary-strip">
-            <div>
-              <div class="label">Realtime transport</div>
-              <div class="delta">Server-sent events for the hot path, JSON fetches for heavier views.</div>
-            </div>
-            <div>
-              <div class="label">Primary lane</div>
-              <div class="delta">Canonical bars, training readiness, vendor activity, and budget truth.</div>
-            </div>
-            <div>
-              <div class="label">UX goal</div>
-              <div class="delta">One stable page with fast updates instead of whole-page flashes.</div>
-            </div>
+          <div class="hero-status-line">
+            <div class="badge">Realtime node telemetry</div>
+            <div class="badge">Canonical collection priority</div>
+            <div class="badge">Training gate tracking</div>
           </div>
           <div class="nav">
             <button class="active" data-section="status">Status</button>
