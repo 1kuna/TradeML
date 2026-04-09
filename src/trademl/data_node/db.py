@@ -1286,6 +1286,39 @@ class DataNodeDB:
                 payloads,
             )
 
+    def reopen_planner_tasks(self, task_keys: list[str] | tuple[str, ...], *, reason: str) -> int:
+        """Reopen planner tasks whose coverage regressed and clear stale attempt state."""
+        if not task_keys:
+            return 0
+        timestamp = utc_now().isoformat()
+        reopened = 0
+        with self._connect() as connection:
+            for index in range(0, len(task_keys), 500):
+                chunk = [str(task_key) for task_key in task_keys[index : index + 500]]
+                placeholders = ",".join("?" for _ in chunk)
+                connection.execute(
+                    f"DELETE FROM vendor_attempts WHERE task_key IN ({placeholders})",
+                    chunk,
+                )
+                cursor = connection.execute(
+                    f"""
+                    UPDATE planner_tasks
+                    SET status = 'PENDING',
+                        attempts = 0,
+                        lease_owner = NULL,
+                        leased_at = NULL,
+                        lease_expires_at = NULL,
+                        next_eligible_at = NULL,
+                        last_error = ?,
+                        updated_at = ?
+                    WHERE task_key IN ({placeholders})
+                      AND status IN ('SUCCESS', 'PERMANENT_FAILED')
+                    """,
+                    [reason, timestamp, *chunk],
+                )
+                reopened += int(cursor.rowcount)
+        return reopened
+
     def fetch_planner_task_progress(self, task_key: str) -> PlannerTaskProgress | None:
         """Return progress for a planner task."""
         with self._connect() as connection:

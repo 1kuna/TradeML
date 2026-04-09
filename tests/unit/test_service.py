@@ -14,6 +14,7 @@ from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.canonical_runtime import CanonicalRuntime
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
+from trademl.data_node.planner import PlannedTask
 from trademl.data_node import service as service_module
 from trademl.data_node.service import DataNodePaths, DataNodeService
 
@@ -421,6 +422,86 @@ def test_seed_planner_tasks_passes_freeze_cutoff_to_planner(tmp_path: Path, monk
 
     assert captured["freeze_report_date"] == "2026-03-06"
     assert captured["current_date"] == "2026-04-07"
+
+
+def test_seed_planner_tasks_reopens_regressed_canonical_tasks(tmp_path: Path, monkeypatch) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector(), "tiingo": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+    task = PlannedTask(
+        task_key="canonical::AAPL::2025-01-03",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2025-01-03",
+        end_date="2025-01-03",
+        symbols=("AAPL",),
+        output_name=None,
+        preferred_vendors=("alpaca", "tiingo"),
+        payload={"scope_kind": "symbol_range", "trading_days": ["2025-01-03"]},
+    )
+    db.upsert_planner_task(
+        task_key=task.task_key,
+        task_family=task.task_family,
+        planner_group=task.planner_group,
+        dataset=task.dataset,
+        tier=task.tier,
+        priority=task.priority,
+        start_date=task.start_date,
+        end_date=task.end_date,
+        symbols=task.symbols,
+        eligible_vendors=task.preferred_vendors,
+        payload=task.payload,
+    )
+    db.mark_planner_task_success(task.task_key)
+    db.update_planner_task_progress(
+        task_key=task.task_key,
+        expected_units=1,
+        completed_units=1,
+        remaining_units=0,
+        completed_symbols=["AAPL"],
+        remaining_symbols=[],
+        state={"scope_kind": "symbol_range"},
+    )
+    leased = db.lease_vendor_attempt(
+        task_key=task.task_key,
+        task_family="canonical_bars",
+        planner_group=task.planner_group,
+        vendor="alpaca",
+        lease_owner=service.worker_id,
+        payload={"symbols": ["AAPL"], "start_date": task.start_date, "end_date": task.end_date},
+    )
+    assert leased is not None
+    db.mark_vendor_attempt_success(task_key=task.task_key, vendor="alpaca", rows_returned=1)
+
+    monkeypatch.setattr(
+        service_module,
+        "recommended_training_cutoff",
+        lambda **kwargs: {"date": "2025-01-03", "coverage_ratio": 1.0},
+    )
+    monkeypatch.setattr(service_module, "plan_coverage_tasks", lambda **kwargs: [task])
+
+    service._seed_planner_tasks(trading_date="2025-01-04")
+
+    refreshed = db.get_planner_task(task.task_key)
+    progress = db.fetch_planner_task_progress(task.task_key)
+    attempts = db.vendor_attempts_for_task(task.task_key)
+
+    assert refreshed is not None
+    assert refreshed.status == "PENDING"
+    assert refreshed.last_error == "canonical coverage regressed"
+    assert progress is not None
+    assert progress.remaining_units == 1
+    assert progress.completed_units == 0
+    assert attempts == []
 
 
 def test_backfill_budget_exhaustion_defers_task_instead_of_marking_failed(tmp_path: Path) -> None:
@@ -1061,6 +1142,30 @@ def test_load_corp_actions_reference_skips_corrupt_parquet(tmp_path: Path) -> No
     assert sorted(frame["symbol"].astype(str).str.upper().unique().tolist()) == ["AAPL"]
 
 
+def test_load_corp_actions_reference_ignores_unrelated_reference_parquet(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    reference_root = tmp_path / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [{"symbol": "AAPL", "ex_date": "2025-01-02", "amount": 1.0, "ratio": pd.NA, "event_type": "dividend", "source": "alpha_vantage"}]
+    ).to_parquet(reference_root / "dividends.parquet", index=False)
+    unrelated_path = reference_root / "fred_vintagedates.parquet"
+    unrelated_path.write_text("not parquet", encoding="utf-8")
+
+    frame = service.load_corp_actions_reference()
+
+    assert sorted(frame["symbol"].astype(str).str.upper().unique().tolist()) == ["AAPL"]
+    assert unrelated_path.exists()
+
+
 def test_curate_dates_reads_only_changed_raw_partitions(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
@@ -1093,6 +1198,44 @@ def test_curate_dates_reads_only_changed_raw_partitions(tmp_path: Path) -> None:
     result = service.curate_dates(corp_actions=pd.DataFrame(), changed_dates=["2025-01-03"])
 
     assert sorted(pd.to_datetime(result.frame["date"]).dt.strftime("%Y-%m-%d").unique().tolist()) == ["2025-01-03"]
+
+
+def test_curate_dates_quarantines_corrupt_changed_partition_and_continues(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    raw_root = tmp_path / "data" / "raw" / "equities_bars"
+    good_partition = raw_root / "date=2025-01-03"
+    bad_partition = raw_root / "date=2025-01-04"
+    good_partition.mkdir(parents=True, exist_ok=True)
+    bad_partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "date": "2025-01-03",
+                "symbol": "MSFT",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "volume": 100,
+                "source_name": "alpaca",
+            }
+        ]
+    ).to_parquet(good_partition / "data.parquet", index=False)
+    (bad_partition / "data.parquet").write_text("not parquet", encoding="utf-8")
+
+    result = service.curate_dates(corp_actions=pd.DataFrame(), changed_dates=["2025-01-03", "2025-01-04"])
+
+    assert sorted(pd.to_datetime(result.frame["date"]).dt.strftime("%Y-%m-%d").unique().tolist()) == ["2025-01-03"]
+    assert not (bad_partition / "data.parquet").exists()
+    assert list(bad_partition.glob("data.corrupt.*.parquet"))
 
 
 def test_curate_dates_streams_multiple_changed_dates_without_full_batch_concat(tmp_path: Path) -> None:
@@ -1388,6 +1531,32 @@ def test_collect_macro_data_persists_vintage_reference(tmp_path: Path) -> None:
     outputs = service.collect_macro_data(["DGS10"], "2026-03-01", "2026-03-31")
 
     assert tmp_path / "data" / "reference" / "fred_vintagedates.parquet" in outputs
+    vintages = pd.read_parquet(tmp_path / "data" / "reference" / "fred_vintagedates.parquet")
+    assert vintages["series_id"].tolist() == ["DGS10"]
+
+
+def test_collect_macro_data_persists_vintages_even_when_observations_are_empty(tmp_path: Path) -> None:
+    class _VintagesOnlyFredConnector:
+        def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+            if dataset == "macros_treasury":
+                return pd.DataFrame(columns=["series_id", "observation_date", "value", "vintage_date", "ingested_at"])
+            if dataset == "vintagedates":
+                return pd.DataFrame([{"series_id": symbols[0], "vintage_date": end_date}])
+            raise ValueError(dataset)
+
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"fred": _VintagesOnlyFredConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    outputs = service.collect_macro_data(["DGS10"], "2026-03-01", "2026-03-31")
+
+    assert tmp_path / "data" / "reference" / "fred_vintagedates.parquet" in outputs
+    assert not (tmp_path / "data" / "raw" / "macros_fred" / "series=DGS10" / "data.parquet").exists()
     vintages = pd.read_parquet(tmp_path / "data" / "reference" / "fred_vintagedates.parquet")
     assert vintages["series_id"].tolist() == ["DGS10"]
 

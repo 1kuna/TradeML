@@ -296,6 +296,11 @@ class DataNodeService:
         coverage_index = self._canonical_runtime._build_canonical_coverage_index() if any(task.task_family == "canonical_bars" for task in planned) else {}
         task_rows: list[dict[str, object]] = []
         progress_rows: list[dict[str, object]] = []
+        canonical_task_map = {
+            task.task_key: task
+            for task in self.db.fetch_planner_tasks(task_family="canonical_bars")
+        }
+        regressed_task_keys: list[str] = []
         for task in planned:
             task_family = task.task_family
             if task_family == "auxiliary":
@@ -323,12 +328,19 @@ class DataNodeService:
             if task_family == "auxiliary":
                 task_family = self._planner_family_for_dataset(task.dataset)
             if task_family == "canonical_bars":
+                existing_task = canonical_task_map.get(task.task_key)
                 existing_progress = existing_progress_map.get(task.task_key)
                 progress_payload = self._canonical_runtime._canonical_progress_for_scope(
                     symbols=list(task.symbols),
                     trading_days=list(task.payload.get("trading_days", [])),
                     coverage_index=coverage_index,
                 )
+                if (
+                    existing_task is not None
+                    and existing_task.status in {"SUCCESS", "PERMANENT_FAILED"}
+                    and int(progress_payload["remaining_units"]) > 0
+                ):
+                    regressed_task_keys.append(task.task_key)
                 if existing_progress is not None and existing_progress.completed_units == progress_payload["completed_units"] and existing_progress.remaining_units == progress_payload["remaining_units"]:
                     continue
                 progress_rows.append(
@@ -355,6 +367,10 @@ class DataNodeService:
                     }
                 )
         self.db.bulk_update_planner_task_progress(progress_rows)
+        if regressed_task_keys:
+            reopened = self.db.reopen_planner_tasks(sorted(set(regressed_task_keys)), reason="canonical coverage regressed")
+            if reopened:
+                LOGGER.warning("reopened_regressed_canonical_tasks count=%s", reopened)
 
     def _drain_canonical_lane(self, vendor: str, exchange: str) -> list[str]:
         """Drain canonical planner tasks for a single vendor lane."""
@@ -413,7 +429,9 @@ class DataNodeService:
             logs: list[pd.DataFrame] = []
             for path in raw_files:
                 day_key = path.parent.name.partition("=")[2]
-                raw_frame = pd.read_parquet(path)
+                raw_frame = self._canonical_runtime._read_partition_frame(path)
+                if raw_frame.empty:
+                    continue
                 result = self.curator.write_curated(
                     raw_bars=raw_frame,
                     corp_actions=actions,
@@ -436,7 +454,8 @@ class DataNodeService:
             return CuratorResult(frame=combined_frame, adjustment_log=combined_log)
 
         raw_files = sorted(self.paths.raw_equities.glob("date=*/data.parquet"))
-        raw_frame = pd.concat((pd.read_parquet(path) for path in raw_files), ignore_index=True) if raw_files else pd.DataFrame()
+        raw_frames = [frame for frame in (self._canonical_runtime._read_partition_frame(path) for path in raw_files) if not frame.empty]
+        raw_frame = pd.concat(raw_frames, ignore_index=True) if raw_frames else pd.DataFrame()
         return self.curator.write_curated(
             raw_bars=raw_frame,
             corp_actions=actions,
@@ -456,7 +475,10 @@ class DataNodeService:
     def load_corp_actions_reference(self) -> pd.DataFrame:
         """Load any persisted corp-action reference parquet files into the curator schema."""
         frames: list[pd.DataFrame] = []
-        for path in sorted(self.paths.reference_root.glob("*.parquet")):
+        for filename in ("corp_actions.parquet", "splits.parquet", "dividends.parquet"):
+            path = self.paths.reference_root / filename
+            if not path.exists():
+                continue
             try:
                 frame = pd.read_parquet(path)
             except Exception as exc:

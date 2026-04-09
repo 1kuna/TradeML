@@ -132,14 +132,13 @@ class AuxiliaryRuntime:
         connector = self.connectors["fred"]
         frame = connector.fetch("macros_treasury", series_ids, start_date, end_date)
         outputs: list[Path] = []
-        if frame.empty or "series_id" not in frame.columns:
-            return outputs
-        for series_id, series_frame in frame.groupby("series_id"):
-            partition = self.paths.root / "data" / "raw" / "macros_fred" / f"series={series_id}"
-            partition.mkdir(parents=True, exist_ok=True)
-            output = partition / "data.parquet"
-            series_frame.to_parquet(output, index=False)
-            outputs.append(output)
+        if not frame.empty and "series_id" in frame.columns:
+            for series_id, series_frame in frame.groupby("series_id"):
+                partition = self.paths.root / "data" / "raw" / "macros_fred" / f"series={series_id}"
+                partition.mkdir(parents=True, exist_ok=True)
+                output = partition / "data.parquet"
+                series_frame.to_parquet(output, index=False)
+                outputs.append(output)
         vintages = connector.fetch("vintagedates", series_ids, start_date, end_date)
         if not vintages.empty and {"series_id", "vintage_date"}.issubset(vintages.columns):
             self.paths.reference_root.mkdir(parents=True, exist_ok=True)

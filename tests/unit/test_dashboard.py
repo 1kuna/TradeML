@@ -467,6 +467,101 @@ def test_build_collection_health_keeps_frozen_bars_and_collection_numbers_aligne
     assert health["collection_status"]["raw_vendor_rows"] == 111
 
 
+def test_build_collection_health_uses_minimum_critical_ratio_for_training_ready() -> None:
+    health = dashboard_controller._build_collection_health(
+        planner_summary={"progress": {"canonical_bars": {"expected_units": 1000, "completed_units": 996, "remaining_units": 4}}},
+        reference_files=["corp_actions.parquet", "listing_history.parquet", "delistings.parquet", "sec_filings.parquet", "fred_vintagedates.parquet"],
+        macro_series=dashboard_controller.default_macro_series(),
+        planner_eta={"canonical_bars": {"remaining_units": 4, "eta_minutes": 12.0}},
+        freeze_cutoff={"date": "2026-03-07", "effective_window_coverage_ratio": 0.9789525102662604},
+        raw_dates=[],
+        expected_sessions=10,
+        partition_summary={"coverage_green": 0.0},
+        price_check_files=[],
+        raw_datapoints=111,
+        expected_datapoints=1000,
+        queue_counts={"PENDING": 2, "PARTIAL": 1, "LEASED": 3, "FAILED": 4},
+    )
+
+    assert health["collection_status"]["training_ready_percent"] == 97.9
+    assert health["collection_status"]["training_critical_percent"] == 97.9
+
+
+def test_collect_dashboard_snapshot_ignores_unreadable_reference_files(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text(
+        f"NAS_MOUNT={nas_mount}\nNAS_SHARE=//127.0.0.1/trademl\nLOCAL_STATE={workspace / 'control'}\n",
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 1, "symbols": ["AAPL", "MSFT", "NVDA"], "years": 5}, sort_keys=False),
+        encoding="utf-8",
+    )
+    reference_root = nas_mount / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    for name in ["corp_actions", "listing_history", "delistings", "sec_filings"]:
+        pd.DataFrame([{"symbol": "AAPL"}]).to_parquet(reference_root / f"{name}.parquet", index=False)
+    (reference_root / "fred_vintagedates.parquet").write_text("not parquet", encoding="utf-8")
+    for series in dashboard_controller.default_macro_series():
+        partition = nas_mount / "data" / "raw" / "macros_fred" / f"series={series}"
+        partition.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([{"series_id": series, "value": 1.0}]).to_parquet(partition / "data.parquet", index=False)
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_read_planner_summary",
+        lambda db_path: {"progress": {"canonical_bars": {"expected_units": 1000, "completed_units": 1000, "remaining_units": 0}}},
+    )
+    monkeypatch.setattr(dashboard_controller, "_read_queue_counts", lambda db_path: {})
+    monkeypatch.setattr(dashboard_controller, "_read_partition_summary", lambda qc_path: {"counts": {}, "coverage_green": 1.0})
+    monkeypatch.setattr(dashboard_controller, "_partition_dates_from_qc", lambda summary: [])
+    monkeypatch.setattr(dashboard_controller, "_raw_datapoints_from_qc", lambda summary: 0)
+    monkeypatch.setattr(dashboard_controller, "_curated_datapoints_estimate", lambda settings, raw: 0)
+    monkeypatch.setattr(dashboard_controller, "_read_vendor_attempt_summary", lambda db_path: {"counts": {}, "by_vendor": [], "recent_failures": []})
+    monkeypatch.setattr(dashboard_controller, "_read_budget_summary", lambda settings: {"rows": [], "available_vendors": 0, "day_capped_vendors": 0, "minute_capped_vendors": 0, "checked_at": None, "day_anchor": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_vendor_throughput", lambda db_path, budget_summary: {"rows": [], "checked_at": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_planner_eta", lambda db_path, planner_summary, vendor_throughput: {})
+    monkeypatch.setattr(dashboard_controller, "_read_runtime_state", lambda settings: {"pid": 1, "started_at": "2026-03-31T20:00:00+00:00"})
+    monkeypatch.setattr(dashboard_controller, "_is_process_running", lambda pid: True)
+    monkeypatch.setattr(dashboard_controller, "evaluate_training_gates", lambda **kwargs: {
+        "phase1": {"ready": False, "blockers": ["macro_vintages"]},
+        "phase2": {"ready": False, "blockers": ["macro_vintages"]},
+        "freeze_cutoff": {
+            "date": "2026-03-07",
+            "coverage_ratio": 1.0,
+            "window_coverage_ratio": 1.0,
+            "planner_window_coverage_ratio": 1.0,
+            "effective_window_coverage_ratio": 1.0,
+            "complete_symbols": 500,
+            "expected_symbols": 500,
+        },
+    })
+
+    snapshot = collect_dashboard_snapshot(settings)
+
+    assert "fred_vintagedates.parquet" not in snapshot["reference_files"]
+    assert snapshot["dataset_coverage"]["macro"]["blocking"] is True
+
+
 def test_history_probe_connector_prefers_tiingo_when_available(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     config_path = workspace / "node.yml"
@@ -621,7 +716,7 @@ def test_start_node_rotates_existing_log(tmp_path: Path) -> None:
     stop_node(settings)
 
 
-def test_start_node_persists_cluster_passphrase(tmp_path: Path) -> None:
+def test_start_node_uses_ephemeral_cluster_passphrase_without_persisting(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     config_path = workspace / "node.yml"
     workspace.mkdir(parents=True, exist_ok=True)
@@ -641,15 +736,25 @@ def test_start_node_persists_cluster_passphrase(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    captured: dict[str, object] = {}
 
-    runtime = start_node(
-        settings,
-        command=[sys.executable, "-c", "import time; time.sleep(60)"],
-        passphrase="pw123",
-    )
+    class _DummyProcess:
+        pid = 43210
 
-    env_text = (workspace / ".env").read_text(encoding="utf-8")
-    assert "TRADEML_CLUSTER_PASSPHRASE=pw123" in env_text
+    def _fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return _DummyProcess()
+
+    monkeypatch.setattr(dashboard_controller.subprocess, "Popen", _fake_popen)
+
+    runtime = start_node(settings, passphrase="pw123")
+
+    env_text = (workspace / ".env").read_text(encoding="utf-8") if (workspace / ".env").exists() else ""
+    assert "TRADEML_CLUSTER_PASSPHRASE=pw123" not in env_text
+    assert runtime["running"] is True
+    assert isinstance(captured["env"], dict)
+    assert captured["env"]["TRADEML_CLUSTER_PASSPHRASE"] == "pw123"
 
 
 def test_start_node_includes_stage_symbols_in_launch_command(tmp_path: Path, monkeypatch) -> None:

@@ -271,8 +271,6 @@ def start_node(
     passphrase: str | None = None,
 ) -> dict[str, Any]:
     """Start the data-node process in the background if it is not already running."""
-    if passphrase:
-        persist_cluster_passphrase(settings, passphrase)
     svc = systemd_status()
     if svc.get("supported") and svc.get("UnitFileState") not in {None, "not-found", "", "masked"}:
         subprocess.run(["systemctl", "start", "trademl-node.service"], check=False)
@@ -305,6 +303,8 @@ def start_node(
         launch_command.extend(["--symbols", *stage_symbols])
     env = os.environ.copy()
     env.update(_read_env_file(settings.env_path))
+    if passphrase:
+        env["TRADEML_CLUSTER_PASSPHRASE"] = passphrase
     with settings.log_path.open("a", encoding="utf-8") as log_handle:
         process = subprocess.Popen(  # noqa: S603
             launch_command,
@@ -795,7 +795,7 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
     curated_dates = _partition_dates(settings.curated_equities_root)
     raw_datapoints = _raw_datapoints_from_qc(partition_summary)
     curated_datapoints = _curated_datapoints_estimate(settings, raw_datapoints)
-    reference_files = sorted(path.name for path in settings.reference_root.glob("*.parquet")) if settings.reference_root.exists() else []
+    reference_files = _readable_reference_files(settings.reference_root)
     macro_series = _macro_series(settings.macro_root)
     price_check_files = _price_check_files(settings.price_checks_root)
     audit = load_audit_state(_audit_report_path(settings))
@@ -1409,7 +1409,7 @@ def _build_collection_health(
         dataset_coverage.get("sec_filings", {}).get("ratio", 0.0),
         dataset_coverage.get("macro", {}).get("ratio", 0.0),
     ]
-    readiness_ratio = sum(training_critical) / len(training_critical) if training_critical else 0.0
+    readiness_ratio = min(training_critical) if training_critical else 0.0
     collection_status = {
         "coverage_ratio": coverage_ratio,
         "coverage_percent": round(coverage_ratio * 100.0, 1),
@@ -1602,6 +1602,20 @@ def _partition_dates(root: Path) -> list[str]:
         if value:
             dates.append(value)
     return sorted(set(dates))
+
+
+def _readable_reference_files(root: Path) -> list[str]:
+    """Return readable reference parquet filenames for dashboard readiness views."""
+    if not root.exists():
+        return []
+    readable: list[str] = []
+    for path in sorted(root.glob("*.parquet")):
+        try:
+            pd.read_parquet(path, columns=[])
+        except Exception:
+            continue
+        readable.append(path.name)
+    return readable
 
 
 def _partition_dates_from_qc(partition_summary: dict[str, Any]) -> list[str]:

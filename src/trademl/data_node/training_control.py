@@ -88,7 +88,7 @@ def evaluate_training_gates(
 ) -> dict[str, Any]:
     """Evaluate Phase 1 and Phase 2 readiness from current NAS-backed artifacts."""
     reference_root = data_root / "data" / "reference"
-    reference_files = {path.name for path in reference_root.glob("*.parquet")} if reference_root.exists() else set()
+    reference_files = _readable_reference_files(reference_root)
     macro_root = data_root / "data" / "raw" / "macros_fred"
     macro_series = {path.name.partition("=")[2] for path in macro_root.glob("series=*")} if macro_root.exists() else set()
     qc_path = data_root / "data" / "qc" / "partition_status.parquet"
@@ -140,6 +140,20 @@ def evaluate_training_gates(
         "phase2": {"ready": not phase2_blockers, "blockers": phase2_blockers},
         "freeze_cutoff": freeze_cutoff,
     }
+
+
+def _readable_reference_files(reference_root: Path) -> set[str]:
+    """Return only readable reference parquet filenames."""
+    if not reference_root.exists():
+        return set()
+    readable: set[str] = set()
+    for path in reference_root.glob("*.parquet"):
+        try:
+            pd.read_parquet(path, columns=[])
+        except Exception:
+            continue
+        readable.add(path.name)
+    return readable
 
 
 def recommended_training_cutoff(
