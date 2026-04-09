@@ -24,6 +24,7 @@ def _render_markdown(report: dict) -> str:
     lgbm = report.get("lightgbm", {})
     diagnostics = report.get("diagnostics", {})
     assessment = report.get("assessment", {})
+    sign_flip = diagnostics.get("sign_flip_canary", {})
     ridge_folds = ridge.get("folds", [])
     lightgbm_folds = lgbm.get("folds", [])
     fold_lines = ["## Ridge Folds", ""] + [
@@ -45,6 +46,8 @@ def _render_markdown(report: dict) -> str:
             f"- LightGBM mean rank IC: {lgbm.get('mean_rank_ic', 0):.4f}",
             f"- Placebo max abs IC: {max((abs(x) for x in diagnostics.get('placebo', [0])), default=0):.4f}",
             f"- Cost-stress net return: {diagnostics.get('cost_stress', {}).get('net_return', 0):.4f}",
+            f"- Sign-flip preferred direction: {sign_flip.get('preferred_direction', 'unknown')}",
+            f"- Sign-flip mean rank IC: {sign_flip.get('flipped_mean_rank_ic', 0):.4f}",
             f"- CPCV mean OOS score: {diagnostics.get('cpcv', {}).get('mean_oos_score', 0):.4f}",
             f"- PBO: {diagnostics.get('pbo', 0):.4f}",
             f"- DSR: {diagnostics.get('dsr', 0):.4f}",

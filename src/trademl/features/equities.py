@@ -29,7 +29,7 @@ def build_features(
         frame[f"momentum_{window}d"] = grouped["close"].transform(lambda s, w=window: np.log(s / s.shift(w)))
 
     for window in config.get("price", {}).get("reversal", [1, 5]):
-        frame[f"reversal_{window}d"] = grouped["close"].transform(lambda s, w=window: np.log(s / s.shift(w)))
+        frame[f"reversal_{window}d"] = grouped["close"].transform(lambda s, w=window: -np.log(s / s.shift(w)))
 
     for window in config.get("price", {}).get("drawdown", [20, 60]):
         frame[f"drawdown_{window}d"] = grouped["close"].transform(lambda s, w=window: s / s.rolling(w).max() - 1.0)

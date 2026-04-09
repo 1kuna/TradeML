@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,11 +18,70 @@ from trademl.labels.returns import build_labels
 from trademl.models.lgbm import LightGBMModel, tune_lightgbm_via_walk_forward
 from trademl.models.ridge import RidgeModel, tune_ridge_via_walk_forward
 from trademl.reports.emitter import emit_report
-from trademl.validation.diagnostics import cost_stress_test, ic_by_year, placebo_test
+from trademl.validation.diagnostics import ic_by_year, placebo_test, portfolio_cost_stress_test, sign_flip_canary
 from trademl.validation.cpcv import combinatorially_purged_cv
 from trademl.validation.dsr import deflated_sharpe_ratio
 from trademl.validation.pbo import probability_of_backtest_overfitting
 from trademl.validation.walk_forward import expanding_walk_forward
+
+
+def _resolve_effective_end_date(qc: pd.DataFrame, report_date: str | None) -> pd.Timestamp:
+    latest_date = pd.Timestamp(qc["date"].max())
+    if report_date is None:
+        return latest_date
+    requested = pd.Timestamp(report_date)
+    return min(latest_date, requested)
+
+
+def _partition_date(path: Path) -> pd.Timestamp:
+    return pd.Timestamp(path.parent.name.split("=", 1)[1])
+
+
+def _planner_window_coverage_ratio(*, db_path: Path, window_start: pd.Timestamp, window_end: pd.Timestamp) -> float | None:
+    if not db_path.exists():
+        return None
+    try:
+        with sqlite3.connect(db_path, timeout=5.0) as connection:
+            row = connection.execute(
+                """
+                SELECT SUM(planner_task_progress.expected_units) AS expected_units,
+                       SUM(planner_task_progress.completed_units) AS completed_units
+                FROM planner_tasks
+                LEFT JOIN planner_task_progress
+                  ON planner_tasks.task_key = planner_task_progress.task_key
+                WHERE planner_tasks.task_family = 'canonical_bars'
+                  AND planner_tasks.start_date >= ?
+                  AND planner_tasks.end_date <= ?
+                """,
+                (window_start.strftime("%Y-%m-%d"), window_end.strftime("%Y-%m-%d")),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    expected_units = int(row[0] or 0)
+    completed_units = int(row[1] or 0)
+    if expected_units <= 0:
+        return None
+    return min(1.0, completed_units / expected_units)
+
+
+def _load_curated_panel(curated_files: list[Path]) -> tuple[pd.DataFrame, list[str]]:
+    loaded_frames: list[pd.DataFrame] = []
+    skipped_partitions: list[str] = []
+    for path in curated_files:
+        try:
+            frame = pd.read_parquet(path)
+        except Exception:
+            skipped_partitions.append(path.parent.name.partition("=")[2])
+            continue
+        if frame.empty:
+            skipped_partitions.append(path.parent.name.partition("=")[2])
+            continue
+        loaded_frames.append(frame)
+    if not loaded_frames:
+        raise FileNotFoundError("no readable curated parquet partitions found for the requested report window")
+    return pd.concat(loaded_frames, ignore_index=True), skipped_partitions
 
 
 def run_training(
@@ -45,22 +105,31 @@ def run_training(
 
     qc = pd.read_parquet(qc_path)
     qc["date"] = pd.to_datetime(qc["date"])
-    latest_date = qc["date"].max()
-    window_start = latest_date - pd.DateOffset(years=int(config["data"].get("window_years", 5)))
+    effective_end_date = _resolve_effective_end_date(qc, report_date)
+    qc = qc.loc[qc["date"] <= effective_end_date].copy()
+    if qc.empty:
+        raise RuntimeError(f"no QC rows available on or before report_date={report_date!r}")
+    window_start = effective_end_date - pd.DateOffset(years=int(config["data"].get("window_years", 5)))
     qc_window = qc.loc[
         (qc["dataset"] == "equities_eod")
         & (qc["source"] == "alpaca")
-        & (qc["date"].between(window_start, latest_date))
+        & (qc["date"].between(window_start, effective_end_date))
     ].copy()
-    coverage = float((qc_window["status"] == "GREEN").mean()) if not qc_window.empty else 0.0
+    qc_coverage = float((qc_window["status"] == "GREEN").mean()) if not qc_window.empty else 0.0
+    planner_coverage = _planner_window_coverage_ratio(
+        db_path=data_root / "control" / "node.sqlite",
+        window_start=window_start,
+        window_end=effective_end_date,
+    )
+    coverage = max(qc_coverage, planner_coverage or 0.0)
     missing_dates = sorted(qc_window.loc[qc_window["status"] != "GREEN", "date"].dt.strftime("%Y-%m-%d").unique().tolist())
     if coverage < float(config["data"]["green_threshold"]):
         raise RuntimeError(f"green coverage below threshold: {coverage:.3f}; missing dates={missing_dates[:25]}")
 
-    curated_files = sorted(curated_root.glob("date=*/data.parquet"))
+    curated_files = sorted(path for path in curated_root.glob("date=*/data.parquet") if _partition_date(path) <= effective_end_date)
     if not curated_files:
-        raise FileNotFoundError(f"no curated parquet files found under {curated_root}")
-    panel = pd.concat((pd.read_parquet(path) for path in curated_files), ignore_index=True)
+        raise FileNotFoundError(f"no curated parquet files found under {curated_root} on or before {effective_end_date.strftime('%Y-%m-%d')}")
+    panel, skipped_curated_partitions = _load_curated_panel(curated_files)
 
     features = build_features(panel, config["features"])
     labels = build_labels(panel, horizon=5)
@@ -107,8 +176,6 @@ def run_training(
         )
 
     ridge_predictions = pd.concat([fold.predictions for fold in ridge_folds], ignore_index=True)
-    ridge_predictions["gross_return"] = ridge_predictions["label_5d"]
-    ridge_predictions["cost"] = 0.0005
     cpcv_results = combinatorially_purged_cv(
         normalized.dropna(subset=["label_5d"]),
         feature_cols,
@@ -127,7 +194,13 @@ def run_training(
             validation_runner=expanding_walk_forward,
             validation_config=validation_config,
         ),
-        "cost_stress": cost_stress_test(ridge_predictions[["gross_return", "cost"]], multiplier=float(config["portfolio"]["cost_stress_multiplier"])),
+        "cost_stress": portfolio_cost_stress_test(
+            prices=panel[["date", "symbol", "close"]],
+            prediction_frame=ridge_predictions,
+            multiplier=float(config["portfolio"]["cost_stress_multiplier"]),
+            cost_spread_bps=float(config["portfolio"].get("cost_spread_bps", 5.0)),
+        ),
+        "sign_flip_canary": sign_flip_canary(ridge_predictions, label_col="label_5d"),
         "cpcv": {
             "folds": len(cpcv_results),
             "mean_oos_score": float(pd.Series([result.out_of_sample_score for result in cpcv_results]).mean()) if cpcv_results else 0.0,
@@ -148,9 +221,12 @@ def run_training(
     )
     report = {
         "coverage": coverage,
+        "qc_coverage": qc_coverage,
+        "planner_window_coverage": planner_coverage,
         "window_start": window_start.strftime("%Y-%m-%d"),
-        "window_end": latest_date.strftime("%Y-%m-%d"),
+        "window_end": effective_end_date.strftime("%Y-%m-%d"),
         "missing_dates": missing_dates,
+        "skipped_curated_partitions": skipped_curated_partitions,
         "ridge": {
             "alpha": ridge_alpha,
             "folds": [

@@ -151,3 +151,36 @@ def test_backtest_applies_corporate_actions_and_emits_diagnostics() -> None:
     ]
     assert not msft_dividend.empty
     assert msft_dividend.iloc[0] > 0
+
+
+def test_backtest_handles_sparse_price_matrix_without_nan_equity() -> None:
+    prices = pd.DataFrame(
+        {
+            "date": [
+                pd.Timestamp("2026-01-02"),
+                pd.Timestamp("2026-01-05"),
+                pd.Timestamp("2026-01-06"),
+                pd.Timestamp("2026-01-05"),
+                pd.Timestamp("2026-01-06"),
+            ],
+            "symbol": ["AAPL", "AAPL", "AAPL", "MSFT", "MSFT"],
+            "close": [100.0, 101.0, 102.0, 50.0, 51.0],
+        }
+    )
+    targets = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-01-02"), pd.Timestamp("2026-01-05")],
+            "symbol": ["AAPL", "MSFT"],
+            "score": [1.0, 1.0],
+            "target_weight": [1.0, 1.0],
+        }
+    )
+
+    result = run_backtest(
+        prices,
+        targets,
+        apply_costs,
+        {"initial_capital": 1_000_000.0, "cost_spread_bps": 5.0},
+    )
+
+    assert result.equity_curve["equity"].notna().all()

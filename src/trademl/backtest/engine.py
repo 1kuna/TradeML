@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 
 import pandas as pd
 from scipy.stats import spearmanr
@@ -32,28 +33,31 @@ def run_backtest(
     capital = float(config.get("initial_capital", 1_000_000.0))
     price_frame = prices.copy()
     price_frame["date"] = pd.to_datetime(price_frame["date"])
-    price_pivot = price_frame.pivot(index="date", columns="symbol", values="close").sort_index()
     target_frame = target_weights.copy()
     target_frame["date"] = pd.to_datetime(target_frame["date"])
+    all_symbols = sorted(set(price_frame["symbol"]).union(set(target_frame["symbol"])))
+    price_pivot = price_frame.pivot(index="date", columns="symbol", values="close").reindex(columns=all_symbols).sort_index()
     corp_actions_frame = corp_actions.copy() if corp_actions is not None else pd.DataFrame(columns=["symbol", "event_type", "ex_date", "ratio"])
     if not corp_actions_frame.empty:
         corp_actions_frame["ex_date"] = pd.to_datetime(corp_actions_frame["ex_date"])
 
     positions = {symbol: 0.0 for symbol in price_pivot.columns}
+    last_prices = {symbol: None for symbol in price_pivot.columns}
     equity_rows: list[dict[str, float | pd.Timestamp]] = []
     trade_rows: list[dict[str, float | str | pd.Timestamp]] = []
-    prior_prices = None
 
     for current_date, price_row in price_pivot.iterrows():
         actions_today = corp_actions_frame.loc[corp_actions_frame["ex_date"] == current_date] if not corp_actions_frame.empty else pd.DataFrame()
-        if prior_prices is not None and not actions_today.empty:
+        if not actions_today.empty:
             for action in actions_today.itertuples(index=False):
                 symbol = str(action.symbol)
                 if symbol not in positions or positions[symbol] == 0:
                     continue
                 action_value = float(action.ratio)
                 if action.event_type == "split" and action_value not in {0.0, 1.0}:
-                    prior_prices[symbol] = prior_prices[symbol] * action_value
+                    last_price = last_prices.get(symbol)
+                    if last_price is not None:
+                        last_prices[symbol] = last_price * action_value
                     old_shares = positions[symbol]
                     positions[symbol] = positions[symbol] / action_value
                     trade_rows.append(
@@ -61,7 +65,7 @@ def run_backtest(
                             "date": current_date,
                             "symbol": symbol,
                             "shares": positions[symbol] - old_shares,
-                            "price": price_row[symbol],
+                            "price": _trade_price(price_row, last_prices, symbol),
                             "trade_value": 0.0,
                             "spread_cost": 0.0,
                             "impact_cost": 0.0,
@@ -88,17 +92,37 @@ def run_backtest(
                         }
                     )
 
-        if prior_prices is not None:
-            for symbol, shares in positions.items():
-                capital += shares * (price_row[symbol] - prior_prices[symbol])
+        for symbol, shares in positions.items():
+            if abs(shares) < 1e-12:
+                continue
+            current_price = _row_price(price_row, symbol)
+            previous_price = last_prices.get(symbol)
+            if current_price is None:
+                continue
+            if previous_price is not None:
+                capital += shares * (current_price - previous_price)
+            last_prices[symbol] = current_price
+
+        for symbol in price_pivot.columns:
+            current_price = _row_price(price_row, symbol)
+            if current_price is not None:
+                last_prices[symbol] = current_price
 
         rebalance = target_frame.loc[target_frame["date"] == current_date]
         if not rebalance.empty:
-            portfolio_value = capital + sum(positions[symbol] * price_row[symbol] for symbol in positions)
+            target_by_symbol = rebalance.groupby("symbol")["target_weight"].last().to_dict()
+            portfolio_value = capital + sum(
+                positions[symbol] * mark_price
+                for symbol, shares in positions.items()
+                if abs(shares) >= 1e-12 and (mark_price := _trade_price(price_row, last_prices, symbol)) is not None
+            )
             trade_batch = []
             for symbol in price_pivot.columns:
-                target_weight = float(rebalance.loc[rebalance["symbol"] == symbol, "target_weight"].iloc[0]) if symbol in set(rebalance["symbol"]) else 0.0
-                desired_shares = 0.0 if price_row[symbol] == 0 else (portfolio_value * target_weight) / price_row[symbol]
+                target_weight = float(target_by_symbol.get(symbol, 0.0))
+                trade_price = _trade_price(price_row, last_prices, symbol)
+                if trade_price is None or trade_price == 0.0:
+                    continue
+                desired_shares = (portfolio_value * target_weight) / trade_price
                 delta_shares = desired_shares - positions[symbol]
                 if abs(delta_shares) < 1e-12:
                     continue
@@ -107,8 +131,8 @@ def run_backtest(
                         "date": current_date,
                         "symbol": symbol,
                         "shares": delta_shares,
-                        "price": price_row[symbol],
-                        "trade_value": delta_shares * price_row[symbol],
+                        "price": trade_price,
+                        "trade_value": delta_shares * trade_price,
                         "action": "REBALANCE",
                         "event_type": None,
                     }
@@ -117,13 +141,22 @@ def run_backtest(
 
             if trade_batch:
                 trade_frame = pd.DataFrame(trade_batch)
-                costed = cost_model(trade_frame, {"spread_bps": config.get("cost_spread_bps", 5.0), "stress_multiplier": 1.0})
+                costed = cost_model(
+                    trade_frame,
+                    {
+                        "spread_bps": config.get("cost_spread_bps", 5.0),
+                        "stress_multiplier": config.get("stress_multiplier", 1.0),
+                    },
+                )
                 capital -= float(costed["trade_value"].sum() + costed["cost"].sum())
                 trade_rows.extend(costed.to_dict("records"))
 
-        equity = capital + sum(positions[symbol] * price_row[symbol] for symbol in positions)
+        equity = capital + sum(
+            positions[symbol] * mark_price
+            for symbol, shares in positions.items()
+            if abs(shares) >= 1e-12 and (mark_price := _trade_price(price_row, last_prices, symbol)) is not None
+        )
         equity_rows.append({"date": current_date, "equity": equity})
-        prior_prices = price_row
 
     trade_log = pd.DataFrame(trade_rows)
     equity_curve = pd.DataFrame(equity_rows)
@@ -179,3 +212,28 @@ def _prediction_diagnostics(prediction_frame: pd.DataFrame | None) -> tuple[pd.D
             )
 
     return pd.DataFrame(ic_rows), pd.DataFrame(decile_rows)
+
+
+def _row_price(price_row: pd.Series, symbol: str) -> float | None:
+    """Return a finite row price when present."""
+    value = price_row.get(symbol)
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(numeric):
+        return None
+    return numeric
+
+
+def _trade_price(price_row: pd.Series, last_prices: dict[str, float | None], symbol: str) -> float | None:
+    """Return the current tradeable price or the last observed mark price."""
+    current_price = _row_price(price_row, symbol)
+    if current_price is not None:
+        return current_price
+    previous_price = last_prices.get(symbol)
+    if previous_price is None or not isfinite(previous_price):
+        return None
+    return previous_price

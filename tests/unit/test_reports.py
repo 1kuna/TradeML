@@ -12,9 +12,15 @@ def test_report_emitter_writes_json_and_markdown(tmp_path: Path) -> None:
         "coverage": 1.0,
         "ridge": {"mean_rank_ic": 0.03},
         "lightgbm": {"mean_rank_ic": 0.04},
-        "diagnostics": {"placebo": [0.0], "cost_stress": {"net_return": 0.1}},
+        "diagnostics": {
+            "placebo": [0.0],
+            "cost_stress": {"net_return": 0.1},
+            "sign_flip_canary": {"preferred_direction": "flipped", "flipped_mean_rank_ic": 0.05},
+        },
     }
     json_path, md_path = emit_report(report=report, output_root=tmp_path, report_date="2026-03-31")
 
     assert json.loads(json_path.read_text(encoding="utf-8"))["coverage"] == 1.0
-    assert "TradeML Report" in md_path.read_text(encoding="utf-8")
+    markdown = md_path.read_text(encoding="utf-8")
+    assert "TradeML Report" in markdown
+    assert "Sign-flip preferred direction: flipped" in markdown

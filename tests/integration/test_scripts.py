@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -135,6 +136,182 @@ def test_train_script_phase1_ridge_only_skips_lightgbm_artifacts(tmp_path: Path)
     report = json.loads((data_root / "reports" / "daily" / "2026-04-01.json").read_text(encoding="utf-8"))
     assert report["lightgbm"]["skipped"] is True
     assert not (data_root / "models" / "lightgbm").exists()
+
+
+def test_train_script_uses_report_date_for_coverage_gate_and_curated_window(tmp_path: Path) -> None:
+    data_root = tmp_path / "workspace"
+    _write_training_dataset(data_root)
+    config = {
+        "data": {"green_threshold": 0.9},
+        "features": {
+            "price": {"momentum": [5, 20, 60, 126], "reversal": [1, 5], "drawdown": [20, 60]},
+            "volatility": {"realized": [20, 60], "idiosyncratic": [60]},
+            "liquidity": {"adv_dollar": [20], "amihud": [20]},
+            "controls": {"log_price": True},
+        },
+        "preprocessing": {"missing_threshold": 0.30},
+        "validation": {"initial_train_years": 1, "step": "6_months"},
+        "portfolio": {"cost_stress_multiplier": 2.0},
+    }
+    config_path = tmp_path / "train.yml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    qc_path = data_root / "data" / "qc" / "partition_status.parquet"
+    qc = pd.read_parquet(qc_path)
+    tail_start = pd.Timestamp("2025-12-01")
+    qc.loc[pd.to_datetime(qc["date"]) >= tail_start, "status"] = "AMBER"
+    qc.to_parquet(qc_path, index=False)
+
+    report_date = "2025-11-28"
+    subprocess.run(
+        [
+            sys.executable,
+            "src/scripts/train.py",
+            "--data-root",
+            str(data_root),
+            "--config",
+            str(config_path),
+            "--output-root",
+            str(data_root),
+            "--report-date",
+            report_date,
+            "--model-suite",
+            "ridge_only",
+        ],
+        check=True,
+        cwd=Path.cwd(),
+    )
+
+    report = json.loads((data_root / "reports" / "daily" / f"{report_date}.json").read_text(encoding="utf-8"))
+    assert report["coverage"] >= 0.9
+    assert report["window_end"] == report_date
+    assert all(missing_date <= report_date for missing_date in report["missing_dates"])
+
+
+def test_train_script_accepts_planner_backed_window_coverage_when_qc_is_stale(tmp_path: Path) -> None:
+    data_root = tmp_path / "workspace"
+    _write_training_dataset(data_root)
+    config = {
+        "data": {"green_threshold": 0.98},
+        "features": {
+            "price": {"momentum": [5, 20, 60, 126], "reversal": [1, 5], "drawdown": [20, 60]},
+            "volatility": {"realized": [20, 60], "idiosyncratic": [60]},
+            "liquidity": {"adv_dollar": [20], "amihud": [20]},
+            "controls": {"log_price": True},
+        },
+        "preprocessing": {"missing_threshold": 0.30},
+        "validation": {"initial_train_years": 1, "step": "6_months"},
+        "portfolio": {"cost_stress_multiplier": 2.0},
+    }
+    config_path = tmp_path / "train.yml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    qc_path = data_root / "data" / "qc" / "partition_status.parquet"
+    qc = pd.read_parquet(qc_path)
+    qc["status"] = "AMBER"
+    qc.to_parquet(qc_path, index=False)
+
+    control_root = data_root / "control"
+    control_root.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(control_root / "node.sqlite") as connection:
+        connection.execute(
+            """
+            CREATE TABLE planner_tasks (
+                task_key TEXT PRIMARY KEY,
+                task_family TEXT NOT NULL,
+                start_date TEXT,
+                end_date TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE planner_task_progress (
+                task_key TEXT PRIMARY KEY,
+                expected_units INTEGER,
+                completed_units INTEGER
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO planner_tasks (task_key, task_family, start_date, end_date) VALUES (?, ?, ?, ?)",
+            ("canonical_bars::window", "canonical_bars", "2024-01-01", "2025-06-28"),
+        )
+        connection.execute(
+            "INSERT INTO planner_task_progress (task_key, expected_units, completed_units) VALUES (?, ?, ?)",
+            ("canonical_bars::window", 100, 100),
+        )
+        connection.commit()
+
+    report_date = "2026-03-31"
+    subprocess.run(
+        [
+            sys.executable,
+            "src/scripts/train.py",
+            "--data-root",
+            str(data_root),
+            "--config",
+            str(config_path),
+            "--output-root",
+            str(data_root),
+            "--report-date",
+            report_date,
+            "--model-suite",
+            "ridge_only",
+        ],
+        check=True,
+        cwd=Path.cwd(),
+    )
+
+    report = json.loads((data_root / "reports" / "daily" / f"{report_date}.json").read_text(encoding="utf-8"))
+    assert report["qc_coverage"] == 0.0
+    assert report["planner_window_coverage"] == 1.0
+    assert report["coverage"] == 1.0
+
+
+def test_train_script_skips_zero_byte_curated_partitions(tmp_path: Path) -> None:
+    data_root = tmp_path / "workspace"
+    _write_training_dataset(data_root)
+    config = {
+        "data": {"green_threshold": 0.9},
+        "features": {
+            "price": {"momentum": [5, 20, 60, 126], "reversal": [1, 5], "drawdown": [20, 60]},
+            "volatility": {"realized": [20, 60], "idiosyncratic": [60]},
+            "liquidity": {"adv_dollar": [20], "amihud": [20]},
+            "controls": {"log_price": True},
+        },
+        "preprocessing": {"missing_threshold": 0.30},
+        "validation": {"initial_train_years": 1, "step": "6_months"},
+        "portfolio": {"cost_stress_multiplier": 2.0},
+    }
+    config_path = tmp_path / "train.yml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    broken_partition = data_root / "data" / "curated" / "equities_ohlcv_adj" / "date=2024-06-03" / "data.parquet"
+    broken_partition.write_bytes(b"")
+
+    report_date = "2026-03-31"
+    subprocess.run(
+        [
+            sys.executable,
+            "src/scripts/train.py",
+            "--data-root",
+            str(data_root),
+            "--config",
+            str(config_path),
+            "--output-root",
+            str(data_root),
+            "--report-date",
+            report_date,
+            "--model-suite",
+            "ridge_only",
+        ],
+        check=True,
+        cwd=Path.cwd(),
+    )
+
+    report = json.loads((data_root / "reports" / "daily" / f"{report_date}.json").read_text(encoding="utf-8"))
+    assert "2024-06-03" in report["skipped_curated_partitions"]
 
 
 def test_backtest_script_writes_outputs(tmp_path: Path) -> None:

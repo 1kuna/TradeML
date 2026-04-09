@@ -79,3 +79,29 @@ def test_features_are_pit_safe_outside_future_window() -> None:
     left = baseline.loc[baseline["date"] < cutoff, ["date", "symbol", *columns]].reset_index(drop=True)
     right = shifted.loc[shifted["date"] < cutoff, ["date", "symbol", *columns]].reset_index(drop=True)
     pd.testing.assert_frame_equal(left, right)
+
+
+def test_reversal_features_are_negative_of_recent_returns_not_momentum_duplicates() -> None:
+    panel = pd.DataFrame(
+        {
+            "date": pd.bdate_range("2026-01-01", periods=8).tolist() * 2,
+            "symbol": ["AAPL"] * 8 + ["MSFT"] * 8,
+            "open": [10, 11, 12, 13, 12, 11, 10, 9, 20, 19, 18, 17, 18, 19, 20, 21],
+            "high": [10, 11, 12, 13, 12, 11, 10, 9, 20, 19, 18, 17, 18, 19, 20, 21],
+            "low": [10, 11, 12, 13, 12, 11, 10, 9, 20, 19, 18, 17, 18, 19, 20, 21],
+            "close": [10, 11, 12, 13, 12, 11, 10, 9, 20, 19, 18, 17, 18, 19, 20, 21],
+            "vwap": [10, 11, 12, 13, 12, 11, 10, 9, 20, 19, 18, 17, 18, 19, 20, 21],
+            "volume": [1_000_000] * 16,
+        }
+    )
+
+    features = build_features(panel, _feature_config())
+    aligned = features.dropna(subset=["momentum_5d", "reversal_5d", "reversal_1d"]).reset_index(drop=True)
+
+    assert not aligned.empty
+    pd.testing.assert_series_equal(
+        aligned["reversal_5d"],
+        -aligned["momentum_5d"],
+        check_names=False,
+    )
+    assert not aligned["reversal_1d"].equals(aligned["momentum_5d"])
