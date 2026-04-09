@@ -61,6 +61,8 @@ class FinnhubConnector(HTTPConnector):
                 task_kind="FORWARD",
                 logical_units=1,
             )
+            if payload.get("s") == "no_data":
+                continue
             if payload.get("s") != "ok" or not payload.get("t"):
                 continue
             frame = pd.DataFrame(payload)

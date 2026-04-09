@@ -20,6 +20,8 @@ def test_provider_contract_exposes_canonical_contracts() -> None:
     assert massive_equities.pagination_mode == "next_url"
     assert massive_reference is not None
     assert massive_reference.pagination_mode == "next_url"
+    assert dataset_contract("fmp", "delistings").pagination_mode == "page"
+    assert dataset_contract("fmp", "delistings").pagination_limit == 100
 
 
 def test_default_vendor_limits_are_derived_from_provider_contracts() -> None:

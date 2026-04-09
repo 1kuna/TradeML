@@ -63,14 +63,56 @@ class SecEdgarConnector(HTTPConnector):
         for cik in symbols:
             normalized_cik = str(cik).zfill(10)
             payload = self.request_json(endpoint=f"/submissions/CIK{normalized_cik}.json", endpoint_key="filing_index", logical_units=1)
-            recent = pd.DataFrame(payload.get("filings", {}).get("recent", {}))
-            if recent.empty:
-                continue
-            recent["cik"] = normalized_cik
-            recent["filingDate"] = pd.to_datetime(recent["filingDate"])
-            filtered = recent.loc[
-                recent["filingDate"].between(start_ts.normalize(), end_ts.normalize())
-                & recent["form"].isin(["8-K", "10-K", "10-Q"])
-            ]
-            frames.append(filtered)
+            recent = self._normalize_filing_rows(payload.get("filings", {}).get("recent", {}), cik=normalized_cik)
+            if not recent.empty:
+                frames.append(self._filter_filings(recent, start_ts=start_ts, end_ts=end_ts))
+            for metadata in payload.get("filings", {}).get("files", []) or []:
+                if not self._submission_segment_overlaps(metadata, start_ts=start_ts, end_ts=end_ts):
+                    continue
+                name = str(metadata.get("name") or "").strip()
+                if not name:
+                    continue
+                archive_payload = self.request_json(endpoint=f"/submissions/{name}", endpoint_key="filing_index", logical_units=1)
+                archive_rows = self._normalize_filing_rows(archive_payload, cik=normalized_cik)
+                if archive_rows.empty:
+                    continue
+                frames.append(self._filter_filings(archive_rows, start_ts=start_ts, end_ts=end_ts))
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    @staticmethod
+    def _normalize_filing_rows(payload: object, *, cik: str) -> pd.DataFrame:
+        """Normalize a SEC recent-filings payload into a dataframe."""
+        frame = pd.DataFrame(payload)
+        if frame.empty:
+            return pd.DataFrame()
+        frame["cik"] = cik
+        frame["filingDate"] = pd.to_datetime(frame.get("filingDate"), errors="coerce")
+        return frame
+
+    @staticmethod
+    def _filter_filings(frame: pd.DataFrame, *, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
+        """Filter filing rows down to the forms and date window we care about."""
+        if frame.empty:
+            return frame
+        return frame.loc[
+            frame["filingDate"].between(start_ts.normalize(), end_ts.normalize())
+            & frame["form"].isin(["8-K", "10-K", "10-Q"])
+        ].copy()
+
+    @staticmethod
+    def _submission_segment_overlaps(metadata: object, *, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
+        """Return whether an archived submissions segment overlaps the requested window."""
+        if not isinstance(metadata, dict):
+            return False
+        filing_from = pd.to_datetime(metadata.get("filingFrom"), errors="coerce")
+        filing_to = pd.to_datetime(metadata.get("filingTo"), errors="coerce")
+        if pd.notna(filing_from) and pd.notna(filing_to):
+            return filing_to.normalize() >= start_ts.normalize() and filing_from.normalize() <= end_ts.normalize()
+        date_range = str(metadata.get("dateRange") or "").strip()
+        if " to " in date_range:
+            left, right = date_range.split(" to ", 1)
+            range_start = pd.to_datetime(left, errors="coerce")
+            range_end = pd.to_datetime(right, errors="coerce")
+            if pd.notna(range_start) and pd.notna(range_end):
+                return range_end.normalize() >= start_ts.normalize() and range_start.normalize() <= end_ts.normalize()
+        return True

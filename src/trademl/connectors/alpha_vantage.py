@@ -108,11 +108,12 @@ class AlphaVantageConnector(HTTPConnector):
         start_date: pd.Timestamp,
         end_date: pd.Timestamp,
     ) -> pd.DataFrame:
-        rows = payload.get("data", []) if isinstance(payload, dict) else payload
+        rows = _action_rows(payload, event_type=event_type)
         frame = pd.DataFrame(rows)
         if frame.empty:
             return pd.DataFrame(columns=["symbol", "event_type", "ex_date", "ratio", "amount", "source"])
-        frame["ex_date"] = pd.to_datetime(frame[date_key], errors="coerce")
+        resolved_date_key = date_key if date_key in frame.columns else "date"
+        frame["ex_date"] = pd.to_datetime(frame[resolved_date_key], errors="coerce")
         frame = frame.loc[frame["ex_date"].between(start_date.normalize(), end_date.normalize())].copy()
         if frame.empty:
             return pd.DataFrame(columns=["symbol", "event_type", "ex_date", "ratio", "amount", "source"])
@@ -143,3 +144,13 @@ def _parse_split_factor(value: str) -> float | pd.NA:
         return pd.NA
     numeric = pd.to_numeric(value, errors="coerce")
     return float(numeric) if pd.notna(numeric) else pd.NA
+
+
+def _action_rows(payload: object, *, event_type: str) -> object:
+    if not isinstance(payload, dict):
+        return payload
+    if event_type == "dividend":
+        return payload.get("dividends", payload.get("data", []))
+    if event_type == "split":
+        return payload.get("splits", payload.get("data", []))
+    return payload.get("data", [])

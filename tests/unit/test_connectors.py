@@ -301,6 +301,38 @@ def test_alpha_vantage_corp_actions_normalize_splits_and_dividends() -> None:
     assert set(actions.columns) >= {"symbol", "event_type", "ex_date", "ratio", "source"}
 
 
+def test_alpha_vantage_corp_actions_accept_named_top_level_arrays() -> None:
+    av_session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "symbol": "AAPL",
+                    "dividends": [
+                        {"date": "2024-01-15", "amount": "0.24"},
+                    ],
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "symbol": "AAPL",
+                    "splits": [
+                        {"date": "2024-02-01", "split_factor": "2:1"},
+                    ],
+                },
+            ),
+        ]
+    )
+    av = AlphaVantageConnector(base_url="https://www.alphavantage.co", api_key="key", budget_manager=_budget_manager(), session=av_session)
+
+    actions = av.fetch("corp_actions", ["AAPL"], "2024-01-01", "2024-03-01")
+
+    assert set(actions["event_type"]) == {"dividend", "split"}
+    split_row = actions.loc[actions["event_type"] == "split"].iloc[0]
+    assert split_row["ratio"] == pytest.approx(0.5)
+
+
 def test_fmp_and_sec_edgar_connectors() -> None:
     fmp_session = FakeSession(
         [
@@ -342,6 +374,69 @@ def test_fmp_and_sec_edgar_connectors() -> None:
     assert filings.iloc[0]["form"] == "8-K"
     assert sec_session.calls[0][3]["User-Agent"] == "TradeML/0.1 test@example.com"
     assert "Host" not in sec_session.calls[0][3]
+
+
+def test_fmp_delistings_follow_documented_page_limit_pagination() -> None:
+    fmp_session = FakeSession(
+        [
+            FakeResponse(200, [{"symbol": f"SYM{i}", "delistedDate": "2024-01-05"} for i in range(100)]),
+            FakeResponse(200, [{"symbol": "TAIL", "delistedDate": "2024-01-06"}]),
+        ]
+    )
+    fmp = FMPConnector(base_url="https://financialmodelingprep.com", api_key="key", budget_manager=_budget_manager(), session=fmp_session)
+
+    delistings = fmp.fetch("delistings", [], "2024-01-01", "2024-01-31")
+
+    assert len(delistings) == 101
+    assert fmp_session.calls[0][2]["page"] == 0
+    assert fmp_session.calls[0][2]["limit"] == 100
+    assert fmp_session.calls[1][2]["page"] == 1
+    assert fmp_session.calls[1][2]["limit"] == 100
+
+
+def test_sec_edgar_connector_fetches_archived_submission_segments() -> None:
+    sec_session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "filings": {
+                        "recent": {
+                            "filingDate": ["2024-02-10"],
+                            "form": ["4"],
+                            "accessionNumber": ["2"],
+                        },
+                        "files": [
+                            {
+                                "name": "CIK0000320193-submissions-001.json",
+                                "filingFrom": "2024-01-01",
+                                "filingTo": "2024-01-31",
+                            }
+                        ],
+                    }
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "filingDate": ["2024-01-03", "2024-01-20"],
+                    "form": ["8-K", "10-Q"],
+                    "accessionNumber": ["1", "3"],
+                },
+            ),
+        ]
+    )
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=sec_session,
+    )
+
+    filings = sec.fetch("filing_index", ["320193"], "2024-01-01", "2024-01-31")
+
+    assert filings["form"].tolist() == ["8-K", "10-Q"]
+    assert sec_session.calls[1][1] == "https://data.sec.gov/submissions/CIK0000320193-submissions-001.json"
 
 
 def test_sec_edgar_company_tickers_uses_sec_host_without_forced_data_host() -> None:

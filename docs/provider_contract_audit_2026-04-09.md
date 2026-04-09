@@ -24,6 +24,8 @@ This ledger is the docs-backed source note for the provider contract table in
 - Runtime decisions:
   - canonical critical path enabled
   - daily bars remain ticker-scoped
+  - supported tickers metadata is collected as reference state
+  - documented `startDate` / `endDate` bounds can veto impossible canonical requests before they hit the connector
   - adjusted fields preserved as supplemental metadata
 
 ### Massive / Polygon
@@ -57,6 +59,7 @@ This ledger is the docs-backed source note for the provider contract table in
   - `https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html`
 - Runtime decisions:
   - treat observations and vintages as separate lanes
+  - observations use explicit deterministic `limit=100000` and ascending sort
   - never let empty observations suppress vintage writes
 
 ### SEC EDGAR
@@ -64,6 +67,7 @@ This ledger is the docs-backed source note for the provider contract table in
   - `https://www.sec.gov/search-filings/edgar-application-programming-interfaces`
 - Runtime decisions:
   - preserve user-agent requirement
+  - fetch archived submissions segments when the primary submissions payload points to additional history files
   - treat as reference-only paced lane
 
 ### FMP
@@ -71,12 +75,14 @@ This ledger is the docs-backed source note for the provider contract table in
   - `https://site.financialmodelingprep.com/developer/docs`
 - Runtime decisions:
   - low-throughput reference-only
+  - delistings follow documented `page` / `limit` pagination with limit `100`
 
 ### Finnhub
 - Docs:
   - `https://finnhub.io/docs/api`
 - Runtime decisions:
   - research/reference supplemental lane
+  - treat `s=no_data` on candles as a valid empty result
   - not a canonical closer
 
 ### Alpha Vantage
@@ -84,6 +90,8 @@ This ledger is the docs-backed source note for the provider contract table in
   - `https://www.alphavantage.co/documentation/`
 - Runtime decisions:
   - low-throughput reference-only
+  - `LISTING_STATUS` stays CSV with explicit `date` / `state` filters
+  - corp-actions normalize documented named arrays (`dividends`, `splits`) in addition to prior `data` payloads
 
 ## Runtime Rewrite Notes
 - The budget manager now tracks:

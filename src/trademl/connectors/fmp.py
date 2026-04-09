@@ -26,8 +26,23 @@ class FMPConnector(HTTPConnector):
     ) -> pd.DataFrame:
         """Fetch normalized FMP datasets."""
         if dataset == "delistings":
-            payload = self.request_json(endpoint="/stable/delisted-companies", endpoint_key="delistings")
-            return pd.DataFrame(payload)
+            frames: list[pd.DataFrame] = []
+            page = 0
+            limit = 100
+            while True:
+                payload = self.request_json(
+                    endpoint="/stable/delisted-companies",
+                    endpoint_key="delistings",
+                    params={"page": page, "limit": limit},
+                )
+                frame = pd.DataFrame(payload)
+                if frame.empty:
+                    break
+                frames.append(frame)
+                if len(frame) < limit:
+                    break
+                page += 1
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if dataset == "symbol_changes":
             payload = self.request_json(endpoint="/stable/symbol-change", endpoint_key="symbol_changes")
             return pd.DataFrame(payload)

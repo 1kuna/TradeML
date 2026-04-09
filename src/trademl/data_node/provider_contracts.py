@@ -238,6 +238,7 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 max_batch_symbols=1,
                 pagination_mode="none",
                 docs_urls=("https://fred.stlouisfed.org/docs/api/fred/series_observations.html",),
+                notes="Observations support explicit limit and offset; use limit 100000 and ascending sort for deterministic pulls.",
             ),
             DatasetContract(
                 dataset="vintagedates",
@@ -245,6 +246,7 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 max_batch_symbols=1,
                 pagination_mode="none",
                 docs_urls=("https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html",),
+                notes="Vintage dates are series-scoped and support explicit limits; use large single pulls for current macro lanes.",
             ),
         ),
     ),
@@ -253,7 +255,7 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
         rpm=570,
         daily_cap=820800,
         docs_urls=("https://www.sec.gov/search-filings/edgar-application-programming-interfaces",),
-        notes="Respect SEC fair-access guidance and always send a valid user-agent.",
+        notes="Respect SEC fair-access guidance, always send a valid user-agent, and fetch archived submission segments when present.",
         datasets=(
             DatasetContract(
                 dataset="filing_index",
@@ -282,7 +284,15 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
         docs_urls=("https://site.financialmodelingprep.com/developer/docs",),
         notes="Treat FMP as low-throughput reference-only in this runtime.",
         datasets=(
-            DatasetContract(dataset="delistings", endpoint_key="delistings", max_batch_symbols=1, docs_urls=("https://site.financialmodelingprep.com/developer/docs/stable-delisted-companies-api",)),
+            DatasetContract(
+                dataset="delistings",
+                endpoint_key="delistings",
+                max_batch_symbols=1,
+                pagination_mode="page",
+                pagination_limit=100,
+                docs_urls=("https://site.financialmodelingprep.com/developer/docs/stable-delisted-companies-api",),
+                notes="Stable delisted-companies uses page/limit pagination with documented limit 100.",
+            ),
             DatasetContract(dataset="symbol_changes", endpoint_key="symbol_changes", max_batch_symbols=1, docs_urls=("https://site.financialmodelingprep.com/developer/docs/stable-symbol-change-api",)),
         ),
     ),
@@ -291,7 +301,7 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
         rpm=57,
         daily_cap=82080,
         docs_urls=("https://finnhub.io/docs/api",),
-        notes="Use as supplemental reference/research lane, not canonical bar closer.",
+        notes="Use as supplemental reference/research lane, not canonical bar closer; candle endpoint documents s=no_data as a valid empty response.",
         datasets=(
             DatasetContract(dataset="equities_eod", endpoint_key="equities_eod", max_batch_symbols=1, critical_path_allowed=False, docs_urls=("https://finnhub.io/docs/api/stock-candles",)),
             DatasetContract(dataset="earnings_calendar", endpoint_key="earnings_calendar", max_batch_symbols=1, docs_urls=("https://finnhub.io/docs/api/company-earnings-calendar",)),
@@ -305,8 +315,20 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
         docs_urls=("https://www.alphavantage.co/documentation/",),
         notes="Free tier remains very low-throughput; reference-only in this runtime.",
         datasets=(
-            DatasetContract(dataset="listings", endpoint_key="listings", max_batch_symbols=1, docs_urls=("https://www.alphavantage.co/documentation/",)),
-            DatasetContract(dataset="corp_actions", endpoint_key="corp_actions", max_batch_symbols=1, docs_urls=("https://www.alphavantage.co/documentation/",)),
+            DatasetContract(
+                dataset="listings",
+                endpoint_key="listings",
+                max_batch_symbols=1,
+                docs_urls=("https://www.alphavantage.co/documentation/",),
+                notes="LISTING_STATUS returns CSV and accepts optional date/state filters.",
+            ),
+            DatasetContract(
+                dataset="corp_actions",
+                endpoint_key="corp_actions",
+                max_batch_symbols=1,
+                docs_urls=("https://www.alphavantage.co/documentation/",),
+                notes="DIVIDENDS and SPLITS are single-symbol lanes and may return named top-level arrays or CSV depending on datatype.",
+            ),
         ),
     ),
 }
