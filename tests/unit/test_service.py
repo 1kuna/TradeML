@@ -9,7 +9,9 @@ import sqlite3
 
 from trademl.calendars.exchange import ExchangeCalendarStore
 from trademl.connectors.base import PermanentConnectorError, TemporaryConnectorError
+from trademl.data_node.auxiliary_runtime import AuxiliaryRuntime
 from trademl.data_node.auditor import PartitionAuditor
+from trademl.data_node.canonical_runtime import CanonicalRuntime
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node import service as service_module
@@ -435,7 +437,7 @@ def test_backfill_budget_exhaustion_defers_task_instead_of_marking_failed(tmp_pa
         source_name="finnhub",
     )
 
-    changed = service._process_backfill_task_for_vendor(leased, "finnhub")
+    changed = service._canonical_runtime._process_backfill_task_for_vendor(leased, "finnhub")
     with sqlite3.connect(tmp_path / "control" / "node.sqlite") as connection:
         row = connection.execute("SELECT status, last_error, next_not_before FROM backfill_queue WHERE id = ?", (task_id,)).fetchone()
 
@@ -458,8 +460,8 @@ def test_lease_next_task_for_vendor_skips_single_symbol_vendors_for_datewide_bac
         source_name="alpaca",
     )
 
-    tiingo_task = service._lease_next_task_for_vendor("tiingo")
-    alpaca_task = service._lease_next_task_for_vendor("alpaca")
+    tiingo_task = service._canonical_runtime._lease_next_task_for_vendor("tiingo")
+    alpaca_task = service._canonical_runtime._lease_next_task_for_vendor("alpaca")
 
     assert tiingo_task is None
     assert alpaca_task is not None
@@ -483,7 +485,7 @@ def test_datewide_backfill_merges_parallel_vendor_results_and_marks_task_done(tm
     )
     service.default_symbols = ["AAPL", "MSFT", "NVDA"]
 
-    changed = service._process_backfill_task_for_vendor(leased, "alpaca")
+    changed = service._canonical_runtime._process_backfill_task_for_vendor(leased, "alpaca")
 
     assert changed == ["2025-01-01"]
     stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-01" / "data.parquet")
@@ -511,7 +513,7 @@ def test_datewide_backfill_keeps_partial_progress_and_defers_remaining_symbols(t
     )
     service.default_symbols = ["AAPL", "MSFT"]
 
-    changed = service._process_backfill_task_for_vendor(leased, "alpaca")
+    changed = service._canonical_runtime._process_backfill_task_for_vendor(leased, "alpaca")
 
     assert changed == ["2025-01-02"]
     stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-02" / "data.parquet")
@@ -557,9 +559,9 @@ def test_canonical_planner_batch_uses_atomic_symbol_tasks_and_multisymbol_fetch(
             remaining_symbols=[symbol],
             state={"scope_kind": "symbol_range"},
         )
-    tasks = service._lease_canonical_batch("alpaca")
+    tasks = service._canonical_runtime._lease_canonical_batch("alpaca")
 
-    changed = service._process_canonical_planner_batch(batch=tasks, vendor="alpaca", exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_batch(batch=tasks, vendor="alpaca", exchange="XNYS")
 
     assert changed == ["2025-01-02"]
     connector = service.connectors["alpaca"]
@@ -588,7 +590,7 @@ def test_materialize_job_rotates_symbol_subset_deterministically() -> None:
 
 
 def test_expand_reference_jobs_respects_batch_jobs() -> None:
-    expanded = DataNodeService._expand_reference_jobs(
+    expanded = AuxiliaryRuntime._expand_reference_jobs(
         [
             {
                 "source": "tiingo",
@@ -630,7 +632,7 @@ def test_append_reference_frame_deduplicates_dict_valued_rows_without_crashing(t
         ]
     )
 
-    service._append_reference_frame(output, frame)
+    service._auxiliary_runtime._append_reference_frame(output, frame)
 
     stored = pd.read_parquet(output)
     assert len(stored) == 1
@@ -666,7 +668,7 @@ def test_append_reference_frame_deduplicates_ndarray_valued_rows_without_crashin
         ]
     )
 
-    service._append_reference_frame(output, frame)
+    service._auxiliary_runtime._append_reference_frame(output, frame)
 
     stored = pd.read_parquet(output)
     assert len(stored) == 1
@@ -685,7 +687,7 @@ def test_process_planner_queue_survives_auxiliary_lane_exception(tmp_path: Path)
 
     service.default_symbols = ["AAPL"]
     service._seed_planner_tasks = lambda trading_date=None: None  # type: ignore[method-assign]
-    service._backfill_lane_widths = lambda: {}  # type: ignore[method-assign]
+    service._canonical_runtime._backfill_lane_widths = lambda: {}  # type: ignore[method-assign]
     service._aux_lane_widths = lambda task_kinds=None: {"alpaca": 1}  # type: ignore[method-assign]
     service._drain_auxiliary_lane = lambda vendor: (_ for _ in ()).throw(RuntimeError("aux boom"))  # type: ignore[method-assign]
 
@@ -827,7 +829,7 @@ def test_lease_canonical_batch_scans_past_front_slice_starvation(tmp_path: Path)
             leased = db.lease_planner_task_by_key(task_key=task_key, lease_owner="alpaca-worker")
             assert leased is not None
 
-    batch = service._lease_canonical_batch("tiingo")
+    batch = service._canonical_runtime._lease_canonical_batch("tiingo")
 
     assert batch
     assert batch[0].symbols == ("SYM0256",)
@@ -870,7 +872,7 @@ def test_permanent_vendor_failure_does_not_terminally_poison_task_when_alternati
     task = db.lease_planner_task_by_key(task_key="canonical::AAPL", lease_owner=service.worker_id)
 
     assert task is not None
-    changed = service._process_canonical_planner_batch(batch=[task], vendor="alpaca", exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_batch(batch=[task], vendor="alpaca", exchange="XNYS")
 
     assert changed == []
     refreshed = db.get_planner_task("canonical::AAPL")
@@ -917,7 +919,7 @@ def test_canonical_partial_success_is_immediately_reeligible_when_alternative_ve
     task = db.lease_planner_task_by_key(task_key="canonical::AAPL::chunk0", lease_owner=service.worker_id)
 
     assert task is not None
-    changed = service._process_canonical_planner_batch(batch=[task], vendor="alpaca", exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_batch(batch=[task], vendor="alpaca", exchange="XNYS")
 
     assert changed == ["2025-01-02"]
     refreshed = db.get_planner_task("canonical::AAPL::chunk0")
@@ -965,7 +967,7 @@ def test_canonical_vendor_budget_failure_does_not_back_off_other_available_vendo
     task = db.lease_planner_task_by_key(task_key="canonical::AAPL::budget", lease_owner=service.worker_id)
 
     assert task is not None
-    changed = service._process_canonical_planner_batch(batch=[task], vendor="tiingo", exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_batch(batch=[task], vendor="tiingo", exchange="XNYS")
 
     assert changed == []
     refreshed = db.get_planner_task("canonical::AAPL::budget")
@@ -1029,7 +1031,7 @@ def test_canonical_vendor_selection_skips_symbol_windows_before_learned_vendor_f
     task = db.lease_planner_task_by_key(task_key="canonical::APLD::current", lease_owner=service.worker_id)
 
     assert task is not None
-    changed = service._process_canonical_planner_task(task, exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_task(task, exchange="XNYS")
 
     assert changed == ["2021-07-01"]
     assert alpaca.calls == []
@@ -1217,7 +1219,7 @@ def test_run_cluster_forever_curates_only_trading_date_during_audit_curate(tmp_p
     captured: dict[str, object] = {}
 
     service._collect_cluster_shard = lambda **kwargs: None  # type: ignore[method-assign]
-    service._run_cluster_auxiliary_tasks = lambda **kwargs: None  # type: ignore[method-assign]
+    service._auxiliary_runtime._run_cluster_auxiliary_tasks = lambda **kwargs: None  # type: ignore[method-assign]
     service.sync_partition_status = lambda: tmp_path / "data" / "qc" / "partition_status.parquet"  # type: ignore[method-assign]
     service.auditor.audit_range = lambda **kwargs: []  # type: ignore[method-assign]
     service.load_corp_actions_reference = lambda: pd.DataFrame()  # type: ignore[method-assign]
@@ -1315,7 +1317,7 @@ def test_process_planner_queue_skips_auxiliary_lanes_while_canonical_backlog_exi
     calls: list[str] = []
 
     service._seed_planner_tasks = lambda **kwargs: None  # type: ignore[method-assign]
-    service._backfill_lane_widths = lambda: {"alpaca": 1}  # type: ignore[method-assign]
+    service._canonical_runtime._backfill_lane_widths = lambda: {"alpaca": 1}  # type: ignore[method-assign]
     service._aux_lane_widths = lambda **kwargs: {"alpha_vantage": 1}  # type: ignore[method-assign]
     service._drain_canonical_lane = lambda vendor, exchange: calls.append(f"canonical:{vendor}") or []  # type: ignore[method-assign]
     service._drain_auxiliary_lane = lambda vendor: calls.append(f"aux:{vendor}") or []  # type: ignore[method-assign]
@@ -1510,7 +1512,7 @@ def test_planned_auxiliary_work_materializes_reference_and_macro_tasks(tmp_path:
     )
     service.default_symbols = ["AAPL", "MSFT"]
 
-    macro_series, reference_jobs = service._planned_auxiliary_work(trading_date="2026-03-31")
+    macro_series, reference_jobs = service._auxiliary_runtime._planned_auxiliary_work(trading_date="2026-03-31")
 
     assert "DGS10" in macro_series
     datasets = {job["dataset"] for job in reference_jobs}
@@ -1585,7 +1587,7 @@ def test_build_canonical_coverage_index_streams_partitions_and_skips_unreadable_
     )
     (bad_partition / "data.parquet").write_text("not parquet", encoding="utf-8")
 
-    coverage = service._build_canonical_coverage_index(trading_days=["2026-03-31", "2026-04-01"])
+    coverage = service._canonical_runtime._build_canonical_coverage_index(trading_days=["2026-03-31", "2026-04-01"])
 
     assert coverage == {"AAPL": {"2026-03-31"}, "MSFT": {"2026-03-31"}}
 
@@ -1605,8 +1607,8 @@ def test_build_canonical_coverage_index_logs_unreadable_partition_once(tmp_path:
     bad_path.write_text("not parquet", encoding="utf-8")
 
     with caplog.at_level("WARNING"):
-        first = service._build_canonical_coverage_index(trading_days=["2026-04-01"])
-        second = service._build_canonical_coverage_index(trading_days=["2026-04-01"])
+        first = service._canonical_runtime._build_canonical_coverage_index(trading_days=["2026-04-01"])
+        second = service._canonical_runtime._build_canonical_coverage_index(trading_days=["2026-04-01"])
 
     assert first == {}
     assert second == {}
@@ -1643,7 +1645,7 @@ def test_merge_partition_frame_quarantines_zero_byte_existing_partition(tmp_path
         ]
     )
 
-    merged = service._merge_partition_frame(partition=partition, frame=incoming)
+    merged = service._canonical_runtime._merge_partition_frame(partition=partition, frame=incoming)
 
     assert len(merged) == 1
     assert merged.iloc[0]["symbol"] == "AAPL"
@@ -1665,13 +1667,14 @@ def test_run_cluster_auxiliary_tasks_uses_daily_reference_bucket_until_core_read
     coordinator.allowed = {"reference"}
     service.collect_reference_data = lambda *args, **kwargs: []  # type: ignore[method-assign]
 
-    service._run_cluster_auxiliary_tasks(
+    service._auxiliary_runtime._run_cluster_auxiliary_tasks(
         coordinator=coordinator,  # type: ignore[arg-type]
         trading_date="2026-03-31",
         current_et=datetime.fromisoformat("2026-03-31T18:00:00+00:00"),
         macro_series_ids=["DGS10"],
         reference_jobs=[{"source": "alpaca", "dataset": "assets", "symbols": [], "output_name": "alpaca_assets"}],
         price_check_symbols=["AAPL"],
+        source_name=service.source_name,
     )
 
     assert "reference:2026-03-31" in coordinator._lease_calls
@@ -1788,8 +1791,8 @@ def test_process_auxiliary_planner_task_marks_reference_success_and_deferred_con
     assert success_task is not None
     assert deferred_task is not None
 
-    service._process_auxiliary_planner_task(success_task, "alpha_vantage")
-    service._process_auxiliary_planner_task(deferred_task, "alpha_vantage")
+    service._auxiliary_runtime._process_auxiliary_planner_task(success_task, "alpha_vantage")
+    service._auxiliary_runtime._process_auxiliary_planner_task(deferred_task, "alpha_vantage")
 
     assert db.get_planner_task("aux::AAPL").status == "SUCCESS"
     assert db.get_planner_task("aux::MSFT").status == "PARTIAL"

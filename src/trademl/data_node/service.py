@@ -2,37 +2,28 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
-import os
 import signal
 import threading
-import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from time import sleep
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pandas as pd
 
 from trademl.calendars.exchange import get_trading_days, is_trading_day
-from trademl.connectors.base import BaseConnector, ConnectorError, TemporaryConnectorError
+from trademl.connectors.base import BaseConnector, ConnectorError
 from trademl.data_node.auditor import PartitionAuditor
-from trademl.data_node.auxiliary_runtime import AuxiliaryExecutionResult, AuxiliaryRuntime, ReferenceCollectionResult
-from trademl.data_node.capabilities import (
-    default_macro_series,
-    forward_capabilities,
-)
-from trademl.data_node.canonical_runtime import CanonicalFetchResult, CanonicalRuntime
+from trademl.data_node.auxiliary_runtime import AuxiliaryRuntime, ReferenceCollectionResult
+from trademl.data_node.capabilities import forward_capabilities
+from trademl.data_node.canonical_runtime import CanonicalRuntime
 from trademl.data_node.curator import Curator, CuratorResult
-from trademl.data_node.db import DataNodeDB, PlannerTask
-from trademl.data_node.planner import (
-    plan_coverage_tasks,
-)
+from trademl.data_node.db import DataNodeDB
+from trademl.data_node.planner import plan_coverage_tasks
 from trademl.data_node.training_control import recommended_training_cutoff
 from trademl.fleet.cluster import ClusterCoordinator, ShardSpec
 
@@ -168,7 +159,7 @@ class DataNodeService:
             day_value = pd.Timestamp(day).strftime("%Y-%m-%d")
             partition = self.paths.raw_equities / f"date={day_value}"
             partition.mkdir(parents=True, exist_ok=True)
-            merged = self._merge_partition_frame(partition=partition, frame=day_frame)
+            merged = self._canonical_runtime._merge_partition_frame(partition=partition, frame=day_frame)
             merged.to_parquet(partition / "data.parquet", index=False)
             changed_dates.append(day_value)
             expected_rows = len(self.default_symbols) if self.default_symbols else len(merged)
@@ -224,7 +215,7 @@ class DataNodeService:
 
     def _process_legacy_backfill_queue(self) -> list[str]:
         """Drain legacy date/symbol backfill rows during the migration window."""
-        lane_widths = self._backfill_lane_widths()
+        lane_widths = self._canonical_runtime._backfill_lane_widths()
         if not lane_widths:
             return []
         changed_dates: list[str] = []
@@ -235,10 +226,10 @@ class DataNodeService:
                 for vendor, width in lane_widths.items():
                     active_for_vendor = sum(1 for active_vendor in futures.values() if active_vendor == vendor)
                     while active_for_vendor < width:
-                        task = self._lease_next_task_for_vendor(vendor)
+                        task = self._canonical_runtime._lease_next_task_for_vendor(vendor)
                         if task is None:
                             break
-                        future = executor.submit(self._process_backfill_task_for_vendor, task, vendor)
+                        future = executor.submit(self._canonical_runtime._process_backfill_task_for_vendor, task, vendor)
                         futures[future] = vendor
                         active_for_vendor += 1
                         scheduled = True
@@ -259,7 +250,7 @@ class DataNodeService:
         self._seed_planner_tasks(trading_date=trading_date)
         changed_dates: list[str] = []
         futures: dict[object, str] = {}
-        canonical_lane_widths = self._backfill_lane_widths()
+        canonical_lane_widths = self._canonical_runtime._backfill_lane_widths()
         canonical_backlog_active = self.db.has_pending_planner_tasks(task_families=("canonical_bars",)) or self.db.has_pending_backfill()
         aux_lane_widths = {} if canonical_backlog_active else self._aux_lane_widths(task_kinds={"REFERENCE", "EVENT", "MACRO"})
         max_workers = max(1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values()))
@@ -302,7 +293,7 @@ class DataNodeService:
         canonical_task_keys = {task.task_key for task in planned if task.task_family == "canonical_bars"}
         if canonical_task_keys:
             self.db.prune_planner_tasks(task_families=("canonical_bars",), valid_task_keys=canonical_task_keys)
-        coverage_index = self._build_canonical_coverage_index() if any(task.task_family == "canonical_bars" for task in planned) else {}
+        coverage_index = self._canonical_runtime._build_canonical_coverage_index() if any(task.task_family == "canonical_bars" for task in planned) else {}
         task_rows: list[dict[str, object]] = []
         progress_rows: list[dict[str, object]] = []
         for task in planned:
@@ -333,7 +324,7 @@ class DataNodeService:
                 task_family = self._planner_family_for_dataset(task.dataset)
             if task_family == "canonical_bars":
                 existing_progress = existing_progress_map.get(task.task_key)
-                progress_payload = self._canonical_progress_for_scope(
+                progress_payload = self._canonical_runtime._canonical_progress_for_scope(
                     symbols=list(task.symbols),
                     trading_days=list(task.payload.get("trading_days", [])),
                     coverage_index=coverage_index,
@@ -369,10 +360,10 @@ class DataNodeService:
         """Drain canonical planner tasks for a single vendor lane."""
         changed_dates: list[str] = []
         while not self._stop_event.is_set():
-            batch = self._lease_canonical_batch(vendor)
+            batch = self._canonical_runtime._lease_canonical_batch(vendor)
             if not batch:
                 break
-            changed_dates.extend(self._process_canonical_planner_batch(batch=batch, vendor=vendor, exchange=exchange))
+            changed_dates.extend(self._canonical_runtime._process_canonical_planner_batch(batch=batch, vendor=vendor, exchange=exchange))
         return changed_dates
 
     def _drain_auxiliary_lane(self, vendor: str) -> list[str]:
@@ -385,12 +376,8 @@ class DataNodeService:
             )
             if task is None:
                 break
-            self._process_auxiliary_planner_task(task, vendor)
+            self._auxiliary_runtime._process_auxiliary_planner_task(task, vendor)
         return []
-
-    def _lease_canonical_batch(self, vendor: str) -> list[PlannerTask]:
-        """Lease a vendor-compatible batch of canonical planner tasks."""
-        return self._canonical_runtime._lease_canonical_batch(vendor)
 
     def collect_reference_data(self, jobs: list[dict[str, object]]) -> ReferenceCollectionResult:
         """Collect reference datasets into parquet files."""
@@ -593,13 +580,14 @@ class DataNodeService:
                 self.curate_dates(corp_actions=self.load_corp_actions_reference(), changed_dates=[trading_date])
                 self.sync_partition_status()
                 coordinator.mark_singleton_success("audit_curate", trading_date, {"symbol_count": len(symbols)})
-            self._run_cluster_auxiliary_tasks(
+            self._auxiliary_runtime._run_cluster_auxiliary_tasks(
                 coordinator=coordinator,
                 trading_date=trading_date,
                 current_et=current_et,
                 macro_series_ids=macro_series_ids,
                 reference_jobs=reference_jobs,
                 price_check_symbols=price_check_symbols,
+                source_name=self.source_name,
             )
 
         def backfill_iteration(*, local_day: str, current_local: datetime, pending_backfill: bool) -> None:
@@ -615,13 +603,14 @@ class DataNodeService:
                 self._maintenance_history.add(local_day)
 
         def after_backlog_clear(*, trading_date: str, current_et: datetime, current_local: datetime) -> None:
-            self._run_cluster_auxiliary_tasks(
+            self._auxiliary_runtime._run_cluster_auxiliary_tasks(
                 coordinator=coordinator,
                 trading_date=trading_date,
                 current_et=current_et,
                 macro_series_ids=macro_series_ids,
                 reference_jobs=reference_jobs,
                 price_check_symbols=price_check_symbols,
+                source_name=self.source_name,
             )
 
         self._run_scheduler_loop(
@@ -897,138 +886,6 @@ class DataNodeService:
             return "macro"
         return "supplemental_research"
 
-    def _process_canonical_planner_task(self, task: PlannerTask, exchange: str) -> list[str]:
-        """Compatibility wrapper for a single planner task."""
-        return self._canonical_runtime._process_canonical_planner_task(task, exchange)
-
-    def _fetch_canonical_frame(
-        self,
-        *,
-        vendor: str,
-        dataset: str,
-        symbols: list[str],
-        start_date: str,
-        end_date: str,
-        empty_error: str | None = None,
-        empty_permanent: bool = False,
-        empty_backoff_minutes: int = 15,
-    ) -> CanonicalFetchResult:
-        """Fetch canonical data and normalize vendor failure semantics."""
-        return self._canonical_runtime._fetch_canonical_frame(
-            vendor=vendor,
-            dataset=dataset,
-            symbols=symbols,
-            start_date=start_date,
-            end_date=end_date,
-            empty_error=empty_error,
-            empty_permanent=empty_permanent,
-            empty_backoff_minutes=empty_backoff_minutes,
-        )
-
-    def _mark_planner_canonical_batch_failure(
-        self,
-        *,
-        tasks: list[PlannerTask],
-        vendor: str,
-        fetch_result: CanonicalFetchResult,
-    ) -> None:
-        """Apply a shared planner-task failure transition for a canonical batch."""
-        self._canonical_runtime._mark_planner_canonical_batch_failure(
-            tasks=tasks,
-            vendor=vendor,
-            fetch_result=fetch_result,
-        )
-
-    def _process_canonical_planner_batch(self, *, batch: list[PlannerTask], vendor: str, exchange: str) -> list[str]:
-        """Process a vendor-compatible batch of atomic canonical tasks."""
-        return self._canonical_runtime._process_canonical_planner_batch(batch=batch, vendor=vendor, exchange=exchange)
-
-    def _canonical_task_progress(self, *, task: PlannerTask, exchange: str) -> dict[str, object]:
-        """Compute symbol-date coverage for a canonical planner task from raw partitions."""
-        return self._canonical_runtime._canonical_task_progress(task=task, exchange=exchange)
-
-    def _canonical_progress_for_scope(
-        self,
-        *,
-        symbols: list[str],
-        trading_days: list[str],
-        coverage_index: dict[str, set[str]] | None = None,
-    ) -> dict[str, object]:
-        """Compute canonical symbol-date coverage for a given task scope."""
-        return self._canonical_runtime._canonical_progress_for_scope(
-            symbols=symbols,
-            trading_days=trading_days,
-            coverage_index=coverage_index,
-        )
-
-    def _canonical_batch_progress(self, *, tasks: list[PlannerTask], exchange: str) -> dict[str, dict[str, object]]:
-        """Compute canonical progress for a homogeneous task batch."""
-        return self._canonical_runtime._canonical_batch_progress(tasks=tasks, exchange=exchange)
-
-    def _canonical_task_has_remaining_vendors(self, task: PlannerTask, *, failed_vendor: str) -> bool:
-        """Return whether another eligible vendor could still complete this canonical task."""
-        return self._canonical_runtime._canonical_task_has_remaining_vendors(task, failed_vendor=failed_vendor)
-
-    def _canonical_next_task_backoff_minutes(
-        self,
-        task: PlannerTask,
-        *,
-        excluded_vendor: str | None = None,
-        default_minutes: int = 1,
-    ) -> int:
-        """Return the soonest task-level backoff implied by remaining vendor eligibility."""
-        return self._canonical_runtime._canonical_next_task_backoff_minutes(
-            task,
-            excluded_vendor=excluded_vendor,
-            default_minutes=default_minutes,
-        )
-
-    def _vendor_can_serve_canonical_task(self, *, vendor: str, task: PlannerTask) -> bool:
-        """Return whether attempt history implies a vendor can plausibly serve this task."""
-        return self._canonical_runtime._vendor_can_serve_canonical_task(vendor=vendor, task=task)
-
-    def _vendor_symbol_floor(self, *, vendor: str, symbol: str) -> str | None:
-        """Infer the earliest non-empty date range a vendor has shown for a symbol."""
-        return self._canonical_runtime._vendor_symbol_floor(vendor=vendor, symbol=symbol)
-
-    def _build_canonical_coverage_index(self, *, trading_days: list[str] | None = None) -> dict[str, set[str]]:
-        """Return the existing canonical coverage index keyed by symbol."""
-        return self._canonical_runtime._build_canonical_coverage_index(trading_days=trading_days)
-
-    def _process_auxiliary_planner_task(self, task: PlannerTask, vendor: str) -> list[str]:
-        """Run a single planner-native auxiliary task."""
-        return self._auxiliary_runtime._process_auxiliary_planner_task(task, vendor)
-
-    def _run_cluster_auxiliary_tasks(
-        self,
-        *,
-        coordinator: ClusterCoordinator,
-        trading_date: str,
-        current_et: datetime,
-        macro_series_ids: list[str] | None,
-        reference_jobs: list[dict[str, object]] | None,
-        price_check_symbols: list[str] | None,
-    ) -> None:
-        self._auxiliary_runtime._run_cluster_auxiliary_tasks(
-            coordinator=coordinator,
-            trading_date=trading_date,
-            current_et=current_et,
-            macro_series_ids=macro_series_ids,
-            reference_jobs=reference_jobs,
-            price_check_symbols=price_check_symbols,
-            source_name=self.source_name,
-        )
-
-    def _planned_auxiliary_work(self, *, trading_date: str) -> tuple[list[str], list[dict[str, object]]]:
-        return self._auxiliary_runtime._planned_auxiliary_work(trading_date=trading_date)
-
-    def _core_auxiliary_incomplete(self) -> bool:
-        return self._auxiliary_runtime._core_auxiliary_incomplete()
-
-    @staticmethod
-    def _expand_reference_jobs(jobs: list[dict[str, object]]) -> list[dict[str, object]]:
-        return AuxiliaryRuntime._expand_reference_jobs(jobs)
-
     @staticmethod
     def _rotate_symbols(symbols: list[str], *, limit: int, trading_date: str, rotation_key: str) -> list[str]:
         ordered = list(dict.fromkeys(symbols))
@@ -1049,127 +906,11 @@ class DataNodeService:
     def _merge_raw_shards_for_date(self, day_value: str) -> Path:
         return self._canonical_runtime._merge_raw_shards_for_date(day_value)
 
-    @staticmethod
-    def _acquire_file_lock(path: Path, *, stale_after_seconds: int = 15) -> None:
-        CanonicalRuntime._acquire_file_lock(path, stale_after_seconds=stale_after_seconds)
-
     def _collect_cluster_shard(self, *, trading_date: str, shard: ShardSpec) -> None:
         partition = self.paths.raw_equities / f"date={trading_date}" / "shards" / f"{shard.shard_id}.parquet"
         if partition.exists():
             return
         self.collect_forward_shard(trading_date=trading_date, symbols=shard.symbols, shard_id=shard.shard_id)
 
-    def _backfill_connector_order(self, *, dataset: str) -> list[str]:
-        if dataset == "equities_eod":
-            capabilities = backfill_capabilities(
-                dataset=dataset,
-                connectors=self.connectors,
-                audit_state=self.capability_audit_state,
-            )
-            ordered = [capability.vendor for capability in capabilities]
-            if ordered:
-                return ordered
-        preferred = [self.source_name]
-        return [name for index, name in enumerate(preferred) if name in self.connectors and name not in preferred[:index]]
-
-    def _backfill_lane_widths(self) -> dict[str, int]:
-        return self._canonical_runtime._backfill_lane_widths()
-
     def _aux_lane_widths(self, *, task_kinds: set[str]) -> dict[str, int]:
         return self._auxiliary_runtime._aux_lane_widths(task_kinds=task_kinds)
-
-    def _lease_next_task_for_vendor(self, vendor: str):
-        return self._canonical_runtime._lease_next_task_for_vendor(vendor)
-
-    def _process_backfill_task_for_vendor(self, task, vendor: str) -> list[str]:
-        return self._canonical_runtime._process_backfill_task_for_vendor(task, vendor)
-
-    def _process_parallel_datewide_backfill_task(self, *, task, coordinator_vendor: str) -> list[str]:
-        return self._canonical_runtime._process_parallel_datewide_backfill_task(task=task, coordinator_vendor=coordinator_vendor)
-
-    def _datewide_backfill_capabilities(self, *, dataset: str, preferred_vendor: str) -> list:
-        """Return eligible capabilities for a date-wide canonical task."""
-        return self._canonical_runtime._datewide_backfill_capabilities(dataset=dataset, preferred_vendor=preferred_vendor)
-
-    def _canonical_capability(self, vendor: str):
-        """Return the canonical bar capability for a specific vendor."""
-        return self._canonical_runtime._canonical_capability(vendor)
-
-    def _planner_task_vendor_eligible(self, task: PlannerTask, *, vendor: str, now_iso: str) -> bool:
-        """Return whether a planner task can be attempted by the given vendor now."""
-        return self._canonical_runtime._planner_task_vendor_eligible(task, vendor=vendor, now_iso=now_iso)
-
-    @staticmethod
-    def _capability_batch_size(capability) -> int:
-        """Return the batch size to use for a capability inside date-wide backfill dispatch."""
-        return CanonicalRuntime._capability_batch_size(capability)
-
-    def _read_existing_partition(self, *, date: str) -> pd.DataFrame:
-        """Read the existing canonical raw partition for a date if present."""
-        return self._canonical_runtime._read_existing_partition(date=date)
-
-    def _merge_partition_frame(self, *, partition: Path, frame: pd.DataFrame) -> pd.DataFrame:
-        """Merge new rows into an existing raw partition without losing already collected symbols."""
-        return self._canonical_runtime._merge_partition_frame(partition=partition, frame=frame)
-
-    def _read_partition_frame(self, path: Path, *, empty_columns: object | None = None) -> pd.DataFrame:
-        """Read a parquet partition, quarantining unreadable files instead of crashing the worker."""
-        return self._canonical_runtime._read_partition_frame(path, empty_columns=empty_columns)
-
-    def _log_unreadable_partition_once(
-        self,
-        *,
-        event: str,
-        path: Path,
-        error: Exception,
-        quarantine: Path | None = None,
-    ) -> None:
-        """Warn once per unreadable path/event pair, then downgrade repeats to debug."""
-        self._canonical_runtime._log_unreadable_partition_once(event=event, path=path, error=error, quarantine=quarantine)
-
-    def _canonical_vendor_priority(self) -> dict[str, int]:
-        """Return the canonical vendor preference ordering for equities backfill/forward rows."""
-        return self._canonical_runtime._canonical_vendor_priority()
-
-    def _execute_auxiliary_job(
-        self,
-        job: dict[str, object],
-        *,
-        task_key: str | None = None,
-        task_family: str = "auxiliary",
-        planner_group: str | None = None,
-    ) -> AuxiliaryExecutionResult:
-        """Run one auxiliary job with shared attempt, defer, and success semantics."""
-        return self._auxiliary_runtime._execute_auxiliary_job(
-            job,
-            task_key=task_key,
-            task_family=task_family,
-            planner_group=planner_group,
-        )
-
-    def _execute_macro_auxiliary_job(
-        self,
-        job: dict[str, object],
-        *,
-        task_key: str,
-        vendor: str,
-    ) -> AuxiliaryExecutionResult:
-        """Run one macro auxiliary job using the shared outcome contract."""
-        return self._auxiliary_runtime._execute_macro_auxiliary_job(job, task_key=task_key, vendor=vendor)
-
-    def _append_reference_frame(self, output: Path, frame: pd.DataFrame) -> None:
-        self._auxiliary_runtime._append_reference_frame(output, frame)
-
-    @classmethod
-    def _deduplicate_reference_frame(cls, frame: pd.DataFrame) -> pd.DataFrame:
-        """Drop duplicate reference rows, including nested object-valued cells."""
-        return AuxiliaryRuntime._deduplicate_reference_frame(frame)
-
-    @classmethod
-    def _freeze_reference_value(cls, value: object) -> object:
-        """Convert nested reference payload values into hashable, deterministic keys."""
-        return AuxiliaryRuntime._freeze_reference_value(value)
-
-    @staticmethod
-    def _aux_task_key(job: dict[str, object]) -> str:
-        return AuxiliaryRuntime._aux_task_key(job)
