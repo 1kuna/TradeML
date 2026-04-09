@@ -49,48 +49,77 @@ HTML_PAGE = """<!doctype html>
   <title>TradeML Operator Dashboard</title>
   <style>
     :root {
-      color-scheme: light;
-      --bg: #f4f6ef;
-      --panel: #fbfbf5;
-      --panel-alt: #eef2e0;
-      --text: #18210f;
-      --muted: #5f6c50;
-      --line: #d3dcc3;
-      --accent: #136f63;
-      --accent-strong: #0b5148;
-      --warn: #9a6400;
-      --bad: #9e2a2b;
-      --good: #2d6a4f;
-      --shadow: 0 16px 40px rgba(24, 33, 15, 0.08);
-      --radius: 18px;
-      font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+      color-scheme: dark;
+      --bg: #08111c;
+      --bg-alt: #0d1725;
+      --panel: rgba(12, 22, 34, 0.92);
+      --panel-strong: rgba(16, 28, 43, 0.98);
+      --panel-alt: rgba(29, 44, 64, 0.76);
+      --text: #edf4ff;
+      --muted: #8fa3bf;
+      --line: rgba(126, 152, 182, 0.18);
+      --line-strong: rgba(126, 152, 182, 0.28);
+      --accent: #20c997;
+      --accent-strong: #18a67d;
+      --accent-soft: rgba(32, 201, 151, 0.14);
+      --warn: #f6ad55;
+      --bad: #ff6b6b;
+      --good: #68d391;
+      --shadow: 0 26px 60px rgba(0, 0, 0, 0.35);
+      --radius: 20px;
+      --mono: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-family: "IBM Plex Sans", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
     }
     * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
     body {
       margin: 0;
       background:
-        radial-gradient(circle at top left, rgba(19,111,99,0.10), transparent 30%),
-        radial-gradient(circle at top right, rgba(214,164,57,0.12), transparent 25%),
-        linear-gradient(180deg, #f8faef 0%, var(--bg) 100%);
+        radial-gradient(circle at top left, rgba(32, 201, 151, 0.12), transparent 24%),
+        radial-gradient(circle at top right, rgba(43, 108, 176, 0.22), transparent 30%),
+        linear-gradient(180deg, #09111b 0%, var(--bg) 46%, #050b14 100%);
       color: var(--text);
+      overflow-x: hidden;
     }
     .shell {
-      max-width: 1460px;
+      width: min(1480px, 100%);
       margin: 0 auto;
-      padding: 24px;
+      padding: 22px;
     }
     .hero, .panel {
-      background: rgba(251, 251, 245, 0.92);
+      background: var(--panel);
       border: 1px solid var(--line);
       border-radius: var(--radius);
       box-shadow: var(--shadow);
-      backdrop-filter: blur(14px);
+      backdrop-filter: blur(18px);
     }
     .hero {
-      padding: 22px 24px;
+      padding: 24px;
       margin-bottom: 18px;
     }
-    .hero-top, .actions, .nav {
+    .hero-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(340px, 0.95fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+    .hero-copy, .actions-panel, .summary-strip {
+      background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+      border: 1px solid var(--line);
+      border-radius: 18px;
+    }
+    .hero-copy {
+      padding: 22px;
+      display: grid;
+      gap: 18px;
+    }
+    .actions-panel {
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+      background: linear-gradient(180deg, rgba(10, 19, 31, 0.95), rgba(16, 28, 43, 0.95));
+    }
+    .hero-top, .actions, .nav, .summary-meta {
       display: flex;
       gap: 12px;
       flex-wrap: wrap;
@@ -98,53 +127,101 @@ HTML_PAGE = """<!doctype html>
     }
     .hero-top { justify-content: space-between; }
     h1, h2, h3 { margin: 0; font-weight: 700; }
+    h1 {
+      font-size: clamp(2rem, 4vw, 3rem);
+      line-height: 1;
+      letter-spacing: -0.03em;
+    }
+    h2 {
+      font-size: 1.25rem;
+      letter-spacing: -0.02em;
+    }
+    h3 {
+      font-size: 1rem;
+      letter-spacing: -0.01em;
+    }
     p { margin: 0; color: var(--muted); }
+    .eyebrow {
+      display: inline-flex;
+      width: fit-content;
+      border-radius: 999px;
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      background: var(--accent-soft);
+      color: #b9ffeb;
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
     .badge {
       border-radius: 999px;
       padding: 8px 12px;
-      border: 1px solid var(--line);
+      border: 1px solid var(--line-strong);
       background: var(--panel-alt);
       font-size: 13px;
-      color: var(--accent-strong);
+      color: #d7fff1;
     }
-    .actions, .nav { margin-top: 16px; }
+    .hero-copy p {
+      max-width: 70ch;
+      font-size: 15px;
+      line-height: 1.55;
+    }
+    .actions, .nav { margin-top: 0; }
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      padding: 16px;
+    }
+    .summary-meta {
+      justify-content: space-between;
+    }
+    .summary-meta .badge {
+      background: rgba(32, 201, 151, 0.12);
+    }
     input, select, button, textarea {
       font: inherit;
     }
     input, textarea {
-      border: 1px solid var(--line);
+      border: 1px solid var(--line-strong);
       border-radius: 12px;
       padding: 11px 12px;
-      background: white;
+      background: rgba(9, 17, 28, 0.88);
       color: var(--text);
+      width: 100%;
+      min-width: 0;
     }
-    input, textarea { min-width: 180px; }
+    input::placeholder, textarea::placeholder { color: #6f86a4; }
     button {
-      border: 0;
+      border: 1px solid transparent;
       border-radius: 12px;
       padding: 11px 14px;
       background: var(--accent);
-      color: white;
+      color: #071218;
       cursor: pointer;
-      transition: transform 120ms ease, background 120ms ease;
+      font-weight: 600;
+      transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
     }
     button.secondary {
-      background: #dfe8cc;
+      background: rgba(44, 62, 84, 0.85);
       color: var(--text);
-      border: 1px solid var(--line);
+      border-color: var(--line-strong);
     }
     button.ghost {
-      background: transparent;
+      background: rgba(8, 17, 28, 0.2);
       color: var(--muted);
       border: 1px solid var(--line);
     }
-    button:hover { transform: translateY(-1px); }
+    button:hover {
+      transform: translateY(-1px);
+      border-color: rgba(32, 201, 151, 0.28);
+    }
     .summary-grid, .detail-grid, .setup-grid {
       display: grid;
       gap: 14px;
     }
     .summary-grid {
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
       margin-bottom: 18px;
     }
     .detail-grid {
@@ -152,17 +229,17 @@ HTML_PAGE = """<!doctype html>
       margin-top: 18px;
     }
     .setup-grid {
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
       margin-top: 18px;
     }
     .card, .section-card {
-      background: var(--panel);
+      background: linear-gradient(180deg, rgba(15, 26, 40, 0.98), rgba(10, 18, 29, 0.96));
       border: 1px solid var(--line);
       border-radius: 16px;
     }
     .card {
-      padding: 16px;
-      min-height: 124px;
+      padding: 18px;
+      min-height: 132px;
     }
     .label {
       font-size: 12px;
@@ -172,7 +249,7 @@ HTML_PAGE = """<!doctype html>
       margin-bottom: 10px;
     }
     .value {
-      font-size: 34px;
+      font-size: clamp(1.8rem, 3vw, 2.5rem);
       line-height: 1.1;
       font-weight: 700;
       margin-bottom: 8px;
@@ -180,13 +257,14 @@ HTML_PAGE = """<!doctype html>
     .delta {
       font-size: 13px;
       color: var(--muted);
+      line-height: 1.45;
     }
     .panel {
-      padding: 18px;
+      padding: 20px;
     }
     .panel[hidden] { display: none; }
     .section-card {
-      padding: 16px;
+      padding: 18px;
     }
     .stack {
       display: grid;
@@ -206,50 +284,56 @@ HTML_PAGE = """<!doctype html>
       gap: 8px;
       padding: 8px 10px;
       border-radius: 999px;
-      background: var(--panel-alt);
-      border: 1px solid var(--line);
-      color: var(--muted);
+      background: rgba(27, 41, 59, 0.92);
+      border: 1px solid var(--line-strong);
+      color: #d0def2;
       font-size: 13px;
     }
     .pill.good { color: var(--good); }
     .pill.bad { color: var(--bad); }
     .pill.warn { color: var(--warn); }
     .mono, pre, code {
-      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-family: var(--mono);
     }
     pre {
       margin: 0;
       white-space: pre-wrap;
       word-break: break-word;
       line-height: 1.45;
-      background: #f6f7ef;
+      background: rgba(7, 14, 24, 0.98);
       border: 1px solid var(--line);
       border-radius: 14px;
       padding: 14px;
       max-height: 420px;
       overflow: auto;
+      color: #d9e8ff;
     }
     .table-wrap {
-      overflow: auto;
+      overflow-x: hidden;
       border: 1px solid var(--line);
       border-radius: 14px;
+      background: rgba(7, 14, 24, 0.62);
     }
     table {
       width: 100%;
       border-collapse: collapse;
-      min-width: 640px;
-      background: white;
+      table-layout: fixed;
+      min-width: 0;
+      background: transparent;
     }
     th, td {
       padding: 10px 12px;
-      border-bottom: 1px solid #ebefdf;
+      border-bottom: 1px solid rgba(126, 152, 182, 0.14);
       text-align: left;
       font-size: 14px;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      vertical-align: top;
     }
     th {
       position: sticky;
       top: 0;
-      background: #f7f8f1;
+      background: rgba(14, 24, 38, 0.96);
       color: var(--muted);
       text-transform: uppercase;
       letter-spacing: 0.05em;
@@ -280,7 +364,7 @@ HTML_PAGE = """<!doctype html>
     .kv strong { color: var(--text); }
     .nav button.active {
       background: var(--accent-strong);
-      color: white;
+      color: #061116;
     }
     .muted { color: var(--muted); }
     .small { font-size: 13px; }
@@ -291,35 +375,112 @@ HTML_PAGE = """<!doctype html>
       flex-wrap: wrap;
       align-items: center;
     }
+    @media (max-width: 1180px) {
+      .hero-grid {
+        grid-template-columns: 1fr;
+      }
+    }
     @media (max-width: 980px) {
+      .shell {
+        padding: 14px;
+      }
       .detail-grid { grid-template-columns: 1fr; }
+      .summary-strip { grid-template-columns: 1fr; }
+      .kv { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 860px) {
+      .table-wrap {
+        overflow-x: visible;
+        border: 0;
+        background: transparent;
+      }
+      table, thead, tbody, tr, th, td {
+        display: block;
+        width: 100%;
+      }
+      thead {
+        display: none;
+      }
+      tbody {
+        display: grid;
+        gap: 10px;
+      }
+      tr {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: rgba(10, 18, 29, 0.94);
+        overflow: hidden;
+      }
+      td {
+        display: grid;
+        grid-template-columns: minmax(110px, 132px) 1fr;
+        gap: 8px;
+        padding: 10px 12px;
+      }
+      td::before {
+        content: attr(data-label);
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        font-size: 11px;
+      }
     }
   </style>
 </head>
 <body>
   <div class="shell">
     <div class="hero">
-      <div class="hero-top">
-        <div>
-          <h1>TradeML Operator Dashboard</h1>
-          <p>Live node metrics update in-place over a persistent event stream.</p>
+      <div class="hero-grid">
+        <div class="hero-copy">
+          <div class="hero-top">
+            <div>
+              <div class="eyebrow">Operator Console</div>
+              <h1>TradeML Dashboard</h1>
+            </div>
+            <div class="badge" id="connection-badge">Connecting</div>
+          </div>
+          <p>Live node metrics update in-place over a persistent event stream. No page reruns, no Streamlit repaint loop, and the top-line state stays visible while the heavier sections refresh independently.</p>
+          <div class="summary-strip">
+            <div>
+              <div class="label">Realtime transport</div>
+              <div class="delta">Server-sent events for the hot path, JSON fetches for heavier views.</div>
+            </div>
+            <div>
+              <div class="label">Primary lane</div>
+              <div class="delta">Canonical bars, training readiness, vendor activity, and budget truth.</div>
+            </div>
+            <div>
+              <div class="label">UX goal</div>
+              <div class="delta">One stable page with fast updates instead of whole-page flashes.</div>
+            </div>
+          </div>
+          <div class="nav">
+            <button class="active" data-section="status">Status</button>
+            <button class="ghost" data-section="budgets">Budgets</button>
+            <button class="ghost" data-section="setup">Setup</button>
+            <button class="ghost" data-section="logs">Logs</button>
+          </div>
         </div>
-        <div class="badge" id="connection-badge">Connecting</div>
-      </div>
-      <div class="actions">
-        <input id="cluster-passphrase" type="password" placeholder="Cluster passphrase">
-        <button data-action="start-node">Start Node</button>
-        <button data-action="stop-node" class="secondary">Stop Node</button>
-        <button data-action="restart-node" class="secondary">Restart Node</button>
-        <button data-action="run-vendor-audit" class="ghost">Run Audit</button>
-        <button data-action="replan-coverage" class="ghost">Replan Coverage</button>
-        <span id="action-message" class="message"></span>
-      </div>
-      <div class="nav">
-        <button class="active" data-section="status">Status</button>
-        <button class="ghost" data-section="budgets">Budgets</button>
-        <button class="ghost" data-section="setup">Setup</button>
-        <button class="ghost" data-section="logs">Logs</button>
+        <div class="actions-panel">
+          <div class="summary-meta">
+            <div>
+              <div class="label">Quick Control</div>
+              <div class="delta">Node lifecycle and collection control live here.</div>
+            </div>
+            <div class="badge">Live control plane</div>
+          </div>
+          <input id="cluster-passphrase" type="password" placeholder="Cluster passphrase">
+          <div class="form-row">
+            <button data-action="start-node">Start Node</button>
+            <button data-action="stop-node" class="secondary">Stop Node</button>
+            <button data-action="restart-node" class="secondary">Restart Node</button>
+          </div>
+          <div class="form-row">
+            <button data-action="run-vendor-audit" class="ghost">Run Audit</button>
+            <button data-action="replan-coverage" class="ghost">Replan Coverage</button>
+          </div>
+          <span id="action-message" class="message"></span>
+        </div>
       </div>
     </div>
 
@@ -334,7 +495,10 @@ HTML_PAGE = """<!doctype html>
 
     <section class="panel" id="section-status">
       <div class="toolbar">
-        <h2>Status</h2>
+        <div>
+          <h2>Status</h2>
+          <div class="small muted">Training gate, collection coverage, and vendor throughput.</div>
+        </div>
         <span class="small muted" id="status-updated">Waiting for first snapshot</span>
       </div>
       <div class="detail-grid">
@@ -370,7 +534,10 @@ HTML_PAGE = """<!doctype html>
 
     <section class="panel" id="section-budgets" hidden>
       <div class="toolbar">
-        <h2>Budgets</h2>
+        <div>
+          <h2>Budgets</h2>
+          <div class="small muted">Current request pressure and daily cap state per vendor.</div>
+        </div>
         <span class="small muted" id="budgets-updated">Waiting for first snapshot</span>
       </div>
       <div class="stack">
@@ -385,7 +552,10 @@ HTML_PAGE = """<!doctype html>
 
     <section class="panel" id="section-setup" hidden>
       <div class="toolbar">
-        <h2>Setup</h2>
+        <div>
+          <h2>Setup</h2>
+          <div class="small muted">Cluster membership, NAS wiring, secrets, and worker lifecycle.</div>
+        </div>
         <span class="small muted" id="setup-updated">Loads on demand</span>
       </div>
       <div class="setup-grid">
@@ -442,7 +612,10 @@ HTML_PAGE = """<!doctype html>
 
     <section class="panel" id="section-logs" hidden>
       <div class="toolbar">
-        <h2>Logs</h2>
+        <div>
+          <h2>Logs</h2>
+          <div class="small muted">Node stdout plus recent systemd journal lines.</div>
+        </div>
         <span class="small muted" id="logs-updated">Loads on demand</span>
       </div>
       <div class="stack">
@@ -498,7 +671,7 @@ HTML_PAGE = """<!doctype html>
       const columns = Object.keys(rows[0]);
       const head = `<thead><tr>${columns.map((column) => `<th>${column}</th>`).join('')}</tr></thead>`;
       const body = rows.map((row) => {
-        return `<tr>${columns.map((column) => `<td>${row[column] ?? ''}</td>`).join('')}</tr>`;
+        return `<tr>${columns.map((column) => `<td data-label="${column}">${row[column] ?? ''}</td>`).join('')}</tr>`;
       }).join('');
       table.innerHTML = `${head}<tbody>${body}</tbody>`;
     }
