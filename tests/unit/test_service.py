@@ -1119,6 +1119,54 @@ def test_canonical_vendor_selection_skips_symbol_windows_before_learned_vendor_f
     assert len(tiingo.calls) == 1
 
 
+def test_canonical_vendor_selection_skips_tiingo_before_supported_ticker_start_date(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    alpaca = _BackfillConnector("alpaca")
+    tiingo = _BackfillConnector("tiingo")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": alpaca, "tiingo": tiingo},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    reference_root = tmp_path / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [{"symbol": "APLD", "exchange": "XNAS", "start_date": "2022-03-18", "end_date": "2026-04-09"}]
+    ).to_parquet(reference_root / "tiingo_supported_tickers.parquet", index=False)
+    db.upsert_planner_task(
+        task_key="canonical::APLD::tiingo_meta",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2021-07-01",
+        end_date="2021-07-29",
+        symbols=["APLD"],
+        eligible_vendors=["tiingo", "alpaca"],
+        payload={"scope_kind": "symbol_range", "trading_days": ["2021-07-01"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::APLD::tiingo_meta",
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=["APLD"],
+        state={"scope_kind": "symbol_range"},
+    )
+    task = db.lease_planner_task_by_key(task_key="canonical::APLD::tiingo_meta", lease_owner=service.worker_id)
+
+    assert task is not None
+    changed = service._canonical_runtime._process_canonical_planner_task(task, exchange="XNYS")
+
+    assert changed == ["2021-07-01"]
+    assert alpaca.calls == [("equities_eod", ["APLD"], "2021-07-01", "2021-07-29")]
+    assert tiingo.calls == []
+
+
 def test_load_corp_actions_reference_skips_corrupt_parquet(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

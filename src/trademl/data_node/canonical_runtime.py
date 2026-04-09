@@ -74,6 +74,7 @@ class CanonicalRuntime:
         self._logged_unreadable_paths: set[tuple[str, str]] = set()
         self._log_dedupe_lock = threading.Lock()
         self._vendor_symbol_floor_cache: dict[tuple[str, str], str | None] = {}
+        self._tiingo_supported_ticker_cache: dict[str, tuple[str | None, str | None]] | None = None
 
     def _lease_canonical_batch(self, vendor: str) -> list[PlannerTask]:
         """Lease a vendor-compatible batch of canonical planner tasks."""
@@ -438,10 +439,52 @@ class CanonicalRuntime:
                 return False
         if len(task.symbols) != 1:
             return True
+        if vendor == "tiingo" and not self._tiingo_supported_ticker_allows(task.symbols[0], start_date=str(task.start_date), end_date=str(task.end_date)):
+            return False
         floor = self._vendor_symbol_floor(vendor=vendor, symbol=task.symbols[0])
         if not floor:
             return True
         return str(task.end_date) >= floor
+
+    def _tiingo_supported_ticker_allows(self, symbol: str, *, start_date: str, end_date: str) -> bool:
+        """Return whether Tiingo metadata says a symbol can cover the requested window."""
+        metadata = self._tiingo_supported_tickers().get(str(symbol).upper())
+        if metadata is None:
+            return True
+        start_floor, end_ceiling = metadata
+        if start_floor and pd.Timestamp(end_date) < pd.Timestamp(start_floor):
+            return False
+        if end_ceiling and pd.Timestamp(start_date) > pd.Timestamp(end_ceiling):
+            return False
+        return True
+
+    def _tiingo_supported_tickers(self) -> dict[str, tuple[str | None, str | None]]:
+        """Load Tiingo supported ticker metadata keyed by symbol."""
+        if self._tiingo_supported_ticker_cache is not None:
+            return self._tiingo_supported_ticker_cache
+        path = self.paths.reference_root / "tiingo_supported_tickers.parquet"
+        if not path.exists():
+            self._tiingo_supported_ticker_cache = {}
+            return self._tiingo_supported_ticker_cache
+        try:
+            frame = pd.read_parquet(path, columns=["symbol", "start_date", "end_date"])
+        except Exception as exc:  # pragma: no cover
+            self._log_unreadable_partition_once(event="skipping_unreadable_reference_partition", path=path, error=exc)
+            self._tiingo_supported_ticker_cache = {}
+            return self._tiingo_supported_ticker_cache
+        metadata: dict[str, tuple[str | None, str | None]] = {}
+        if not frame.empty:
+            normalized = frame.copy()
+            normalized["symbol"] = normalized["symbol"].astype("string").str.upper()
+            normalized["start_date"] = pd.to_datetime(normalized.get("start_date"), errors="coerce").dt.strftime("%Y-%m-%d")
+            normalized["end_date"] = pd.to_datetime(normalized.get("end_date"), errors="coerce").dt.strftime("%Y-%m-%d")
+            for row in normalized.dropna(subset=["symbol"]).itertuples(index=False):
+                metadata[str(row.symbol)] = (
+                    str(row.start_date) if pd.notna(row.start_date) else None,
+                    str(row.end_date) if pd.notna(row.end_date) else None,
+                )
+        self._tiingo_supported_ticker_cache = metadata
+        return self._tiingo_supported_ticker_cache
 
     def _vendor_symbol_floor(self, *, vendor: str, symbol: str) -> str | None:
         """Infer the earliest non-empty date range a vendor has shown for a symbol."""
