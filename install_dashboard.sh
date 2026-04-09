@@ -9,7 +9,7 @@ WRAPPER_PATH="${BIN_DIR}/trademl"
 
 "${PYTHON_BIN}" -m venv "${VENV_PATH}"
 "${VENV_PATH}/bin/pip" install --upgrade pip
-"${VENV_PATH}/bin/pip" install -e "${REPO_ROOT}[dev,dashboard]"
+"${VENV_PATH}/bin/pip" install -e "${REPO_ROOT}[dev]"
 
 mkdir -p "${BIN_DIR}"
 cat > "${WRAPPER_PATH}" <<EOF

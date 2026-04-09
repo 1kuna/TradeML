@@ -32,7 +32,6 @@ dev = [
   "rich>=13.9",
 ]
 dashboard = [
-  "streamlit>=1.39",
 ]
 
 [tool.setuptools]

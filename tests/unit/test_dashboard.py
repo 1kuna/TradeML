@@ -1050,6 +1050,93 @@ def test_collect_dashboard_snapshot_tolerates_locked_queue_db(tmp_path: Path, mo
     assert snapshot["queue_counts"]["FAILED"] == 0
 
 
+def test_collect_dashboard_status_snapshot_skips_setup_and_log_probes(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                },
+                "vendors": {"alpaca": {"rpm": 150, "daily_cap": 10000}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 0, "symbols": ["AAPL"], "years": 1}, sort_keys=False),
+        encoding="utf-8",
+    )
+    db = DataNodeDB(workspace / "control" / "node.sqlite")
+    db.update_partition_status("alpaca", "equities_eod", "2025-01-02", "GREEN", 1, 1, "OK")
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    monkeypatch.setattr(dashboard_controller, "_check_host_reachable", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("host probe should not run")))
+    monkeypatch.setattr(dashboard_controller, "_check_mount_writable", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("mount probe should not run")))
+    monkeypatch.setattr(dashboard_controller, "_tail_file", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("log tail should not run")))
+    monkeypatch.setattr(dashboard_controller, "read_cluster_snapshot", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cluster snapshot should not run")))
+    monkeypatch.setattr(dashboard_controller, "systemd_status", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("systemd status should not run")))
+    monkeypatch.setattr(dashboard_controller, "systemd_journal_tail", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("journal tail should not run")))
+    monkeypatch.setattr(dashboard_controller, "_connectors_from_settings", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("connector build should not run")))
+
+    snapshot = dashboard_controller.collect_dashboard_status_snapshot(settings)
+
+    assert snapshot["runtime"]["running"] is False
+    assert snapshot["collection_status"]["coverage_percent"] >= 0.0
+    assert "nas" not in snapshot
+    assert "log_tail" not in snapshot
+
+
+def test_collect_dashboard_live_snapshot_skips_support_file_scans(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                },
+                "vendors": {"alpaca": {"rpm": 150, "daily_cap": 10000}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 0, "symbols": ["AAPL"], "years": 1}, sort_keys=False),
+        encoding="utf-8",
+    )
+    db = DataNodeDB(workspace / "control" / "node.sqlite")
+    db.update_partition_status("alpaca", "equities_eod", "2025-01-02", "GREEN", 1, 1, "OK")
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    monkeypatch.setattr(dashboard_controller, "load_audit_state", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("audit load should not run")))
+    monkeypatch.setattr(dashboard_controller, "_read_optional_json", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("optional json should not run")))
+    monkeypatch.setattr(dashboard_controller, "_connectors_from_settings", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("connector build should not run")))
+    monkeypatch.setattr(dashboard_controller, "_macro_series", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("macro scan should not run")))
+    monkeypatch.setattr(dashboard_controller, "_price_check_files", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("price check scan should not run")))
+
+    snapshot = dashboard_controller.collect_dashboard_live_snapshot(settings)
+
+    assert snapshot["runtime"]["running"] is False
+    assert snapshot["collection_status"]["canonical_completed_units"] >= 0
+    assert "vendor_throughput" in snapshot
+
+
 def test_update_worker_refreshes_wrapper_and_reports_paths(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     config_path = workspace / "node.yml"

@@ -576,7 +576,7 @@ def update_worker(settings: NodeSettings) -> dict[str, Any]:
     subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True)
     pip_path = venv_path / "bin" / "pip"
     subprocess.run([str(pip_path), "install", "--upgrade", "pip"], check=True)
-    subprocess.run([str(pip_path), "install", "-e", f"{settings.repo_root}[dev,dashboard]"], check=True)
+    subprocess.run([str(pip_path), "install", "-e", f"{settings.repo_root}[dev]"], check=True)
     bin_dir.mkdir(parents=True, exist_ok=True)
     wrapper_path.write_text(
         "#!/usr/bin/env sh\n"
@@ -773,6 +773,15 @@ def _rotate_runtime_log(log_path: Path) -> None:
 
 def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
     """Collect a restart-safe snapshot for the dashboard UI."""
+    snapshot = collect_dashboard_status_snapshot(settings)
+    snapshot.update(collect_dashboard_setup_snapshot(settings))
+    snapshot.update(collect_dashboard_logs_snapshot(settings))
+    snapshot["provider_role_matrix"] = provider_role_matrix(connectors=_connectors_from_settings(settings), audit_state=snapshot["audit"])
+    return snapshot
+
+
+def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
+    """Collect the live dashboard state used by the main status and budget views."""
     runtime = _read_runtime_state(settings)
     pid = runtime.get("pid")
     running = isinstance(pid, int) and _is_process_running(pid)
@@ -813,7 +822,6 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
                 expected_datapoints = expected_sessions * len(stage_symbols)
                 if expected_datapoints:
                     datapoint_progress_ratio = raw_datapoints / expected_datapoints
-    host = _extract_share_host(settings.nas_share)
     readiness = evaluate_training_gates(
         data_root=settings.nas_mount,
         stage_symbol_count=len(stage_symbols),
@@ -842,7 +850,6 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "phase2": read_training_runtime(path=shared_training_runtime_path(data_root=settings.nas_mount, phase=2)),
     }
     train_operational_status = _summarize_train_operational_status(training_status=training_status, readiness=readiness)
-    role_matrix = provider_role_matrix(connectors=_connectors_from_settings(settings), audit_state=audit)
     snapshot = {
         "settings": asdict(settings),
         "runtime": runtime,
@@ -877,7 +884,6 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "training_readiness": readiness,
         "training_status": training_status,
         "train_operational_status": train_operational_status,
-        "provider_role_matrix": role_matrix,
         "suggested_training_commands": {
             "phase1": (
                 f"trademl train --data-root {settings.nas_mount} start --phase 1 --report-date {freeze_cutoff_date}"
@@ -892,6 +898,73 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         },
         "audit": audit,
         "coverage_plan": coverage_plan,
+    }
+    return snapshot
+
+
+def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
+    """Collect the lightweight live snapshot used for continuously updating top-line metrics."""
+    runtime = _read_runtime_state(settings)
+    pid = runtime.get("pid")
+    running = isinstance(pid, int) and _is_process_running(pid)
+    runtime["running"] = running
+    if running and runtime.get("started_at"):
+        started_at = datetime.fromisoformat(str(runtime["started_at"]))
+        runtime["uptime_seconds"] = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
+    queue_counts = _read_queue_counts(settings.db_path)
+    partition_summary = _read_partition_summary(settings.qc_path)
+    raw_datapoints = _raw_datapoints_from_qc(partition_summary)
+    planner_summary = _read_planner_summary(settings.db_path)
+    budget_summary = _read_budget_summary(settings)
+    vendor_throughput = _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
+    planner_eta = _summarize_planner_eta(settings.db_path, planner_summary=planner_summary, vendor_throughput=vendor_throughput)
+    stage = _read_yaml(settings.stage_path)
+    stage_symbols = stage.get("symbols", [])
+    stage_years = stage.get("years")
+    readiness = evaluate_training_gates(
+        data_root=settings.nas_mount,
+        stage_symbol_count=len(stage_symbols),
+        stage_years=int(stage_years or 0),
+        planner_db_path=settings.db_path,
+    )
+    progress = planner_summary.get("progress", {})
+    bars_progress = progress.get("canonical_bars", {})
+    canonical_expected = int(bars_progress.get("expected_units", 0))
+    canonical_completed = int(bars_progress.get("completed_units", 0))
+    canonical_remaining = int(bars_progress.get("remaining_units", max(0, canonical_expected - canonical_completed)))
+    canonical_ratio = min(1.0, canonical_completed / canonical_expected) if canonical_expected else 0.0
+    training_critical_ratio = float(
+        readiness.get("freeze_cutoff", {}).get(
+            "effective_window_coverage_ratio",
+            readiness.get("freeze_cutoff", {}).get("window_coverage_ratio", 0.0),
+        )
+        or 0.0
+    )
+    collection_status = {
+        "coverage_ratio": canonical_ratio,
+        "coverage_percent": round(canonical_ratio * 100.0, 1),
+        "canonical_completed_units": canonical_completed,
+        "canonical_expected_units": canonical_expected,
+        "canonical_remaining_units": canonical_remaining,
+        "raw_vendor_rows": int(raw_datapoints),
+        "training_critical_percent": round(training_critical_ratio * 100.0, 1),
+        "pending_tasks": int(queue_counts.get("PENDING", 0)) + int(queue_counts.get("PARTIAL", 0)) + int(queue_counts.get("LEASED", 0)),
+        "failed_tasks": int(queue_counts.get("FAILED", 0)),
+    }
+    return {
+        "runtime": runtime,
+        "collection_status": collection_status,
+        "training_readiness": readiness,
+        "planner_eta": planner_eta,
+        "budget_summary": budget_summary,
+        "vendor_throughput": vendor_throughput,
+    }
+
+
+def collect_dashboard_setup_snapshot(settings: NodeSettings) -> dict[str, Any]:
+    """Collect slower NAS, cluster, and service state only when the setup view is open."""
+    host = _extract_share_host(settings.nas_share)
+    return {
         "nas": {
             "share": settings.nas_share,
             "host": host,
@@ -899,12 +972,17 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
             "mount_path": str(settings.nas_mount),
             "mount_writable": _check_mount_writable(settings.nas_mount),
         },
-        "log_tail": _tail_file(settings.log_path),
         "cluster": read_cluster_snapshot(nas_root=settings.nas_mount, worker_id=settings.worker_id),
         "systemd": systemd_status(),
+    }
+
+
+def collect_dashboard_logs_snapshot(settings: NodeSettings) -> dict[str, Any]:
+    """Collect log tails only when the logs view is open."""
+    return {
+        "log_tail": _tail_file(settings.log_path),
         "journal_tail": systemd_journal_tail(),
     }
-    return snapshot
 
 
 def _audit_report_path(settings: NodeSettings) -> Path:

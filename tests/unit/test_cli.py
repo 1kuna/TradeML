@@ -8,7 +8,7 @@ import yaml
 from trademl import cli
 
 
-def test_dashboard_cli_builds_streamlit_command(tmp_path: Path, monkeypatch) -> None:
+def test_dashboard_cli_builds_http_server_command(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     config_path = workspace / "node.yml"
@@ -43,7 +43,7 @@ def test_dashboard_cli_builds_streamlit_command(tmp_path: Path, monkeypatch) -> 
 
     assert rc == 0
     assert seen["check"] is False
-    assert "streamlit" in seen["command"]
+    assert seen["command"][:3] == [cli.sys.executable, "-m", "trademl.dashboard.server"]
     assert "--workspace-root" in seen["command"]
 
 

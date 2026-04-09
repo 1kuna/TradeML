@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="trademl", description="TradeML operator CLI.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    dashboard_parser = subparsers.add_parser("dashboard", help="Launch the Streamlit operator dashboard.")
+    dashboard_parser = subparsers.add_parser("dashboard", help="Launch the operator dashboard server.")
     dashboard_parser.add_argument("--workspace-root", default=None)
     dashboard_parser.add_argument("--config", default=None)
     dashboard_parser.add_argument("--env-file", default=None)
@@ -174,25 +174,19 @@ def _launch_dashboard(args: argparse.Namespace) -> int:
         config_path=args.config,
         env_path=args.env_file,
     )
-    app_path = Path(__file__).resolve().parent / "dashboard" / "app.py"
     command = [
         sys.executable,
         "-m",
-        "streamlit",
-        "run",
-        str(app_path),
-        "--server.address",
+        "trademl.dashboard.server",
+        "--host",
         args.host,
-        "--server.port",
+        "--port",
         str(args.port),
-        "--browser.gatherUsageStats",
-        "false",
     ]
     if args.no_browser:
-        command.extend(["--server.headless", "true"])
+        command.append("--no-browser")
     command.extend(
         [
-            "--",
             "--workspace-root",
             str(settings.workspace_root),
             "--config",
