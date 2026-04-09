@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date as date_type
+from itertools import islice
 
 import pandas as pd
 
@@ -71,33 +72,69 @@ class TwelveDataConnector(HTTPConnector):
         frames: list[pd.DataFrame] = []
         start = pd.Timestamp(start_date).strftime("%Y-%m-%d")
         end = pd.Timestamp(end_date).strftime("%Y-%m-%d")
-        for symbol in symbols:
+        for batch in _chunked(symbols, 8):
+            batch_units = max(1, len(batch))
             payload = self.request_json(
                 endpoint="/time_series",
-                params={"symbol": symbol, "interval": "1day", "start_date": start, "end_date": end, "order": "ASC", "format": "JSON"},
+                params={
+                    "symbol": ",".join(batch),
+                    "interval": "1day",
+                    "start_date": start,
+                    "end_date": end,
+                    "order": "ASC",
+                    "format": "JSON",
+                },
                 task_kind="FORWARD",
+                budget_units=batch_units,
             )
-            values = payload.get("values", []) if isinstance(payload, dict) else payload
-            frame = pd.DataFrame(values)
-            if frame.empty:
-                continue
-            frame["symbol"] = payload.get("meta", {}).get("symbol", symbol) if isinstance(payload, dict) else symbol
-            frame["vendor_ts"] = pd.to_datetime(frame.get("datetime", frame.get("date")), errors="coerce", utc=True)
-            frame["date"] = frame["vendor_ts"].dt.date
-            frame["open"] = pd.to_numeric(frame.get("open"), errors="coerce")
-            frame["high"] = pd.to_numeric(frame.get("high"), errors="coerce")
-            frame["low"] = pd.to_numeric(frame.get("low"), errors="coerce")
-            frame["close"] = pd.to_numeric(frame.get("close"), errors="coerce")
-            frame["volume"] = pd.to_numeric(frame.get("volume"), errors="coerce")
-            frame["vwap"] = pd.NA
-            frame["trade_count"] = pd.NA
-            frame["ingested_at"] = pd.Timestamp.now(tz=UTC)
-            frame["source_name"] = self.vendor_name
-            frame["source_uri"] = "/time_series"
-            frames.append(frame)
+            for symbol, values in self._iter_time_series_payloads(payload=payload, requested=batch):
+                frame = pd.DataFrame(values)
+                if frame.empty:
+                    continue
+                frame["symbol"] = symbol
+                frame["vendor_ts"] = pd.to_datetime(frame.get("datetime", frame.get("date")), errors="coerce", utc=True)
+                frame["date"] = frame["vendor_ts"].dt.date
+                frame["open"] = pd.to_numeric(frame.get("open"), errors="coerce")
+                frame["high"] = pd.to_numeric(frame.get("high"), errors="coerce")
+                frame["low"] = pd.to_numeric(frame.get("low"), errors="coerce")
+                frame["close"] = pd.to_numeric(frame.get("close"), errors="coerce")
+                frame["volume"] = pd.to_numeric(frame.get("volume"), errors="coerce")
+                frame["vwap"] = pd.NA
+                frame["trade_count"] = pd.NA
+                frame["ingested_at"] = pd.Timestamp.now(tz=UTC)
+                frame["source_name"] = self.vendor_name
+                frame["source_uri"] = "/time_series"
+                frames.append(frame)
         if not frames:
             return pd.DataFrame(columns=self._equity_columns())
         return pd.concat(frames, ignore_index=True)[self._equity_columns()].sort_values(["date", "symbol"]).reset_index(drop=True)
+
+    @staticmethod
+    def _iter_time_series_payloads(
+        *,
+        payload: object,
+        requested: list[str],
+    ) -> list[tuple[str, list[dict[str, object]]]]:
+        if isinstance(payload, dict) and "values" in payload:
+            symbol = str(payload.get("meta", {}).get("symbol", requested[0] if requested else "")).upper()
+            values = payload.get("values", [])
+            return [(symbol, values if isinstance(values, list) else [])]
+        if isinstance(payload, dict):
+            requested_lookup = {_normalize_batch_symbol(symbol): str(symbol).upper() for symbol in requested}
+            rows: list[tuple[str, list[dict[str, object]]]] = []
+            for top_level_key, candidate in payload.items():
+                if not isinstance(candidate, dict):
+                    continue
+                meta_symbol = str(candidate.get("meta", {}).get("symbol", top_level_key)).upper()
+                normalized_symbol = _normalize_batch_symbol(meta_symbol)
+                fallback_symbol = _normalize_batch_symbol(str(top_level_key))
+                requested_symbol = requested_lookup.get(normalized_symbol) or requested_lookup.get(fallback_symbol)
+                if requested_symbol is None:
+                    continue
+                values = candidate.get("values", [])
+                rows.append((requested_symbol, values if isinstance(values, list) else []))
+            return rows
+        return []
 
     def _fetch_corporate_actions(
         self,
@@ -212,3 +249,16 @@ def _normalize_optional_date(frame: pd.DataFrame, *column_names: str) -> pd.Seri
         if column_name in frame.columns:
             return pd.to_datetime(frame[column_name], errors="coerce")
     return pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+
+
+def _chunked(values: list[str], size: int):
+    iterator = iter(values)
+    while chunk := list(islice(iterator, size)):
+        yield chunk
+
+
+def _normalize_batch_symbol(value: object) -> str:
+    text = str(value or "").strip().upper()
+    if ":" in text:
+        return text.split(":", 1)[0]
+    return text

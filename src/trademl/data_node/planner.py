@@ -115,11 +115,13 @@ def plan_auxiliary_tasks(
 
 def plan_canonical_bar_tasks(
     *,
+    data_root: Path | None = None,
     stage_symbols: list[str],
     stage_years: int,
     connectors: dict[str, object],
     audit_state: dict[str, Any] | None = None,
     current_date: str | None = None,
+    freeze_report_date: str | None = None,
     symbol_batch_size: int = 1,
     trading_day_chunk_size: int = 20,
 ) -> list[PlannedTask]:
@@ -127,7 +129,15 @@ def plan_canonical_bar_tasks(
     if not stage_symbols or stage_years <= 0:
         return []
     as_of = pd.Timestamp(current_date or datetime.now(tz=UTC).date().isoformat()).normalize()
-    start = (as_of - pd.DateOffset(years=max(1, int(stage_years)))).date()
+    nominal_start = (as_of - pd.DateOffset(years=max(1, int(stage_years)))).normalize()
+    freeze_end = pd.Timestamp(freeze_report_date).normalize() if freeze_report_date else None
+    freeze_start = (
+        (freeze_end - pd.DateOffset(years=max(1, int(stage_years)))).normalize()
+        if freeze_end is not None
+        else None
+    )
+    start_anchor = min(nominal_start, freeze_start) if freeze_start is not None else nominal_start
+    start = start_anchor.date()
     end = as_of.date()
     trading_days = [day.isoformat() for day in get_trading_days("XNYS", start, end)]
     if not trading_days:
@@ -145,18 +155,29 @@ def plan_canonical_bar_tasks(
 
     tasks: list[PlannedTask] = []
     ordered_symbols = list(dict.fromkeys(str(symbol).upper() for symbol in stage_symbols))
-    for symbol_index in range(0, len(ordered_symbols), max(1, symbol_batch_size)):
-        symbol_chunk = tuple(ordered_symbols[symbol_index : symbol_index + max(1, symbol_batch_size)])
-        if not symbol_chunk:
+    listing_windows = _load_listing_windows(data_root) if data_root is not None else {}
+    for symbol_index, symbol in enumerate(ordered_symbols):
+        symbol_chunk = (symbol,)
+        eligible_days = _eligible_trading_days(
+            trading_days=trading_days,
+            listing_window=listing_windows.get(symbol),
+        )
+        if not eligible_days:
             continue
-        symbol_chunk_id = f"{symbol_index // max(1, symbol_batch_size):05d}"
-        for date_index in range(0, len(trading_days), max(1, trading_day_chunk_size)):
-            window = trading_days[date_index : date_index + max(1, trading_day_chunk_size)]
+        symbol_chunk_id = f"{symbol_index:05d}"
+        for date_index in range(0, len(eligible_days), max(1, trading_day_chunk_size)):
+            window = eligible_days[date_index : date_index + max(1, trading_day_chunk_size)]
             if not window:
                 continue
             date_chunk_id = f"{date_index // max(1, trading_day_chunk_size):04d}"
             start_date = window[0]
             end_date = window[-1]
+            in_freeze_window = (
+                freeze_end is not None
+                and freeze_start is not None
+                and pd.Timestamp(end_date) <= freeze_end
+                and pd.Timestamp(start_date) >= freeze_start
+            )
             tasks.append(
                 PlannedTask(
                     task_key=f"canonical_bars::equities_eod::{symbol_chunk_id}::{date_chunk_id}::{start_date}::{end_date}",
@@ -164,22 +185,34 @@ def plan_canonical_bar_tasks(
                     planner_group="canonical_bars_backlog",
                     dataset="equities_eod",
                     tier="A",
-                    priority=10,
+                    priority=5 if in_freeze_window else 10,
                     start_date=start_date,
                     end_date=end_date,
                     symbols=symbol_chunk,
                     output_name="equities_bars",
-                    preferred_vendors=canonical_vendors,
+                    preferred_vendors=_canonical_vendors_for_window(
+                        canonical_vendors=canonical_vendors,
+                        in_freeze_window=in_freeze_window,
+                    ),
                     payload={
                         "scope_kind": "symbol_range",
                         "symbol_chunk_id": symbol_chunk_id,
                         "date_chunk_id": date_chunk_id,
                         "symbol_batch_size": len(symbol_chunk),
                         "trading_days": list(window),
+                        "freeze_priority": in_freeze_window,
                     },
                 )
             )
     return tasks
+
+
+def _canonical_vendors_for_window(*, canonical_vendors: tuple[str, ...], in_freeze_window: bool) -> tuple[str, ...]:
+    """Return the vendor set to use for a canonical bar task window."""
+    if not in_freeze_window:
+        return canonical_vendors
+    ordered = tuple(vendor for vendor in ("alpaca", "tiingo") if vendor in canonical_vendors)
+    return ordered or canonical_vendors
 
 
 def plan_coverage_tasks(
@@ -191,16 +224,19 @@ def plan_coverage_tasks(
     audit_state: dict[str, Any] | None = None,
     include_research: bool = False,
     current_date: str | None = None,
+    freeze_report_date: str | None = None,
     symbol_batch_size: int = 1,
     trading_day_chunk_size: int = 20,
 ) -> list[PlannedTask]:
     """Return the full planner backlog ordered by core-first priority."""
     canonical = plan_canonical_bar_tasks(
+        data_root=data_root,
         stage_symbols=stage_symbols,
         stage_years=stage_years,
         connectors=connectors,
         audit_state=audit_state,
         current_date=current_date,
+        freeze_report_date=freeze_report_date,
         symbol_batch_size=symbol_batch_size,
         trading_day_chunk_size=trading_day_chunk_size,
     )
@@ -214,6 +250,53 @@ def plan_coverage_tasks(
         current_date=current_date,
     )
     return sorted([*canonical, *auxiliary], key=lambda task: (task.priority, task.task_key))
+
+
+def _load_listing_windows(data_root: Path | None) -> dict[str, tuple[pd.Timestamp | None, pd.Timestamp | None]]:
+    """Return symbol-specific IPO/delist windows when listing history is available."""
+    if data_root is None:
+        return {}
+    path = data_root / "data" / "reference" / "listing_history.parquet"
+    if not path.exists():
+        return {}
+    try:
+        frame = pd.read_parquet(path, columns=["symbol", "ipo_date", "delist_date"])
+    except Exception:
+        return {}
+    if frame.empty:
+        return {}
+    frame["symbol"] = frame["symbol"].astype("string").str.strip().str.upper()
+    frame["ipo_date"] = pd.to_datetime(frame.get("ipo_date"), errors="coerce").dt.normalize()
+    frame["delist_date"] = pd.to_datetime(frame.get("delist_date"), errors="coerce").dt.normalize()
+    windows: dict[str, tuple[pd.Timestamp | None, pd.Timestamp | None]] = {}
+    for symbol, group in frame.groupby("symbol", dropna=True):
+        ipo_dates = group["ipo_date"].dropna()
+        delist_dates = group["delist_date"].dropna()
+        windows[str(symbol)] = (
+            ipo_dates.min() if not ipo_dates.empty else None,
+            delist_dates.min() if not delist_dates.empty else None,
+        )
+    return windows
+
+
+def _eligible_trading_days(
+    *,
+    trading_days: list[str],
+    listing_window: tuple[pd.Timestamp | None, pd.Timestamp | None] | None,
+) -> list[str]:
+    """Filter trading days to the symbol's eligible listing window."""
+    if not listing_window:
+        return list(trading_days)
+    ipo_date, delist_date = listing_window
+    eligible: list[str] = []
+    for trading_day in trading_days:
+        trading_ts = pd.Timestamp(trading_day).normalize()
+        if ipo_date is not None and trading_ts < ipo_date:
+            continue
+        if delist_date is not None and trading_ts >= delist_date:
+            continue
+        eligible.append(trading_day)
+    return eligible
 
 
 def _materialize_capability_tasks(

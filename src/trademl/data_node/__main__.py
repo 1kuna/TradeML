@@ -11,12 +11,6 @@ import pandas as pd
 import yaml
 
 from trademl.calendars.exchange import ExchangeCalendarStore
-from trademl.connectors.alpaca import AlpacaConnector
-from trademl.connectors.alpha_vantage import AlphaVantageConnector
-from trademl.connectors.fmp import FMPConnector
-from trademl.connectors.sec_edgar import SecEdgarConnector
-from trademl.connectors.tiingo import TiingoConnector
-from trademl.connectors.twelve_data import TwelveDataConnector
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.bootstrap import Stage0UniverseBuilder
 from trademl.data_node.budgets import BudgetManager
@@ -24,8 +18,8 @@ from trademl.data_node.capabilities import build_reference_jobs as build_referen
 from trademl.data_node.capabilities import default_macro_series, load_audit_state
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
+from trademl.data_node.runtime import build_connectors, build_connector, resolve_vendor_budgets
 from trademl.data_node.service import DataNodePaths, DataNodeService
-from trademl.data_node.vendor_limits import DEFAULT_VENDOR_LIMITS
 from trademl.fleet.cluster import ClusterCoordinator
 
 
@@ -75,72 +69,26 @@ def main() -> int:
     ).expanduser().parent
     local_state_default = workspace_root / "control" if args.root else Path(config["node"]["local_state"]).expanduser()
     local_state = Path(os.getenv("LOCAL_STATE", str(local_state_default))).expanduser()
+    vendor_limits = resolve_vendor_budgets(config)
     budgets = BudgetManager(
-        _resolve_vendor_budgets(config),
+        vendor_limits,
         snapshot_path=local_state / "budget_state.json",
     )
-    connector = AlpacaConnector(
-        base_url=os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
-        trading_base_url=os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
-        api_key=os.getenv("ALPACA_API_KEY", ""),
-        secret_key=os.getenv("ALPACA_API_SECRET", ""),
-        budget_manager=budgets,
+    connectors = build_connectors(
+        env_values=os.environ,
+        vendor_limits=vendor_limits,
+        budget_manager_factory=lambda _vendor: budgets,
+        sec_edgar_user_agent="TradeML/0.1 test@example.com",
     )
+    connector = build_connector(
+        vendor="alpaca",
+        env_values=os.environ,
+        vendor_limits=vendor_limits,
+        budget_manager_factory=lambda _vendor: budgets,
+    )
+    if connector is None:
+        raise SystemExit("ALPACA_API_KEY is required to start the data node")
     stage0_universe_builder = Stage0UniverseBuilder(connector=connector)
-    connectors = {"alpaca": connector}
-    if os.getenv("MASSIVE_API_KEY"):
-        from trademl.connectors.massive import MassiveConnector
-
-        connectors["massive"] = MassiveConnector(
-            base_url="https://api.polygon.io",
-            api_key=os.environ["MASSIVE_API_KEY"],
-            budget_manager=budgets,
-        )
-    if os.getenv("FINNHUB_API_KEY"):
-        from trademl.connectors.finnhub import FinnhubConnector
-
-        connectors["finnhub"] = FinnhubConnector(
-            base_url="https://finnhub.io",
-            api_key=os.environ["FINNHUB_API_KEY"],
-            budget_manager=budgets,
-        )
-    if os.getenv("FRED_API_KEY"):
-        from trademl.connectors.fred import FredConnector
-
-        connectors["fred"] = FredConnector(
-            base_url="https://api.stlouisfed.org",
-            api_key=os.environ["FRED_API_KEY"],
-            budget_manager=budgets,
-        )
-    if os.getenv("ALPHA_VANTAGE_API_KEY"):
-        connectors["alpha_vantage"] = AlphaVantageConnector(
-            base_url="https://www.alphavantage.co",
-            api_key=os.environ["ALPHA_VANTAGE_API_KEY"],
-            budget_manager=budgets,
-        )
-    if os.getenv("TIINGO_API_KEY"):
-        connectors["tiingo"] = TiingoConnector(
-            base_url="https://api.tiingo.com",
-            api_key=os.environ["TIINGO_API_KEY"],
-            budget_manager=budgets,
-        )
-    if os.getenv("TWELVE_DATA_API_KEY"):
-        connectors["twelve_data"] = TwelveDataConnector(
-            base_url="https://api.twelvedata.com",
-            api_key=os.environ["TWELVE_DATA_API_KEY"],
-            budget_manager=budgets,
-        )
-    if os.getenv("FMP_API_KEY"):
-        connectors["fmp"] = FMPConnector(
-            base_url="https://financialmodelingprep.com",
-            api_key=os.environ["FMP_API_KEY"],
-            budget_manager=budgets,
-        )
-    connectors["sec_edgar"] = SecEdgarConnector(
-        base_url="https://data.sec.gov",
-        user_agent=os.getenv("SEC_EDGAR_USER_AGENT", "TradeML/0.1 test@example.com"),
-        budget_manager=budgets,
-    )
     worker_id = os.getenv("EDGE_NODE_ID", config.get("node", {}).get("worker_id", os.uname().nodename if hasattr(os, "uname") else "worker"))
     db = DataNodeDB(local_state / "node.sqlite")
     data_root = Path(args.data_root or os.getenv("NAS_MOUNT", config["node"]["nas_mount"])).expanduser()
@@ -176,7 +124,7 @@ def main() -> int:
             materialized = [service._materialize_job(job, args.date) for job in reference_jobs]
             service.collect_reference_data(materialized)
             service.curate_dates(corp_actions=service.load_corp_actions_reference())
-        if "massive" in connectors and "finnhub" in connectors:
+        if {"massive", "twelve_data", "tiingo"}.intersection(connectors):
             service.run_cross_vendor_price_checks(trading_date=args.date, sample_symbols=symbols[:5])
         service.sync_partition_status()
         return 0
@@ -214,7 +162,7 @@ def main() -> int:
         poll_seconds=args.poll_seconds,
         macro_series_ids=default_macro_series() if "fred" in connectors else [],
         reference_jobs=reference_jobs,
-        price_check_symbols=active_symbols[:5] if {"massive", "finnhub"}.issubset(connectors) else [],
+        price_check_symbols=active_symbols[:5] if {"massive", "twelve_data", "tiingo"}.intersection(connectors) else [],
     )
     return 0
 
@@ -245,16 +193,7 @@ def _load_stage_years(root: Path) -> int:
 
 
 def _resolve_vendor_budgets(config: dict[str, object]) -> dict[str, dict[str, int]]:
-    resolved = {name: limits.copy() for name, limits in DEFAULT_VENDOR_LIMITS.items()}
-    for vendor, values in (config.get("vendors", {}) or {}).items():
-        if not isinstance(values, dict):
-            continue
-        existing = resolved.get(str(vendor), {"rpm": 1, "daily_cap": 1})
-        resolved[str(vendor)] = {
-            "rpm": int(values.get("rpm", existing["rpm"])),
-            "daily_cap": int(values.get("daily_cap", existing["daily_cap"])),
-        }
-    return resolved
+    return resolve_vendor_budgets(config)
 
 
 if __name__ == "__main__":

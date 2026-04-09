@@ -6,10 +6,12 @@ from trademl.data_node.audit import run_capability_audit
 from trademl.data_node.capabilities import (
     backfill_capabilities,
     build_reference_jobs,
+    canonical_qc_capabilities,
     capability_map,
     default_macro_series,
     effective_enable_status,
     forward_capabilities,
+    provider_role_matrix,
 )
 
 
@@ -38,7 +40,7 @@ def test_backfill_capabilities_follow_priority_order() -> None:
         },
     )
 
-    assert [capability.vendor for capability in ordered] == ["tiingo", "alpaca", "twelve_data", "massive", "finnhub"]
+    assert [capability.vendor for capability in ordered] == ["tiingo", "alpaca", "massive"]
 
 
 def test_forward_capabilities_follow_priority_order() -> None:
@@ -53,7 +55,7 @@ def test_forward_capabilities_follow_priority_order() -> None:
         },
     )
 
-    assert [capability.vendor for capability in ordered] == ["alpaca", "tiingo", "twelve_data", "massive", "finnhub"]
+    assert [capability.vendor for capability in ordered] == ["alpaca", "tiingo", "massive"]
 
 
 def test_reference_jobs_only_include_enabled_verified_lanes() -> None:
@@ -76,6 +78,39 @@ def test_reference_jobs_only_include_enabled_verified_lanes() -> None:
     assert all(job["dataset"] != "price_target" for job in jobs)
     assert any(job["dataset"] == "company_profile" for job in jobs)
     assert any(job["dataset"] == "filing_index" for job in jobs)
+
+
+def test_canonical_qc_capabilities_use_independent_backup_vendors_first() -> None:
+    ordered = canonical_qc_capabilities(
+        connectors={
+            "alpaca": object(),
+            "tiingo": object(),
+            "twelve_data": object(),
+            "massive": object(),
+        },
+    )
+
+    assert [capability.vendor for capability in ordered] == ["massive", "tiingo", "alpaca"]
+
+
+def test_provider_role_matrix_captures_runtime_roles() -> None:
+    rows = provider_role_matrix(
+        connectors={
+            "alpaca": object(),
+            "tiingo": object(),
+            "twelve_data": object(),
+            "massive": object(),
+            "finnhub": object(),
+        },
+    )
+
+    by_vendor = {row["vendor"]: row for row in rows}
+    assert by_vendor["alpaca"]["saturation_policy"] == "canonical_first"
+    assert "multi-symbol daily bars" in by_vendor["alpaca"]["best_for"]
+    assert by_vendor["twelve_data"]["saturation_policy"] == "reference_only"
+    assert by_vendor["twelve_data"]["qc_policy"] == "disabled for bars"
+    assert by_vendor["finnhub"]["qc_policy"] == "disabled for bars until candle entitlement is re-verified"
+    assert "equities_eod" in by_vendor["tiingo"]["enabled_datasets"]
 
 
 def test_effective_enable_status_disables_doc_unverified_or_live_failed() -> None:

@@ -175,6 +175,57 @@ def test_plan_canonical_bar_tasks_uses_symbol_range_windows() -> None:
     assert len(first.payload["trading_days"]) <= 10
 
 
+def test_plan_canonical_bar_tasks_expands_and_prioritizes_frozen_training_window() -> None:
+    tasks = plan_canonical_bar_tasks(
+        stage_symbols=["AAPL"],
+        stage_years=1,
+        connectors={"alpaca": object(), "tiingo": object(), "twelve_data": object(), "massive": object()},
+        current_date="2026-04-07",
+        freeze_report_date="2026-03-06",
+        symbol_batch_size=1,
+        trading_day_chunk_size=20,
+    )
+
+    assert tasks
+    assert min(task.start_date for task in tasks) <= "2025-03-06"
+    frozen = [task for task in tasks if task.end_date <= "2026-03-06"]
+    tail = [task for task in tasks if task.start_date > "2026-03-06"]
+    assert frozen
+    assert tail
+    assert all(task.priority == 5 for task in frozen)
+    assert all(task.payload["freeze_priority"] is True for task in frozen)
+    assert all(task.preferred_vendors == ("alpaca", "tiingo") for task in frozen)
+    assert all(task.priority == 10 for task in tail)
+
+
+def test_plan_canonical_bar_tasks_respects_listing_history_windows(tmp_path: Path) -> None:
+    reference_root = tmp_path / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {"symbol": "AAPL", "ipo_date": "1980-12-12", "delist_date": None},
+            {"symbol": "SN", "ipo_date": "2023-07-31", "delist_date": None},
+        ]
+    ).to_parquet(reference_root / "listing_history.parquet", index=False)
+
+    tasks = plan_canonical_bar_tasks(
+        data_root=tmp_path,
+        stage_symbols=["AAPL", "SN"],
+        stage_years=1,
+        connectors={"alpaca": object(), "tiingo": object(), "twelve_data": object()},
+        current_date="2024-01-10",
+        freeze_report_date="2023-12-29",
+        symbol_batch_size=2,
+        trading_day_chunk_size=20,
+    )
+
+    assert tasks
+    sn_tasks = [task for task in tasks if task.symbols == ("SN",)]
+    assert sn_tasks
+    assert min(task.start_date for task in sn_tasks) >= "2023-07-31"
+    assert all(task.preferred_vendors == ("alpaca", "tiingo") for task in sn_tasks if task.payload["freeze_priority"] is True)
+
+
 def test_plan_coverage_tasks_orders_canonical_before_auxiliary(tmp_path: Path) -> None:
     reference_root = tmp_path / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)

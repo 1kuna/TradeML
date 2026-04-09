@@ -122,13 +122,15 @@ class HTTPConnector:
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         task_kind: str = "OTHER",
+        budget_units: int = 1,
         timeout: int = DEFAULT_TIMEOUT,
     ) -> requests.Response:
         params = {**self._auth_params(), **(params or {})}
         request_headers = {**self._headers(), **(headers or {})}
+        normalized_units = max(1, int(budget_units))
 
         for attempt in range(1, self.retry_config.max_attempts + 1):
-            if not self.budget_manager.can_spend(self.vendor_name, task_kind=task_kind):
+            if not self.budget_manager.can_spend(self.vendor_name, task_kind=task_kind, units=normalized_units):
                 raise TemporaryConnectorError(f"budget exhausted for vendor={self.vendor_name}")
 
             start = time.perf_counter()
@@ -141,13 +143,13 @@ class HTTPConnector:
                     timeout=timeout,
                 )
             except requests.RequestException as exc:
-                self.budget_manager.record_spend(self.vendor_name, task_kind=task_kind)
+                self.budget_manager.record_spend(self.vendor_name, task_kind=task_kind, units=normalized_units)
                 if attempt < self.retry_config.max_attempts:
                     self.sleep_fn(self._sleep_duration(attempt))
                     continue
                 raise TemporaryConnectorError(f"{self.vendor_name} request failed: {exc}") from exc
             elapsed_ms = (time.perf_counter() - start) * 1000
-            self.budget_manager.record_spend(self.vendor_name, task_kind=task_kind)
+            self.budget_manager.record_spend(self.vendor_name, task_kind=task_kind, units=normalized_units)
 
             response_text = response.text[:512] if response.text else ""
             if "NOT_ENTITLED" in response_text or "NOT_SUPPORTED" in response_text:
@@ -176,6 +178,7 @@ class HTTPConnector:
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         task_kind: str = "OTHER",
+        budget_units: int = 1,
     ) -> dict[str, Any] | list[Any]:
         """Issue a JSON request."""
         response = self._request(
@@ -185,6 +188,7 @@ class HTTPConnector:
             params=params,
             headers=headers,
             task_kind=task_kind,
+            budget_units=budget_units,
         )
         return response.json()
 
@@ -196,6 +200,7 @@ class HTTPConnector:
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         task_kind: str = "OTHER",
+        budget_units: int = 1,
     ) -> pd.DataFrame:
         """Issue a CSV request."""
         response = self._request(
@@ -205,6 +210,7 @@ class HTTPConnector:
             params=params,
             headers=headers,
             task_kind=task_kind,
+            budget_units=budget_units,
         )
         reader = csv.DictReader(io.StringIO(response.text))
         return pd.DataFrame(reader)

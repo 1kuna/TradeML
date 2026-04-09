@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import platform
 import shutil
@@ -23,24 +24,14 @@ import pandas as pd
 import yaml
 
 from trademl.calendars.exchange import get_trading_days
-from trademl.connectors.alpaca import AlpacaConnector
 from trademl.connectors.base import BaseConnector, ConnectorError
-from trademl.connectors.alpha_vantage import AlphaVantageConnector
-from trademl.connectors.finnhub import FinnhubConnector
-from trademl.connectors.fmp import FMPConnector
-from trademl.connectors.fred import FredConnector
-from trademl.connectors.massive import MassiveConnector
-from trademl.connectors.sec_edgar import SecEdgarConnector
-from trademl.connectors.twelve_data import TwelveDataConnector
-from trademl.connectors.tiingo import TiingoConnector
 from trademl.data_node.audit import run_capability_audit
 from trademl.data_node.bootstrap import Stage0UniverseBuilder
-from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
-from trademl.data_node.capabilities import default_macro_series, load_audit_state
+from trademl.data_node.capabilities import default_macro_series, load_audit_state, provider_role_matrix
 from trademl.data_node.planner import plan_coverage_tasks
+from trademl.data_node.runtime import build_connector, build_connectors, resolve_vendor_budgets
 from trademl.data_node.training_control import evaluate_training_gates, read_training_runtime, shared_training_runtime_path
-from trademl.data_node.vendor_limits import DEFAULT_VENDOR_LIMITS
 from trademl.fleet.cluster import (
     ClusterCoordinator,
     ClusterPaths,
@@ -53,6 +44,8 @@ from trademl.fleet.cluster import (
     systemd_status,
 )
 from trademl.reference.universe import build_stage1_universe, build_time_varying_universe
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -321,6 +314,16 @@ def start_node(
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+    exit_code: int | None = None
+    process_poll = getattr(process, "poll", None)
+    if callable(process_poll):
+        exit_code = process_poll()
+        if exit_code is None:
+            for _ in range(5):
+                time.sleep(0.1)
+                exit_code = process_poll()
+                if exit_code is not None:
+                    break
     runtime = {
         "pid": process.pid,
         "started_at": datetime.now(tz=UTC).isoformat(),
@@ -329,8 +332,13 @@ def start_node(
         "workspace_root": str(settings.workspace_root),
         "config_path": str(settings.config_path),
         "env_path": str(settings.env_path),
-        "running": True,
+        "running": exit_code is None,
     }
+    if exit_code is not None:
+        runtime["startup_failed"] = True
+        runtime["exit_code"] = exit_code
+        runtime["stopped_at"] = datetime.now(tz=UTC).isoformat()
+        LOGGER.warning("node_start_failed pid=%s exit_code=%s log_path=%s", process.pid, exit_code, settings.log_path)
     _write_runtime_state(settings, runtime)
     return runtime
 
@@ -806,37 +814,35 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
                 if expected_datapoints:
                     datapoint_progress_ratio = raw_datapoints / expected_datapoints
     host = _extract_share_host(settings.nas_share)
-    dataset_coverage = _dataset_coverage(
-        planner_summary=planner_summary,
-        reference_files=reference_files,
-        macro_series=macro_series,
-        planner_eta=planner_eta,
-    )
-    data_readiness = _summarize_data_readiness(
-        raw_dates=len(raw_dates),
-        expected_sessions=expected_sessions,
-        partition_summary=partition_summary,
-        reference_files=reference_files,
-        macro_series=macro_series,
-        price_check_files=price_check_files,
-    )
     readiness = evaluate_training_gates(
         data_root=settings.nas_mount,
         stage_symbol_count=len(stage_symbols),
         stage_years=int(stage_years or 0),
+        planner_db_path=settings.db_path,
     )
-    collection_status = _summarize_collection_status(
+    collection_health = _build_collection_health(
+        planner_summary=planner_summary,
+        reference_files=reference_files,
+        macro_series=macro_series,
+        planner_eta=planner_eta,
+        freeze_cutoff=readiness.get("freeze_cutoff", {}),
+        raw_dates=raw_dates,
+        expected_sessions=expected_sessions,
+        partition_summary=partition_summary,
+        price_check_files=price_check_files,
         raw_datapoints=raw_datapoints,
         expected_datapoints=expected_datapoints,
         queue_counts=queue_counts,
-        planner_summary=planner_summary,
-        dataset_coverage=dataset_coverage,
     )
+    dataset_coverage = collection_health["dataset_coverage"]
+    freeze_cutoff_date = readiness.get("freeze_cutoff", {}).get("date")
+    collection_status = collection_health["collection_status"]
     training_status = {
         "phase1": read_training_runtime(path=shared_training_runtime_path(data_root=settings.nas_mount, phase=1)),
         "phase2": read_training_runtime(path=shared_training_runtime_path(data_root=settings.nas_mount, phase=2)),
     }
     train_operational_status = _summarize_train_operational_status(training_status=training_status, readiness=readiness)
+    role_matrix = provider_role_matrix(connectors=_connectors_from_settings(settings), audit_state=audit)
     snapshot = {
         "settings": asdict(settings),
         "runtime": runtime,
@@ -867,13 +873,22 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "stage_datapoint_progress_ratio": datapoint_progress_ratio,
         "collection_status": collection_status,
         "dataset_coverage": dataset_coverage,
-        "data_readiness": data_readiness,
+        "data_readiness": collection_health["data_readiness"],
         "training_readiness": readiness,
         "training_status": training_status,
         "train_operational_status": train_operational_status,
+        "provider_role_matrix": role_matrix,
         "suggested_training_commands": {
-            "phase1": f"trademl train --data-root {settings.nas_mount} start --phase 1",
-            "phase2": f"trademl train --data-root {settings.nas_mount} start --phase 2",
+            "phase1": (
+                f"trademl train --data-root {settings.nas_mount} start --phase 1 --report-date {freeze_cutoff_date}"
+                if freeze_cutoff_date
+                else f"trademl train --data-root {settings.nas_mount} start --phase 1"
+            ),
+            "phase2": (
+                f"trademl train --data-root {settings.nas_mount} start --phase 2 --report-date {freeze_cutoff_date}"
+                if freeze_cutoff_date
+                else f"trademl train --data-root {settings.nas_mount} start --phase 2"
+            ),
         },
         "audit": audit,
         "coverage_plan": coverage_plan,
@@ -905,7 +920,8 @@ def _read_optional_json(path: Path) -> dict[str, Any]:
         return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        LOGGER.warning("invalid_optional_json path=%s error=%s", path, exc)
         return {}
 
 
@@ -928,6 +944,7 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
                 "day_cap": limits["daily_cap"],
                 "day_remaining": limits["daily_cap"],
                 "day_used_percent": 0.0,
+                "day_requests": 0,
                 "rpm_used": 0,
                 "rpm_limit": limits["rpm"],
                 "minute_available": True,
@@ -948,7 +965,8 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
         }
     try:
         payload = json.loads(settings.budget_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        LOGGER.warning("invalid_budget_summary_json path=%s error=%s", settings.budget_path, exc)
         return {
             "available_vendors": 0,
             "day_capped_vendors": 0,
@@ -958,8 +976,16 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
             "day_anchor": None,
         }
     checked_at = payload.get("checked_at")
+    checked_at_dt: datetime | None = None
+    if checked_at:
+        with contextlib.suppress(ValueError):
+            checked_at_dt = datetime.fromisoformat(str(checked_at))
     day_anchor = payload.get("day_anchor")
     current = datetime.now(tz=UTC)
+    snapshot_age_seconds = (
+        max(0, int((current - checked_at_dt).total_seconds())) if checked_at_dt is not None else None
+    )
+    stale = snapshot_age_seconds is not None and snapshot_age_seconds > 120
     rows: list[dict[str, Any]] = []
     available_vendors = 0
     day_capped_vendors = 0
@@ -972,6 +998,8 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
         minute_window = [stamp for stamp in window_timestamps if (current - stamp).total_seconds() < 60]
         daily_spend = snapshot.get("daily_spend", {})
         day_used = int(daily_spend.get("TOTAL", 0))
+        daily_requests = snapshot.get("daily_requests", {})
+        day_requests = int(daily_requests.get("TOTAL", day_used))
         reserved_units = int(snapshot.get("reserved_units", max(1, int(daily_cap * 0.10)))) if daily_cap else 0
         non_forward_ceiling = int(snapshot.get("non_forward_ceiling", max(0, daily_cap - reserved_units)))
         other_used = int(daily_spend.get("OTHER", 0))
@@ -999,6 +1027,7 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
                 "day_cap": daily_cap,
                 "day_remaining": max(0, daily_cap - day_used),
                 "day_used_percent": round((day_used / daily_cap) * 100.0, 1) if daily_cap else 0.0,
+                "day_requests": day_requests,
                 "rpm_used": len(minute_window),
                 "rpm_limit": rpm_limit,
                 "minute_available": minute_available,
@@ -1006,6 +1035,7 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
                 "forward_available": forward_available,
                 "other_available": other_available,
                 "reason": reason,
+                "snapshot_stale": stale,
             }
         )
     return {
@@ -1015,6 +1045,8 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
         "rows": rows,
         "checked_at": checked_at,
         "day_anchor": day_anchor,
+        "snapshot_age_seconds": snapshot_age_seconds,
+        "stale": stale,
     }
 
 
@@ -1088,12 +1120,14 @@ def _summarize_vendor_throughput(db_path: Path, *, budget_summary: dict[str, Any
             {
                 "vendor": vendor,
                 "state": str(budget_rows.get(vendor, {}).get("state", "no_data")),
-                "requests_per_min": float(budget_rows.get(vendor, {}).get("rpm_used", 0)),
+                "requests_per_min": 0.0,
                 "symbols_per_min": 0.0,
                 "rows_per_min": 0.0,
                 "success_15m": 0,
                 "failed_15m": 0,
+                "minute_window_used": int(budget_rows.get(vendor, {}).get("rpm_used", 0)),
                 "reason": str(budget_rows.get(vendor, {}).get("reason", "no planner data")),
+                "request_events_15m": 0,
             },
         )
         updated_at = datetime.fromisoformat(attempt.updated_at)
@@ -1101,10 +1135,13 @@ def _summarize_vendor_throughput(db_path: Path, *, budget_summary: dict[str, Any
             continue
         if attempt.status == "SUCCESS":
             row["success_15m"] += 1
+            row["request_events_15m"] += 1
             row["rows_per_min"] += float(attempt.rows_returned or 0) / window_minutes
             row["symbols_per_min"] += float(len(attempt.payload.get("symbols", [])) or 1) / window_minutes
         elif attempt.status in {"FAILED", "PERMANENT_FAILED"}:
             row["failed_15m"] += 1
+            if "budget exhausted" not in str(attempt.last_error or "").lower():
+                row["request_events_15m"] += 1
             if row["state"] == "available" and attempt.next_eligible_at and attempt.next_eligible_at > now.isoformat():
                 row["state"] = "backoff"
                 row["reason"] = "temporary backoff"
@@ -1114,16 +1151,19 @@ def _summarize_vendor_throughput(db_path: Path, *, budget_summary: dict[str, Any
             {
                 "vendor": vendor,
                 "state": str(budget_row.get("state", "no_data")),
-                "requests_per_min": float(budget_row.get("rpm_used", 0)),
+                "requests_per_min": 0.0,
                 "symbols_per_min": 0.0,
                 "rows_per_min": 0.0,
                 "success_15m": 0,
                 "failed_15m": 0,
+                "minute_window_used": int(budget_row.get("rpm_used", 0)),
                 "reason": str(budget_row.get("reason", "no planner data")),
+                "request_events_15m": 0,
             },
         )
     rows = sorted(grouped.values(), key=lambda item: item["vendor"])
     for row in rows:
+        row["requests_per_min"] = float(row.get("request_events_15m", 0)) / float(window_minutes)
         row["requests_per_min"] = round(float(row["requests_per_min"]), 2)
         row["symbols_per_min"] = round(float(row["symbols_per_min"]), 2)
         row["rows_per_min"] = round(float(row["rows_per_min"]), 2)
@@ -1167,25 +1207,42 @@ def _summarize_planner_eta(
     return eta
 
 
-def _dataset_coverage(
+def _build_collection_health(
     *,
     planner_summary: dict[str, Any],
     reference_files: list[str],
     macro_series: list[str],
     planner_eta: dict[str, Any],
+    freeze_cutoff: dict[str, Any],
+    raw_dates: list[str],
+    expected_sessions: int | None,
+    partition_summary: dict[str, Any],
+    price_check_files: list[str],
+    raw_datapoints: int,
+    expected_datapoints: int | None,
+    queue_counts: dict[str, int],
 ) -> dict[str, dict[str, Any]]:
+    """Build coherent collection-health sections from one shared input set."""
     progress = planner_summary.get("progress", {})
     bars_progress = progress.get("canonical_bars", {})
     bars_expected = int(bars_progress.get("expected_units", 0))
     bars_completed = int(bars_progress.get("completed_units", 0))
-    bars_ratio = min(1.0, bars_completed / bars_expected) if bars_expected else 0.0
+    global_bars_ratio = min(1.0, bars_completed / bars_expected) if bars_expected else 0.0
+    frozen_bars_ratio = float(
+        freeze_cutoff.get(
+            "effective_window_coverage_ratio",
+            freeze_cutoff.get("window_coverage_ratio", freeze_cutoff.get("coverage_ratio", 0.0)),
+        )
+        or 0.0
+    )
+    bars_ratio = frozen_bars_ratio if freeze_cutoff.get("date") else global_bars_ratio
 
     def _bool_ratio(value: bool) -> float:
         return 1.0 if value else 0.0
 
     macro_required = set(default_macro_series())
     macro_ratio = (len(macro_required.intersection(macro_series)) / len(macro_required)) if macro_required else 1.0
-    return {
+    dataset_coverage = {
         "canonical_bars": {
             "ratio": bars_ratio,
             "label": "Bars",
@@ -1236,26 +1293,80 @@ def _dataset_coverage(
             "eta_minutes": planner_eta.get("supplemental_research", {}).get("eta_minutes"),
         },
     }
+    eod_complete = bool(
+        expected_sessions
+        and len(raw_dates) >= expected_sessions
+        and partition_summary.get("coverage_green") == 1.0
+    )
+    missing: list[str] = []
+    if not eod_complete:
+        missing.append("equities EOD backfill")
+    if not reference_files:
+        missing.append("reference datasets")
+    if not macro_series:
+        missing.append("macro series")
+    if "fred_vintagedates.parquet" not in reference_files:
+        missing.append("macro vintages")
+    if not price_check_files:
+        missing.append("cross-vendor price checks")
+    if not missing:
+        headline = "All tracked Stage 0 datasets present"
+        readiness_state = "complete"
+    elif eod_complete:
+        headline = "Equities EOD complete; additional datasets still pending"
+        readiness_state = "partial"
+    else:
+        headline = "Initial collection still in progress"
+        readiness_state = "collecting"
 
-
-
+    expected = int(bars_expected or expected_datapoints or 0)
+    collected = int(bars_completed or raw_datapoints)
+    coverage_ratio = min(1.0, collected / expected) if expected > 0 else 0.0
+    remaining = max(0, expected - collected)
+    training_critical = [
+        dataset_coverage.get("canonical_bars", {}).get("ratio", 0.0),
+        dataset_coverage.get("corp_actions", {}).get("ratio", 0.0),
+        dataset_coverage.get("listing_history", {}).get("ratio", 0.0),
+        dataset_coverage.get("delistings", {}).get("ratio", 0.0),
+        dataset_coverage.get("sec_filings", {}).get("ratio", 0.0),
+        dataset_coverage.get("macro", {}).get("ratio", 0.0),
+    ]
+    readiness_ratio = sum(training_critical) / len(training_critical) if training_critical else 0.0
+    collection_status = {
+        "coverage_ratio": coverage_ratio,
+        "coverage_percent": round(coverage_ratio * 100.0, 1),
+        "remaining_ratio": max(0.0, 1.0 - coverage_ratio),
+        "remaining_percent": round(max(0.0, 1.0 - coverage_ratio) * 100.0, 1),
+        "training_ready_ratio": readiness_ratio,
+        "training_ready_percent": round(readiness_ratio * 100.0, 1),
+        "training_critical_percent": round(readiness_ratio * 100.0, 1),
+        "collected_datapoints": collected,
+        "expected_datapoints": expected,
+        "remaining_datapoints": remaining,
+        "canonical_completed_units": collected,
+        "canonical_expected_units": expected,
+        "canonical_remaining_units": remaining,
+        "raw_vendor_rows": int(raw_datapoints),
+        "pending_tasks": int(queue_counts.get("PENDING", 0)) + int(queue_counts.get("PARTIAL", 0)) + int(queue_counts.get("LEASED", 0)),
+        "failed_tasks": int(queue_counts.get("FAILED", 0)),
+    }
+    return {
+        "dataset_coverage": dataset_coverage,
+        "collection_status": collection_status,
+        "data_readiness": {
+            "state": readiness_state,
+            "headline": headline,
+            "missing": missing,
+            "eod_complete": eod_complete,
+        },
+    }
 
 def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
-    env_values = _read_env_file(settings.env_path)
-    config = _read_yaml(settings.config_path)
-    vendors = config.get("vendors", {})
-    alpaca_budget = _vendor_budget(vendors, "alpaca")
+    env_values, vendor_limits = _runtime_inputs(settings)
     universe_builder = None
-    if env_values.get("ALPACA_API_KEY"):
-        universe_builder = Stage0UniverseBuilder(
-            connector=AlpacaConnector(
-                base_url=env_values.get("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
-                trading_base_url=env_values.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
-                api_key=env_values.get("ALPACA_API_KEY", ""),
-                secret_key=env_values.get("ALPACA_API_SECRET", ""),
-                budget_manager=BudgetManager({"alpaca": alpaca_budget}),
-            )
-        )
+    alpaca = _alpaca_connector(settings)
+    if alpaca is not None:
+        universe_builder = Stage0UniverseBuilder(connector=alpaca)
     return ClusterCoordinator(
         nas_root=settings.nas_mount,
         workspace_root=settings.workspace_root,
@@ -1268,107 +1379,33 @@ def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
     )
 
 
-def _vendor_budget(vendors: dict[str, Any], vendor: str) -> dict[str, int]:
-    """Resolve a vendor budget from config with researched defaults as fallback."""
+def _runtime_inputs(settings: NodeSettings) -> tuple[dict[str, str], dict[str, dict[str, int]]]:
+    """Load the runtime env/config inputs once."""
+    env_values = _read_env_file(settings.env_path)
+    config = _read_yaml(settings.config_path)
+    return env_values, resolve_vendor_budgets(config)
 
-    source = dict(vendors.get(vendor, DEFAULT_VENDOR_LIMITS[vendor]))
-    return {
-        "rpm": int(source.get("rpm", DEFAULT_VENDOR_LIMITS[vendor]["rpm"])),
-        "daily_cap": int(source.get("daily_cap", DEFAULT_VENDOR_LIMITS[vendor]["daily_cap"])),
-    }
+
+def _connector_from_inputs(*, vendor: str, env_values: dict[str, str], vendor_limits: dict[str, dict[str, int]]) -> BaseConnector | None:
+    """Build one connector when the required credentials are present."""
+    return build_connector(vendor=vendor, env_values=env_values, vendor_limits=vendor_limits)
 
 
 def _connectors_from_settings(settings: NodeSettings) -> dict[str, BaseConnector]:
-    env_values = _read_env_file(settings.env_path)
-    config = _read_yaml(settings.config_path)
-    vendors = config.get("vendors", {})
-    connectors: dict[str, BaseConnector] = {}
-    if env_values.get("ALPACA_API_KEY"):
-        connectors["alpaca"] = AlpacaConnector(
-            base_url=env_values.get("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
-            trading_base_url=env_values.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
-            api_key=env_values.get("ALPACA_API_KEY", ""),
-            secret_key=env_values.get("ALPACA_API_SECRET", ""),
-            budget_manager=BudgetManager({"alpaca": _vendor_budget(vendors, "alpaca")}),
-        )
-    if env_values.get("TIINGO_API_KEY"):
-        connectors["tiingo"] = TiingoConnector(
-            base_url="https://api.tiingo.com",
-            api_key=env_values.get("TIINGO_API_KEY", ""),
-            budget_manager=BudgetManager({"tiingo": _vendor_budget(vendors, "tiingo")}),
-        )
-    if env_values.get("TWELVE_DATA_API_KEY"):
-        connectors["twelve_data"] = TwelveDataConnector(
-            base_url="https://api.twelvedata.com",
-            api_key=env_values.get("TWELVE_DATA_API_KEY", ""),
-            budget_manager=BudgetManager({"twelve_data": _vendor_budget(vendors, "twelve_data")}),
-        )
-    if env_values.get("MASSIVE_API_KEY"):
-        connectors["massive"] = MassiveConnector(
-            base_url="https://api.massive.com",
-            api_key=env_values.get("MASSIVE_API_KEY", ""),
-            budget_manager=BudgetManager({"massive": _vendor_budget(vendors, "massive")}),
-        )
-    if env_values.get("FINNHUB_API_KEY"):
-        connectors["finnhub"] = FinnhubConnector(
-            base_url="https://finnhub.io/api/v1",
-            api_key=env_values.get("FINNHUB_API_KEY", ""),
-            budget_manager=BudgetManager({"finnhub": _vendor_budget(vendors, "finnhub")}),
-        )
-    if env_values.get("ALPHA_VANTAGE_API_KEY"):
-        connectors["alpha_vantage"] = AlphaVantageConnector(
-            base_url="https://www.alphavantage.co",
-            api_key=env_values.get("ALPHA_VANTAGE_API_KEY", ""),
-            budget_manager=BudgetManager({"alpha_vantage": _vendor_budget(vendors, "alpha_vantage")}),
-        )
-    if env_values.get("FRED_API_KEY"):
-        connectors["fred"] = FredConnector(
-            base_url="https://api.stlouisfed.org/fred",
-            api_key=env_values.get("FRED_API_KEY", ""),
-            budget_manager=BudgetManager({"fred": _vendor_budget(vendors, "fred")}),
-        )
-    if env_values.get("FMP_API_KEY"):
-        connectors["fmp"] = FMPConnector(
-            base_url="https://financialmodelingprep.com/api",
-            api_key=env_values.get("FMP_API_KEY", ""),
-            budget_manager=BudgetManager({"fmp": _vendor_budget(vendors, "fmp")}),
-        )
-    if env_values.get("SEC_EDGAR_USER_AGENT"):
-        connectors["sec_edgar"] = SecEdgarConnector(
-            base_url="https://data.sec.gov",
-            user_agent=env_values.get("SEC_EDGAR_USER_AGENT", ""),
-            budget_manager=BudgetManager({"sec_edgar": _vendor_budget(vendors, "sec_edgar")}),
-        )
-    return connectors
+    env_values, vendor_limits = _runtime_inputs(settings)
+    return build_connectors(env_values=env_values, vendor_limits=vendor_limits)
 
 
-def _alpaca_connector(settings: NodeSettings) -> AlpacaConnector | None:
-    env_values = _read_env_file(settings.env_path)
-    config = _read_yaml(settings.config_path)
-    vendors = config.get("vendors", {})
-    alpaca_budget = _vendor_budget(vendors, "alpaca")
-    if not env_values.get("ALPACA_API_KEY"):
-        return None
-    return AlpacaConnector(
-        base_url=env_values.get("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
-        trading_base_url=env_values.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2"),
-        api_key=env_values.get("ALPACA_API_KEY", ""),
-        secret_key=env_values.get("ALPACA_API_SECRET", ""),
-        budget_manager=BudgetManager({"alpaca": alpaca_budget}),
-    )
+def _alpaca_connector(settings: NodeSettings) -> BaseConnector | None:
+    env_values, vendor_limits = _runtime_inputs(settings)
+    return _connector_from_inputs(vendor="alpaca", env_values=env_values, vendor_limits=vendor_limits)
 
 
 def _history_probe_connector(settings: NodeSettings) -> BaseConnector | None:
-    env_values = _read_env_file(settings.env_path)
-    config = _read_yaml(settings.config_path)
-    vendors = config.get("vendors", {})
-    if env_values.get("TIINGO_API_KEY"):
-        tiingo_budget = _vendor_budget(vendors, "tiingo")
-        return TiingoConnector(
-            base_url="https://api.tiingo.com",
-            api_key=env_values.get("TIINGO_API_KEY", ""),
-            budget_manager=BudgetManager({"tiingo": tiingo_budget}),
-        )
+    env_values, vendor_limits = _runtime_inputs(settings)
+    connector = _connector_from_inputs(vendor="tiingo", env_values=env_values, vendor_limits=vendor_limits)
+    if connector is not None:
+        return connector
     return _alpaca_connector(settings)
 
 
@@ -1380,7 +1417,8 @@ def _seed_stage_backfill(db_path: Path, *, symbols: list[str], years: int) -> in
     for symbol in symbols:
         try:
             db.enqueue_task("equities_eod", symbol, start_date, end_date, "BOOTSTRAP", 5)
-        except Exception:
+        except Exception as exc:
+            LOGGER.warning("stage_backfill_seed_failed symbol=%s start=%s end=%s error=%s", symbol, start_date, end_date, exc)
             continue
         else:
             created += 1
@@ -1522,86 +1560,6 @@ def _price_check_files(root: Path) -> list[str]:
     return sorted(path.name for path in root.glob("price_checks_*.parquet"))
 
 
-def _summarize_data_readiness(
-    *,
-    raw_dates: int,
-    expected_sessions: int | None,
-    partition_summary: dict[str, Any],
-    reference_files: list[str],
-    macro_series: list[str],
-    price_check_files: list[str],
-) -> dict[str, Any]:
-    eod_complete = bool(
-        expected_sessions
-        and raw_dates >= expected_sessions
-        and partition_summary.get("coverage_green") == 1.0
-    )
-    missing: list[str] = []
-    if not eod_complete:
-        missing.append("equities EOD backfill")
-    if not reference_files:
-        missing.append("reference datasets")
-    if not macro_series:
-        missing.append("macro series")
-    if "fred_vintagedates.parquet" not in reference_files:
-        missing.append("macro vintages")
-    if not price_check_files:
-        missing.append("cross-vendor price checks")
-
-    if not missing:
-        headline = "All tracked Stage 0 datasets present"
-        state = "complete"
-    elif eod_complete:
-        headline = "Equities EOD complete; additional datasets still pending"
-        state = "partial"
-    else:
-        headline = "Initial collection still in progress"
-        state = "collecting"
-    return {
-        "state": state,
-        "headline": headline,
-        "missing": missing,
-        "eod_complete": eod_complete,
-    }
-
-
-def _summarize_collection_status(
-    *,
-    raw_datapoints: int,
-    expected_datapoints: int | None,
-    queue_counts: dict[str, int],
-    planner_summary: dict[str, Any],
-    dataset_coverage: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    canonical = planner_summary.get("progress", {}).get("canonical_bars", {})
-    expected = int(canonical.get("expected_units") or expected_datapoints or 0)
-    collected = int(canonical.get("completed_units") or raw_datapoints)
-    coverage_ratio = min(1.0, collected / expected) if expected > 0 else 0.0
-    remaining = max(0, expected - collected)
-    training_critical = [
-        dataset_coverage.get("canonical_bars", {}).get("ratio", 0.0),
-        dataset_coverage.get("corp_actions", {}).get("ratio", 0.0),
-        dataset_coverage.get("listing_history", {}).get("ratio", 0.0),
-        dataset_coverage.get("delistings", {}).get("ratio", 0.0),
-        dataset_coverage.get("sec_filings", {}).get("ratio", 0.0),
-        dataset_coverage.get("macro", {}).get("ratio", 0.0),
-    ]
-    readiness_ratio = sum(training_critical) / len(training_critical) if training_critical else 0.0
-    return {
-        "coverage_ratio": coverage_ratio,
-        "coverage_percent": round(coverage_ratio * 100.0, 1),
-        "remaining_ratio": max(0.0, 1.0 - coverage_ratio),
-        "remaining_percent": round(max(0.0, 1.0 - coverage_ratio) * 100.0, 1),
-        "training_ready_ratio": readiness_ratio,
-        "training_ready_percent": round(readiness_ratio * 100.0, 1),
-        "collected_datapoints": collected,
-        "expected_datapoints": expected,
-        "remaining_datapoints": remaining,
-        "pending_tasks": int(queue_counts.get("PENDING", 0)) + int(queue_counts.get("PARTIAL", 0)) + int(queue_counts.get("LEASED", 0)),
-        "failed_tasks": int(queue_counts.get("FAILED", 0)),
-    }
-
-
 def _summarize_train_operational_status(*, training_status: dict[str, dict[str, Any]], readiness: dict[str, Any]) -> str:
     for phase in ("phase2", "phase1"):
         status = str(training_status.get(phase, {}).get("status", "")).lower()
@@ -1650,7 +1608,8 @@ def _read_runtime_state(settings: NodeSettings) -> dict[str, Any]:
         return {}
     try:
         return json.loads(settings.runtime_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        LOGGER.warning("invalid_runtime_state_json path=%s error=%s", settings.runtime_path, exc)
         return {}
 
 

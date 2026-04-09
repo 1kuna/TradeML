@@ -370,13 +370,20 @@ def test_tiingo_connector_normalizes_prices_actions_and_fundamentals() -> None:
 
 
 def test_twelve_data_connector_normalizes_prices_actions_and_statements() -> None:
+    budget_manager = _budget_manager()
     session = FakeSession(
         [
             FakeResponse(
                 200,
                 {
-                    "meta": {"symbol": "AAPL", "interval": "1day"},
-                    "values": [{"datetime": "2024-01-02", "open": "10", "high": "11", "low": "9", "close": "10.5", "volume": "100"}],
+                    "AAPL": {
+                        "meta": {"symbol": "AAPL", "interval": "1day"},
+                        "values": [{"datetime": "2024-01-02", "open": "10", "high": "11", "low": "9", "close": "10.5", "volume": "100"}],
+                    },
+                    "MSFT": {
+                        "meta": {"symbol": "MSFT", "interval": "1day"},
+                        "values": [{"datetime": "2024-01-02", "open": "20", "high": "21", "low": "19", "close": "20.5", "volume": "200"}],
+                    },
                 },
             ),
             FakeResponse(
@@ -417,24 +424,58 @@ def test_twelve_data_connector_normalizes_prices_actions_and_statements() -> Non
     connector = TwelveDataConnector(
         base_url="https://api.twelvedata.com",
         api_key="key",
-        budget_manager=_budget_manager(),
+        budget_manager=budget_manager,
         session=session,
     )
 
-    bars = connector.fetch("equities_eod", ["AAPL"], "2024-01-02", "2024-01-02")
+    bars = connector.fetch("equities_eod", ["AAPL", "MSFT"], "2024-01-02", "2024-01-02")
     dividends = connector.fetch("dividends", ["AAPL"], "2024-01-01", "2024-01-31")
     splits = connector.fetch("splits", ["AAPL"], "2024-02-01", "2024-02-01")
     earnings = connector.fetch("earnings_calendar", [], "2024-01-01", "2024-01-31")
     statements = connector.fetch("financial_statements", ["AAPL"], "2024-01-01", "2024-01-31")
 
-    assert bars.iloc[0]["symbol"] == "AAPL"
-    assert bars.iloc[0]["close"] == pytest.approx(10.5)
+    assert sorted(bars["symbol"].tolist()) == ["AAPL", "MSFT"]
+    assert bars.loc[bars["symbol"] == "AAPL", "close"].iloc[0] == pytest.approx(10.5)
+    assert session.calls[0][2]["symbol"] == "AAPL,MSFT"
     assert dividends.iloc[0]["symbol"] == "AAPL"
     assert dividends.iloc[0]["amount"] == pytest.approx(0.24)
     assert splits.iloc[0]["ratio"] == pytest.approx(0.5)
     assert earnings.iloc[0]["symbol"] == "AAPL"
     assert set(statements["statement_type"]) == {"income_statement", "balance_sheet", "cash_flow"}
     assert session.calls[0][2]["apikey"] == "key"
+    snapshot = budget_manager.snapshot()
+    assert snapshot["vendors"]["twelve_data"]["daily_spend"]["FORWARD"] == 2
+    assert snapshot["vendors"]["twelve_data"]["daily_requests"]["FORWARD"] == 1
+
+
+def test_twelve_data_connector_parses_exchange_suffixed_batch_keys() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "COST:NYSE": {
+                        "meta": {"symbol": "COST", "interval": "1day"},
+                        "values": [{"datetime": "2024-01-02", "open": "10", "high": "11", "low": "9", "close": "10.5", "volume": "100"}],
+                    },
+                    "DVN:NYSE": {
+                        "meta": {"symbol": "DVN", "interval": "1day"},
+                        "values": [{"datetime": "2024-01-02", "open": "20", "high": "21", "low": "19", "close": "20.5", "volume": "200"}],
+                    },
+                },
+            )
+        ]
+    )
+    connector = TwelveDataConnector(
+        base_url="https://api.twelvedata.com",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    bars = connector.fetch("equities_eod", ["COST", "DVN"], "2024-01-02", "2024-01-02")
+
+    assert sorted(bars["symbol"].tolist()) == ["COST", "DVN"]
 
 
 def test_retry_and_permanent_error_behavior() -> None:

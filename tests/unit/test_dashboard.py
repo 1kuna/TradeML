@@ -161,6 +161,20 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert leased is not None
     db.mark_task_failed(leased.id, "test", backoff_minutes=1)
     db.update_partition_status("alpaca", "equities_eod", "2025-01-02", "GREEN", 2, 2, "OK")
+    attempt = db.lease_vendor_attempt(
+        task_key="canonical_bars::equities_eod::00001::0001::2025-01-01::2025-01-02",
+        task_family="canonical_bars",
+        planner_group="equities_eod",
+        vendor="alpaca",
+        lease_owner="worker-1",
+        payload={"symbols": ["AAPL"], "start_date": "2025-01-01", "end_date": "2025-01-02"},
+    )
+    assert attempt is not None
+    db.mark_vendor_attempt_success(
+        task_key="canonical_bars::equities_eod::00001::0001::2025-01-01::2025-01-02",
+        vendor="alpaca",
+        rows_returned=20,
+    )
 
     qc_root = nas_mount / "data" / "qc"
     qc_root.mkdir(parents=True, exist_ok=True)
@@ -205,6 +219,7 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
                         "non_forward_ceiling": 9000,
                         "window_timestamps": ["2026-03-31T20:04:50+00:00"],
                         "daily_spend": {"FORWARD": 2, "OTHER": 3, "TOTAL": 5},
+                        "daily_requests": {"FORWARD": 2, "OTHER": 3, "TOTAL": 5},
                     },
                     "tiingo": {
                         "rpm": 40,
@@ -213,6 +228,7 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
                         "non_forward_ceiling": 360,
                         "window_timestamps": [f"2026-03-31T20:04:{value:02d}+00:00" for value in range(40)],
                         "daily_spend": {"FORWARD": 0, "OTHER": 400, "TOTAL": 400},
+                        "daily_requests": {"FORWARD": 0, "OTHER": 400, "TOTAL": 400},
                     },
                 },
             }
@@ -236,17 +252,24 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert snapshot["data_readiness"]["missing"] == ["equities EOD backfill", "macro vintages"]
     assert snapshot["training_readiness"]["phase1"]["ready"] is False
     assert "corp_actions" in snapshot["training_readiness"]["phase1"]["blockers"]
-    assert snapshot["vendor_attempt_summary"]["counts"] == {}
+    assert snapshot["vendor_attempt_summary"]["counts"] == {"SUCCESS": 1}
     assert snapshot["budget_summary"]["available_vendors"] == 1
     assert snapshot["budget_summary"]["day_capped_vendors"] == 1
     assert snapshot["budget_summary"]["rows"][0]["vendor"] == "alpaca"
+    assert snapshot["budget_summary"]["rows"][0]["day_requests"] == 5
     assert snapshot["budget_summary"]["rows"][1]["state"] == "day_capped"
+    assert snapshot["budget_summary"]["stale"] is True
     assert snapshot["vendor_throughput"]["rows"][0]["vendor"] == "alpaca"
+    assert snapshot["vendor_throughput"]["rows"][0]["requests_per_min"] > 0.0
+    assert snapshot["vendor_throughput"]["rows"][0]["minute_window_used"] == 0
     assert snapshot["planner_eta"] == {}
     assert "cycle done" in snapshot["log_tail"]
     assert snapshot["collection_status"]["coverage_percent"] > 0.0
     assert snapshot["collection_status"]["remaining_datapoints"] > 1
+    assert snapshot["collection_status"]["canonical_completed_units"] == snapshot["collection_status"]["collected_datapoints"]
+    assert snapshot["collection_status"]["raw_vendor_rows"] == 1
     assert snapshot["train_operational_status"] == "blocked"
+    assert any(row["vendor"] == "alpaca" for row in snapshot["provider_role_matrix"])
 
 
 def test_run_vendor_audit_and_replan_coverage_persist_outputs(tmp_path: Path, monkeypatch) -> None:
@@ -296,6 +319,236 @@ def test_run_vendor_audit_and_replan_coverage_persist_outputs(tmp_path: Path, mo
     assert audit["summary"]["live_status"]["live_verified"] == 1
     assert (nas_mount / "control" / "cluster" / "state" / "coverage_plan.json").exists()
     assert plan["task_count"] >= 0
+
+
+def test_collect_dashboard_snapshot_uses_freeze_cutoff_in_training_command(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text(
+        f"NAS_MOUNT={nas_mount}\nNAS_SHARE=//127.0.0.1/trademl\nLOCAL_STATE={workspace / 'control'}\n",
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 1, "symbols": ["AAPL", "MSFT", "NVDA"], "years": 5}, sort_keys=False),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    monkeypatch.setattr(
+        dashboard_controller,
+        "evaluate_training_gates",
+        lambda **kwargs: {
+            "phase1": {"ready": False, "blockers": ["canonical_eod_bars"]},
+            "phase2": {"ready": False, "blockers": ["history_depth"]},
+            "freeze_cutoff": {"date": "2026-04-02", "complete_symbols": 500, "expected_symbols": 500},
+        },
+    )
+
+    snapshot = collect_dashboard_snapshot(settings)
+
+    assert snapshot["suggested_training_commands"]["phase1"].endswith("--report-date 2026-04-02")
+
+
+def test_collect_dashboard_snapshot_uses_freeze_cutoff_for_training_ready_percent(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text(
+        f"NAS_MOUNT={nas_mount}\nNAS_SHARE=//127.0.0.1/trademl\nLOCAL_STATE={workspace / 'control'}\n",
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 1, "symbols": ["AAPL", "MSFT", "NVDA"], "years": 5}, sort_keys=False),
+        encoding="utf-8",
+    )
+    reference_root = nas_mount / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    for name in ["corp_actions", "listing_history", "delistings", "sec_filings"]:
+        pd.DataFrame([{"symbol": "AAPL"}]).to_parquet(reference_root / f"{name}.parquet", index=False)
+    pd.DataFrame([{"series_id": "DGS10", "vintage_date": "2026-03-01"}]).to_parquet(
+        reference_root / "fred_vintagedates.parquet",
+        index=False,
+    )
+    for series in dashboard_controller.default_macro_series():
+        partition = nas_mount / "data" / "raw" / "macros_fred" / f"series={series}"
+        partition.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([{"series_id": series, "value": 1.0}]).to_parquet(partition / "data.parquet", index=False)
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_read_planner_summary",
+        lambda db_path: {"progress": {"canonical_bars": {"expected_units": 1000, "completed_units": 996, "remaining_units": 4}}},
+    )
+    monkeypatch.setattr(dashboard_controller, "_read_queue_counts", lambda db_path: {})
+    monkeypatch.setattr(dashboard_controller, "_read_partition_summary", lambda qc_path: {"counts": {}, "coverage_green": 0.0})
+    monkeypatch.setattr(dashboard_controller, "_partition_dates_from_qc", lambda summary: [])
+    monkeypatch.setattr(dashboard_controller, "_raw_datapoints_from_qc", lambda summary: 0)
+    monkeypatch.setattr(dashboard_controller, "_curated_datapoints_estimate", lambda settings, raw: 0)
+    monkeypatch.setattr(dashboard_controller, "_read_vendor_attempt_summary", lambda db_path: {"counts": {}, "by_vendor": [], "recent_failures": []})
+    monkeypatch.setattr(dashboard_controller, "_read_budget_summary", lambda settings: {"rows": [], "available_vendors": 0, "day_capped_vendors": 0, "minute_capped_vendors": 0, "checked_at": None, "day_anchor": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_vendor_throughput", lambda db_path, budget_summary: {"rows": [], "checked_at": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_planner_eta", lambda db_path, planner_summary, vendor_throughput: {})
+    monkeypatch.setattr(dashboard_controller, "_read_runtime_state", lambda settings: {"pid": 1, "started_at": "2026-03-31T20:00:00+00:00"})
+    monkeypatch.setattr(dashboard_controller, "_is_process_running", lambda pid: True)
+    monkeypatch.setattr(dashboard_controller, "evaluate_training_gates", lambda **kwargs: {
+        "phase1": {"ready": True, "blockers": []},
+        "phase2": {"ready": False, "blockers": ["history_depth"]},
+        "freeze_cutoff": {
+            "date": "2026-03-07",
+            "coverage_ratio": 1.0,
+            "window_coverage_ratio": 0.2,
+            "planner_window_coverage_ratio": 1.0,
+            "effective_window_coverage_ratio": 1.0,
+            "complete_symbols": 500,
+            "expected_symbols": 500,
+        },
+    })
+
+    snapshot = collect_dashboard_snapshot(settings)
+
+    assert snapshot["dataset_coverage"]["canonical_bars"]["ratio"] == 1.0
+    assert snapshot["collection_status"]["training_ready_percent"] == 100.0
+
+
+def test_build_collection_health_keeps_frozen_bars_and_collection_numbers_aligned() -> None:
+    health = dashboard_controller._build_collection_health(
+        planner_summary={"progress": {"canonical_bars": {"expected_units": 1000, "completed_units": 996, "remaining_units": 4}}},
+        reference_files=["corp_actions.parquet", "listing_history.parquet", "delistings.parquet", "sec_filings.parquet", "fred_vintagedates.parquet"],
+        macro_series=dashboard_controller.default_macro_series(),
+        planner_eta={"canonical_bars": {"remaining_units": 4, "eta_minutes": 12.0}},
+        freeze_cutoff={"date": "2026-03-07", "effective_window_coverage_ratio": 1.0},
+        raw_dates=[],
+        expected_sessions=10,
+        partition_summary={"coverage_green": 0.0},
+        price_check_files=[],
+        raw_datapoints=111,
+        expected_datapoints=1000,
+        queue_counts={"PENDING": 2, "PARTIAL": 1, "LEASED": 3, "FAILED": 4},
+    )
+
+    assert health["dataset_coverage"]["canonical_bars"]["ratio"] == 1.0
+    assert health["collection_status"]["coverage_percent"] == 99.6
+    assert health["collection_status"]["training_ready_percent"] == 100.0
+    assert health["collection_status"]["canonical_completed_units"] == 996
+    assert health["collection_status"]["raw_vendor_rows"] == 111
+
+
+def test_history_probe_connector_prefers_tiingo_when_available(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                },
+                "vendors": {
+                    "alpaca": {"rpm": 200, "daily_cap": 1000},
+                    "tiingo": {"rpm": 300, "daily_cap": 2000},
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text(
+        "\n".join(
+            [
+                "ALPACA_API_KEY=alpaca-key",
+                "ALPACA_API_SECRET=alpaca-secret",
+                "TIINGO_API_KEY=tiingo-key",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    connector = dashboard_controller._history_probe_connector(settings)
+
+    assert connector is not None
+    assert connector.__class__.__name__ == "TiingoConnector"
+
+
+def test_connectors_from_settings_builds_only_configured_connectors(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                },
+                "vendors": {
+                    "alpaca": {"rpm": 200, "daily_cap": 1000},
+                    "fred": {"rpm": 50, "daily_cap": 500},
+                    "fmp": {"rpm": 25, "daily_cap": 250},
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text(
+        "\n".join(
+            [
+                "ALPACA_API_KEY=alpaca-key",
+                "ALPACA_API_SECRET=alpaca-secret",
+                "FRED_API_KEY=fred-key",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    connectors = dashboard_controller._connectors_from_settings(settings)
+
+    assert sorted(connectors) == ["alpaca", "fred"]
 
 
 def test_start_and_stop_node_manage_runtime_metadata(tmp_path: Path) -> None:
@@ -437,6 +690,127 @@ def test_start_node_includes_stage_symbols_in_launch_command(tmp_path: Path, mon
 
     assert runtime["command"][-3:] == ["--symbols", "AAPL", "MSFT"] or runtime["command"][-4:] == ["--symbols", "AAPL", "MSFT"]
     assert "--symbols" in captured["command"]
+
+
+def test_start_node_marks_immediate_exit_as_not_running(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    class _DeadProcess:
+        pid = 12345
+
+        def poll(self) -> int:
+            return 17
+
+    monkeypatch.setattr(dashboard_controller.subprocess, "Popen", lambda *args, **kwargs: _DeadProcess())
+
+    runtime = start_node(settings)
+
+    assert runtime["running"] is False
+    assert runtime["startup_failed"] is True
+    assert runtime["exit_code"] == 17
+    persisted = json.loads(settings.runtime_path.read_text(encoding="utf-8"))
+    assert persisted["running"] is False
+
+
+def test_seed_stage_backfill_logs_enqueue_failures(tmp_path: Path, monkeypatch, caplog) -> None:
+    calls: list[str] = []
+
+    class _DummyDB:
+        def __init__(self, _path: Path) -> None:
+            pass
+
+        def enqueue_task(self, dataset: str, symbol: str, start_date: str, end_date: str, source: str, priority: int) -> None:
+            calls.append(symbol)
+            if symbol == "MSFT":
+                raise sqlite3.IntegrityError("duplicate task")
+
+    monkeypatch.setattr(dashboard_controller, "DataNodeDB", _DummyDB)
+
+    with caplog.at_level("WARNING"):
+        created = dashboard_controller._seed_stage_backfill(tmp_path / "node.sqlite", symbols=["AAPL", "MSFT"], years=5)
+
+    assert created == 1
+    assert calls == ["AAPL", "MSFT"]
+    assert any("stage_backfill_seed_failed" in record.message and "MSFT" in record.message for record in caplog.records)
+
+
+def test_read_runtime_state_logs_invalid_json(tmp_path: Path, caplog) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    settings.runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.runtime_path.write_text("{invalid", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        runtime = dashboard_controller._read_runtime_state(settings)
+
+    assert runtime == {}
+    assert any("invalid_runtime_state_json" in record.message for record in caplog.records)
+
+
+def test_read_budget_summary_logs_invalid_json(tmp_path: Path, caplog) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                },
+                "vendors": {"alpaca": {"rpm": 200, "daily_cap": 1000}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    settings.budget_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.budget_path.write_text("{invalid", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        summary = dashboard_controller._read_budget_summary(settings)
+
+    assert summary["rows"] == []
+    assert any("invalid_budget_summary_json" in record.message for record in caplog.records)
 
 
 def test_advance_collection_stage_updates_stage_manifest_and_queue(tmp_path: Path, monkeypatch) -> None:

@@ -292,3 +292,90 @@ def test_lease_next_planner_task_filters_task_family_before_scan_window(tmp_path
 
     assert leased is not None
     assert leased.task_key == "macro::DGS10"
+
+
+def test_update_partition_status_is_thread_safe(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    barrier = threading.Barrier(8)
+    errors: list[Exception] = []
+
+    def worker(index: int) -> None:
+        barrier.wait()
+        try:
+            database.update_partition_status(
+                "alpaca",
+                "equities_eod",
+                f"2025-01-{index + 1:02d}",
+                "GREEN",
+                10,
+                10,
+                "OK",
+            )
+        except Exception as exc:  # pragma: no cover - asserted after join
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    rows = database.fetch_partition_status()
+    assert len(rows) == 8
+
+
+def test_prune_planner_tasks_removes_stale_tasks_and_attempts(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    database.upsert_planner_task(
+        task_key="keep",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2025-01-01",
+        end_date="2025-01-31",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        payload={"scope_kind": "symbol_range"},
+    )
+    database.upsert_planner_task(
+        task_key="drop",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2025-01-01",
+        end_date="2025-01-31",
+        symbols=["SN"],
+        eligible_vendors=["twelve_data"],
+        payload={"scope_kind": "symbol_range"},
+    )
+    leased = database.lease_planner_task_by_key(task_key="drop", lease_owner="worker-a")
+    assert leased is not None
+    database.lease_vendor_attempt(
+        task_key="drop",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        vendor="twelve_data",
+        lease_owner="worker-a",
+        payload={"symbols": ["SN"]},
+    )
+    database.update_planner_task_progress(
+        task_key="drop",
+        expected_units=20,
+        completed_units=0,
+        remaining_units=20,
+        completed_symbols=[],
+        remaining_symbols=["SN"],
+        state={"trading_days": 20},
+    )
+
+    removed = database.prune_planner_tasks(task_families=("canonical_bars",), valid_task_keys={"keep"})
+
+    assert removed == 1
+    assert database.get_planner_task("drop") is None
+    assert database.fetch_planner_task_progress("drop") is None
+    assert database.get_planner_task("keep") is not None

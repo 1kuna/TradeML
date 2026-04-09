@@ -91,24 +91,42 @@ def main() -> None:
     running = bool(runtime.get("running"))
 
     controls = st.columns([1, 1, 1, 2])
-    if controls[0].button("Start Node", type="primary", use_container_width=True):
+    if controls[0].button("Start Node", type="primary", width="stretch"):
         start_node(settings, passphrase=cluster_passphrase or None)
         st.rerun()
-    if controls[1].button("Stop Node", use_container_width=True):
+    if controls[1].button("Stop Node", width="stretch"):
         stop_node(settings)
         st.rerun()
-    if controls[2].button("Restart Node", use_container_width=True):
+    if controls[2].button("Restart Node", width="stretch"):
         restart_node(settings, passphrase=cluster_passphrase or None)
         st.rerun()
     controls[3].metric("Node Status", "Running" if running else "Stopped", f"PID {runtime.get('pid', '-')}")
 
-    summary_cols = st.columns(5)
-    summary_cols[0].metric("Collected", f"{collection_status['coverage_percent']:.1f}%")
-    summary_cols[1].metric("Left To Collect", f"{collection_status['remaining_percent']:.1f}%")
-    summary_cols[2].metric("Remaining Datapoints", f"{collection_status['remaining_datapoints']:,}")
-    summary_cols[3].metric("Train Ready", f"{collection_status['training_ready_percent']:.1f}%")
+    summary_cols = st.columns(6)
+    summary_cols[0].metric("Canonical Coverage", f"{collection_status['coverage_percent']:.1f}%")
+    summary_cols[1].metric("Canonical Datapoints", f"{collection_status['canonical_completed_units']:,}")
+    summary_cols[2].metric("Raw Vendor Rows", f"{collection_status['raw_vendor_rows']:,}")
+    summary_cols[3].metric("Remaining Canonical", f"{collection_status['canonical_remaining_units']:,}")
+    summary_cols[4].metric(
+        "Phase 1 Gate",
+        "Ready" if training_readiness["phase1"]["ready"] else "Blocked",
+        f"{collection_status['training_critical_percent']:.1f}% critical coverage",
+    )
     canonical_eta = planner_eta.get("canonical_bars", {}).get("eta_minutes")
-    summary_cols[4].metric("Bars ETA", _format_eta(canonical_eta))
+    summary_cols[5].metric("Bars ETA", _format_eta(canonical_eta))
+
+    freeze_cutoff = training_readiness.get("freeze_cutoff", {})
+    if training_readiness["phase1"]["ready"]:
+        cutoff_label = freeze_cutoff.get("date") or "latest frozen window"
+        st.success(
+            f"Phase 1 ready through {cutoff_label}. "
+            f"Critical coverage: {collection_status['training_critical_percent']:.1f}%."
+        )
+    else:
+        st.warning(
+            f"Phase 1 not ready yet. "
+            f"Critical coverage: {collection_status['training_critical_percent']:.1f}%."
+        )
 
     st.progress(collection_status["coverage_ratio"], text=f"Collection coverage: {collection_status['coverage_percent']:.1f}%")
 
@@ -137,10 +155,11 @@ def main() -> None:
             for details in dataset_coverage.values()
         ]
         st.subheader("Training-Critical Coverage")
-        st.dataframe(coverage_rows, use_container_width=True, hide_index=True)
+        st.dataframe(coverage_rows, width="stretch", hide_index=True)
 
         st.subheader("Vendor Activity")
-        st.dataframe(vendor_throughput["rows"], use_container_width=True, hide_index=True)
+        st.caption("`requests_per_min` is observed request activity over the last 15 minutes; `minute_window_used` is the current budget minute-bucket occupancy.")
+        st.dataframe(vendor_throughput["rows"], width="stretch", hide_index=True)
 
         training_cols = st.columns(2)
         with training_cols[0]:
@@ -149,6 +168,12 @@ def main() -> None:
                 st.success("Phase 1 is ready for DGX/workstation training.")
             else:
                 st.warning("Phase 1 is not ready yet.")
+            if freeze_cutoff.get("date"):
+                cutoff_prefix = "Pinned freeze cutoff" if freeze_cutoff.get("pinned") else "Recommended freeze cutoff"
+                st.caption(
+                    f"{cutoff_prefix}: {freeze_cutoff['date']} "
+                    f"({freeze_cutoff.get('complete_symbols', 0)}/{freeze_cutoff.get('expected_symbols', 0)} symbols)"
+                )
             blockers = training_readiness["phase1"]["blockers"]
             st.write(blockers or ["No current blockers"])
         with training_cols[1]:
@@ -164,9 +189,10 @@ def main() -> None:
             st.json(training_readiness, expanded=False)
 
         with st.expander("Advanced collection detail", expanded=False):
-            st.write(f"Expected datapoints: `{collection_status['expected_datapoints'] or '-'}`")
-            st.write(f"Collected datapoints: `{collection_status['collected_datapoints']}`")
-            st.write(f"Remaining datapoints: `{collection_status['remaining_datapoints']}`")
+            st.write(f"Canonical expected units: `{collection_status['canonical_expected_units'] or '-'}`")
+            st.write(f"Canonical completed units: `{collection_status['canonical_completed_units']}`")
+            st.write(f"Canonical remaining units: `{collection_status['canonical_remaining_units']}`")
+            st.write(f"Raw vendor rows: `{collection_status['raw_vendor_rows']}`")
             st.write(f"EOD QC green ratio: `{_format_ratio(partition_summary.get('coverage_green'))}`")
             st.write(f"Reference files: `{snapshot['reference_file_count']}`")
             st.write(f"Macro series: `{snapshot['macro_series_count']}`")
@@ -174,19 +200,19 @@ def main() -> None:
 
         with st.expander("Advanced cluster and audit detail", expanded=False):
             action_cols = st.columns(2)
-            if action_cols[0].button("Run Vendor Audit", use_container_width=True):
+            if action_cols[0].button("Run Vendor Audit", width="stretch"):
                 result = run_vendor_audit(settings)
                 st.success(f"Audit completed at {result['checked_at']}")
                 st.rerun()
-            if action_cols[1].button("Replan Coverage", use_container_width=True):
+            if action_cols[1].button("Replan Coverage", width="stretch"):
                 result = replan_coverage(settings)
                 st.success(f"Planned {result['task_count']} auxiliary tasks")
                 st.rerun()
             st.caption(f"Vendor attempts tracked: {sum(vendor_attempt_summary['counts'].values())}")
             st.caption(f"Audit failures: {len(audit.get('summary', {}).get('failures', []))}")
-            st.dataframe(vendor_attempt_summary["by_vendor"], use_container_width=True)
+            st.dataframe(vendor_attempt_summary["by_vendor"], width="stretch")
             if vendor_attempt_summary["recent_failures"]:
-                st.dataframe(vendor_attempt_summary["recent_failures"], use_container_width=True)
+                st.dataframe(vendor_attempt_summary["recent_failures"], width="stretch")
 
     with tabs[1]:
         st.subheader("API Budgets")
@@ -196,20 +222,24 @@ def main() -> None:
         budget_cols[2].metric("Minute Capped", budget_summary["minute_capped_vendors"])
         if budget_summary["checked_at"]:
             st.caption(f"Budget snapshot: {budget_summary['checked_at']} UTC")
+        if budget_summary.get("stale"):
+            age_seconds = int(budget_summary.get("snapshot_age_seconds") or 0)
+            st.warning(f"Budget snapshot is stale ({age_seconds}s old). Recent provider activity may be newer than the budget file.")
+        st.caption("`day_*` columns reflect daily spend units or credits; `day_requests` and `rpm_*` reflect raw request counts.")
         if budget_summary["rows"]:
-            st.dataframe(budget_summary["rows"], use_container_width=True, hide_index=True)
+            st.dataframe(budget_summary["rows"], width="stretch", hide_index=True)
         else:
             st.info("No budget snapshot has been written yet. Start the worker and let it issue requests first.")
 
     with tabs[2]:
         cluster_actions = st.columns(3)
-        if cluster_actions[0].button("Join Cluster", use_container_width=True):
+        if cluster_actions[0].button("Join Cluster", width="stretch"):
             join_cluster(settings, passphrase=cluster_passphrase or None)
             st.rerun()
-        if cluster_actions[1].button("Rebuild Local State", use_container_width=True):
+        if cluster_actions[1].button("Rebuild Local State", width="stretch"):
             rebuild_cluster_state(settings, passphrase=cluster_passphrase or None)
             st.rerun()
-        if cluster_actions[2].button("Leave Cluster", use_container_width=True):
+        if cluster_actions[2].button("Leave Cluster", width="stretch"):
             leave_cluster(settings)
             st.rerun()
 
@@ -258,20 +288,20 @@ def main() -> None:
                     rotate_cluster_passphrase(settings, old_passphrase=old_pass, new_passphrase=new_pass)
                     st.success("Cluster passphrase rotated")
                     st.rerun()
-            if st.button("Install systemd Service", use_container_width=True):
+            if st.button("Install systemd Service", width="stretch"):
                 result = install_service(settings)
                 st.success(f"Service written to {result['service_path']}")
                 st.rerun()
         lifecycle_cols = st.columns(3)
-        if lifecycle_cols[0].button("Update Worker", use_container_width=True):
+        if lifecycle_cols[0].button("Update Worker", width="stretch"):
             result = update_worker(settings)
             st.success(f"Updated worker at {result['wrapper_path']}")
             st.rerun()
-        if lifecycle_cols[1].button("Reset Worker", use_container_width=True):
+        if lifecycle_cols[1].button("Reset Worker", width="stretch"):
             result = reset_worker(settings, passphrase=cluster_passphrase or None)
             st.success(f"Reset worker workspace {result['workspace_root']}")
             st.rerun()
-        if lifecycle_cols[2].button("Uninstall Worker", use_container_width=True):
+        if lifecycle_cols[2].button("Uninstall Worker", width="stretch"):
             result = uninstall_worker(settings)
             st.success(f"Removed local worker artifacts: {len(result['removed_paths'])}")
         with st.expander("Stage expansion", expanded=False):
@@ -305,8 +335,8 @@ def main() -> None:
             st.write(f"Mount path: `{nas['mount_path']}`")
             st.write(f"Mount writable: `{nas['mount_writable']}`")
             st.write(f"Systemd: `{snapshot['systemd'].get('ActiveState', snapshot['systemd'].get('reason', 'unknown'))}`")
-            st.dataframe(cluster["workers"], use_container_width=True)
-            st.dataframe(cluster["leases"], use_container_width=True)
+            st.dataframe(cluster["workers"], width="stretch")
+            st.dataframe(cluster["leases"], width="stretch")
             lease_options = [lease["lease_id"] for lease in cluster["leases"] if lease]
             selected = st.selectbox("Force release lease", [""] + lease_options)
             if selected and st.button("Force Release", type="secondary"):

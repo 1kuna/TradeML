@@ -12,7 +12,7 @@ from typing import Any
 import pandas as pd
 
 from trademl.connectors.base import BaseConnector, ConnectorError, PermanentConnectorError, TemporaryConnectorError
-from trademl.data_node.capabilities import VendorCapability, capability_registry
+from trademl.data_node.capabilities import VendorCapability, capability_registry, provider_role_matrix
 
 
 @dataclass(slots=True, frozen=True)
@@ -139,6 +139,7 @@ def run_capability_audit(
     report = {
         "checked_at": checked_at,
         "capabilities": {result.capability_id: result.to_dict() for result in results},
+        "provider_roles": provider_role_matrix(connectors=connectors),
         "summary": summarize_audit_results(results),
     }
     if output_path is not None:

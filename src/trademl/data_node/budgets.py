@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -38,9 +39,53 @@ class BudgetManager:
         self._lock = threading.RLock()
         self.request_windows: dict[str, deque[datetime]] = defaultdict(deque)
         self.daily_spend: dict[str, dict[str, int]] = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
+        self.daily_requests: dict[str, dict[str, int]] = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
         self.day_anchor = datetime.now(tz=UTC).date()
         self.snapshot_path = Path(snapshot_path).expanduser() if snapshot_path else None
+        self._restore_snapshot()
         self._persist_snapshot()
+
+    def _restore_snapshot(self) -> None:
+        """Restore same-day budget state from the last persisted snapshot when available."""
+        if self.snapshot_path is None or not self.snapshot_path.exists():
+            return
+        try:
+            payload = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        raw_anchor = payload.get("day_anchor")
+        if not raw_anchor:
+            return
+        try:
+            day_anchor = datetime.fromisoformat(f"{raw_anchor}T00:00:00+00:00").date()
+        except ValueError:
+            return
+        if day_anchor != self.day_anchor:
+            return
+        vendors = payload.get("vendors")
+        if not isinstance(vendors, dict):
+            return
+        for vendor in self.vendor_limits:
+            snapshot = vendors.get(vendor, {})
+            if not isinstance(snapshot, dict):
+                continue
+            spend = snapshot.get("daily_spend", {})
+            if isinstance(spend, dict):
+                self.daily_spend[vendor]["FORWARD"] = int(spend.get("FORWARD", 0) or 0)
+                self.daily_spend[vendor]["OTHER"] = int(spend.get("OTHER", 0) or 0)
+            requests = snapshot.get("daily_requests", {})
+            if isinstance(requests, dict):
+                self.daily_requests[vendor]["FORWARD"] = int(requests.get("FORWARD", 0) or 0)
+                self.daily_requests[vendor]["OTHER"] = int(requests.get("OTHER", 0) or 0)
+            window = self.request_windows[vendor]
+            for raw_stamp in snapshot.get("window_timestamps", []) or []:
+                try:
+                    stamp = datetime.fromisoformat(str(raw_stamp))
+                except ValueError:
+                    continue
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=UTC)
+                window.append(stamp)
 
     def _normalize(self, now: datetime | None) -> datetime:
         current = now or datetime.now(tz=UTC)
@@ -55,13 +100,21 @@ class BudgetManager:
         while window and (now - window[0]).total_seconds() >= 60:
             window.popleft()
 
-    def can_spend(self, vendor: str, task_kind: str = "OTHER", now: datetime | None = None) -> bool:
+    def can_spend(
+        self,
+        vendor: str,
+        task_kind: str = "OTHER",
+        *,
+        units: int = 1,
+        now: datetime | None = None,
+    ) -> bool:
         """Return whether a request can be issued for the vendor now."""
         with self._lock:
             current = self._normalize(now)
             self._trim_window(vendor, current)
             limits = self.vendor_limits[vendor]
             spend = self.daily_spend[vendor]
+            requested_units = max(1, int(units))
 
             if len(self.request_windows[vendor]) >= limits.rpm:
                 return False
@@ -71,17 +124,28 @@ class BudgetManager:
             non_forward_ceiling = max(0, limits.daily_cap - reserved_units)
 
             if task_kind == "FORWARD":
-                return total_spend < limits.daily_cap
-            return spend["OTHER"] < non_forward_ceiling and total_spend < limits.daily_cap
+                return total_spend + requested_units <= limits.daily_cap
+            return (
+                spend["OTHER"] + requested_units <= non_forward_ceiling
+                and total_spend + requested_units <= limits.daily_cap
+            )
 
-    def record_spend(self, vendor: str, task_kind: str = "OTHER", now: datetime | None = None) -> None:
+    def record_spend(
+        self,
+        vendor: str,
+        task_kind: str = "OTHER",
+        *,
+        units: int = 1,
+        now: datetime | None = None,
+    ) -> None:
         """Record a completed request."""
         with self._lock:
             current = self._normalize(now)
             self._trim_window(vendor, current)
             self.request_windows[vendor].append(current)
             bucket = "FORWARD" if task_kind == "FORWARD" else "OTHER"
-            self.daily_spend[vendor][bucket] += 1
+            self.daily_requests[vendor][bucket] += 1
+            self.daily_spend[vendor][bucket] += max(1, int(units))
             self._persist_snapshot(now=current)
 
     def reset_daily(self, now: datetime | None = None) -> None:
@@ -92,6 +156,7 @@ class BudgetManager:
                 current = current.replace(tzinfo=UTC)
             self.day_anchor = current.date()
             self.daily_spend = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
+            self.daily_requests = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
             self._persist_snapshot(now=current)
 
     def snapshot(self, now: datetime | None = None) -> dict[str, object]:
@@ -102,7 +167,9 @@ class BudgetManager:
             for vendor, limits in self.vendor_limits.items():
                 self._trim_window(vendor, current)
                 spend = self.daily_spend[vendor]
+                request_counts = self.daily_requests[vendor]
                 total_spend = spend["FORWARD"] + spend["OTHER"]
+                total_requests = request_counts["FORWARD"] + request_counts["OTHER"]
                 reserved_units = max(1, int(limits.daily_cap * self.reserve_fraction))
                 non_forward_ceiling = max(0, limits.daily_cap - reserved_units)
                 vendors[vendor] = {
@@ -118,10 +185,16 @@ class BudgetManager:
                         "OTHER": int(spend["OTHER"]),
                         "TOTAL": int(total_spend),
                     },
+                    "daily_requests": {
+                        "FORWARD": int(request_counts["FORWARD"]),
+                        "OTHER": int(request_counts["OTHER"]),
+                        "TOTAL": int(total_requests),
+                    },
                 }
             return {
                 "day_anchor": self.day_anchor.isoformat(),
                 "checked_at": current.isoformat(),
+                "writer_pid": os.getpid(),
                 "vendors": vendors,
             }
 

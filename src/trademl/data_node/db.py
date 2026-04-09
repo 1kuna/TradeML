@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -178,6 +179,7 @@ class DataNodeDB:
 
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
+        self._connection_lock = threading.RLock()
         self._initialize()
 
     @classmethod
@@ -191,17 +193,18 @@ class DataNodeDB:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=5.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 5000")
-        try:
-            yield connection
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        with self._connection_lock:
+            connection = sqlite3.connect(self.path, timeout=30.0)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 30000")
+            try:
+                yield connection
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
 
     def _initialize(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -781,6 +784,29 @@ class DataNodeDB:
             ).fetchall()
         return [VendorAttempt(**dict(row)) for row in rows]
 
+    def vendor_attempts_for_symbol(
+        self,
+        *,
+        vendor: str,
+        symbol: str,
+        task_family: str = "canonical_bars",
+    ) -> list[VendorAttempt]:
+        """Return vendor attempts whose payload scope includes the requested symbol."""
+        pattern = f'%"{str(symbol).upper()}"%'
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM vendor_attempts
+                WHERE vendor = ?
+                  AND task_family = ?
+                  AND payload_json LIKE ?
+                ORDER BY updated_at DESC
+                """,
+                (vendor, task_family, pattern),
+            ).fetchall()
+        return [VendorAttempt(**dict(row)) for row in rows]
+
     def fetch_vendor_attempts(self, *, planner_group: str | None = None) -> list[VendorAttempt]:
         """Return all vendor attempts for dashboard/status views."""
         with self._connect() as connection:
@@ -927,6 +953,36 @@ class DataNodeDB:
                 """,
                 prepared,
             )
+
+    def prune_planner_tasks(self, *, task_families: tuple[str, ...], valid_task_keys: set[str]) -> int:
+        """Delete planner tasks and associated state that are no longer part of the planned backlog."""
+        if not task_families:
+            return 0
+        placeholders = ",".join("?" for _ in task_families)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT task_key FROM planner_tasks WHERE task_family IN ({placeholders})",
+                list(task_families),
+            ).fetchall()
+            stale_keys = [str(row["task_key"]) for row in rows if str(row["task_key"]) not in valid_task_keys]
+            if not stale_keys:
+                return 0
+            for index in range(0, len(stale_keys), 500):
+                chunk = stale_keys[index : index + 500]
+                chunk_placeholders = ",".join("?" for _ in chunk)
+                connection.execute(
+                    f"DELETE FROM vendor_attempts WHERE task_key IN ({chunk_placeholders})",
+                    chunk,
+                )
+                connection.execute(
+                    f"DELETE FROM planner_task_progress WHERE task_key IN ({chunk_placeholders})",
+                    chunk,
+                )
+                connection.execute(
+                    f"DELETE FROM planner_tasks WHERE task_key IN ({chunk_placeholders})",
+                    chunk,
+                )
+        return len(stale_keys)
 
     def get_planner_task(self, task_key: str) -> PlannerTask | None:
         """Return a planner task by key."""
