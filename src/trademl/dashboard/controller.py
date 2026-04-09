@@ -30,6 +30,7 @@ from trademl.data_node.bootstrap import Stage0UniverseBuilder
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.capabilities import default_macro_series, load_audit_state, provider_role_matrix
 from trademl.data_node.planner import plan_coverage_tasks
+from trademl.data_node.provider_contracts import clone_provider_contract_rows
 from trademl.data_node.runtime import build_connector, build_connectors, resolve_vendor_budgets
 from trademl.data_node.training_control import evaluate_training_gates, read_training_runtime, shared_training_runtime_path
 from trademl.fleet.cluster import (
@@ -974,6 +975,7 @@ def collect_dashboard_setup_snapshot(settings: NodeSettings) -> dict[str, Any]:
         },
         "cluster": read_cluster_snapshot(nas_root=settings.nas_mount, worker_id=settings.worker_id),
         "systemd": systemd_status(),
+        "provider_contracts": clone_provider_contract_rows(),
     }
 
 
@@ -1005,13 +1007,12 @@ def _read_optional_json(path: Path) -> dict[str, Any]:
 
 def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
     config = _read_yaml(settings.config_path)
+    resolved_limits = resolve_vendor_budgets(config)
+    configured = [str(vendor) for vendor in ((config.get("vendors") or {}).keys())]
     vendor_limits = {
-        vendor: {
-            "rpm": int(values.get("rpm", 0)),
-            "daily_cap": int(values.get("daily_cap", 0)),
-        }
-        for vendor, values in (config.get("vendors", {}) or {}).items()
-        if isinstance(values, dict)
+        vendor: resolved_limits[vendor]
+        for vendor in (configured or list(resolved_limits))
+        if vendor in resolved_limits
     }
     if not settings.budget_path.exists():
         rows = [
@@ -1029,6 +1030,13 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
                 "day_available": True,
                 "forward_available": True,
                 "other_available": True,
+                "outbound_requests_total": 0,
+                "logical_units_total": 0,
+                "request_cost_units_total": 0,
+                "local_budget_blocks_total": 0,
+                "remote_rate_limits_total": 0,
+                "permanent_failures_total": 0,
+                "empty_successes_total": 0,
                 "reason": "worker has not written budget data yet",
             }
             for vendor, limits in sorted(vendor_limits.items())
@@ -1081,6 +1089,9 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
         reserved_units = int(snapshot.get("reserved_units", max(1, int(daily_cap * 0.10)))) if daily_cap else 0
         non_forward_ceiling = int(snapshot.get("non_forward_ceiling", max(0, daily_cap - reserved_units)))
         other_used = int(daily_spend.get("OTHER", 0))
+        telemetry = snapshot.get("telemetry", {}) if isinstance(snapshot.get("telemetry", {}), dict) else {}
+        telemetry_totals = telemetry.get("totals", {}) if isinstance(telemetry.get("totals", {}), dict) else {}
+        window_counts = telemetry.get("window_counts", {}) if isinstance(telemetry.get("window_counts", {}), dict) else {}
         minute_available = len(minute_window) < rpm_limit if rpm_limit else False
         day_available = day_used < daily_cap if daily_cap else False
         other_available = minute_available and other_used < non_forward_ceiling and day_available
@@ -1112,6 +1123,18 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
                 "day_available": day_available,
                 "forward_available": forward_available,
                 "other_available": other_available,
+                "outbound_requests_total": int(telemetry_totals.get("outbound_requests", 0)),
+                "logical_units_total": int(telemetry_totals.get("logical_units", 0)),
+                "request_cost_units_total": int(telemetry_totals.get("request_cost_units", 0)),
+                "local_budget_blocks_total": int(telemetry_totals.get("local_budget_blocks", 0)),
+                "remote_rate_limits_total": int(telemetry_totals.get("remote_rate_limits", 0)),
+                "permanent_failures_total": int(telemetry_totals.get("permanent_failures", 0)),
+                "empty_successes_total": int(telemetry_totals.get("empty_successes", 0)),
+                "outbound_requests_60s": int(window_counts.get("outbound_requests", 0)),
+                "local_budget_blocks_60s": int(window_counts.get("local_budget_blocks", 0)),
+                "remote_rate_limits_60s": int(window_counts.get("remote_rate_limits", 0)),
+                "permanent_failures_60s": int(window_counts.get("permanent_failures", 0)),
+                "empty_successes_60s": int(window_counts.get("empty_successes", 0)),
                 "reason": reason,
                 "snapshot_stale": stale,
             }
@@ -1193,19 +1216,24 @@ def _summarize_vendor_throughput(db_path: Path, *, budget_summary: dict[str, Any
     grouped: dict[str, dict[str, Any]] = {}
     for attempt in attempts:
         vendor = attempt.vendor
+        budget_row = budget_rows.get(vendor, {})
         row = grouped.setdefault(
             vendor,
             {
                 "vendor": vendor,
-                "state": str(budget_rows.get(vendor, {}).get("state", "no_data")),
-                "requests_per_min": 0.0,
+                "state": str(budget_row.get("state", "no_data")),
+                "outbound_requests_per_min": 0.0,
                 "symbols_per_min": 0.0,
                 "rows_per_min": 0.0,
+                "local_budget_blocks_per_min": round(float(budget_row.get("local_budget_blocks_60s", 0)), 2),
+                "remote_rate_limits_per_min": round(float(budget_row.get("remote_rate_limits_60s", 0)), 2),
+                "permanent_failures_per_min": round(float(budget_row.get("permanent_failures_60s", 0)), 2),
+                "empty_successes_per_min": round(float(budget_row.get("empty_successes_60s", 0)), 2),
                 "success_15m": 0,
                 "failed_15m": 0,
-                "minute_window_used": int(budget_rows.get(vendor, {}).get("rpm_used", 0)),
-                "reason": str(budget_rows.get(vendor, {}).get("reason", "no planner data")),
-                "request_events_15m": 0,
+                "minute_window_used": int(budget_row.get("rpm_used", 0)),
+                "reason": str(budget_row.get("reason", "no planner data")),
+                "outbound_requests_60s": int(budget_row.get("outbound_requests_60s", 0)),
             },
         )
         updated_at = datetime.fromisoformat(attempt.updated_at)
@@ -1213,13 +1241,10 @@ def _summarize_vendor_throughput(db_path: Path, *, budget_summary: dict[str, Any
             continue
         if attempt.status == "SUCCESS":
             row["success_15m"] += 1
-            row["request_events_15m"] += 1
             row["rows_per_min"] += float(attempt.rows_returned or 0) / window_minutes
             row["symbols_per_min"] += float(len(attempt.payload.get("symbols", [])) or 1) / window_minutes
         elif attempt.status in {"FAILED", "PERMANENT_FAILED"}:
             row["failed_15m"] += 1
-            if "budget exhausted" not in str(attempt.last_error or "").lower():
-                row["request_events_15m"] += 1
             if row["state"] == "available" and attempt.next_eligible_at and attempt.next_eligible_at > now.isoformat():
                 row["state"] = "backoff"
                 row["reason"] = "temporary backoff"
@@ -1229,20 +1254,23 @@ def _summarize_vendor_throughput(db_path: Path, *, budget_summary: dict[str, Any
             {
                 "vendor": vendor,
                 "state": str(budget_row.get("state", "no_data")),
-                "requests_per_min": 0.0,
+                "outbound_requests_per_min": 0.0,
                 "symbols_per_min": 0.0,
                 "rows_per_min": 0.0,
+                "local_budget_blocks_per_min": round(float(budget_row.get("local_budget_blocks_60s", 0)), 2),
+                "remote_rate_limits_per_min": round(float(budget_row.get("remote_rate_limits_60s", 0)), 2),
+                "permanent_failures_per_min": round(float(budget_row.get("permanent_failures_60s", 0)), 2),
+                "empty_successes_per_min": round(float(budget_row.get("empty_successes_60s", 0)), 2),
                 "success_15m": 0,
                 "failed_15m": 0,
                 "minute_window_used": int(budget_row.get("rpm_used", 0)),
                 "reason": str(budget_row.get("reason", "no planner data")),
-                "request_events_15m": 0,
+                "outbound_requests_60s": int(budget_row.get("outbound_requests_60s", 0)),
             },
         )
     rows = sorted(grouped.values(), key=lambda item: item["vendor"])
     for row in rows:
-        row["requests_per_min"] = float(row.get("request_events_15m", 0)) / float(window_minutes)
-        row["requests_per_min"] = round(float(row["requests_per_min"]), 2)
+        row["outbound_requests_per_min"] = round(float(row.get("outbound_requests_60s", 0)), 2)
         row["symbols_per_min"] = round(float(row["symbols_per_min"]), 2)
         row["rows_per_min"] = round(float(row["rows_per_min"]), 2)
     return {"rows": rows, "checked_at": now.isoformat()}

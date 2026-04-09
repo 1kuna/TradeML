@@ -105,6 +105,36 @@ def test_alpaca_connector_normalizes_bars() -> None:
     assert frame.iloc[0]["volume"] == 10
 
 
+def test_twelve_data_batch_fetch_records_weighted_request_telemetry() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "AAPL": {"meta": {"symbol": "AAPL"}, "values": [{"datetime": "2026-01-02", "open": "1", "high": "2", "low": "0.5", "close": "1.5", "volume": "10"}]},
+                    "MSFT": {"meta": {"symbol": "MSFT"}, "values": [{"datetime": "2026-01-02", "open": "3", "high": "4", "low": "2.5", "close": "3.5", "volume": "11"}]},
+                },
+            )
+        ]
+    )
+    budget_manager = _budget_manager()
+    connector = TwelveDataConnector(
+        base_url="https://api.twelvedata.com",
+        api_key="key",
+        budget_manager=budget_manager,
+        session=session,
+    )
+
+    frame = connector.fetch("equities_eod", ["AAPL", "MSFT"], "2026-01-02", "2026-01-02")
+
+    snapshot = budget_manager.snapshot()
+    telemetry = snapshot["vendors"]["twelve_data"]["telemetry"]
+    assert len(frame) == 2
+    assert telemetry["totals"]["outbound_requests"] == 1
+    assert telemetry["totals"]["logical_units"] == 2
+    assert telemetry["totals"]["request_cost_units"] == 2
+
+
 def test_alpaca_connector_normalizes_assets() -> None:
     session = FakeSession(
         [

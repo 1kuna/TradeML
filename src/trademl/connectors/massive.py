@@ -32,7 +32,7 @@ class MassiveConnector(HTTPConnector):
         if dataset == "reference_dividends":
             return self._fetch_reference(symbols=symbols, endpoint_template="/v3/reference/dividends")
         if dataset == "reference_tickers":
-            payload = self.request_json(endpoint="/v3/reference/tickers", params={"active": "true", "limit": 1000})
+            payload = self.request_json(endpoint="/v3/reference/tickers", endpoint_key="reference_tickers", params={"active": "true", "limit": 1000})
             return pd.DataFrame(payload.get("results", []))
         raise ValueError(f"unsupported dataset for massive: {dataset}")
 
@@ -49,7 +49,9 @@ class MassiveConnector(HTTPConnector):
         for symbol in symbols:
             payload = self.request_json(
                 endpoint=f"/v2/aggs/ticker/{symbol}/range/1/day/{start}/{end}",
+                endpoint_key="equities_eod",
                 params={"adjusted": "false", "sort": "asc", "limit": 50000},
+                logical_units=1,
             )
             rows = payload.get("results", [])
             if not rows:
@@ -58,6 +60,7 @@ class MassiveConnector(HTTPConnector):
             frame["symbol"] = symbol
             frames.append(frame)
         if not frames:
+            self.budget_manager.record_empty_success(self.vendor_name, endpoint="equities_eod")
             return pd.DataFrame(columns=self._bar_columns())
         bars_frame = pd.concat(frames, ignore_index=True)
         bars_frame["date"] = pd.to_datetime(bars_frame["t"], unit="ms", utc=True).dt.date
@@ -75,7 +78,12 @@ class MassiveConnector(HTTPConnector):
     def _fetch_reference(self, *, symbols: list[str], endpoint_template: str) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
         for symbol in symbols:
-            payload = self.request_json(endpoint=endpoint_template, params={"ticker": symbol, "limit": 1000})
+            payload = self.request_json(
+                endpoint=endpoint_template,
+                endpoint_key="reference_splits" if "splits" in endpoint_template else "reference_dividends",
+                params={"ticker": symbol, "limit": 1000},
+                logical_units=1,
+            )
             frame = pd.DataFrame(payload.get("results", []))
             if not frame.empty:
                 frame["symbol"] = symbol

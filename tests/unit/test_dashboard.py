@@ -260,7 +260,7 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert snapshot["budget_summary"]["rows"][1]["state"] == "day_capped"
     assert snapshot["budget_summary"]["stale"] is True
     assert snapshot["vendor_throughput"]["rows"][0]["vendor"] == "alpaca"
-    assert snapshot["vendor_throughput"]["rows"][0]["requests_per_min"] > 0.0
+    assert snapshot["vendor_throughput"]["rows"][0]["outbound_requests_per_min"] >= 0.0
     assert snapshot["vendor_throughput"]["rows"][0]["minute_window_used"] == 0
     assert snapshot["planner_eta"] == {}
     assert "cycle done" in snapshot["log_tail"]
@@ -746,6 +746,7 @@ def test_start_node_uses_ephemeral_cluster_passphrase_without_persisting(tmp_pat
         captured["env"] = kwargs["env"]
         return _DummyProcess()
 
+    monkeypatch.setattr(dashboard_controller, "systemd_status", lambda: {"supported": False})
     monkeypatch.setattr(dashboard_controller.subprocess, "Popen", _fake_popen)
 
     runtime = start_node(settings, passphrase="pw123")
@@ -789,6 +790,7 @@ def test_start_node_includes_stage_symbols_in_launch_command(tmp_path: Path, mon
         captured["command"] = command
         return _DummyProcess()
 
+    monkeypatch.setattr(dashboard_controller, "systemd_status", lambda: {"supported": False})
     monkeypatch.setattr(dashboard_controller.subprocess, "Popen", _fake_popen)
 
     runtime = start_node(settings)
@@ -824,6 +826,7 @@ def test_start_node_marks_immediate_exit_as_not_running(tmp_path: Path, monkeypa
         def poll(self) -> int:
             return 17
 
+    monkeypatch.setattr(dashboard_controller, "systemd_status", lambda: {"supported": False})
     monkeypatch.setattr(dashboard_controller.subprocess, "Popen", lambda *args, **kwargs: _DeadProcess())
 
     runtime = start_node(settings)

@@ -510,7 +510,7 @@ HTML_PAGE = """<!doctype html>
         </div>
         <div class="stack">
           <div class="section-card">
-            <h3 style="margin-bottom:12px">Vendor Activity</h3>
+            <h3 style="margin-bottom:12px">Vendor Utilization</h3>
             <div class="table-wrap"><table id="vendor-table"></table></div>
           </div>
           <div class="section-card">

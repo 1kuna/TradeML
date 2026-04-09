@@ -17,6 +17,7 @@ from trademl.data_node.capabilities import (
     default_macro_series,
 )
 from trademl.data_node.db import BackfillTask, VendorAttempt
+from trademl.data_node.provider_contracts import dataset_contract
 
 
 @dataclass(slots=True, frozen=True)
@@ -209,10 +210,16 @@ def plan_canonical_bar_tasks(
 
 def _canonical_vendors_for_window(*, canonical_vendors: tuple[str, ...], in_freeze_window: bool) -> tuple[str, ...]:
     """Return the vendor set to use for a canonical bar task window."""
-    if not in_freeze_window:
-        return canonical_vendors
-    ordered = tuple(vendor for vendor in ("alpaca", "tiingo") if vendor in canonical_vendors)
-    return ordered or canonical_vendors
+    critical_path = tuple(
+        vendor
+        for vendor in canonical_vendors
+        if (contract := dataset_contract(vendor, "equities_eod")) is not None and contract.critical_path_allowed
+    )
+    if in_freeze_window:
+        ordered = tuple(vendor for vendor in ("alpaca", "tiingo") if vendor in critical_path)
+        return ordered or critical_path or canonical_vendors
+    non_critical = tuple(vendor for vendor in canonical_vendors if vendor not in critical_path)
+    return critical_path + non_critical if critical_path else canonical_vendors
 
 
 def plan_coverage_tasks(

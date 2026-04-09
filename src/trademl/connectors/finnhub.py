@@ -30,13 +30,15 @@ class FinnhubConnector(HTTPConnector):
         if dataset == "earnings_calendar":
             payload = self.request_json(
                 endpoint="/api/v1/calendar/earnings",
+                endpoint_key="earnings_calendar",
                 params={"from": pd.Timestamp(start_date).strftime("%Y-%m-%d"), "to": pd.Timestamp(end_date).strftime("%Y-%m-%d")},
+                task_kind="OTHER",
             )
             return pd.DataFrame(payload.get("earningsCalendar", []))
         if dataset == "company_profile":
             frames = []
             for symbol in symbols:
-                payload = self.request_json(endpoint="/api/v1/stock/profile2", params={"symbol": symbol})
+                payload = self.request_json(endpoint="/api/v1/stock/profile2", endpoint_key="profile", params={"symbol": symbol}, logical_units=1)
                 frames.append(pd.DataFrame([payload]))
             return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         raise ValueError(f"unsupported dataset for finnhub: {dataset}")
@@ -54,7 +56,10 @@ class FinnhubConnector(HTTPConnector):
         for symbol in symbols:
             payload = self.request_json(
                 endpoint="/api/v1/stock/candle",
+                endpoint_key="equities_eod",
                 params={"symbol": symbol, "resolution": "D", "from": start, "to": end},
+                task_kind="FORWARD",
+                logical_units=1,
             )
             if payload.get("s") != "ok" or not payload.get("t"):
                 continue
@@ -62,6 +67,7 @@ class FinnhubConnector(HTTPConnector):
             frame["symbol"] = symbol
             frames.append(frame)
         if not frames:
+            self.budget_manager.record_empty_success(self.vendor_name, endpoint="equities_eod")
             return pd.DataFrame(columns=self._columns())
         bars_frame = pd.concat(frames, ignore_index=True)
         bars_frame["date"] = pd.to_datetime(bars_frame["t"], unit="s", utc=True).dt.date

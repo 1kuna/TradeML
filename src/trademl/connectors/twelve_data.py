@@ -33,6 +33,7 @@ class TwelveDataConnector(HTTPConnector):
         if dataset == "earnings_calendar":
             payload = self.request_json(
                 endpoint="/earnings",
+                endpoint_key="earnings_calendar",
                 params={"start_date": pd.Timestamp(start_date).strftime("%Y-%m-%d"), "end_date": pd.Timestamp(end_date).strftime("%Y-%m-%d")},
                 task_kind="OTHER",
             )
@@ -41,19 +42,25 @@ class TwelveDataConnector(HTTPConnector):
         if dataset == "financial_statements":
             return self._fetch_financial_statements(symbols=symbols)
         if dataset == "stocks":
-            payload = self.request_json(endpoint="/stocks", task_kind="OTHER")
+            payload = self.request_json(endpoint="/stocks", endpoint_key="stocks", task_kind="OTHER")
             rows = payload.get("data", payload if isinstance(payload, list) else []) if isinstance(payload, dict) else payload
             return pd.DataFrame(rows)
         if dataset == "price_target":
             frames = []
             for symbol in symbols:
-                payload = self.request_json(endpoint="/price_target", params={"symbol": symbol}, task_kind="OTHER")
+                payload = self.request_json(endpoint="/price_target", endpoint_key="price_target", params={"symbol": symbol}, task_kind="OTHER", logical_units=1)
                 frames.append(pd.DataFrame([payload.get("data", payload)] if isinstance(payload, dict) else payload))
             return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if dataset == "insider_transactions":
             frames = []
             for symbol in symbols:
-                payload = self.request_json(endpoint="/insider_transactions", params={"symbol": symbol}, task_kind="OTHER")
+                payload = self.request_json(
+                    endpoint="/insider_transactions",
+                    endpoint_key="insider_transactions",
+                    params={"symbol": symbol},
+                    task_kind="OTHER",
+                    logical_units=1,
+                )
                 rows = payload.get("data", payload if isinstance(payload, list) else []) if isinstance(payload, dict) else payload
                 frame = pd.DataFrame(rows)
                 if not frame.empty:
@@ -76,6 +83,7 @@ class TwelveDataConnector(HTTPConnector):
             batch_units = max(1, len(batch))
             payload = self.request_json(
                 endpoint="/time_series",
+                endpoint_key="equities_eod",
                 params={
                     "symbol": ",".join(batch),
                     "interval": "1day",
@@ -86,6 +94,7 @@ class TwelveDataConnector(HTTPConnector):
                 },
                 task_kind="FORWARD",
                 budget_units=batch_units,
+                logical_units=len(batch),
             )
             for symbol, values in self._iter_time_series_payloads(payload=payload, requested=batch):
                 frame = pd.DataFrame(values)
@@ -106,6 +115,7 @@ class TwelveDataConnector(HTTPConnector):
                 frame["source_uri"] = "/time_series"
                 frames.append(frame)
         if not frames:
+            self.budget_manager.record_empty_success(self.vendor_name, endpoint="equities_eod")
             return pd.DataFrame(columns=self._equity_columns())
         return pd.concat(frames, ignore_index=True)[self._equity_columns()].sort_values(["date", "symbol"]).reset_index(drop=True)
 
@@ -151,8 +161,10 @@ class TwelveDataConnector(HTTPConnector):
         for symbol in symbols:
             payload = self.request_json(
                 endpoint=endpoint,
+                endpoint_key=dataset,
                 params={"symbol": symbol, "start_date": start, "end_date": end},
                 task_kind="OTHER",
+                logical_units=1,
             )
             rows = payload.get(dataset, payload.get("data", payload.get("values", []))) if isinstance(payload, dict) else payload
             frame = pd.DataFrame(rows)
@@ -186,7 +198,7 @@ class TwelveDataConnector(HTTPConnector):
         }
         for symbol in symbols:
             for statement_type, endpoint in endpoints.items():
-                payload = self.request_json(endpoint=endpoint, params={"symbol": symbol}, task_kind="OTHER")
+                payload = self.request_json(endpoint=endpoint, endpoint_key="financial_statements", params={"symbol": symbol}, task_kind="OTHER", logical_units=1)
                 rows = payload.get(statement_type, payload.get("data", payload if isinstance(payload, list) else [])) if isinstance(payload, dict) else payload
                 for row in rows:
                     if not isinstance(row, dict):

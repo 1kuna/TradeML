@@ -15,6 +15,7 @@ import pandas as pd
 import requests
 
 from trademl.data_node.budgets import BudgetManager
+from trademl.data_node.provider_contracts import dataset_contract, provider_contract
 
 
 LOGGER = logging.getLogger(__name__)
@@ -113,24 +114,49 @@ class HTTPConnector:
         """Return the normalized retryable error for vendor budget/rate exhaustion."""
         return TemporaryConnectorError(f"budget exhausted for vendor={self.vendor_name}")
 
+    def _entitlement_failure_markers(self, endpoint_key: str | None = None) -> tuple[str, ...]:
+        """Return known entitlement or unsupported-plan markers for an endpoint."""
+        markers: list[str] = ["NOT_ENTITLED", "NOT_SUPPORTED"]
+        provider = provider_contract(self.vendor_name)
+        if provider is not None:
+            for contract in provider.datasets:
+                if endpoint_key is not None and contract.endpoint_key != endpoint_key and contract.dataset != endpoint_key:
+                    continue
+                markers.extend(contract.entitlement_failure_markers)
+        return tuple(marker for marker in markers if marker)
+
+    def _retryable_statuses(self, endpoint_key: str | None = None) -> tuple[int, ...]:
+        """Return the documented retryable status codes for an endpoint."""
+        contract = dataset_contract(self.vendor_name, endpoint_key or "")
+        if contract is not None:
+            return contract.retryable_statuses
+        return (429, 500, 502, 503, 504)
+
     def _request(
         self,
         *,
         method: str,
         endpoint: str,
+        endpoint_key: str | None = None,
         base_url: str | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         task_kind: str = "OTHER",
         budget_units: int = 1,
+        logical_units: int = 1,
         timeout: int = DEFAULT_TIMEOUT,
     ) -> requests.Response:
         params = {**self._auth_params(), **(params or {})}
         request_headers = {**self._headers(), **(headers or {})}
         normalized_units = max(1, int(budget_units))
+        normalized_logical_units = max(0, int(logical_units))
+        telemetry_key = endpoint_key or endpoint
+        retryable_statuses = set(self._retryable_statuses(endpoint_key))
+        entitlement_markers = tuple(marker.lower() for marker in self._entitlement_failure_markers(endpoint_key))
 
         for attempt in range(1, self.retry_config.max_attempts + 1):
             if not self.budget_manager.can_spend(self.vendor_name, task_kind=task_kind, units=normalized_units):
+                self.budget_manager.record_local_budget_block(self.vendor_name, endpoint=telemetry_key)
                 raise TemporaryConnectorError(f"budget exhausted for vendor={self.vendor_name}")
 
             start = time.perf_counter()
@@ -143,29 +169,44 @@ class HTTPConnector:
                     timeout=timeout,
                 )
             except requests.RequestException as exc:
-                self.budget_manager.record_spend(self.vendor_name, task_kind=task_kind, units=normalized_units)
+                self.budget_manager.record_spend(
+                    self.vendor_name,
+                    task_kind=task_kind,
+                    units=normalized_units,
+                    endpoint=telemetry_key,
+                    logical_units=normalized_logical_units,
+                )
                 if attempt < self.retry_config.max_attempts:
                     self.sleep_fn(self._sleep_duration(attempt))
                     continue
                 raise TemporaryConnectorError(f"{self.vendor_name} request failed: {exc}") from exc
             elapsed_ms = (time.perf_counter() - start) * 1000
-            self.budget_manager.record_spend(self.vendor_name, task_kind=task_kind, units=normalized_units)
+            self.budget_manager.record_spend(
+                self.vendor_name,
+                task_kind=task_kind,
+                units=normalized_units,
+                endpoint=telemetry_key,
+                logical_units=normalized_logical_units,
+            )
 
             response_text = response.text[:512] if response.text else ""
-            if "NOT_ENTITLED" in response_text or "NOT_SUPPORTED" in response_text:
+            if any(marker in response_text.lower() for marker in entitlement_markers):
+                self.budget_manager.record_permanent_failure(self.vendor_name, endpoint=telemetry_key)
                 raise PermanentConnectorError(response_text)
 
             if response.status_code < 400:
                 self._log_request(endpoint=endpoint, symbols=[], rows=0, elapsed_ms=elapsed_ms)
                 return response
 
-            if response.status_code in {429, 500, 502, 503, 504} and attempt < self.retry_config.max_attempts:
+            if response.status_code in retryable_statuses and attempt < self.retry_config.max_attempts:
                 self.sleep_fn(self._sleep_duration(attempt))
                 continue
             if response.status_code == 429:
+                self.budget_manager.record_remote_rate_limit(self.vendor_name, endpoint=telemetry_key)
                 raise self._rate_limit_error()
-            if response.status_code in {500, 502, 503, 504}:
+            if response.status_code in retryable_statuses:
                 raise TemporaryConnectorError(f"{self.vendor_name} request failed: {response.status_code} {response_text}")
+            self.budget_manager.record_permanent_failure(self.vendor_name, endpoint=telemetry_key)
             raise PermanentConnectorError(f"{self.vendor_name} request failed: {response.status_code} {response_text}")
 
         raise TemporaryConnectorError(f"{self.vendor_name} request failed after retries")
@@ -174,21 +215,25 @@ class HTTPConnector:
         self,
         *,
         endpoint: str,
+        endpoint_key: str | None = None,
         base_url: str | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         task_kind: str = "OTHER",
         budget_units: int = 1,
+        logical_units: int = 1,
     ) -> dict[str, Any] | list[Any]:
         """Issue a JSON request."""
         response = self._request(
             method="GET",
             endpoint=endpoint,
+            endpoint_key=endpoint_key,
             base_url=base_url,
             params=params,
             headers=headers,
             task_kind=task_kind,
             budget_units=budget_units,
+            logical_units=logical_units,
         )
         return response.json()
 
@@ -196,21 +241,25 @@ class HTTPConnector:
         self,
         *,
         endpoint: str,
+        endpoint_key: str | None = None,
         base_url: str | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         task_kind: str = "OTHER",
         budget_units: int = 1,
+        logical_units: int = 1,
     ) -> pd.DataFrame:
         """Issue a CSV request."""
         response = self._request(
             method="GET",
             endpoint=endpoint,
+            endpoint_key=endpoint_key,
             base_url=base_url,
             params=params,
             headers=headers,
             task_kind=task_kind,
             budget_units=budget_units,
+            logical_units=logical_units,
         )
         reader = csv.DictReader(io.StringIO(response.text))
         return pd.DataFrame(reader)

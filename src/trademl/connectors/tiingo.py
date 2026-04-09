@@ -46,7 +46,7 @@ class TiingoConnector(HTTPConnector):
         if dataset == "fundamentals":
             return self._fetch_fundamentals(symbols=symbols, start_date=start_date, end_date=end_date)
         if dataset == "supported_tickers":
-            payload = self.request_json(endpoint="/tiingo/daily", task_kind="OTHER")
+            payload = self.request_json(endpoint="/tiingo/daily", endpoint_key="supported_tickers", task_kind="OTHER")
             frame = pd.DataFrame(payload)
             if frame.empty:
                 return pd.DataFrame(columns=["symbol", "name", "exchange", "asset_type", "start_date", "end_date"])
@@ -76,8 +76,10 @@ class TiingoConnector(HTTPConnector):
         for symbol in symbols:
             payload = self.request_json(
                 endpoint=f"/tiingo/daily/{symbol}/prices",
+                endpoint_key="equities_eod",
                 params={"startDate": start, "endDate": end, "resampleFreq": "daily"},
                 task_kind="FORWARD",
+                logical_units=1,
             )
             frame = pd.DataFrame(payload)
             if frame.empty:
@@ -106,6 +108,7 @@ class TiingoConnector(HTTPConnector):
             )
             frames.append(normalized)
         if not frames:
+            self.budget_manager.record_empty_success(self.vendor_name, endpoint="equities_eod")
             return pd.DataFrame(columns=self._equity_columns())
         return pd.concat(frames, ignore_index=True)[self._equity_columns()].sort_values(["date", "symbol"]).reset_index(drop=True)
 
@@ -124,7 +127,13 @@ class TiingoConnector(HTTPConnector):
         }
         if symbols:
             params["tickers"] = ",".join(symbols)
-        payload = self.request_json(endpoint=endpoint, params=params, task_kind="OTHER")
+        payload = self.request_json(
+            endpoint=endpoint,
+            endpoint_key="corp_actions_dividends" if event_type == "dividend" else "corp_actions_splits",
+            params=params,
+            task_kind="OTHER",
+            logical_units=max(1, len(symbols)),
+        )
         frame = pd.DataFrame(payload)
         if frame.empty:
             return pd.DataFrame(columns=self._action_columns())
@@ -164,14 +173,18 @@ class TiingoConnector(HTTPConnector):
         for symbol in symbols:
             daily_payload = self.request_json(
                 endpoint=f"/tiingo/fundamentals/{symbol}/daily",
+                endpoint_key="fundamentals_daily",
                 params={"startDate": start, "endDate": end},
                 task_kind="OTHER",
+                logical_units=1,
             )
             frames.extend(self._normalize_fundamental_payload(symbol=symbol, payload=daily_payload, statement_type="daily"))
             statements_payload = self.request_json(
                 endpoint=f"/tiingo/fundamentals/{symbol}/statements",
+                endpoint_key="fundamentals_statements",
                 params={"startDate": start, "endDate": end},
                 task_kind="OTHER",
+                logical_units=1,
             )
             frames.extend(self._normalize_fundamental_payload(symbol=symbol, payload=statements_payload, statement_type="statements"))
         if not frames:

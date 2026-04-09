@@ -21,6 +21,7 @@ from trademl.connectors.base import BaseConnector, ConnectorError, PermanentConn
 from trademl.data_node.capabilities import backfill_capabilities, forward_capabilities
 from trademl.data_node.db import DataNodeDB, PlannerTask
 from trademl.data_node.planner import canonical_task_key, choose_vendor_for_canonical_task
+from trademl.data_node.provider_contracts import dataset_contract
 
 LOGGER = logging.getLogger(__name__)
 
@@ -264,23 +265,24 @@ class CanonicalRuntime:
             if task_rows > 0:
                 self.db.mark_vendor_attempt_success(task_key=task.task_key, vendor=vendor, rows_returned=task_rows)
             else:
+                empty_error = self._canonical_empty_result_error(vendor=vendor, dataset=task.dataset)
                 self.db.mark_vendor_attempt_failed(
                     task_key=task.task_key,
                     vendor=vendor,
-                    error="empty planner canonical result",
+                    error=empty_error,
                     backoff_minutes=0,
                     permanent=True,
                 )
                 if self._canonical_task_has_remaining_vendors(task, failed_vendor=vendor):
                     self.db.mark_planner_task_partial(
                         task.task_key,
-                        error=f"{vendor}: empty planner canonical result",
+                        error=f"{vendor}: {empty_error}",
                         backoff_minutes=self._canonical_next_task_backoff_minutes(task, excluded_vendor=vendor),
                     )
                     continue
                 self.db.mark_planner_task_failed(
                     task.task_key,
-                    error=f"{vendor}: empty planner canonical result",
+                    error=f"{vendor}: {empty_error}",
                     backoff_minutes=15,
                     permanent=True,
                 )
@@ -426,6 +428,14 @@ class CanonicalRuntime:
 
     def _vendor_can_serve_canonical_task(self, *, vendor: str, task: PlannerTask) -> bool:
         """Return whether attempt history implies a vendor can plausibly serve this task."""
+        contract = dataset_contract(vendor, task.dataset)
+        if contract is not None and task.priority <= 5 and not contract.critical_path_allowed:
+            return False
+        if contract is not None and contract.max_history_years is not None:
+            current = pd.Timestamp(datetime.now(tz=UTC).date())
+            earliest_supported = (current - pd.DateOffset(years=int(contract.max_history_years))).normalize()
+            if pd.Timestamp(task.start_date) < earliest_supported:
+                return False
         if len(task.symbols) != 1:
             return True
         floor = self._vendor_symbol_floor(vendor=vendor, symbol=task.symbols[0])
@@ -447,7 +457,10 @@ class CanonicalRuntime:
             end_date = str(payload.get("end_date") or "")
             if attempt.status == "SUCCESS" and start_date:
                 success_starts.append(start_date)
-            if attempt.status == "PERMANENT_FAILED" and attempt.last_error == "empty planner canonical result" and end_date:
+            if attempt.status == "PERMANENT_FAILED" and attempt.last_error in {
+                "empty planner canonical result",
+                "valid empty planner canonical result",
+            } and end_date:
                 empty_fail_ends.append(end_date)
         boundary: str | None = None
         if success_starts and empty_fail_ends:
@@ -809,11 +822,22 @@ class CanonicalRuntime:
     @staticmethod
     def _capability_batch_size(capability) -> int:
         """Return the batch size to use for a capability inside date-wide backfill dispatch."""
+        contract = dataset_contract(capability.vendor, capability.dataset)
+        if contract is not None and int(contract.max_batch_symbols or 0) > 0:
+            return int(contract.max_batch_symbols)
         if int(getattr(capability, "preferred_batch_size", 0) or 0) > 0:
             return int(capability.preferred_batch_size)
         if capability.batching_mode == "multi_symbol":
             return 100
         return 1
+
+    @staticmethod
+    def _canonical_empty_result_error(*, vendor: str, dataset: str) -> str:
+        """Return the docs-backed empty-result error label for a canonical lane."""
+        contract = dataset_contract(vendor, dataset)
+        if contract is not None and contract.empty_result_policy == "valid_empty":
+            return "valid empty planner canonical result"
+        return "empty planner canonical result"
 
     def _read_existing_partition(self, *, date: str) -> pd.DataFrame:
         """Read the existing canonical raw partition for a date if present."""

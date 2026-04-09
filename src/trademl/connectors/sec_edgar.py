@@ -33,6 +33,7 @@ class SecEdgarConnector(HTTPConnector):
             payload = self.request_json(
                 base_url="https://www.sec.gov",
                 endpoint="/files/company_tickers.json",
+                endpoint_key="company_tickers",
             )
             rows = payload.values() if isinstance(payload, dict) else payload
             return pd.DataFrame(rows)
@@ -40,7 +41,7 @@ class SecEdgarConnector(HTTPConnector):
             frames = []
             for cik in symbols:
                 normalized_cik = str(cik).zfill(10)
-                payload = self.request_json(endpoint=f"/api/xbrl/companyfacts/CIK{normalized_cik}.json")
+                payload = self.request_json(endpoint=f"/api/xbrl/companyfacts/CIK{normalized_cik}.json", endpoint_key="companyfacts", logical_units=1)
                 frames.append(
                     pd.DataFrame(
                         [
@@ -61,7 +62,7 @@ class SecEdgarConnector(HTTPConnector):
         frames = []
         for cik in symbols:
             normalized_cik = str(cik).zfill(10)
-            payload = self.request_json(endpoint=f"/submissions/CIK{normalized_cik}.json")
+            payload = self.request_json(endpoint=f"/submissions/CIK{normalized_cik}.json", endpoint_key="filing_index", logical_units=1)
             recent = pd.DataFrame(payload.get("filings", {}).get("recent", {}))
             if recent.empty:
                 continue

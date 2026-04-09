@@ -45,6 +45,7 @@ class AlpacaConnector(HTTPConnector):
             payload = self.request_json(
                 base_url=self.trading_base_url,
                 endpoint=self._assets_endpoint(),
+                endpoint_key="assets",
                 params={"status": "active", "asset_class": "us_equity"},
                 task_kind="OTHER",
             )
@@ -69,8 +70,10 @@ class AlpacaConnector(HTTPConnector):
             for symbol in symbols:
                 payload = self.request_json(
                     endpoint=f"/v2/stocks/{symbol}/corporate_actions/announcements",
+                    endpoint_key="corp_actions",
                     params={"since": start, "until": end},
                     task_kind="OTHER",
+                    logical_units=1,
                 )
                 rows = payload.get("announcements", payload.get("results", payload if isinstance(payload, list) else [])) if isinstance(payload, dict) else payload
                 frame = pd.DataFrame(rows)
@@ -101,6 +104,7 @@ class AlpacaConnector(HTTPConnector):
             while True:
                 payload = self.request_json(
                     endpoint="/v2/stocks/bars",
+                    endpoint_key="equities_eod",
                     params={
                         "symbols": ",".join(batch),
                         "timeframe": "1Day",
@@ -111,6 +115,7 @@ class AlpacaConnector(HTTPConnector):
                         **({"page_token": page_token} if page_token else {}),
                     },
                     task_kind="FORWARD",
+                    logical_units=len(batch),
                 )
                 bars = payload.get("bars", {})
                 for symbol, rows in bars.items():
@@ -123,6 +128,7 @@ class AlpacaConnector(HTTPConnector):
                 if not page_token:
                     break
         if not frames:
+            self.budget_manager.record_empty_success(self.vendor_name, endpoint="equities_eod")
             return pd.DataFrame(columns=self._columns())
         bars_frame = pd.concat(frames, ignore_index=True)
         bars_frame["date"] = pd.to_datetime(bars_frame["t"]).dt.date

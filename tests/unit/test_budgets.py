@@ -134,3 +134,30 @@ def test_budget_manager_restores_same_day_snapshot_on_restart(tmp_path) -> None:
     assert vendor["daily_requests"]["TOTAL"] == 2
     assert vendor["window_used"] == 2
     assert not restored.can_spend("alpaca", now=now + timedelta(seconds=2))
+
+
+def test_budget_manager_tracks_endpoint_telemetry(tmp_path) -> None:
+    snapshot_path = tmp_path / "budget_state.json"
+    manager = BudgetManager(
+        {"twelve_data": {"rpm": 10, "daily_cap": 100}},
+        snapshot_path=snapshot_path,
+    )
+    now = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+
+    manager.record_spend("twelve_data", task_kind="FORWARD", units=8, endpoint="equities_eod", logical_units=8, now=now)
+    manager.record_local_budget_block("twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=1))
+    manager.record_remote_rate_limit("twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=2))
+    manager.record_permanent_failure("twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=3))
+    manager.record_empty_success("twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=4))
+
+    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    telemetry = payload["vendors"]["twelve_data"]["telemetry"]
+    assert telemetry["totals"]["outbound_requests"] == 1
+    assert telemetry["totals"]["logical_units"] == 8
+    assert telemetry["totals"]["request_cost_units"] == 8
+    assert telemetry["totals"]["local_budget_blocks"] == 1
+    assert telemetry["totals"]["remote_rate_limits"] == 1
+    assert telemetry["totals"]["permanent_failures"] == 1
+    assert telemetry["totals"]["empty_successes"] == 1
+    assert telemetry["window_counts"]["outbound_requests"] == 1
+    assert telemetry["per_endpoint"]["equities_eod"]["request_cost_units"] == 8

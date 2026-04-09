@@ -26,14 +26,15 @@ class FMPConnector(HTTPConnector):
     ) -> pd.DataFrame:
         """Fetch normalized FMP datasets."""
         if dataset == "delistings":
-            payload = self.request_json(endpoint="/stable/delisted-companies")
+            payload = self.request_json(endpoint="/stable/delisted-companies", endpoint_key="delistings")
             return pd.DataFrame(payload)
         if dataset == "symbol_changes":
-            payload = self.request_json(endpoint="/stable/symbol-change")
+            payload = self.request_json(endpoint="/stable/symbol-change", endpoint_key="symbol_changes")
             return pd.DataFrame(payload)
         if dataset == "earnings_calendar":
             payload = self.request_json(
                 endpoint="/stable/earnings-calendar",
+                endpoint_key="earnings_calendar",
                 params={"from": pd.Timestamp(start_date).strftime("%Y-%m-%d"), "to": pd.Timestamp(end_date).strftime("%Y-%m-%d")},
             )
             return pd.DataFrame(payload)

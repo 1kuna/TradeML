@@ -29,6 +29,7 @@ class AlphaVantageConnector(HTTPConnector):
             frames = [
                 self.request_csv(
                     endpoint="/query",
+                    endpoint_key="listings",
                     params={"function": "LISTING_STATUS", "date": pd.Timestamp(end_date).strftime("%Y-%m-%d"), "state": state},
                 )
                 for state in ["active", "delisted"]
@@ -55,11 +56,15 @@ class AlphaVantageConnector(HTTPConnector):
         for symbol in symbols:
             dividends_payload = self.request_json(
                 endpoint="/query",
+                endpoint_key="corp_actions",
                 params={"function": "DIVIDENDS", "symbol": symbol},
+                logical_units=1,
             )
             splits_payload = self.request_json(
                 endpoint="/query",
+                endpoint_key="corp_actions",
                 params={"function": "SPLITS", "symbol": symbol},
+                logical_units=1,
             )
             dividend_rows = self._normalize_actions(
                 payload=dividends_payload,

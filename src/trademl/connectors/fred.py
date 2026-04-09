@@ -30,9 +30,21 @@ class FredConnector(HTTPConnector):
         if dataset == "vintagedates":
             frames = []
             for series_id in symbols:
-                payload = self.request_json(endpoint="/fred/series/vintagedates", params={"series_id": series_id})
+                payload = self.request_json(
+                    endpoint="/fred/series/vintagedates",
+                    endpoint_key="vintagedates",
+                    params={"series_id": series_id},
+                    task_kind="OTHER",
+                    logical_units=1,
+                )
                 frames.append(pd.DataFrame({"series_id": series_id, "vintage_date": payload.get("vintage_dates", [])}))
-            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            if not frames:
+                self.budget_manager.record_empty_success(self.vendor_name, endpoint="vintagedates")
+                return pd.DataFrame()
+            result = pd.concat(frames, ignore_index=True)
+            if result.empty:
+                self.budget_manager.record_empty_success(self.vendor_name, endpoint="vintagedates")
+            return result
         raise ValueError(f"unsupported dataset for fred: {dataset}")
 
     def _fetch_observations(
@@ -46,11 +58,14 @@ class FredConnector(HTTPConnector):
         for series_id in symbols:
             payload = self.request_json(
                 endpoint="/fred/series/observations",
+                endpoint_key="macros_treasury",
                 params={
                     "series_id": series_id,
                     "observation_start": pd.Timestamp(start_date).strftime("%Y-%m-%d"),
                     "observation_end": pd.Timestamp(end_date).strftime("%Y-%m-%d"),
                 },
+                task_kind="OTHER",
+                logical_units=1,
             )
             frame = pd.DataFrame(payload.get("observations", []))
             if frame.empty:
@@ -58,6 +73,7 @@ class FredConnector(HTTPConnector):
             frame["series_id"] = series_id
             frames.append(frame)
         if not frames:
+            self.budget_manager.record_empty_success(self.vendor_name, endpoint="macros_treasury")
             return pd.DataFrame(columns=["series_id", "observation_date", "value", "vintage_date", "ingested_at"])
         observations = pd.concat(frames, ignore_index=True)
         observations["observation_date"] = pd.to_datetime(observations["date"]).dt.date

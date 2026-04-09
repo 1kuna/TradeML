@@ -13,6 +13,13 @@ import threading
 
 
 UTC = timezone.utc
+WINDOW_METRICS = (
+    "outbound_requests",
+    "local_budget_blocks",
+    "remote_rate_limits",
+    "permanent_failures",
+    "empty_successes",
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -40,10 +47,35 @@ class BudgetManager:
         self.request_windows: dict[str, deque[datetime]] = defaultdict(deque)
         self.daily_spend: dict[str, dict[str, int]] = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
         self.daily_requests: dict[str, dict[str, int]] = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
+        self.telemetry_totals: dict[str, dict[str, int]] = defaultdict(self._empty_telemetry_totals)
+        self.endpoint_telemetry: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
+        self.telemetry_windows: dict[str, dict[str, deque[datetime]]] = defaultdict(self._empty_telemetry_windows)
         self.day_anchor = datetime.now(tz=UTC).date()
         self.snapshot_path = Path(snapshot_path).expanduser() if snapshot_path else None
         self._restore_snapshot()
         self._persist_snapshot()
+
+    @staticmethod
+    def _empty_telemetry_totals() -> dict[str, int]:
+        return {
+            "outbound_requests": 0,
+            "logical_units": 0,
+            "request_cost_units": 0,
+            "local_budget_blocks": 0,
+            "remote_rate_limits": 0,
+            "permanent_failures": 0,
+            "empty_successes": 0,
+        }
+
+    @staticmethod
+    def _empty_telemetry_windows() -> dict[str, deque[datetime]]:
+        return {metric: deque() for metric in WINDOW_METRICS}
+
+    def _ensure_endpoint_telemetry(self, vendor: str, endpoint: str) -> dict[str, int]:
+        endpoint_map = self.endpoint_telemetry[vendor]
+        if endpoint not in endpoint_map:
+            endpoint_map[endpoint] = self._empty_telemetry_totals()
+        return endpoint_map[endpoint]
 
     def _restore_snapshot(self) -> None:
         """Restore same-day budget state from the last persisted snapshot when available."""
@@ -86,6 +118,33 @@ class BudgetManager:
                 if stamp.tzinfo is None:
                     stamp = stamp.replace(tzinfo=UTC)
                 window.append(stamp)
+            telemetry = snapshot.get("telemetry", {})
+            if isinstance(telemetry, dict):
+                totals = telemetry.get("totals", {})
+                if isinstance(totals, dict):
+                    vendor_totals = self.telemetry_totals[vendor]
+                    for key in vendor_totals:
+                        vendor_totals[key] = int(totals.get(key, 0) or 0)
+                per_endpoint = telemetry.get("per_endpoint", {})
+                if isinstance(per_endpoint, dict):
+                    for endpoint, endpoint_totals in per_endpoint.items():
+                        if not isinstance(endpoint_totals, dict):
+                            continue
+                        target = self._ensure_endpoint_telemetry(vendor, str(endpoint))
+                        for key in target:
+                            target[key] = int(endpoint_totals.get(key, 0) or 0)
+                window_timestamps = telemetry.get("window_timestamps", {})
+                if isinstance(window_timestamps, dict):
+                    vendor_windows = self.telemetry_windows[vendor]
+                    for metric in WINDOW_METRICS:
+                        for raw_stamp in window_timestamps.get(metric, []) or []:
+                            try:
+                                stamp = datetime.fromisoformat(str(raw_stamp))
+                            except ValueError:
+                                continue
+                            if stamp.tzinfo is None:
+                                stamp = stamp.replace(tzinfo=UTC)
+                            vendor_windows[metric].append(stamp)
 
     def _normalize(self, now: datetime | None) -> datetime:
         current = now or datetime.now(tz=UTC)
@@ -99,6 +158,13 @@ class BudgetManager:
         window = self.request_windows[vendor]
         while window and (now - window[0]).total_seconds() >= 60:
             window.popleft()
+
+    def _trim_telemetry_windows(self, vendor: str, now: datetime) -> None:
+        windows = self.telemetry_windows[vendor]
+        for metric in WINDOW_METRICS:
+            window = windows[metric]
+            while window and (now - window[0]).total_seconds() >= 60:
+                window.popleft()
 
     def can_spend(
         self,
@@ -130,22 +196,111 @@ class BudgetManager:
                 and total_spend + requested_units <= limits.daily_cap
             )
 
+    def _record_telemetry_event(
+        self,
+        *,
+        vendor: str,
+        endpoint: str,
+        metric: str,
+        now: datetime,
+        request_units: int = 0,
+        logical_units: int = 0,
+    ) -> None:
+        vendor_totals = self.telemetry_totals[vendor]
+        endpoint_totals = self._ensure_endpoint_telemetry(vendor, endpoint)
+        vendor_totals[metric] += 1
+        endpoint_totals[metric] += 1
+        if metric == "outbound_requests":
+            vendor_totals["logical_units"] += max(0, int(logical_units))
+            vendor_totals["request_cost_units"] += max(0, int(request_units))
+            endpoint_totals["logical_units"] += max(0, int(logical_units))
+            endpoint_totals["request_cost_units"] += max(0, int(request_units))
+        if metric in WINDOW_METRICS:
+            self.telemetry_windows[vendor][metric].append(now)
+
+    def record_local_budget_block(
+        self,
+        vendor: str,
+        *,
+        endpoint: str = "__unknown__",
+        now: datetime | None = None,
+    ) -> None:
+        """Record a local pre-request budget block."""
+        with self._lock:
+            current = self._normalize(now)
+            self._trim_telemetry_windows(vendor, current)
+            self._record_telemetry_event(vendor=vendor, endpoint=endpoint, metric="local_budget_blocks", now=current)
+            self._persist_snapshot(now=current)
+
+    def record_remote_rate_limit(
+        self,
+        vendor: str,
+        *,
+        endpoint: str = "__unknown__",
+        now: datetime | None = None,
+    ) -> None:
+        """Record a remote 429 or equivalent throttle response."""
+        with self._lock:
+            current = self._normalize(now)
+            self._trim_telemetry_windows(vendor, current)
+            self._record_telemetry_event(vendor=vendor, endpoint=endpoint, metric="remote_rate_limits", now=current)
+            self._persist_snapshot(now=current)
+
+    def record_permanent_failure(
+        self,
+        vendor: str,
+        *,
+        endpoint: str = "__unknown__",
+        now: datetime | None = None,
+    ) -> None:
+        """Record a permanent request failure."""
+        with self._lock:
+            current = self._normalize(now)
+            self._trim_telemetry_windows(vendor, current)
+            self._record_telemetry_event(vendor=vendor, endpoint=endpoint, metric="permanent_failures", now=current)
+            self._persist_snapshot(now=current)
+
+    def record_empty_success(
+        self,
+        vendor: str,
+        *,
+        endpoint: str = "__unknown__",
+        now: datetime | None = None,
+    ) -> None:
+        """Record a valid empty response."""
+        with self._lock:
+            current = self._normalize(now)
+            self._trim_telemetry_windows(vendor, current)
+            self._record_telemetry_event(vendor=vendor, endpoint=endpoint, metric="empty_successes", now=current)
+            self._persist_snapshot(now=current)
+
     def record_spend(
         self,
         vendor: str,
         task_kind: str = "OTHER",
         *,
         units: int = 1,
+        endpoint: str = "__unknown__",
+        logical_units: int = 1,
         now: datetime | None = None,
     ) -> None:
         """Record a completed request."""
         with self._lock:
             current = self._normalize(now)
             self._trim_window(vendor, current)
+            self._trim_telemetry_windows(vendor, current)
             self.request_windows[vendor].append(current)
             bucket = "FORWARD" if task_kind == "FORWARD" else "OTHER"
             self.daily_requests[vendor][bucket] += 1
             self.daily_spend[vendor][bucket] += max(1, int(units))
+            self._record_telemetry_event(
+                vendor=vendor,
+                endpoint=endpoint,
+                metric="outbound_requests",
+                now=current,
+                request_units=max(1, int(units)),
+                logical_units=max(0, int(logical_units)),
+            )
             self._persist_snapshot(now=current)
 
     def reset_daily(self, now: datetime | None = None) -> None:
@@ -166,12 +321,15 @@ class BudgetManager:
             vendors: dict[str, dict[str, object]] = {}
             for vendor, limits in self.vendor_limits.items():
                 self._trim_window(vendor, current)
+                self._trim_telemetry_windows(vendor, current)
                 spend = self.daily_spend[vendor]
                 request_counts = self.daily_requests[vendor]
                 total_spend = spend["FORWARD"] + spend["OTHER"]
                 total_requests = request_counts["FORWARD"] + request_counts["OTHER"]
                 reserved_units = max(1, int(limits.daily_cap * self.reserve_fraction))
                 non_forward_ceiling = max(0, limits.daily_cap - reserved_units)
+                telemetry_totals = dict(self.telemetry_totals[vendor])
+                telemetry_windows = self.telemetry_windows[vendor]
                 vendors[vendor] = {
                     "rpm": limits.rpm,
                     "daily_cap": limits.daily_cap,
@@ -189,6 +347,21 @@ class BudgetManager:
                         "FORWARD": int(request_counts["FORWARD"]),
                         "OTHER": int(request_counts["OTHER"]),
                         "TOTAL": int(total_requests),
+                    },
+                    "telemetry": {
+                        "totals": telemetry_totals,
+                        "window_counts": {
+                            metric: len(telemetry_windows[metric])
+                            for metric in WINDOW_METRICS
+                        },
+                        "window_timestamps": {
+                            metric: [stamp.isoformat() for stamp in telemetry_windows[metric]]
+                            for metric in WINDOW_METRICS
+                        },
+                        "per_endpoint": {
+                            endpoint: dict(endpoint_totals)
+                            for endpoint, endpoint_totals in sorted(self.endpoint_telemetry[vendor].items())
+                        },
                     },
                 }
             return {
