@@ -1827,6 +1827,66 @@ class DataNodeDB:
                 updated += int(cursor.rowcount)
         return updated
 
+    def release_planner_leases_for_owner(
+        self,
+        *,
+        lease_owner: str,
+        task_families: tuple[str, ...] | None = None,
+    ) -> int:
+        """Release any in-flight planner leases owned by a restarting worker."""
+        clauses = ["status = 'LEASED'", "lease_owner = ?"]
+        params: list[object] = [lease_owner]
+        if task_families:
+            placeholders = ",".join("?" for _ in task_families)
+            clauses.append(f"task_family IN ({placeholders})")
+            params.extend(task_families)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE planner_tasks
+                SET status = CASE WHEN attempts > 0 THEN 'PARTIAL' ELSE 'PENDING' END,
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    lease_expires_at = NULL,
+                    next_eligible_at = NULL,
+                    updated_at = ?
+                WHERE {' AND '.join(clauses)}
+                """,
+                [utc_now().isoformat(), *params],
+            )
+        return int(cursor.rowcount)
+
+    def release_vendor_attempt_leases_for_owner(
+        self,
+        *,
+        lease_owner: str,
+        task_families: tuple[str, ...] | None = None,
+        reason: str,
+    ) -> int:
+        """Release any in-flight vendor attempts owned by a restarting worker."""
+        clauses = ["status = 'LEASED'", "lease_owner = ?"]
+        params: list[object] = [lease_owner]
+        if task_families:
+            placeholders = ",".join("?" for _ in task_families)
+            clauses.append(f"task_family IN ({placeholders})")
+            params.extend(task_families)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE vendor_attempts
+                SET status = 'FAILED',
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    lease_expires_at = NULL,
+                    next_eligible_at = NULL,
+                    last_error = COALESCE(last_error, ?),
+                    updated_at = ?
+                WHERE {' AND '.join(clauses)}
+                """,
+                [reason, utc_now().isoformat(), *params],
+            )
+        return int(cursor.rowcount)
+
     def count_repairable_stale_success_canonical_tasks(self, *, only_future_blocked: bool) -> int:
         """Count incomplete canonical tasks blocked by stale budget failures despite prior success."""
         now_iso = utc_now().isoformat()

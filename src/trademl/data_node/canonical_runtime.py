@@ -99,6 +99,7 @@ class CanonicalRuntime:
                 break
             page_candidates.sort(
                 key=lambda task: (
+                    self._canonical_backlog_rank(task),
                     0 if task.status == "PARTIAL" else 1 if task.status == "FAILED" else 2 if task.status == "PENDING" else 3,
                     progress_map.get(task.task_key).remaining_units if progress_map.get(task.task_key) is not None else 10**9,
                     task.priority,
@@ -137,6 +138,18 @@ class CanonicalRuntime:
             batch.append(leased)
             symbol_count += len(leased.symbols)
         return batch
+
+    @staticmethod
+    def _canonical_backlog_rank(task: PlannerTask) -> int:
+        """Rank canonical backlog classes so repair work preempts rolling drift."""
+        backlog_class = str(task.payload.get("backlog_class", "")).strip().lower() if isinstance(task.payload, dict) else ""
+        if backlog_class == "phase1_pinned" or task.planner_group == "phase1_pinned_canonical":
+            return 0
+        if backlog_class == "repair" or task.planner_group == "canonical_repair":
+            return 1
+        if backlog_class == "rolling" or task.planner_group == "rolling_canonical":
+            return 2
+        return 3
 
     def _process_canonical_planner_task(self, task: PlannerTask, exchange: str) -> list[str]:
         """Compatibility wrapper for a single planner task."""

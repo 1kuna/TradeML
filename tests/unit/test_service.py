@@ -993,6 +993,162 @@ def test_lease_canonical_batch_prioritizes_small_partial_tail(tmp_path: Path) ->
     assert batch[0].task_key == "canonical::small_partial"
 
 
+def test_lease_canonical_batch_prioritizes_repair_before_rolling_partial(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _MultiSymbolBackfillConnector("alpaca"),
+            "tiingo": _BackfillConnector("tiingo"),
+        },
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::rolling_partial",
+        task_family="canonical_bars",
+        planner_group="rolling_canonical",
+        dataset="equities_eod",
+        tier="A",
+        priority=10,
+        start_date="2026-03-16",
+        end_date="2026-04-10",
+        symbols=["ROLL"],
+        eligible_vendors=["alpaca", "tiingo"],
+        payload={"scope_kind": "symbol_range", "backlog_class": "rolling", "trading_days": ["2026-03-16"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::rolling_partial",
+        expected_units=25,
+        completed_units=24,
+        remaining_units=1,
+        remaining_symbols=["ROLL"],
+        state={"scope_kind": "symbol_range", "backlog_class": "rolling"},
+    )
+    db.mark_planner_task_partial(
+        "canonical::rolling_partial",
+        error="alpaca partial",
+        backoff_minutes=0,
+    )
+    db.upsert_planner_task(
+        task_key="canonical_repair::2026-04-10::000",
+        task_family="canonical_repair",
+        planner_group="canonical_repair",
+        dataset="equities_eod",
+        tier="A",
+        priority=8,
+        start_date="2026-04-10",
+        end_date="2026-04-10",
+        symbols=["FIX"],
+        eligible_vendors=["alpaca", "tiingo"],
+        output_name="equities_bars",
+        payload={"scope_kind": "symbol_range", "backlog_class": "repair", "trading_days": ["2026-04-10"], "repair": True},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical_repair::2026-04-10::000",
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=["FIX"],
+        state={"scope_kind": "symbol_range", "backlog_class": "repair"},
+    )
+
+    batch = service._canonical_runtime._lease_canonical_batch("alpaca")
+
+    assert batch
+    assert batch[0].task_key == "canonical_repair::2026-04-10::000"
+
+
+def test_reclaim_startup_leases_releases_same_owner_rolling_tasks_for_repair(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _MultiSymbolBackfillConnector("alpaca"),
+            "tiingo": _BackfillConnector("tiingo"),
+        },
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+        worker_id="rpi-01",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::rolling_partial",
+        task_family="canonical_bars",
+        planner_group="rolling_canonical",
+        dataset="equities_eod",
+        tier="A",
+        priority=10,
+        start_date="2026-03-16",
+        end_date="2026-04-10",
+        symbols=["ROLL"],
+        eligible_vendors=["alpaca", "tiingo"],
+        payload={"scope_kind": "symbol_range", "backlog_class": "rolling", "trading_days": ["2026-03-16"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::rolling_partial",
+        expected_units=25,
+        completed_units=24,
+        remaining_units=1,
+        remaining_symbols=["ROLL"],
+        state={"scope_kind": "symbol_range", "backlog_class": "rolling"},
+    )
+    db.mark_planner_task_partial(
+        "canonical::rolling_partial",
+        error="alpaca partial",
+        backoff_minutes=0,
+    )
+    leased_task = db.lease_planner_task_by_key(task_key="canonical::rolling_partial", lease_owner="rpi-01")
+    assert leased_task is not None
+    leased_attempt = db.lease_vendor_attempt(
+        task_key="canonical::rolling_partial",
+        task_family="canonical_bars",
+        planner_group="rolling_canonical",
+        vendor="alpaca",
+        lease_owner="rpi-01",
+        payload={"symbols": ["ROLL"], "start_date": "2026-03-16", "end_date": "2026-04-10"},
+    )
+    assert leased_attempt is not None
+    db.upsert_planner_task(
+        task_key="canonical_repair::2026-04-10::000",
+        task_family="canonical_repair",
+        planner_group="canonical_repair",
+        dataset="equities_eod",
+        tier="A",
+        priority=8,
+        start_date="2026-04-10",
+        end_date="2026-04-10",
+        symbols=["FIX"],
+        eligible_vendors=["alpaca", "tiingo"],
+        output_name="equities_bars",
+        payload={"scope_kind": "symbol_range", "backlog_class": "repair", "trading_days": ["2026-04-10"], "repair": True},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical_repair::2026-04-10::000",
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=["FIX"],
+        state={"scope_kind": "symbol_range", "backlog_class": "repair"},
+    )
+
+    service._reclaim_startup_leases()
+
+    reclaimed = next(task for task in db.fetch_planner_tasks(task_family="canonical_bars") if task.task_key == "canonical::rolling_partial")
+    assert reclaimed.status == "PARTIAL"
+    attempt = db.vendor_attempts_for_task("canonical::rolling_partial")[0]
+    assert attempt.status == "FAILED"
+    assert attempt.lease_owner is None
+
+    batch = service._canonical_runtime._lease_canonical_batch("alpaca")
+
+    assert batch
+    assert batch[0].task_key == "canonical_repair::2026-04-10::000"
+
+
 def test_permanent_vendor_failure_does_not_terminally_poison_task_when_alternatives_remain(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

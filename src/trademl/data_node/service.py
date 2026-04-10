@@ -88,6 +88,7 @@ class DataNodeService:
         self._price_check_history: set[str] = set()
         self._planner_seed_history: set[str] = set()
         self._ledger_bootstrap_complete = False
+        self._startup_leases_reclaimed = False
         self._auxiliary_runtime = AuxiliaryRuntime(
             db=self.db,
             connectors=self.connectors,
@@ -1079,6 +1080,7 @@ class DataNodeService:
         """Run the shared scheduled service loop for local and clustered modes."""
         market_tz = ZoneInfo("America/New_York")
         collection_hour, collection_minute = (int(part) for part in collection_time_et.split(":", 1))
+        self._reclaim_startup_leases()
         requeued_failures = self.db.requeue_retryable_failures()
         if requeued_failures:
             LOGGER.info("requeued_retryable_failures count=%s", requeued_failures)
@@ -1147,6 +1149,26 @@ class DataNodeService:
 
             if not self._stop_event.is_set():
                 sleep_fn(poll_seconds)
+
+    def _reclaim_startup_leases(self) -> None:
+        """Release stale logical leases held by this worker across process restarts."""
+        if self._startup_leases_reclaimed:
+            return
+        released_attempts = self.db.release_vendor_attempt_leases_for_owner(
+            lease_owner=self.worker_id,
+            reason="stale worker restart reclaimed vendor attempt lease",
+        )
+        released_tasks = self.db.release_planner_leases_for_owner(
+            lease_owner=self.worker_id,
+        )
+        self._startup_leases_reclaimed = True
+        if released_attempts or released_tasks:
+            LOGGER.warning(
+                "reclaimed_startup_leases worker_id=%s planner_tasks=%s vendor_attempts=%s",
+                self.worker_id,
+                released_tasks,
+                released_attempts,
+            )
 
     def _should_run_collection(
         self,
