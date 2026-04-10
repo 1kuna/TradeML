@@ -16,6 +16,7 @@ from typing import Any
 from trademl.dashboard.controller import (
     advance_collection_stage,
     bootstrap_canonical_ledger,
+    collect_dashboard_health_snapshot,
     collect_dashboard_live_snapshot,
     collect_dashboard_logs_snapshot,
     collect_dashboard_setup_snapshot,
@@ -30,13 +31,21 @@ from trademl.dashboard.controller import (
     resolve_node_settings,
     restart_node,
     rotate_cluster_passphrase,
+    lane_health,
     repair_canonical_backlog,
+    repair_status,
     run_vendor_audit,
     start_node,
+    start_training_run,
     stop_node,
+    stop_training_run,
+    training_preflight_status,
+    training_runtime_logs,
+    training_runtime_status,
     uninstall_worker,
     update_worker,
     update_cluster_secrets,
+    verify_recent_canonical_dates,
     reset_worker,
     NodeSettings,
 )
@@ -501,8 +510,25 @@ HTML_PAGE = """<!doctype html>
             </div>
             <div class="kv" id="training-summary"></div>
             <div style="margin-top:14px">
+              <div class="label">Training Target</div>
+              <div class="form-row">
+                <select id="training-target"></select>
+                <button id="training-preflight" class="secondary">Preflight</button>
+                <button id="training-start">Start</button>
+                <button id="training-stop" class="ghost">Stop</button>
+              </div>
+            </div>
+            <div style="margin-top:14px">
+              <div class="label">Training Runtime</div>
+              <div class="kv" id="training-runtime-summary"></div>
+            </div>
+            <div style="margin-top:14px">
               <div class="label">Phase 1 Command</div>
               <pre id="training-command"></pre>
+            </div>
+            <div style="margin-top:14px">
+              <div class="label">Training Log Preview</div>
+              <pre id="training-log-preview"></pre>
             </div>
           </div>
           <div class="section-card">
@@ -514,6 +540,22 @@ HTML_PAGE = """<!doctype html>
           <div class="section-card">
             <h3 style="margin-bottom:12px">Vendor Utilization</h3>
             <div class="table-wrap"><table id="vendor-table"></table></div>
+          </div>
+          <div class="section-card">
+            <h3 style="margin-bottom:12px">Collector Health</h3>
+            <div class="kv" id="repair-health"></div>
+            <div style="margin-top:14px">
+              <div class="label">Leased Work</div>
+              <div class="kv" id="leased-work-summary"></div>
+            </div>
+            <div style="margin-top:14px">
+              <div class="label">Lane Health</div>
+              <div class="table-wrap"><table id="lane-health-table"></table></div>
+            </div>
+            <div style="margin-top:14px">
+              <div class="label">Latest Experiment</div>
+              <div class="kv" id="experiment-summary"></div>
+            </div>
           </div>
           <div class="section-card">
             <h3 style="margin-bottom:12px">Readiness Detail</h3>
@@ -729,10 +771,24 @@ HTML_PAGE = """<!doctype html>
       const readiness = snapshot.training_readiness || {};
       const phase1 = readiness.phase1 || {};
       const freezeCutoff = readiness.freeze_cutoff || {};
+      const health = snapshot.health || {};
+      const trainingStatus = (snapshot.training_status || {}).phase1 || {};
+      const trainingRuntime = trainingStatus.runtime || trainingStatus || {};
+      const defaultTarget = snapshot.default_training_target || {};
+      const targets = snapshot.training_targets || [];
+      const leasedWork = health.leased_work || {};
+      const repairTasks = health.repair_tasks || {};
+      const experiment = snapshot.experiment_summary || {};
       const command = (snapshot.suggested_training_commands || {}).phase1 || '';
       const readinessPill = document.getElementById('status-readiness-pill');
       readinessPill.textContent = phase1.ready ? 'Phase 1 ready' : 'Phase 1 blocked';
       readinessPill.className = `pill ${phase1.ready ? 'good' : 'warn'}`;
+      const targetSelect = document.getElementById('training-target');
+      const selectedTarget = targetSelect.value || defaultTarget.name || '';
+      targetSelect.innerHTML = targets.map((target) => {
+        const selected = (target.name === selectedTarget || (!selectedTarget && target.default)) ? 'selected' : '';
+        return `<option value="${target.name}" ${selected}>${target.label || target.name}</option>`;
+      }).join('');
       renderKeyValue('training-summary', [
         ['Latest raw date', snapshot.latest_raw_date ?? '-'],
         ['Pending tasks', formatNumber(collection.pending_tasks ?? 0)],
@@ -743,8 +799,38 @@ HTML_PAGE = """<!doctype html>
         ['Rolling remaining', formatNumber(collection.rolling_remaining_units ?? 0)],
         ['Repair remaining', formatNumber(collection.repair_remaining_units ?? 0)],
       ]);
+      renderKeyValue('training-runtime-summary', [
+        ['Target', trainingRuntime.target || defaultTarget.name || '-'],
+        ['Status', trainingRuntime.status || '-'],
+        ['Host', trainingRuntime.host || defaultTarget.host || '-'],
+        ['PID', trainingRuntime.pid ? formatNumber(trainingRuntime.pid) : '-'],
+        ['Started', trainingRuntime.started_at || '-'],
+        ['Finished', trainingRuntime.finished_at || '-'],
+      ]);
       document.getElementById('training-command').textContent = command || 'No training command available yet.';
+      document.getElementById('training-log-preview').textContent = trainingStatus.log_tail || 'No training log available yet.';
       document.getElementById('readiness-json').textContent = JSON.stringify(readiness, null, 2);
+      renderKeyValue('repair-health', [
+        ['Repair pending', formatNumber((repairTasks.counts || {}).PENDING ?? 0)],
+        ['Repair partial', formatNumber((repairTasks.counts || {}).PARTIAL ?? 0)],
+        ['Repair success', formatNumber((repairTasks.counts || {}).SUCCESS ?? 0)],
+        ['Repair remaining units', formatNumber(repairTasks.remaining_units ?? 0)],
+        ['Repair drain / min', repairTasks.drain_rate_per_min ?? 0],
+        ['Repair ETA', formatEta(health.repair_eta_minutes)],
+        ['Recent bad dates', (health.recent_bad_dates || []).join(', ') || '-'],
+      ]);
+      renderKeyValue('leased-work-summary', [
+        ['Pinned leased', formatNumber(((leasedWork.counts || {}).phase1_pinned) ?? 0)],
+        ['Rolling leased', formatNumber(((leasedWork.counts || {}).rolling) ?? 0)],
+        ['Repair leased', formatNumber(((leasedWork.counts || {}).repair) ?? 0)],
+      ]);
+      renderKeyValue('experiment-summary', [
+        ['Experiment', experiment.experiment_id || '-'],
+        ['Runs', formatNumber(experiment.run_count ?? 0)],
+        ['Running', formatNumber((experiment.counts || {}).RUNNING ?? 0)],
+        ['Completed', formatNumber((experiment.counts || {}).COMPLETED ?? 0)],
+        ['Best candidate', experiment.best_candidate || experiment.best_run_id || '-'],
+      ]);
       document.getElementById('status-updated').textContent = `Status refreshed ${new Date().toLocaleTimeString()}`;
       renderTable('coverage-table', snapshot.dataset_coverage ? Object.values(snapshot.dataset_coverage).map((details) => ({
         dataset: details.label,
@@ -754,6 +840,7 @@ HTML_PAGE = """<!doctype html>
         blocking: details.blocking ? 'yes' : 'no',
       })) : []);
       renderTable('vendor-table', (snapshot.vendor_throughput || {}).rows || []);
+      renderTable('lane-health-table', health.vendor_lane_health || []);
     }
 
     function renderSetup(snapshot) {
@@ -940,6 +1027,23 @@ HTML_PAGE = """<!doctype html>
       }
     });
 
+    document.getElementById('training-preflight').addEventListener('click', async () => {
+      await runAction('train-preflight', {phase: 1, target: document.getElementById('training-target').value});
+    });
+
+    document.getElementById('training-start').addEventListener('click', async () => {
+      const freeze = (((currentLiveSnapshot || {}).training_readiness || {}).freeze_cutoff || {}).date || null;
+      await runAction('train-start', {
+        phase: 1,
+        target: document.getElementById('training-target').value,
+        report_date: freeze,
+      });
+    });
+
+    document.getElementById('training-stop').addEventListener('click', async () => {
+      await runAction('train-stop', {phase: 1, target: document.getElementById('training-target').value});
+    });
+
     document.getElementById('rotate-passphrase').addEventListener('click', async () => {
       try {
         setMessage('setup-message', 'Rotating passphrase...', 'warn');
@@ -1087,7 +1191,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     server: DashboardHTTPServer
 
     def do_HEAD(self) -> None:  # noqa: N802
-        if self.path in {"/", "/api/live", "/api/status", "/api/setup", "/api/logs", "/_stcore/health", "/_stcore/host-config"}:
+        if self.path in {"/", "/api/live", "/api/status", "/api/health", "/api/setup", "/api/logs", "/_stcore/health", "/_stcore/host-config"}:
             content_type = "text/html; charset=utf-8" if self.path == "/" else "application/json; charset=utf-8"
             self._write_headers(status=HTTPStatus.OK, content_type=content_type)
             return
@@ -1108,6 +1212,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/status":
             self._write_json(collect_dashboard_status_snapshot(self.server.settings))
+            return
+        if self.path == "/api/health":
+            self._write_json(collect_dashboard_health_snapshot(self.server.settings))
             return
         if self.path == "/api/setup":
             self._write_json(collect_dashboard_setup_snapshot(self.server.settings))
@@ -1218,6 +1325,49 @@ def dispatch_dashboard_action(settings: NodeSettings, action: str, payload: dict
             end_date=_optional_str(payload.get("end_date")),
             symbol=_optional_str(payload.get("symbol")),
             verify_only=bool(payload.get("verify_only")),
+        )
+    if action == "verify-recent":
+        return verify_recent_canonical_dates(
+            settings,
+            days=int(payload.get("days") or 7),
+            dataset=str(payload.get("dataset") or "equities_eod"),
+            verify_only=bool(payload.get("verify_only")),
+        )
+    if action == "repair-status":
+        return repair_status(settings)
+    if action == "lane-health":
+        return lane_health(settings, dataset=str(payload.get("dataset") or "equities_eod"))
+    if action == "train-preflight":
+        return training_preflight_status(
+            settings,
+            phase=int(payload.get("phase") or 1),
+            target=_optional_str(payload.get("target")),
+        )
+    if action == "train-start":
+        return start_training_run(
+            settings,
+            phase=int(payload.get("phase") or 1),
+            report_date=_optional_str(payload.get("report_date")),
+            target=_optional_str(payload.get("target")),
+        )
+    if action == "train-stop":
+        return stop_training_run(
+            settings,
+            phase=int(payload.get("phase") or 1),
+            target=_optional_str(payload.get("target")),
+        )
+    if action == "train-status":
+        return training_runtime_status(
+            settings,
+            phase=int(payload.get("phase") or 1),
+            target=_optional_str(payload.get("target")),
+        )
+    if action == "train-logs":
+        return training_runtime_logs(
+            settings,
+            phase=int(payload.get("phase") or 1),
+            target=_optional_str(payload.get("target")),
+            tail_lines=int(payload.get("tail_lines") or 50),
         )
     if action == "save-settings":
         return persist_node_settings(

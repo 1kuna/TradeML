@@ -87,6 +87,7 @@ class DataNodeService:
         self._reference_history: set[str] = set()
         self._price_check_history: set[str] = set()
         self._planner_seed_history: set[str] = set()
+        self._verification_history: set[str] = set()
         self._ledger_bootstrap_complete = False
         self._startup_leases_reclaimed = False
         self._auxiliary_runtime = AuxiliaryRuntime(
@@ -181,6 +182,15 @@ class DataNodeService:
                 expected_rows=expected_rows,
                 qc_code=qc_code,
             )
+        if changed_dates:
+            verification = self._verify_and_seed_canonical_repairs(
+                trading_date=max(changed_dates),
+                changed_dates=changed_dates,
+                symbol_filter=None,
+                verify_only=False,
+            )
+            if verification.get("seeded_tasks", 0):
+                LOGGER.warning("seeded_canonical_repairs count=%s", verification["seeded_tasks"])
         return changed_dates
 
     def collect_forward(self, *, trading_date: str, symbols: list[str]) -> list[str]:
@@ -477,6 +487,45 @@ class DataNodeService:
             "repairable_all_blocked_before": before_all_blocked,
             "repairable_all_blocked_after": after_all_blocked,
             **verification,
+        }
+
+    def verify_recent_canonical_dates(
+        self,
+        *,
+        days: int = 7,
+        dataset: str = "equities_eod",
+        verify_only: bool = False,
+    ) -> dict[str, object]:
+        """Verify the most recently touched canonical dates and seed repair tasks when needed."""
+        manifests = self.db.fetch_raw_partition_manifests(dataset=dataset)
+        target_dates = [manifest.trading_date for manifest in manifests[-max(1, int(days)) :]]
+        if not target_dates:
+            return {
+                "verified_dates": 0,
+                "seeded_tasks": 0,
+                "unreadable_dates": 0,
+                "quarantined_units": 0,
+                "missing_units": 0,
+                "verify_only": verify_only,
+                "recent_bad_dates": [],
+            }
+        trading_date = max(target_dates)
+        verification = self._verify_and_seed_canonical_repairs(
+            trading_date=trading_date,
+            changed_dates=target_dates,
+            symbol_filter=None,
+            verify_only=verify_only,
+        )
+        recent_bad_dates = [
+            manifest.trading_date
+            for manifest in self.db.fetch_raw_partition_manifests(dataset=dataset)
+            if manifest.trading_date in set(target_dates) and manifest.status != "HEALTHY"
+        ]
+        return {
+            **verification,
+            "recent_bad_dates": sorted(set(recent_bad_dates)),
+            "dataset": dataset,
+            "days": max(1, int(days)),
         }
 
     def _verify_and_seed_canonical_repairs(
@@ -1133,6 +1182,11 @@ class DataNodeService:
                     current_local=current_local,
                     pending_backfill=pending_backfill,
                 )
+            if local_day not in self._verification_history and current_local.hour >= maintenance_hour_local:
+                verification = self.verify_recent_canonical_dates(days=7, verify_only=False)
+                if verification.get("seeded_tasks", 0):
+                    LOGGER.warning("seeded_canonical_repairs count=%s", verification["seeded_tasks"])
+                self._verification_history.add(local_day)
 
             if (
                 after_backlog_clear_fn is not None

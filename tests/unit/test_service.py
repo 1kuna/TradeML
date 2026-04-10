@@ -1789,6 +1789,32 @@ def test_repair_canonical_backlog_seeds_targeted_repair_tasks(tmp_path: Path) ->
     assert repair_tasks[0].payload["backlog_class"] == "repair"
 
 
+def test_verify_recent_canonical_dates_reports_recent_bad_dates(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    service.default_symbols = ["AAPL", "MSFT"]
+    partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16"
+    partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"date": "2025-12-16", "symbol": "AAPL", "source_name": "alpaca"}]).to_parquet(
+        partition / "data.parquet",
+        index=False,
+    )
+    service.bootstrap_canonical_ledger()
+
+    result = service.verify_recent_canonical_dates(days=1)
+
+    assert result["verified_dates"] == 1
+    assert result["missing_units"] == 1
+    assert result["recent_bad_dates"] == ["2025-12-16"]
+
+
 def test_write_raw_partition_serializes_concurrent_same_day_writes(tmp_path: Path, monkeypatch) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

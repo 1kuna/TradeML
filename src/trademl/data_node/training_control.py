@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
+from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,33 @@ from trademl.data_node.db import DataNodeDB
 from trademl.data_node.planner import training_readiness
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class TrainingTarget:
+    """Resolved training execution target."""
+
+    name: str
+    kind: str
+    default: bool
+    host: str | None
+    user: str | None
+    port: int
+    repo_root: Path
+    data_root: Path
+    python_executable: str
+    env_path: Path | None
+    identity_file: Path | None
+    local_runtime_root: Path
+
+    @property
+    def label(self) -> str:
+        """Return a compact display label for the target."""
+        if self.kind == "local":
+            return f"{self.name} ({_hostname()})"
+        if self.host:
+            return f"{self.name} ({self.host})"
+        return self.name
 
 
 def phase_freeze_state_path(*, data_root: Path, phase: int = 1) -> Path:
@@ -78,6 +108,110 @@ def read_training_runtime(
     else:
         payload["running"] = status in {"starting", "running"}
     return payload
+
+
+def local_training_runtime_path(
+    *,
+    local_state: Path,
+    phase: int,
+    runtime_name: str | None = None,
+    target_name: str | None = None,
+) -> Path:
+    """Return the controller-side runtime mirror path for a training run."""
+    if runtime_name:
+        target_segment = target_name or "local"
+        return local_state / "training_runs" / target_segment / f"{runtime_name}.json"
+    if target_name and target_name != "local":
+        return local_state / "training_runs" / target_name / f"training_phase_{phase}.json"
+    return local_state / f"training_phase_{phase}.json"
+
+
+def shared_training_runtime_path(*, data_root: Path, phase: int, runtime_name: str | None = None) -> Path:
+    """Return the NAS-visible runtime state path for a training phase or experiment run."""
+    if runtime_name:
+        return data_root / "control" / "cluster" / "state" / "training_runs" / f"{runtime_name}.json"
+    return data_root / "control" / "cluster" / "state" / f"training_phase_{phase}.json"
+
+
+def resolve_training_targets(
+    *,
+    targets_config_path: Path,
+    repo_root: Path,
+    data_root: Path,
+    local_state: Path,
+    python_executable: str = sys.executable,
+) -> dict[str, TrainingTarget]:
+    """Resolve configured training targets plus the implicit local target."""
+    config = _read_yaml(targets_config_path)
+    training_settings = config.get("training", {}) if isinstance(config, dict) else {}
+    configured_targets = config.get("training_targets", {}) if isinstance(config, dict) else {}
+    targets: dict[str, TrainingTarget] = {
+        "local": TrainingTarget(
+            name="local",
+            kind="local",
+            default=False,
+            host=_hostname(),
+            user=None,
+            port=22,
+            repo_root=repo_root,
+            data_root=data_root,
+            python_executable=python_executable,
+            env_path=None,
+            identity_file=None,
+            local_runtime_root=local_state,
+        )
+    }
+    for name, payload in configured_targets.items():
+        if not isinstance(payload, dict):
+            continue
+        kind = str(payload.get("kind") or "ssh").strip().lower()
+        targets[str(name)] = TrainingTarget(
+            name=str(name),
+            kind=kind,
+            default=False,
+            host=_optional_target_value(payload.get("host")),
+            user=_optional_target_value(payload.get("user")),
+            port=int(payload.get("port") or 22),
+            repo_root=Path(str(payload.get("repo_root") or repo_root)).expanduser(),
+            data_root=Path(str(payload.get("data_root") or data_root)).expanduser(),
+            python_executable=str(payload.get("python_executable") or python_executable),
+            env_path=Path(str(payload["env_path"])).expanduser() if payload.get("env_path") else None,
+            identity_file=Path(str(payload["identity_file"])).expanduser() if payload.get("identity_file") else None,
+            local_runtime_root=Path(str(payload.get("local_runtime_root") or local_state)).expanduser(),
+        )
+    preferred_name = str(training_settings.get("default_target") or ("workstation-remote" if "workstation-remote" in targets else "local"))
+    if preferred_name not in targets:
+        preferred_name = "local"
+    targets[preferred_name].default = True
+    return targets
+
+
+def resolve_training_target(
+    *,
+    target_name: str | None,
+    targets_config_path: Path,
+    repo_root: Path,
+    data_root: Path,
+    local_state: Path,
+    python_executable: str = sys.executable,
+) -> TrainingTarget:
+    """Resolve one training target by name, defaulting to the configured default."""
+    targets = resolve_training_targets(
+        targets_config_path=targets_config_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        python_executable=python_executable,
+    )
+    if target_name is None:
+        for target in targets.values():
+            if target.default:
+                return target
+        return targets["local"]
+    if target_name not in targets:
+        available = ", ".join(sorted(targets))
+        raise ValueError(f"unknown training target {target_name!r}; available={available}")
+    return targets[target_name]
 
 
 def evaluate_training_gates(
@@ -304,8 +438,373 @@ def _frozen_window_bar_coverage(
     }
 
 
-def training_preflight(*, data_root: Path, config_path: Path) -> dict[str, Any]:
-    """Run a lightweight training preflight before launching long-running work."""
+def training_preflight(
+    *,
+    data_root: Path,
+    config_path: Path,
+    repo_root: Path | None = None,
+    local_state: Path | None = None,
+    targets_config_path: Path | None = None,
+    target: str | None = None,
+    python_executable: str = sys.executable,
+) -> dict[str, Any]:
+    """Run control-plane, target, and dataset preflight before launching long-running work."""
+    repo_root = repo_root or config_path.parents[1]
+    local_state = local_state or Path("~/.trademl-training").expanduser()
+    targets_config_path = targets_config_path or (repo_root / "configs" / "node.yml")
+    if not config_path.exists():
+        return {"ok": False, "reason": f"missing config: {config_path}", "control": {"ok": False, "config_path": str(config_path)}}
+    resolved_target = resolve_training_target(
+        target_name=target,
+        targets_config_path=targets_config_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        python_executable=python_executable,
+    )
+    control = {"ok": True, "config_path": str(config_path), "repo_root": str(repo_root)}
+    target_report = _target_preflight(target=resolved_target, config_filename=config_path.name)
+    dataset_report = _dataset_preflight(target=resolved_target, config_filename=config_path.name)
+    ok = bool(control["ok"] and target_report.get("ok") and dataset_report.get("ok"))
+    reason = None
+    for report in (target_report, dataset_report):
+        if not report.get("ok", False):
+            reason = str(report.get("reason"))
+            break
+    payload = {
+        "ok": ok,
+        "reason": reason,
+        "control": control,
+        "target": target_report,
+        "dataset": dataset_report,
+        "resolved_target": asdict(resolved_target),
+    }
+    if dataset_report.get("sample_rows") is not None:
+        payload["sample_rows"] = int(dataset_report["sample_rows"])
+        payload["sample_date"] = dataset_report.get("sample_date")
+        payload["qc_path"] = dataset_report.get("qc_path")
+    return payload
+
+
+def launch_training_process(
+    *,
+    repo_root: Path,
+    data_root: Path,
+    local_state: Path,
+    env_path: Path,
+    phase: int,
+    model_suite: str | None = None,
+    python_executable: str = sys.executable,
+    report_date: str | None = None,
+    target: str | None = None,
+    targets_config_path: Path | None = None,
+    runtime_name: str | None = None,
+    config_path: Path | None = None,
+) -> dict[str, Any]:
+    """Launch or resume the background training process for a phase."""
+    targets_config_path = targets_config_path or (repo_root / "configs" / "node.yml")
+    config_path = config_path or (repo_root / "configs" / "equities_xs.yml")
+    resolved_target = resolve_training_target(
+        target_name=target,
+        targets_config_path=targets_config_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        python_executable=python_executable,
+    )
+    runtime_path = local_training_runtime_path(
+        local_state=resolved_target.local_runtime_root,
+        phase=phase,
+        runtime_name=runtime_name,
+        target_name=resolved_target.name,
+    )
+    existing = read_training_runtime(path=runtime_path)
+    if existing.get("running"):
+        return existing
+
+    preflight = training_preflight(
+        data_root=data_root,
+        config_path=config_path,
+        repo_root=repo_root,
+        local_state=local_state,
+        targets_config_path=targets_config_path,
+        target=resolved_target.name,
+        python_executable=python_executable,
+    )
+    if not preflight["ok"]:
+        raise RuntimeError(f"phase {phase} training preflight failed: {preflight['reason']}")
+    resolved_report_date = report_date
+    if resolved_report_date is None:
+        freeze_cutoff = recommended_training_cutoff(
+            data_root=resolved_target.data_root,
+            expected_symbol_count=_stage_symbol_count(resolved_target.data_root),
+        )
+        resolved_report_date = freeze_cutoff.get("date") or date.today().isoformat()
+
+    shared_runtime_path = shared_training_runtime_path(
+        data_root=resolved_target.data_root,
+        phase=phase,
+        runtime_name=runtime_name,
+    )
+    log_path = _local_training_log_path(
+        local_state=resolved_target.local_runtime_root,
+        phase=phase,
+        runtime_name=runtime_name,
+        target_name=resolved_target.name,
+    )
+    remote_runtime_path = _remote_training_runtime_path(
+        target=resolved_target,
+        phase=phase,
+        runtime_name=runtime_name,
+    )
+    remote_log_path = _remote_training_log_path(
+        target=resolved_target,
+        phase=phase,
+        runtime_name=runtime_name,
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_payload = {
+        "phase": phase,
+        "pid": None,
+        "host": _hostname() if resolved_target.kind == "local" else resolved_target.host,
+        "status": "starting",
+        "started_at": datetime.now(tz=UTC).isoformat(),
+        "config_path": str(config_path),
+        "data_root": str(resolved_target.data_root),
+        "report_date": resolved_report_date,
+        "model_suite": model_suite or ("ridge_only" if phase == 1 else "full"),
+        "log_path": str(log_path),
+        "remote_log_path": str(remote_log_path) if remote_log_path is not None else None,
+        "remote_runtime_path": str(remote_runtime_path) if remote_runtime_path is not None else None,
+        "target": resolved_target.name,
+        "target_kind": resolved_target.kind,
+        "shared_runtime_path": str(shared_runtime_path),
+        "running": True,
+        "preflight": preflight,
+    }
+    _write_runtime_payload(runtime_path, runtime_payload)
+    if resolved_target.kind == "local":
+        _write_runtime_payload(shared_runtime_path, runtime_payload)
+        command = [
+            python_executable,
+            str(repo_root / "src" / "scripts" / "training_job.py"),
+            "--data-root",
+            str(resolved_target.data_root),
+            "--config",
+            str(config_path),
+            "--output-root",
+            str(resolved_target.data_root),
+            "--report-date",
+            resolved_report_date,
+            "--model-suite",
+            model_suite or ("ridge_only" if phase == 1 else "full"),
+            "--phase",
+            str(phase),
+            "--local-runtime-path",
+            str(runtime_path),
+            "--shared-runtime-path",
+            str(shared_runtime_path),
+        ]
+        env = os.environ.copy()
+        env.update(_read_env_file(env_path))
+        with log_path.open("a", encoding="utf-8") as handle:
+            process = subprocess.Popen(  # noqa: S603
+                command,
+                cwd=repo_root,
+                env=env,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        runtime_payload["pid"] = process.pid
+        runtime_payload["command"] = command
+        _write_runtime_payload(runtime_path, runtime_payload)
+        _write_runtime_payload(shared_runtime_path, runtime_payload)
+        return runtime_payload
+
+    remote_pid = _launch_remote_training_process(
+        target=resolved_target,
+        phase=phase,
+        config_filename=config_path.name,
+        report_date=resolved_report_date,
+        model_suite=model_suite or ("ridge_only" if phase == 1 else "full"),
+        shared_runtime_path=shared_runtime_path,
+        runtime_name=runtime_name,
+    )
+    runtime_payload["pid"] = remote_pid
+    runtime_payload["command"] = ["ssh", resolved_target.host or "", str(remote_log_path)]
+    _write_runtime_payload(runtime_path, runtime_payload)
+    return runtime_payload
+
+
+def training_status_snapshot(
+    *,
+    repo_root: Path,
+    data_root: Path,
+    local_state: Path,
+    phase: int,
+    target: str | None = None,
+    targets_config_path: Path | None = None,
+    python_executable: str = sys.executable,
+    runtime_name: str | None = None,
+    tail_lines: int = 50,
+) -> dict[str, Any]:
+    """Return merged local/shared/remote runtime state for a training run."""
+    targets_config_path = targets_config_path or (repo_root / "configs" / "node.yml")
+    resolved_target = resolve_training_target(
+        target_name=target,
+        targets_config_path=targets_config_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        python_executable=python_executable,
+    )
+    local_path = local_training_runtime_path(
+        local_state=resolved_target.local_runtime_root,
+        phase=phase,
+        runtime_name=runtime_name,
+        target_name=resolved_target.name,
+    )
+    shared_path = shared_training_runtime_path(
+        data_root=resolved_target.data_root,
+        phase=phase,
+        runtime_name=runtime_name,
+    )
+    local_runtime = read_training_runtime(path=local_path)
+    shared_runtime = read_training_runtime(path=shared_path)
+    remote_runtime = _remote_runtime_snapshot(
+        target=resolved_target,
+        phase=phase,
+        runtime_name=runtime_name,
+        local_runtime=local_runtime,
+        shared_runtime=shared_runtime,
+    )
+    effective = dict(shared_runtime or local_runtime)
+    if remote_runtime:
+        effective.update({key: value for key, value in remote_runtime.items() if value is not None})
+    if local_runtime.get("status") and not effective.get("status"):
+        effective["status"] = local_runtime["status"]
+    if "running" not in effective:
+        effective["running"] = bool(local_runtime.get("running") or shared_runtime.get("running"))
+    log_tail = _training_log_tail(
+        target=resolved_target,
+        phase=phase,
+        runtime_name=runtime_name,
+        tail_lines=tail_lines,
+        runtime=effective,
+    )
+    return {
+        "target": asdict(resolved_target),
+        "local": local_runtime,
+        "shared": shared_runtime,
+        "remote": remote_runtime,
+        "runtime": effective,
+        "log_tail": log_tail,
+    }
+
+
+def stop_training_process(
+    *,
+    repo_root: Path,
+    data_root: Path,
+    local_state: Path,
+    phase: int,
+    target: str | None = None,
+    targets_config_path: Path | None = None,
+    python_executable: str = sys.executable,
+    runtime_name: str | None = None,
+) -> dict[str, Any]:
+    """Stop a detached training process and persist a stopped runtime state."""
+    snapshot = training_status_snapshot(
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        phase=phase,
+        target=target,
+        targets_config_path=targets_config_path,
+        python_executable=python_executable,
+        runtime_name=runtime_name,
+        tail_lines=20,
+    )
+    runtime = dict(snapshot.get("runtime") or {})
+    pid = runtime.get("pid")
+    if not isinstance(pid, int):
+        return {"stopped": False, "reason": "no active pid", **snapshot}
+    resolved_target = TrainingTarget(**snapshot["target"])
+    if resolved_target.kind == "local":
+        os.kill(pid, signal.SIGTERM)
+    else:
+        _run_ssh_command(
+            resolved_target,
+            f"kill -TERM {pid}",
+            check=True,
+        )
+    runtime.update(
+        {
+            "status": "stopped",
+            "running": False,
+            "finished_at": datetime.now(tz=UTC).isoformat(),
+        }
+    )
+    local_path = local_training_runtime_path(
+        local_state=resolved_target.local_runtime_root,
+        phase=phase,
+        runtime_name=runtime_name,
+        target_name=resolved_target.name,
+    )
+    _write_runtime_payload(local_path, runtime)
+    shared_path = Path(str(runtime.get("shared_runtime_path") or shared_training_runtime_path(data_root=resolved_target.data_root, phase=phase, runtime_name=runtime_name)))
+    _write_runtime_payload(shared_path, runtime)
+    return {"stopped": True, "runtime": runtime, "target": snapshot["target"], "log_tail": snapshot["log_tail"]}
+
+
+def training_log_tail(
+    *,
+    repo_root: Path,
+    data_root: Path,
+    local_state: Path,
+    phase: int,
+    target: str | None = None,
+    targets_config_path: Path | None = None,
+    python_executable: str = sys.executable,
+    runtime_name: str | None = None,
+    tail_lines: int = 50,
+) -> dict[str, Any]:
+    """Return the current runtime plus the latest training log tail."""
+    return training_status_snapshot(
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        phase=phase,
+        target=target,
+        targets_config_path=targets_config_path,
+        python_executable=python_executable,
+        runtime_name=runtime_name,
+        tail_lines=tail_lines,
+    )
+
+
+def _dataset_preflight(*, target: TrainingTarget, config_filename: str) -> dict[str, Any]:
+    """Run dataset-level preflight on the resolved execution target."""
+    if target.kind == "local":
+        return _local_dataset_preflight(data_root=target.data_root, config_path=target.repo_root / "configs" / config_filename)
+    command = _remote_python_here_doc(
+        target,
+        f"""
+import json
+from pathlib import Path
+from trademl.data_node.training_control import _local_dataset_preflight
+print(json.dumps(_local_dataset_preflight(data_root=Path({target.data_root.as_posix()!r}), config_path=Path({(target.repo_root / 'configs' / config_filename).as_posix()!r}))))
+""",
+    )
+    result = _run_ssh_command(target, command)
+    if result.returncode != 0:
+        return {"ok": False, "reason": result.stderr.strip() or result.stdout.strip() or "remote dataset preflight failed"}
+    return json.loads(result.stdout.strip() or "{}")
+
+
+def _local_dataset_preflight(*, data_root: Path, config_path: Path) -> dict[str, Any]:
+    """Run the existing local dataset preflight checks."""
     qc_path = data_root / "data" / "qc" / "partition_status.parquet"
     curated_root = data_root / "data" / "curated" / "equities_ohlcv_adj"
     if not config_path.exists():
@@ -326,93 +825,207 @@ def training_preflight(*, data_root: Path, config_path: Path) -> dict[str, Any]:
     }
 
 
-def launch_training_process(
-    *,
-    repo_root: Path,
-    data_root: Path,
-    local_state: Path,
-    env_path: Path,
-    phase: int,
-    model_suite: str | None = None,
-    python_executable: str = sys.executable,
-    report_date: str | None = None,
-) -> dict[str, Any]:
-    """Launch or resume the background training process for a phase."""
-    existing = read_training_runtime(local_state=local_state, phase=phase)
-    if existing.get("running"):
-        return existing
-
-    config_path = repo_root / "configs" / "equities_xs.yml"
-    preflight = training_preflight(data_root=data_root, config_path=config_path)
-    if not preflight["ok"]:
-        raise RuntimeError(f"phase {phase} training preflight failed: {preflight['reason']}")
-    resolved_report_date = report_date
-    if resolved_report_date is None:
-        freeze_cutoff = recommended_training_cutoff(data_root=data_root, expected_symbol_count=_stage_symbol_count(data_root))
-        resolved_report_date = freeze_cutoff.get("date") or date.today().isoformat()
-
-    log_path = local_state / "logs" / f"training_phase_{phase}.log"
-    runtime_path = local_state / f"training_phase_{phase}.json"
-    shared_runtime_path = shared_training_runtime_path(data_root=data_root, phase=phase)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    runtime_payload = {
-        "phase": phase,
-        "pid": None,
-        "host": _hostname(),
-        "status": "starting",
-        "started_at": datetime.now(tz=UTC).isoformat(),
-        "config_path": str(config_path),
-        "data_root": str(data_root),
-        "report_date": resolved_report_date,
-        "model_suite": model_suite or ("ridge_only" if phase == 1 else "full"),
-        "log_path": str(log_path),
-        "shared_runtime_path": str(shared_runtime_path),
-        "running": True,
-        "preflight": preflight,
+def _target_preflight(*, target: TrainingTarget, config_filename: str) -> dict[str, Any]:
+    """Verify that the requested training target is reachable and correctly configured."""
+    if target.kind == "local":
+        config_path = target.repo_root / "configs" / config_filename
+        return {
+            "ok": bool(config_path.exists()),
+            "target": target.name,
+            "kind": target.kind,
+            "host": _hostname(),
+            "repo_root": str(target.repo_root),
+            "data_root": str(target.data_root),
+            "python_executable": target.python_executable,
+            "reason": None if config_path.exists() else f"missing config: {config_path}",
+        }
+    if not target.host or not target.user:
+        return {"ok": False, "target": target.name, "kind": target.kind, "reason": "ssh target requires host and user"}
+    command = " && ".join(
+        [
+            f"test -d {shlex.quote(str(target.repo_root))}",
+            f"test -d {shlex.quote(str(target.data_root))}",
+            f"test -f {shlex.quote(str(target.repo_root / 'configs' / config_filename))}",
+            f"{shlex.quote(target.python_executable)} -V",
+        ]
+    )
+    result = _run_ssh_command(target, command)
+    return {
+        "ok": result.returncode == 0,
+        "target": target.name,
+        "kind": target.kind,
+        "host": target.host,
+        "repo_root": str(target.repo_root),
+        "data_root": str(target.data_root),
+        "python_executable": target.python_executable,
+        "reason": None if result.returncode == 0 else (result.stderr.strip() or result.stdout.strip() or "remote target preflight failed"),
     }
-    _write_runtime_payload(runtime_path, runtime_payload)
-    _write_runtime_payload(shared_runtime_path, runtime_payload)
-    command = [
-        python_executable,
-        str(repo_root / "src" / "scripts" / "training_job.py"),
-        "--data-root",
-        str(data_root),
-        "--config",
-        str(config_path),
-        "--output-root",
-        str(data_root),
-        "--report-date",
-        resolved_report_date,
-        "--model-suite",
-        model_suite or ("ridge_only" if phase == 1 else "full"),
-        "--phase",
-        str(phase),
-        "--local-runtime-path",
-        str(runtime_path),
-        "--shared-runtime-path",
-        str(shared_runtime_path),
-    ]
-    env = os.environ.copy()
-    env.update(_read_env_file(env_path))
-    with log_path.open("a", encoding="utf-8") as handle:
-        process = subprocess.Popen(  # noqa: S603
-            command,
-            cwd=repo_root,
-            env=env,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    runtime_payload["pid"] = process.pid
-    runtime_payload["command"] = command
-    _write_runtime_payload(runtime_path, runtime_payload)
-    _write_runtime_payload(shared_runtime_path, runtime_payload)
-    return runtime_payload
 
 
-def shared_training_runtime_path(*, data_root: Path, phase: int) -> Path:
-    """Return the NAS-visible runtime state path for a training phase."""
-    return data_root / "control" / "cluster" / "state" / f"training_phase_{phase}.json"
+def _launch_remote_training_process(
+    *,
+    target: TrainingTarget,
+    phase: int,
+    config_filename: str,
+    report_date: str,
+    model_suite: str,
+    shared_runtime_path: Path,
+    runtime_name: str | None,
+) -> int:
+    """Launch a detached training job on a remote SSH target."""
+    remote_runtime_path = _remote_training_runtime_path(target=target, phase=phase, runtime_name=runtime_name)
+    remote_log_path = _remote_training_log_path(target=target, phase=phase, runtime_name=runtime_name)
+    assert remote_runtime_path is not None
+    assert remote_log_path is not None
+    command = " && ".join(
+        [
+            f"mkdir -p {shlex.quote(str(remote_runtime_path.parent))}",
+            f"mkdir -p {shlex.quote(str(remote_log_path.parent))}",
+            f"cd {shlex.quote(str(target.repo_root))}",
+            " ".join(
+                [
+                    "nohup",
+                    shlex.quote(target.python_executable),
+                    "src/scripts/training_job.py",
+                    "--data-root",
+                    shlex.quote(str(target.data_root)),
+                    "--config",
+                    shlex.quote(str(target.repo_root / 'configs' / config_filename)),
+                    "--output-root",
+                    shlex.quote(str(target.data_root)),
+                    "--report-date",
+                    shlex.quote(report_date),
+                    "--model-suite",
+                    shlex.quote(model_suite),
+                    "--phase",
+                    shlex.quote(str(phase)),
+                    "--local-runtime-path",
+                    shlex.quote(str(remote_runtime_path)),
+                    "--shared-runtime-path",
+                    shlex.quote(str(shared_runtime_path)),
+                    f">>{shlex.quote(str(remote_log_path))}",
+                    "2>&1",
+                    "</dev/null",
+                    "&",
+                    "echo",
+                    "$!",
+                ]
+            ),
+        ]
+    )
+    result = _run_ssh_command(target, command, check=True)
+    pid = int(str(result.stdout).strip().splitlines()[-1])
+    return pid
+
+
+def _remote_runtime_snapshot(
+    *,
+    target: TrainingTarget,
+    phase: int,
+    runtime_name: str | None,
+    local_runtime: dict[str, Any],
+    shared_runtime: dict[str, Any],
+) -> dict[str, Any]:
+    """Read remote runtime state when the target is SSH-backed."""
+    if target.kind == "local":
+        return {}
+    remote_runtime_path = _remote_training_runtime_path(target=target, phase=phase, runtime_name=runtime_name)
+    if remote_runtime_path is None:
+        return {}
+    command = _remote_python_here_doc(
+        target,
+        f"""
+import json
+from pathlib import Path
+from trademl.data_node.training_control import read_training_runtime
+payload = read_training_runtime(path=Path({remote_runtime_path.as_posix()!r}))
+print(json.dumps(payload))
+""",
+    )
+    result = _run_ssh_command(target, command)
+    if result.returncode != 0 or not result.stdout.strip():
+        return {}
+    try:
+        payload = json.loads(result.stdout.strip())
+    except json.JSONDecodeError:
+        return {}
+    if not payload:
+        payload.update(shared_runtime or local_runtime)
+    return payload
+
+
+def _training_log_tail(
+    *,
+    target: TrainingTarget,
+    phase: int,
+    runtime_name: str | None,
+    tail_lines: int,
+    runtime: dict[str, Any],
+) -> str:
+    """Read the latest training log lines from the correct execution target."""
+    if target.kind == "local":
+        log_path = Path(str(runtime.get("log_path") or _local_training_log_path(local_state=target.local_runtime_root, phase=phase, runtime_name=runtime_name, target_name=target.name)))
+        if not log_path.exists():
+            return ""
+        return "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-tail_lines:])
+    remote_log_path = Path(str(runtime.get("remote_log_path") or _remote_training_log_path(target=target, phase=phase, runtime_name=runtime_name)))
+    result = _run_ssh_command(target, f"tail -n {int(tail_lines)} {shlex.quote(str(remote_log_path))}")
+    if result.returncode != 0:
+        return result.stderr.strip() or ""
+    return result.stdout
+
+
+def _local_training_log_path(*, local_state: Path, phase: int, runtime_name: str | None, target_name: str) -> Path:
+    """Return the controller-side training log path."""
+    if runtime_name:
+        return local_state / "logs" / "training_runs" / target_name / f"{runtime_name}.log"
+    return local_state / "logs" / f"training_phase_{phase}.log"
+
+
+def _remote_training_runtime_path(*, target: TrainingTarget, phase: int, runtime_name: str | None) -> Path | None:
+    """Return the remote runtime path for a target-backed training run."""
+    if target.kind == "local":
+        return None
+    if runtime_name:
+        return target.repo_root / "control" / "training_runs" / f"{runtime_name}.json"
+    return target.repo_root / "control" / f"training_phase_{phase}.json"
+
+
+def _remote_training_log_path(*, target: TrainingTarget, phase: int, runtime_name: str | None) -> Path | None:
+    """Return the remote log path for a target-backed training run."""
+    if target.kind == "local":
+        return None
+    if runtime_name:
+        return target.repo_root / "control" / "logs" / "training_runs" / f"{runtime_name}.log"
+    return target.repo_root / "control" / "logs" / f"training_phase_{phase}.log"
+
+
+def _remote_python_here_doc(target: TrainingTarget, body: str) -> str:
+    """Wrap a Python here-doc for remote execution."""
+    return " && ".join(
+        [
+            f"cd {shlex.quote(str(target.repo_root))}",
+            f"PYTHONPATH=src {shlex.quote(target.python_executable)} - <<'PY'\n{body.strip()}\nPY",
+        ]
+    )
+
+
+def _run_ssh_command(target: TrainingTarget, command: str, *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    """Run one remote shell command against an SSH training target."""
+    ssh_command = ["ssh", "-p", str(target.port)]
+    if target.identity_file is not None:
+        ssh_command.extend(["-i", str(target.identity_file)])
+    ssh_command.append(f"{target.user}@{target.host}")
+    ssh_command.append(command)
+    result = subprocess.run(  # noqa: S603
+        ssh_command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"ssh command failed for target={target.name}")
+    return result
 
 
 def _raw_green_ratio(qc_path: Path) -> float | None:
@@ -511,6 +1124,11 @@ def _read_env_file(path: Path) -> dict[str, str]:
         key, value = stripped.split("=", 1)
         values[key] = value
     return values
+
+
+def _optional_target_value(value: object) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    return text or None
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:

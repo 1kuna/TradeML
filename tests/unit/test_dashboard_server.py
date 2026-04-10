@@ -62,6 +62,7 @@ def test_dashboard_server_serves_index_and_live_snapshot(tmp_path: Path, monkeyp
 
     assert "new EventSource('/api/live/stream')" in html
     assert "TradeML Operator Dashboard" in html
+    assert "Training Target" in html
     assert live_payload["runtime"]["pid"] == 123
     assert live_payload["training_readiness"]["phase1"]["ready"] is True
 
@@ -80,12 +81,18 @@ def test_dashboard_server_answers_head_and_streamlit_probe_paths(tmp_path: Path,
             "vendor_throughput": {"rows": []},
         },
     )
+    monkeypatch.setattr(
+        dashboard_server,
+        "collect_dashboard_health_snapshot",
+        lambda resolved: {"repair_tasks": {"counts": {}, "remaining_units": 0}},
+    )
     httpd = dashboard_server.create_dashboard_server("127.0.0.1", 0, settings=settings)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
         base_url = f"http://127.0.0.1:{httpd.server_port}"
         head_request = urllib.request.Request(f"{base_url}/", method="HEAD")
+        dashboard_health = json.loads(urllib.request.urlopen(f"{base_url}/api/health", timeout=5).read().decode("utf-8"))
         health_payload = json.loads(urllib.request.urlopen(f"{base_url}/_stcore/health", timeout=5).read().decode("utf-8"))
         host_config_payload = json.loads(urllib.request.urlopen(f"{base_url}/_stcore/host-config", timeout=5).read().decode("utf-8"))
         head_response = urllib.request.urlopen(head_request, timeout=5)
@@ -95,6 +102,7 @@ def test_dashboard_server_answers_head_and_streamlit_probe_paths(tmp_path: Path,
         thread.join(timeout=5)
 
     assert head_response.status == 200
+    assert "repair_tasks" in dashboard_health
     assert health_payload == {"ok": True}
     assert host_config_payload["useExternalAuthToken"] is False
 
@@ -177,3 +185,18 @@ def test_dispatch_action_routes_canonical_repair_payload(tmp_path: Path, monkeyp
         "symbol": "TECK",
         "verify_only": True,
     }
+
+
+def test_dispatch_action_routes_training_actions(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path)
+    monkeypatch.setattr(dashboard_server, "training_preflight_status", lambda settings, *, phase, target=None: {"action": "preflight", "phase": phase, "target": target})
+    monkeypatch.setattr(dashboard_server, "start_training_run", lambda settings, *, phase, report_date=None, target=None: {"action": "start", "phase": phase, "target": target, "report_date": report_date})
+    monkeypatch.setattr(dashboard_server, "stop_training_run", lambda settings, *, phase, target=None: {"action": "stop", "phase": phase, "target": target})
+
+    preflight = dashboard_server.dispatch_dashboard_action(settings, "train-preflight", {"phase": 1, "target": "workstation-remote"})
+    start = dashboard_server.dispatch_dashboard_action(settings, "train-start", {"phase": 1, "target": "workstation-remote", "report_date": "2026-04-02"})
+    stop = dashboard_server.dispatch_dashboard_action(settings, "train-stop", {"phase": 1, "target": "workstation-remote"})
+
+    assert preflight["action"] == "preflight"
+    assert start["report_date"] == "2026-04-02"
+    assert stop["action"] == "stop"

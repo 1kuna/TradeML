@@ -28,7 +28,7 @@ from trademl.connectors.base import BaseConnector, ConnectorError
 from trademl.data_node.audit import run_capability_audit
 from trademl.data_node.bootstrap import Stage0UniverseBuilder
 from trademl.data_node.budgets import BudgetManager
-from trademl.data_node.db import DataNodeDB
+from trademl.data_node.db import DataNodeDB, PlannerTask
 from trademl.data_node.curator import Curator
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.capabilities import default_macro_series, load_audit_state, provider_role_matrix
@@ -36,7 +36,17 @@ from trademl.data_node.planner import plan_coverage_tasks
 from trademl.data_node.provider_contracts import clone_provider_contract_rows
 from trademl.data_node.runtime import build_connector, build_connectors, resolve_vendor_budgets
 from trademl.data_node.service import DataNodePaths, DataNodeService
-from trademl.data_node.training_control import evaluate_training_gates, read_training_runtime, shared_training_runtime_path
+from trademl.data_node.training_control import (
+    evaluate_training_gates,
+    resolve_training_target,
+    resolve_training_targets,
+    training_log_tail,
+    training_preflight,
+    training_status_snapshot,
+    stop_training_process,
+    launch_training_process,
+)
+from trademl.experiments import latest_experiment_summary
 from trademl.fleet.cluster import (
     ClusterCoordinator,
     ClusterPaths,
@@ -826,6 +836,175 @@ def bootstrap_canonical_ledger(settings: NodeSettings) -> dict[str, Any]:
     return result
 
 
+def verify_recent_canonical_dates(
+    settings: NodeSettings,
+    *,
+    days: int = 7,
+    dataset: str = "equities_eod",
+    verify_only: bool = False,
+) -> dict[str, Any]:
+    """Run the recent-date verifier and optionally seed repair work."""
+    service = _service_from_settings(settings)
+    result = service.verify_recent_canonical_dates(days=days, dataset=dataset, verify_only=verify_only)
+    append_cluster_event(
+        settings.cluster_paths,
+        "canonical_dates_verified",
+        {"worker_id": settings.worker_id, **result},
+    )
+    return result
+
+
+def repair_status(settings: NodeSettings) -> dict[str, Any]:
+    """Return the current repair-lane health snapshot."""
+    health = collect_dashboard_health_snapshot(settings)
+    return {
+        "repair_tasks": health["repair_tasks"],
+        "recent_bad_dates": health["recent_bad_dates"],
+        "leased_work": health["leased_work"],
+    }
+
+
+def lane_health(settings: NodeSettings, *, dataset: str = "equities_eod") -> dict[str, Any]:
+    """Return persisted vendor lane-health state for a dataset."""
+    db = DataNodeDB(settings.db_path)
+    throughput = _summarize_vendor_throughput(settings.db_path, budget_summary=_read_budget_summary(settings))
+    return {
+        "dataset": dataset,
+        "rows": _summarize_vendor_lane_health(
+            db=db,
+            budget_summary=_read_budget_summary(settings),
+            vendor_throughput=throughput,
+            dataset=dataset,
+        ),
+    }
+
+
+def show_leases(settings: NodeSettings, *, family: str | None = None) -> dict[str, Any]:
+    """Return the currently leased planner work grouped for operator inspection."""
+    db = DataNodeDB(settings.db_path)
+    task_families = (family,) if family else ("canonical_bars", "canonical_repair")
+    tasks = db.fetch_planner_tasks(task_families=task_families, statuses=("LEASED",))
+    rows = []
+    for task in tasks:
+        progress = db.fetch_planner_task_progress(task.task_key)
+        payload = task.payload
+        rows.append(
+            {
+                "task_key": task.task_key,
+                "task_family": task.task_family,
+                "planner_group": task.planner_group,
+                "backlog_class": str(payload.get("backlog_class") or _backlog_class_for_task(task)),
+                "lease_owner": task.lease_owner,
+                "leased_at": task.leased_at,
+                "lease_expires_at": task.lease_expires_at,
+                "start_date": task.start_date,
+                "end_date": task.end_date,
+                "symbol_count": len(task.symbols),
+                "remaining_units": int(progress.remaining_units) if progress is not None else None,
+            }
+        )
+    return {"family": family, "count": len(rows), "rows": rows}
+
+
+def training_preflight_status(
+    settings: NodeSettings,
+    *,
+    phase: int,
+    target: str | None = None,
+) -> dict[str, Any]:
+    """Run split training preflight for the selected target."""
+    config_path = settings.repo_root / "configs" / "equities_xs.yml"
+    return training_preflight(
+        data_root=settings.nas_mount,
+        config_path=config_path,
+        repo_root=settings.repo_root,
+        local_state=settings.local_state,
+        targets_config_path=settings.config_path,
+        target=target,
+        python_executable=sys.executable,
+    )
+
+
+def start_training_run(
+    settings: NodeSettings,
+    *,
+    phase: int,
+    report_date: str | None = None,
+    target: str | None = None,
+) -> dict[str, Any]:
+    """Launch a detached training run for the selected execution target."""
+    env_path = settings.env_path if settings.env_path.exists() else settings.workspace_root / ".env"
+    return launch_training_process(
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        local_state=settings.local_state,
+        env_path=env_path,
+        phase=phase,
+        model_suite="ridge_only" if phase == 1 else "full",
+        python_executable=sys.executable,
+        report_date=report_date,
+        target=target,
+        targets_config_path=settings.config_path,
+    )
+
+
+def stop_training_run(
+    settings: NodeSettings,
+    *,
+    phase: int,
+    target: str | None = None,
+) -> dict[str, Any]:
+    """Stop a detached training run for the selected target."""
+    return stop_training_process(
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        local_state=settings.local_state,
+        phase=phase,
+        target=target,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+    )
+
+
+def training_runtime_status(
+    settings: NodeSettings,
+    *,
+    phase: int,
+    target: str | None = None,
+) -> dict[str, Any]:
+    """Return merged runtime state for the selected training target."""
+    return training_status_snapshot(
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        local_state=settings.local_state,
+        phase=phase,
+        target=target,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+        tail_lines=50,
+    )
+
+
+def training_runtime_logs(
+    settings: NodeSettings,
+    *,
+    phase: int,
+    target: str | None = None,
+    tail_lines: int = 50,
+) -> dict[str, Any]:
+    """Return merged runtime state plus the latest log tail."""
+    return training_log_tail(
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        local_state=settings.local_state,
+        phase=phase,
+        target=target,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+        tail_lines=tail_lines,
+    )
+
+
 def _remove_worker_state(settings: NodeSettings) -> None:
     for path in [
         settings.local_state,
@@ -925,11 +1104,43 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
     dataset_coverage = collection_health["dataset_coverage"]
     freeze_cutoff_date = readiness.get("freeze_cutoff", {}).get("date")
     collection_status = collection_health["collection_status"]
+    training_target = resolve_training_target(
+        target_name=None,
+        targets_config_path=settings.config_path,
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        local_state=settings.local_state,
+        python_executable=sys.executable,
+    )
     training_status = {
-        "phase1": read_training_runtime(path=shared_training_runtime_path(data_root=settings.nas_mount, phase=1)),
-        "phase2": read_training_runtime(path=shared_training_runtime_path(data_root=settings.nas_mount, phase=2)),
+        "phase1": training_status_snapshot(
+            repo_root=settings.repo_root,
+            data_root=settings.nas_mount,
+            local_state=settings.local_state,
+            phase=1,
+            target=training_target.name,
+            targets_config_path=settings.config_path,
+            python_executable=sys.executable,
+            tail_lines=20,
+        ),
+        "phase2": training_status_snapshot(
+            repo_root=settings.repo_root,
+            data_root=settings.nas_mount,
+            local_state=settings.local_state,
+            phase=2,
+            target=training_target.name,
+            targets_config_path=settings.config_path,
+            python_executable=sys.executable,
+            tail_lines=20,
+        ),
     }
     train_operational_status = _summarize_train_operational_status(training_status=training_status, readiness=readiness)
+    health = collect_dashboard_health_snapshot(
+        settings,
+        planner_summary=planner_summary,
+        budget_summary=budget_summary,
+        vendor_throughput=vendor_throughput,
+    )
     snapshot = {
         "settings": asdict(settings),
         "runtime": runtime,
@@ -966,16 +1177,20 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "train_operational_status": train_operational_status,
         "suggested_training_commands": {
             "phase1": (
-                f"trademl train --data-root {settings.nas_mount} start --phase 1 --report-date {freeze_cutoff_date}"
+                f"trademl train --data-root {settings.nas_mount} start --target {training_target.name} --phase 1 --report-date {freeze_cutoff_date}"
                 if freeze_cutoff_date
-                else f"trademl train --data-root {settings.nas_mount} start --phase 1"
+                else f"trademl train --data-root {settings.nas_mount} start --target {training_target.name} --phase 1"
             ),
             "phase2": (
-                f"trademl train --data-root {settings.nas_mount} start --phase 2 --report-date {freeze_cutoff_date}"
+                f"trademl train --data-root {settings.nas_mount} start --target {training_target.name} --phase 2 --report-date {freeze_cutoff_date}"
                 if freeze_cutoff_date
-                else f"trademl train --data-root {settings.nas_mount} start --phase 2"
+                else f"trademl train --data-root {settings.nas_mount} start --target {training_target.name} --phase 2"
             ),
         },
+        "health": health,
+        "training_targets": health["training_targets"],
+        "default_training_target": health["default_training_target"],
+        "experiment_summary": health["experiment_summary"],
         "audit": audit,
         "coverage_plan": coverage_plan,
     }
@@ -1052,6 +1267,66 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "planner_eta": planner_eta,
         "budget_summary": budget_summary,
         "vendor_throughput": vendor_throughput,
+    }
+
+
+def collect_dashboard_health_snapshot(
+    settings: NodeSettings,
+    *,
+    planner_summary: dict[str, Any] | None = None,
+    budget_summary: dict[str, Any] | None = None,
+    vendor_throughput: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Collect repair, lease, lane-health, training-target, and experiment status."""
+    planner_summary = planner_summary or _read_planner_summary(settings.db_path)
+    budget_summary = budget_summary or _read_budget_summary(settings)
+    vendor_throughput = vendor_throughput or _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
+    try:
+        db = DataNodeDB(settings.db_path)
+    except sqlite3.OperationalError:
+        return {
+            "repair_tasks": {"counts": {}, "remaining_units": 0, "drain_rate_per_min": 0.0, "eta_minutes": None, "rows": []},
+            "repair_drain_rate_per_min": 0.0,
+            "repair_eta_minutes": None,
+            "recent_bad_dates": [],
+            "leased_work": {"counts": {}, "rows": []},
+            "vendor_lane_health": [],
+            "training_targets": [],
+            "default_training_target": {},
+            "experiment_summary": {},
+            "planner_backlog": planner_summary.get("backlog_progress", {}),
+        }
+    repair_tasks = _summarize_repair_tasks(db)
+    leased_work = _summarize_leased_work(db)
+    vendor_lane_health = _summarize_vendor_lane_health(
+        db=db,
+        budget_summary=budget_summary,
+        vendor_throughput=vendor_throughput,
+    )
+    targets = resolve_training_targets(
+        targets_config_path=settings.config_path,
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        local_state=settings.local_state,
+        python_executable=sys.executable,
+    )
+    default_target = next((target for target in targets.values() if target.default), targets["local"])
+    recent_bad_dates = [
+        manifest.trading_date
+        for manifest in db.fetch_raw_partition_manifests(dataset="equities_eod", statuses=("INCOMPLETE", "UNREADABLE", "QUARANTINED"))
+    ][-10:]
+    experiment_summary = latest_experiment_summary(local_state=settings.local_state)
+    return {
+        "repair_tasks": repair_tasks,
+        "repair_drain_rate_per_min": repair_tasks["drain_rate_per_min"],
+        "repair_eta_minutes": repair_tasks["eta_minutes"],
+        "recent_bad_dates": recent_bad_dates,
+        "leased_work": leased_work,
+        "vendor_lane_health": vendor_lane_health,
+        "training_targets": [asdict(target) for target in targets.values()],
+        "default_training_target": asdict(default_target),
+        "experiment_summary": experiment_summary,
+        "planner_backlog": planner_summary.get("backlog_progress", {}),
     }
 
 
@@ -1816,12 +2091,117 @@ def _price_check_files(root: Path) -> list[str]:
 
 def _summarize_train_operational_status(*, training_status: dict[str, dict[str, Any]], readiness: dict[str, Any]) -> str:
     for phase in ("phase2", "phase1"):
-        status = str(training_status.get(phase, {}).get("status", "")).lower()
+        phase_payload = training_status.get(phase, {})
+        runtime = phase_payload.get("runtime", phase_payload)
+        status = str(runtime.get("status", "")).lower()
         if status in {"starting", "running", "completed", "failed"}:
             return status
     if readiness["phase1"]["ready"]:
         return "ready"
     return "blocked"
+
+
+def _backlog_class_for_task(task: PlannerTask) -> str:
+    if task.planner_group == "phase1_pinned_canonical":
+        return "phase1_pinned"
+    if task.planner_group == "canonical_repair":
+        return "repair"
+    if task.planner_group == "rolling_canonical":
+        return "rolling"
+    return task.planner_group
+
+
+def _summarize_repair_tasks(db: DataNodeDB, *, window_minutes: int = 60) -> dict[str, Any]:
+    tasks = db.fetch_planner_tasks(task_families=("canonical_repair",))
+    counts: dict[str, int] = {}
+    rows = []
+    now = datetime.now(tz=UTC)
+    cutoff = now - timedelta(minutes=window_minutes)
+    completed_recent = 0
+    for task in tasks:
+        counts[task.status] = counts.get(task.status, 0) + 1
+        progress = db.fetch_planner_task_progress(task.task_key)
+        remaining_units = int(progress.remaining_units) if progress is not None else 0
+        if task.status == "SUCCESS":
+            with contextlib.suppress(ValueError):
+                if datetime.fromisoformat(task.updated_at) >= cutoff:
+                    completed_recent += int(progress.expected_units if progress is not None else len(task.symbols))
+        rows.append(
+            {
+                "task_key": task.task_key,
+                "status": task.status,
+                "remaining_units": remaining_units,
+                "lease_owner": task.lease_owner,
+                "updated_at": task.updated_at,
+            }
+        )
+    remaining_units = sum(int(row["remaining_units"]) for row in rows)
+    drain_rate = round(completed_recent / max(1, window_minutes), 2)
+    eta_minutes = None
+    if remaining_units > 0 and drain_rate > 0:
+        eta_minutes = round(remaining_units / drain_rate, 1)
+    return {
+        "counts": counts,
+        "remaining_units": remaining_units,
+        "drain_rate_per_min": drain_rate,
+        "eta_minutes": eta_minutes,
+        "rows": rows[:25],
+    }
+
+
+def _summarize_leased_work(db: DataNodeDB) -> dict[str, Any]:
+    tasks = db.fetch_planner_tasks(task_families=("canonical_bars", "canonical_repair"), statuses=("LEASED",))
+    counts: dict[str, int] = {}
+    rows = []
+    for task in tasks:
+        backlog_class = _backlog_class_for_task(task)
+        counts[backlog_class] = counts.get(backlog_class, 0) + 1
+        progress = db.fetch_planner_task_progress(task.task_key)
+        rows.append(
+            {
+                "task_key": task.task_key,
+                "task_family": task.task_family,
+                "backlog_class": backlog_class,
+                "lease_owner": task.lease_owner,
+                "lease_expires_at": task.lease_expires_at,
+                "remaining_units": int(progress.remaining_units) if progress is not None else None,
+            }
+        )
+    return {"counts": counts, "rows": rows[:25]}
+
+
+def _summarize_vendor_lane_health(
+    *,
+    db: DataNodeDB,
+    budget_summary: dict[str, Any],
+    vendor_throughput: dict[str, Any],
+    dataset: str = "equities_eod",
+) -> list[dict[str, Any]]:
+    throughput_rows = {str(row["vendor"]): row for row in vendor_throughput.get("rows", [])}
+    budget_rows = {str(row["vendor"]): row for row in budget_summary.get("rows", [])}
+    lane_rows = db.vendor_lane_health_map(dataset=dataset)
+    vendors = sorted(set(throughput_rows) | set(budget_rows) | set(lane_rows))
+    rows: list[dict[str, Any]] = []
+    for vendor in vendors:
+        lane = lane_rows.get(vendor)
+        throughput = throughput_rows.get(vendor, {})
+        budget = budget_rows.get(vendor, {})
+        rows.append(
+            {
+                "vendor": vendor,
+                "state": lane.state if lane is not None else "UNKNOWN",
+                "cooldown_until": lane.cooldown_until if lane is not None else None,
+                "last_state_change": lane.last_state_change if lane is not None else None,
+                "recent_outbound_requests": lane.recent_outbound_requests if lane is not None else int(budget.get("outbound_requests_60s", 0)),
+                "recent_success_units": lane.recent_success_units if lane is not None else 0,
+                "recent_remote_429s": lane.recent_remote_429s if lane is not None else int(budget.get("remote_rate_limits_60s", 0)),
+                "recent_local_budget_blocks": lane.recent_local_budget_blocks if lane is not None else int(budget.get("local_budget_blocks_60s", 0)),
+                "recent_empty_valid": lane.recent_empty_valid if lane is not None else int(budget.get("empty_successes_60s", 0)),
+                "recent_permanent_failures": lane.recent_permanent_failures if lane is not None else int(budget.get("permanent_failures_60s", 0)),
+                "useful_units_per_min": round(float(throughput.get("rows_per_min", 0.0)), 2),
+            }
+        )
+    return rows
 
 
 def _extract_share_host(nas_share: str) -> str | None:

@@ -21,21 +21,28 @@ from trademl.dashboard.controller import (
     rebuild_cluster_state,
     resolve_node_settings,
     restart_node,
+    repair_status,
     run_vendor_audit,
     rotate_cluster_passphrase,
     start_node,
+    start_training_run,
     stop_node,
+    stop_training_run,
+    lane_health,
+    show_leases,
+    training_preflight_status,
+    training_runtime_logs,
+    training_runtime_status,
     reset_worker,
     uninstall_worker,
     update_worker,
     update_cluster_secrets,
+    verify_recent_canonical_dates,
 )
 from trademl.data_node.training_control import (
-    launch_training_process,
-    read_training_runtime,
-    shared_training_runtime_path,
-    training_preflight,
+    resolve_training_target,
 )
+from trademl.experiments import compare_experiment, experiment_status, launch_experiment, plan_experiment, render_experiment_report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,12 +65,22 @@ def main(argv: list[str] | None = None) -> int:
     train_subparsers = train_parser.add_subparsers(dest="train_command", required=True)
     train_status_parser = train_subparsers.add_parser("status", help="Show local and NAS-visible training runtime.")
     train_status_parser.add_argument("--phase", type=int, default=1)
+    train_status_parser.add_argument("--target", default=None)
     train_preflight_parser = train_subparsers.add_parser("preflight", help="Run the training preflight against NAS data.")
     train_preflight_parser.add_argument("--phase", type=int, default=1)
+    train_preflight_parser.add_argument("--target", default=None)
     train_start_parser = train_subparsers.add_parser("start", help="Start a detached DGX/workstation training run.")
     train_start_parser.add_argument("--phase", type=int, default=1)
     train_start_parser.add_argument("--report-date", default=None)
     train_start_parser.add_argument("--python-executable", default=sys.executable)
+    train_start_parser.add_argument("--target", default=None)
+    train_stop_parser = train_subparsers.add_parser("stop", help="Stop a detached training run.")
+    train_stop_parser.add_argument("--phase", type=int, default=1)
+    train_stop_parser.add_argument("--target", default=None)
+    train_logs_parser = train_subparsers.add_parser("logs", help="Tail detached training logs.")
+    train_logs_parser.add_argument("--phase", type=int, default=1)
+    train_logs_parser.add_argument("--tail", type=int, default=50)
+    train_logs_parser.add_argument("--target", default=None)
 
     node_parser = subparsers.add_parser("node", help="Control the data-node service.")
     node_parser.add_argument("--workspace-root", default=None)
@@ -102,12 +119,39 @@ def main(argv: list[str] | None = None) -> int:
     repair_parser.add_argument("--end-date", default=None)
     repair_parser.add_argument("--symbol", default=None)
     repair_parser.add_argument("--verify-only", action="store_true")
+    verify_recent_parser = node_subparsers.add_parser("verify-recent", help="Verify the most recently touched canonical dates.")
+    verify_recent_parser.add_argument("--days", type=int, default=7)
+    verify_recent_parser.add_argument("--dataset", default="equities_eod")
+    verify_recent_parser.add_argument("--verify-only", action="store_true")
+    node_subparsers.add_parser("repair-status", help="Show current repair lane health.")
+    lane_health_parser = node_subparsers.add_parser("lane-health", help="Show current vendor lane health.")
+    lane_health_parser.add_argument("--dataset", default="equities_eod")
+    show_leases_parser = node_subparsers.add_parser("show-leases", help="Show current leased planner work.")
+    show_leases_parser.add_argument("--family", default=None, choices=["canonical_bars", "canonical_repair"])
+
+    experiments_parser = subparsers.add_parser("experiments", help="Plan and launch experiment matrices.")
+    experiments_parser.add_argument("--data-root", default=None)
+    experiments_parser.add_argument("--local-state", default=None)
+    experiments_parser.add_argument("--env-file", default=None)
+    experiments_subparsers = experiments_parser.add_subparsers(dest="experiments_command", required=True)
+    experiments_plan = experiments_subparsers.add_parser("plan", help="Plan an experiment matrix.")
+    experiments_plan.add_argument("--spec", required=True)
+    experiments_launch = experiments_subparsers.add_parser("launch", help="Launch pending runs for an experiment.")
+    experiments_launch.add_argument("--spec", required=True)
+    experiments_status = experiments_subparsers.add_parser("status", help="Refresh experiment run status.")
+    experiments_status.add_argument("--experiment", required=True)
+    experiments_compare = experiments_subparsers.add_parser("compare", help="Compare completed experiment runs.")
+    experiments_compare.add_argument("--experiment", required=True)
+    experiments_report = experiments_subparsers.add_parser("report", help="Write experiment comparison reports.")
+    experiments_report.add_argument("--experiment", required=True)
 
     args = parser.parse_args(argv)
     if args.command == "dashboard":
         return _launch_dashboard(args)
     if args.command == "train":
         return _dispatch_train(args)
+    if args.command == "experiments":
+        return _dispatch_experiments(args)
     settings = resolve_node_settings(
         workspace_root=args.workspace_root,
         config_path=args.config,
@@ -195,6 +239,29 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+    if args.node_command == "verify-recent":
+        print(
+            json.dumps(
+                verify_recent_canonical_dates(
+                    settings,
+                    days=args.days,
+                    dataset=args.dataset,
+                    verify_only=args.verify_only,
+                ),
+                indent=2,
+                default=str,
+            )
+        )
+        return 0
+    if args.node_command == "repair-status":
+        print(json.dumps(repair_status(settings), indent=2, default=str))
+        return 0
+    if args.node_command == "lane-health":
+        print(json.dumps(lane_health(settings, dataset=args.dataset), indent=2, default=str))
+        return 0
+    if args.node_command == "show-leases":
+        print(json.dumps(show_leases(settings, family=args.family), indent=2, default=str))
+        return 0
     raise SystemExit(f"unsupported node command: {args.node_command}")
 
 
@@ -231,33 +298,77 @@ def _launch_dashboard(args: argparse.Namespace) -> int:
 def _dispatch_train(args: argparse.Namespace) -> int:
     data_root = Path(args.data_root or os.getenv("TRADEML_DATA_ROOT") or os.getenv("NAS_MOUNT") or ".").expanduser()
     local_state = Path(args.local_state or os.getenv("TRADEML_TRAIN_STATE") or "~/.trademl-training").expanduser()
-    env_path = Path(args.env_file).expanduser() if args.env_file else Path(".env")
     repo_root = Path(__file__).resolve().parents[2]
-    config_path = repo_root / "configs" / "equities_xs.yml"
+    targets_config_path = repo_root / "configs" / "node.yml"
+    settings = resolve_node_settings(config_path=targets_config_path)
+    settings.nas_mount = data_root
+    settings.local_state = local_state
+    if args.env_file:
+        settings.env_path = Path(args.env_file).expanduser()
     if args.train_command == "status":
-        payload = {
-            "local": read_training_runtime(local_state=local_state, phase=args.phase),
-            "shared": read_training_runtime(path=shared_training_runtime_path(data_root=data_root, phase=args.phase)),
-        }
+        payload = training_runtime_status(settings, phase=args.phase, target=args.target)
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.train_command == "preflight":
-        print(json.dumps(training_preflight(data_root=data_root, config_path=config_path), indent=2, default=str))
+        print(json.dumps(training_preflight_status(settings, phase=args.phase, target=args.target), indent=2, default=str))
         return 0
     if args.train_command == "start":
-        payload = launch_training_process(
-            repo_root=repo_root,
-            data_root=data_root,
-            local_state=local_state,
-            env_path=env_path,
-            phase=args.phase,
-            model_suite="ridge_only" if args.phase == 1 else "full",
-            python_executable=args.python_executable,
-            report_date=args.report_date,
-        )
+        payload = start_training_run(settings, phase=args.phase, report_date=args.report_date, target=args.target)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.train_command == "stop":
+        payload = stop_training_run(settings, phase=args.phase, target=args.target)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.train_command == "logs":
+        payload = training_runtime_logs(settings, phase=args.phase, target=args.target, tail_lines=args.tail)
         print(json.dumps(payload, indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported train command: {args.train_command}")
+
+
+def _dispatch_experiments(args: argparse.Namespace) -> int:
+    data_root = Path(args.data_root or os.getenv("TRADEML_DATA_ROOT") or os.getenv("NAS_MOUNT") or ".").expanduser()
+    local_state = Path(args.local_state or os.getenv("TRADEML_TRAIN_STATE") or "~/.trademl-training").expanduser()
+    env_path = Path(args.env_file).expanduser() if args.env_file else Path(".env")
+    repo_root = Path(__file__).resolve().parents[2]
+    targets_config_path = repo_root / "configs" / "node.yml"
+    common = {
+        "repo_root": repo_root,
+        "data_root": data_root,
+        "local_state": local_state,
+        "env_path": env_path,
+        "targets_config_path": targets_config_path,
+        "python_executable": sys.executable,
+    }
+    if args.experiments_command == "plan":
+        payload = plan_experiment(spec_path=Path(args.spec).expanduser(), **common)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.experiments_command == "launch":
+        payload = launch_experiment(spec_path=Path(args.spec).expanduser(), **common)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.experiments_command == "status":
+        payload = experiment_status(
+            experiment_id=args.experiment,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.experiments_command == "compare":
+        payload = compare_experiment(experiment_id=args.experiment, local_state=local_state)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.experiments_command == "report":
+        payload = render_experiment_report(experiment_id=args.experiment, local_state=local_state)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    raise SystemExit(f"unsupported experiments command: {args.experiments_command}")
 
 
 if __name__ == "__main__":

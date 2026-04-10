@@ -210,6 +210,40 @@ def test_repair_canonical_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> N
     assert json.loads(capsys.readouterr().out) == {"action": "repair", "date": "2026-04-10"}
 
 
+def test_node_health_cli_dispatches(tmp_path: Path, monkeypatch, capsys) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "verify_recent_canonical_dates", lambda settings, **kwargs: {"action": "verify", **kwargs})
+    monkeypatch.setattr(cli, "repair_status", lambda settings: {"action": "repair-status"})
+    monkeypatch.setattr(cli, "lane_health", lambda settings, dataset="equities_eod": {"action": "lane-health", "dataset": dataset})
+    monkeypatch.setattr(cli, "show_leases", lambda settings, family=None: {"action": "show-leases", "family": family})
+
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "verify-recent", "--days", "5"]) == 0
+    assert json.loads(capsys.readouterr().out)["days"] == 5
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "repair-status"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "repair-status"
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "lane-health", "--dataset", "equities_eod"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "lane-health"
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "show-leases", "--family", "canonical_repair"]) == 0
+    assert json.loads(capsys.readouterr().out)["family"] == "canonical_repair"
+
+
 def test_train_start_and_status_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     data_root = tmp_path / "nas"
     local_state = tmp_path / "train-state"
@@ -217,13 +251,13 @@ def test_train_start_and_status_cli_dispatch(tmp_path: Path, monkeypatch, capsys
     env_path.write_text("", encoding="utf-8")
     monkeypatch.setattr(
         cli,
-        "launch_training_process",
-        lambda **kwargs: {"action": "start", "phase": kwargs["phase"], "data_root": str(kwargs["data_root"])},
+        "start_training_run",
+        lambda settings, *, phase, report_date=None, target=None: {"action": "start", "phase": phase, "target": target},
     )
     monkeypatch.setattr(
         cli,
-        "read_training_runtime",
-        lambda *, path=None, local_state=None, phase=None: {"status": "running", "phase": phase or 1, "path": str(path) if path else str(local_state)},
+        "training_runtime_status",
+        lambda settings, *, phase, target=None: {"runtime": {"status": "running", "phase": phase}, "target": {"name": target or "local"}},
     )
 
     assert (
@@ -237,6 +271,8 @@ def test_train_start_and_status_cli_dispatch(tmp_path: Path, monkeypatch, capsys
                 "--env-file",
                 str(env_path),
                 "start",
+                "--target",
+                "workstation-remote",
                 "--phase",
                 "1",
             ]
@@ -254,6 +290,8 @@ def test_train_start_and_status_cli_dispatch(tmp_path: Path, monkeypatch, capsys
                 "--local-state",
                 str(local_state),
                 "status",
+                "--target",
+                "workstation-remote",
                 "--phase",
                 "1",
             ]
@@ -261,4 +299,25 @@ def test_train_start_and_status_cli_dispatch(tmp_path: Path, monkeypatch, capsys
         == 0
     )
     payload = json.loads(capsys.readouterr().out)
-    assert payload["shared"]["status"] == "running"
+    assert payload["runtime"]["status"] == "running"
+
+
+def test_experiments_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
+    spec_path = tmp_path / "spec.yml"
+    spec_path.write_text("experiment_id: phase1\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "plan_experiment", lambda spec_path, **kwargs: {"action": "plan", "spec": str(spec_path)})
+    monkeypatch.setattr(cli, "launch_experiment", lambda spec_path, **kwargs: {"action": "launch", "spec": str(spec_path)})
+    monkeypatch.setattr(cli, "experiment_status", lambda experiment_id, **kwargs: {"action": "status", "experiment_id": experiment_id})
+    monkeypatch.setattr(cli, "compare_experiment", lambda experiment_id, local_state: {"action": "compare", "experiment_id": experiment_id})
+    monkeypatch.setattr(cli, "render_experiment_report", lambda experiment_id, local_state: {"action": "report", "experiment_id": experiment_id})
+
+    assert cli.main(["experiments", "plan", "--spec", str(spec_path)]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "plan"
+    assert cli.main(["experiments", "launch", "--spec", str(spec_path)]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "launch"
+    assert cli.main(["experiments", "status", "--experiment", "phase1"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "status"
+    assert cli.main(["experiments", "compare", "--experiment", "phase1"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "compare"
+    assert cli.main(["experiments", "report", "--experiment", "phase1"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "report"

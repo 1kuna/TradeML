@@ -384,6 +384,7 @@ def test_collect_dashboard_snapshot_uses_freeze_cutoff_in_training_command(tmp_p
 
     snapshot = collect_dashboard_snapshot(settings)
 
+    assert "--target local" in snapshot["suggested_training_commands"]["phase1"]
     assert snapshot["suggested_training_commands"]["phase1"].endswith("--report-date 2026-04-02")
 
 
@@ -1259,6 +1260,96 @@ def test_collect_dashboard_status_snapshot_skips_setup_and_log_probes(tmp_path: 
     assert snapshot["collection_status"]["coverage_percent"] >= 0.0
     assert "nas" not in snapshot
     assert "log_tail" not in snapshot
+
+
+def test_collect_dashboard_status_snapshot_includes_health_and_experiment_summary(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 1, "symbols": ["AAPL", "MSFT"], "years": 5}, sort_keys=False),
+        encoding="utf-8",
+    )
+    db = DataNodeDB(workspace / "control" / "node.sqlite")
+    db.upsert_vendor_lane_health(
+        vendor="alpaca",
+        dataset="equities_eod",
+        state="HEALTHY",
+        recent_outbound_requests=8,
+        recent_success_units=25,
+    )
+    db.upsert_raw_partition_manifest(
+        dataset="equities_eod",
+        trading_date="2026-04-08",
+        partition_revision=2,
+        symbol_count=1,
+        row_count=1,
+        symbols=["AAPL"],
+        content_hash="hash",
+        status="INCOMPLETE",
+    )
+    db.upsert_planner_task(
+        task_key="canonical_repair::equities_eod::2026-04-08::000",
+        task_family="canonical_repair",
+        planner_group="canonical_repair",
+        dataset="equities_eod",
+        tier="A",
+        priority=1,
+        start_date="2026-04-08",
+        end_date="2026-04-08",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_bars",
+        payload={"backlog_class": "repair"},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical_repair::equities_eod::2026-04-08::000",
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=["AAPL"],
+        state={"backlog_class": "repair"},
+    )
+    db.lease_planner_task_by_key(task_key="canonical_repair::equities_eod::2026-04-08::000", lease_owner="worker-1")
+    experiment_root = workspace / "control" / "experiments" / "phase1"
+    experiment_root.mkdir(parents=True, exist_ok=True)
+    (experiment_root / "summary.json").write_text(json.dumps({"experiment_id": "phase1", "run_count": 2}), encoding="utf-8")
+
+    monkeypatch.setattr(
+        dashboard_controller,
+        "training_status_snapshot",
+        lambda **kwargs: {"runtime": {"status": "running", "target": "local", "pid": 4242}, "log_tail": "tail"},
+    )
+    monkeypatch.setattr(
+        dashboard_controller,
+        "evaluate_training_gates",
+        lambda **kwargs: {"phase1": {"ready": True, "blockers": []}, "phase2": {"ready": False, "blockers": []}, "freeze_cutoff": {"date": "2026-04-02", "pinned": True}},
+    )
+
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    snapshot = dashboard_controller.collect_dashboard_status_snapshot(settings)
+
+    assert snapshot["health"]["repair_tasks"]["remaining_units"] == 1
+    assert snapshot["health"]["recent_bad_dates"] == ["2026-04-08"]
+    assert snapshot["health"]["vendor_lane_health"][0]["vendor"] == "alpaca"
+    assert snapshot["experiment_summary"]["experiment_id"] == "phase1"
+    assert snapshot["default_training_target"]["name"] == "local"
 
 
 def test_collect_dashboard_live_snapshot_skips_support_file_scans(tmp_path: Path, monkeypatch) -> None:
