@@ -15,6 +15,7 @@ from typing import Any
 
 from trademl.dashboard.controller import (
     advance_collection_stage,
+    bootstrap_canonical_ledger,
     collect_dashboard_live_snapshot,
     collect_dashboard_logs_snapshot,
     collect_dashboard_setup_snapshot,
@@ -29,6 +30,7 @@ from trademl.dashboard.controller import (
     resolve_node_settings,
     restart_node,
     rotate_cluster_passphrase,
+    repair_canonical_backlog,
     run_vendor_audit,
     start_node,
     stop_node,
@@ -596,6 +598,18 @@ HTML_PAGE = """<!doctype html>
           </div>
           <pre id="setup-json"></pre>
         </div>
+        <div class="section-card forms">
+          <h3>Ledger and Repair</h3>
+          <input id="input-repair-date" placeholder="Repair date (YYYY-MM-DD)">
+          <input id="input-repair-start-date" placeholder="Start date (YYYY-MM-DD)">
+          <input id="input-repair-end-date" placeholder="End date (YYYY-MM-DD)">
+          <input id="input-repair-symbol" placeholder="Symbol">
+          <div class="form-row">
+            <button id="bootstrap-ledger" class="secondary">Bootstrap Ledger</button>
+            <button id="verify-canonical-repair" class="secondary">Verify Repair</button>
+            <button id="run-canonical-repair">Run Repair</button>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -961,6 +975,74 @@ HTML_PAGE = """<!doctype html>
       }
     });
 
+    function canonicalRepairPayload(verifyOnly=false) {
+      const payload = {};
+      const tradingDate = document.getElementById('input-repair-date').value.trim();
+      const startDate = document.getElementById('input-repair-start-date').value.trim();
+      const endDate = document.getElementById('input-repair-end-date').value.trim();
+      const symbol = document.getElementById('input-repair-symbol').value.trim();
+      if (tradingDate) payload.trading_date = tradingDate;
+      if (startDate) payload.start_date = startDate;
+      if (endDate) payload.end_date = endDate;
+      if (symbol) payload.symbol = symbol;
+      if (verifyOnly) payload.verify_only = true;
+      return payload;
+    }
+
+    document.getElementById('bootstrap-ledger').addEventListener('click', async () => {
+      try {
+        setMessage('setup-message', 'Bootstrapping canonical ledger...', 'warn');
+        const result = await fetchJson('/api/actions/bootstrap-ledger', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({}),
+        });
+        document.getElementById('setup-json').textContent = JSON.stringify(result, null, 2);
+        setMessage('setup-message', 'Canonical ledger bootstrapped', 'good');
+        await refreshLiveOnce();
+        await refreshSetup(true);
+        await refreshStatus();
+      } catch (error) {
+        setMessage('setup-message', `Bootstrap failed: ${error.message}`, 'bad');
+      }
+    });
+
+    document.getElementById('verify-canonical-repair').addEventListener('click', async () => {
+      try {
+        setMessage('setup-message', 'Verifying canonical repairs...', 'warn');
+        const result = await fetchJson('/api/actions/repair-canonical', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(canonicalRepairPayload(true)),
+        });
+        document.getElementById('setup-json').textContent = JSON.stringify(result, null, 2);
+        setMessage('setup-message', 'Canonical repair verification complete', 'good');
+        await refreshLiveOnce();
+        await refreshSetup(true);
+        await refreshStatus();
+      } catch (error) {
+        setMessage('setup-message', `Repair verification failed: ${error.message}`, 'bad');
+      }
+    });
+
+    document.getElementById('run-canonical-repair').addEventListener('click', async () => {
+      try {
+        setMessage('setup-message', 'Running canonical repairs...', 'warn');
+        const result = await fetchJson('/api/actions/repair-canonical', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(canonicalRepairPayload(false)),
+        });
+        document.getElementById('setup-json').textContent = JSON.stringify(result, null, 2);
+        setMessage('setup-message', 'Canonical repair run complete', 'good');
+        await refreshLiveOnce();
+        await refreshSetup(true);
+        await refreshStatus();
+      } catch (error) {
+        setMessage('setup-message', `Repair run failed: ${error.message}`, 'bad');
+      }
+    });
+
     function connectLiveStream() {
       const badge = document.getElementById('connection-badge');
       badge.textContent = 'Connecting';
@@ -1126,6 +1208,17 @@ def dispatch_dashboard_action(settings: NodeSettings, action: str, payload: dict
         return run_vendor_audit(settings)
     if action == "replan-coverage":
         return replan_coverage(settings)
+    if action == "bootstrap-ledger":
+        return bootstrap_canonical_ledger(settings)
+    if action == "repair-canonical":
+        return repair_canonical_backlog(
+            settings,
+            trading_date=_optional_str(payload.get("trading_date")),
+            start_date=_optional_str(payload.get("start_date")),
+            end_date=_optional_str(payload.get("end_date")),
+            symbol=_optional_str(payload.get("symbol")),
+            verify_only=bool(payload.get("verify_only")),
+        )
     if action == "save-settings":
         return persist_node_settings(
             settings,

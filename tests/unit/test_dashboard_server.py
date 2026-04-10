@@ -115,3 +115,65 @@ def test_dispatch_action_routes_restart_with_passphrase(tmp_path: Path, monkeypa
     assert result == {"action": "restart"}
     assert seen["settings"] is settings
     assert seen["passphrase"] == "pw"
+
+
+def test_dispatch_action_routes_bootstrap_ledger(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path)
+    seen: dict[str, object] = {}
+
+    def fake_bootstrap(resolved: NodeSettings) -> dict[str, object]:
+        seen["settings"] = resolved
+        return {"bootstrapped": 12}
+
+    monkeypatch.setattr(dashboard_server, "bootstrap_canonical_ledger", fake_bootstrap)
+
+    result = dashboard_server.dispatch_dashboard_action(settings, "bootstrap-ledger", {})
+
+    assert result == {"bootstrapped": 12}
+    assert seen["settings"] is settings
+
+
+def test_dispatch_action_routes_canonical_repair_payload(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path)
+    seen: dict[str, object] = {}
+
+    def fake_repair(
+        resolved: NodeSettings,
+        *,
+        trading_date: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        symbol: str | None = None,
+        verify_only: bool = False,
+    ) -> dict[str, object]:
+        seen["settings"] = resolved
+        seen["trading_date"] = trading_date
+        seen["start_date"] = start_date
+        seen["end_date"] = end_date
+        seen["symbol"] = symbol
+        seen["verify_only"] = verify_only
+        return {"repairable": 4}
+
+    monkeypatch.setattr(dashboard_server, "repair_canonical_backlog", fake_repair)
+
+    result = dashboard_server.dispatch_dashboard_action(
+        settings,
+        "repair-canonical",
+        {
+            "trading_date": "2026-04-10",
+            "start_date": "2026-03-01",
+            "end_date": "2026-04-10",
+            "symbol": "TECK",
+            "verify_only": True,
+        },
+    )
+
+    assert result == {"repairable": 4}
+    assert seen == {
+        "settings": settings,
+        "trading_date": "2026-04-10",
+        "start_date": "2026-03-01",
+        "end_date": "2026-04-10",
+        "symbol": "TECK",
+        "verify_only": True,
+    }
