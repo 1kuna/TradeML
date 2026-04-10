@@ -307,16 +307,40 @@ def test_experiments_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     spec_path.write_text("experiment_id: phase1\n", encoding="utf-8")
     monkeypatch.setattr(cli, "plan_experiment", lambda spec_path, **kwargs: {"action": "plan", "spec": str(spec_path)})
     monkeypatch.setattr(cli, "launch_experiment", lambda spec_path, **kwargs: {"action": "launch", "spec": str(spec_path)})
+    monkeypatch.setattr(cli, "supervise_experiment", lambda spec_path, **kwargs: {"action": "supervise", "spec": str(spec_path), "detach": kwargs.get("detach", False)})
+    monkeypatch.setattr(cli, "run_experiment_until_idle", lambda spec_path, **kwargs: {"action": "run-until-idle", "spec": str(spec_path)})
     monkeypatch.setattr(cli, "experiment_status", lambda experiment_id, **kwargs: {"action": "status", "experiment_id": experiment_id})
-    monkeypatch.setattr(cli, "compare_experiment", lambda experiment_id, local_state: {"action": "compare", "experiment_id": experiment_id})
-    monkeypatch.setattr(cli, "render_experiment_report", lambda experiment_id, local_state: {"action": "report", "experiment_id": experiment_id})
+    monkeypatch.setattr(cli, "pause_experiment_supervisor", lambda local_state, experiment_id: {"action": "pause", "experiment_id": experiment_id})
+    monkeypatch.setattr(cli, "resume_experiment_supervisor", lambda experiment_id, **kwargs: {"action": "resume", "experiment_id": experiment_id})
+    monkeypatch.setattr(cli, "stop_experiment_supervisor", lambda local_state, experiment_id: {"action": "stop", "experiment_id": experiment_id})
+    monkeypatch.setattr(cli, "evaluate_experiment", lambda experiment_id, **kwargs: {"action": "evaluate", "experiment_id": experiment_id})
+    monkeypatch.setattr(cli, "backtest_experiment_survivors", lambda experiment_id, **kwargs: {"action": "backtest", "experiment_id": experiment_id})
+    monkeypatch.setattr(cli, "propose_next_experiment_family", lambda experiment_id, **kwargs: {"action": "propose-next", "experiment_id": experiment_id})
+    monkeypatch.setattr(cli, "compare_experiment", lambda experiment_id, **kwargs: {"action": "compare", "experiment_id": experiment_id})
+    monkeypatch.setattr(cli, "render_experiment_report", lambda experiment_id, **kwargs: {"action": "report", "experiment_id": experiment_id})
 
     assert cli.main(["experiments", "plan", "--spec", str(spec_path)]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "plan"
     assert cli.main(["experiments", "launch", "--spec", str(spec_path)]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "launch"
+    assert cli.main(["experiments", "supervise", "--spec", str(spec_path), "--detach"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "supervise"
+    assert cli.main(["experiments", "run-until-idle", "--spec", str(spec_path), "--poll-seconds", "11"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "run-until-idle"
     assert cli.main(["experiments", "status", "--experiment", "phase1"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "status"
+    assert cli.main(["experiments", "pause", "--experiment", "phase1"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "pause"
+    assert cli.main(["experiments", "resume", "--experiment", "phase1"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "resume"
+    assert cli.main(["experiments", "stop", "--experiment", "phase1"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "stop"
+    assert cli.main(["experiments", "evaluate", "--experiment", "phase1"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "evaluate"
+    assert cli.main(["experiments", "backtest-survivors", "--experiment", "phase1"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "backtest"
+    assert cli.main(["experiments", "propose-next", "--experiment", "phase1"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "propose-next"
     assert cli.main(["experiments", "compare", "--experiment", "phase1"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "compare"
     assert cli.main(["experiments", "report", "--experiment", "phase1"]) == 0

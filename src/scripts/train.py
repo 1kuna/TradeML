@@ -12,11 +12,13 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+from trademl.data_node.training_control import read_pinned_phase_freeze
 from trademl.features.equities import build_features
 from trademl.features.preprocessing import rank_normalize
 from trademl.labels.returns import build_labels
 from trademl.models.lgbm import LightGBMModel, tune_lightgbm_via_walk_forward
 from trademl.models.ridge import RidgeModel, tune_ridge_via_walk_forward
+from trademl.portfolio.build import build_portfolio
 from trademl.reports.emitter import emit_report
 from trademl.validation.diagnostics import ic_by_year, placebo_test, portfolio_cost_stress_test, sign_flip_canary
 from trademl.validation.cpcv import combinatorially_purged_cv
@@ -84,6 +86,22 @@ def _load_curated_panel(curated_files: list[Path]) -> tuple[pd.DataFrame, list[s
     return pd.concat(loaded_frames, ignore_index=True), skipped_partitions
 
 
+def _pinned_freeze_coverage(*, data_root: Path, effective_end_date: pd.Timestamp) -> float | None:
+    pinned = read_pinned_phase_freeze(data_root=data_root, phase=1)
+    if pinned is None:
+        return None
+    if str(pinned.get("date") or "") != effective_end_date.strftime("%Y-%m-%d"):
+        return None
+    explicit = pinned.get("effective_window_coverage_ratio")
+    if explicit is None:
+        explicit = pinned.get("window_coverage_ratio")
+    if explicit is not None:
+        return float(explicit)
+    if bool(pinned.get("pinned")):
+        return 1.0
+    return float(pinned.get("coverage_ratio", 0.0) or 0.0)
+
+
 def run_training(
     *,
     data_root: Path,
@@ -121,7 +139,8 @@ def run_training(
         window_start=window_start,
         window_end=effective_end_date,
     )
-    coverage = max(qc_coverage, planner_coverage or 0.0)
+    pinned_freeze_coverage = _pinned_freeze_coverage(data_root=data_root, effective_end_date=effective_end_date)
+    coverage = max(qc_coverage, planner_coverage or 0.0, pinned_freeze_coverage or 0.0)
     missing_dates = sorted(qc_window.loc[qc_window["status"] != "GREEN", "date"].dt.strftime("%Y-%m-%d").unique().tolist())
     if coverage < float(config["data"]["green_threshold"]):
         raise RuntimeError(f"green coverage below threshold: {coverage:.3f}; missing dates={missing_dates[:25]}")
@@ -176,6 +195,7 @@ def run_training(
         )
 
     ridge_predictions = pd.concat([fold.predictions for fold in ridge_folds], ignore_index=True)
+    lgbm_predictions = pd.concat([fold.predictions for fold in lgbm_folds], ignore_index=True) if lgbm_folds else pd.DataFrame()
     cpcv_results = combinatorially_purged_cv(
         normalized.dropna(subset=["label_5d"]),
         feature_cols,
@@ -223,6 +243,7 @@ def run_training(
         "coverage": coverage,
         "qc_coverage": qc_coverage,
         "planner_window_coverage": planner_coverage,
+        "pinned_freeze_coverage": pinned_freeze_coverage,
         "window_start": window_start.strftime("%Y-%m-%d"),
         "window_end": effective_end_date.strftime("%Y-%m-%d"),
         "missing_dates": missing_dates,
@@ -265,8 +286,12 @@ def run_training(
             output_root=output_root,
             run_ts=run_ts,
             config=config,
+            panel=panel,
             feature_cols=feature_cols,
             normalized=normalized,
+            ridge_predictions=ridge_predictions,
+            lgbm_predictions=lgbm_predictions,
+            model_suite=model_suite,
             ridge_model=RidgeModel(alpha=ridge_alpha).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"]),
             lgbm_model=(
                 LightGBMModel(n_trials=0, best_params=lgbm_params).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"])
@@ -312,13 +337,26 @@ def _persist_run_artifacts(
     output_root: Path,
     run_ts: str,
     config: dict,
+    panel: pd.DataFrame,
     feature_cols: list[str],
     normalized: pd.DataFrame,
+    ridge_predictions: pd.DataFrame,
+    lgbm_predictions: pd.DataFrame,
+    model_suite: str,
     ridge_model: RidgeModel,
     lgbm_model: LightGBMModel | None,
     report_preview: dict,
 ) -> dict[str, str]:
     artifacts: dict[str, str] = {}
+    artifacts.update(
+        _persist_backtest_inputs(
+            output_root=output_root,
+            panel=panel,
+            ridge_predictions=ridge_predictions,
+            lgbm_predictions=lgbm_predictions,
+            model_suite=model_suite,
+        )
+    )
     models = {"ridge": ridge_model}
     if lgbm_model is not None:
         models["lightgbm"] = lgbm_model
@@ -343,6 +381,58 @@ def _persist_run_artifacts(
             pickle.dump(model, handle)
         artifacts[f"{model_name}_dir"] = str(run_dir)
     return artifacts
+
+
+def _persist_backtest_inputs(
+    *,
+    output_root: Path,
+    panel: pd.DataFrame,
+    ridge_predictions: pd.DataFrame,
+    lgbm_predictions: pd.DataFrame,
+    model_suite: str,
+) -> dict[str, str]:
+    inputs_root = output_root / "artifacts" / "backtest_inputs"
+    inputs_root.mkdir(parents=True, exist_ok=True)
+    prices = (
+        panel[["date", "symbol", "close"]]
+        .copy()
+        .drop_duplicates(subset=["date", "symbol"], keep="last")
+        .sort_values(["date", "symbol"])
+        .reset_index(drop=True)
+    )
+    prices_path = inputs_root / "prices.parquet"
+    prices.to_parquet(prices_path, index=False)
+
+    artifacts: dict[str, str] = {"prices_path": str(prices_path)}
+    ridge_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="ridge", predictions=ridge_predictions)
+    artifacts.update(ridge_payload)
+    primary_prefix = "ridge"
+    if not lgbm_predictions.empty:
+        lgbm_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="lightgbm", predictions=lgbm_predictions)
+        artifacts.update(lgbm_payload)
+        if model_suite == "full":
+            primary_prefix = "lightgbm"
+    artifacts["primary_predictions_path"] = artifacts[f"{primary_prefix}_predictions_path"]
+    artifacts["primary_targets_path"] = artifacts[f"{primary_prefix}_targets_path"]
+    return artifacts
+
+
+def _write_prediction_artifacts(*, inputs_root: Path, prefix: str, predictions: pd.DataFrame) -> dict[str, str]:
+    if predictions.empty:
+        return {}
+    prediction_frame = predictions.copy()
+    prediction_frame = prediction_frame.sort_values(["date", "symbol"]).reset_index(drop=True)
+    prediction_path = inputs_root / f"{prefix}_predictions.parquet"
+    prediction_frame.to_parquet(prediction_path, index=False)
+
+    targets_input = prediction_frame.rename(columns={"prediction": "score"})
+    targets = build_portfolio(targets_input, {})
+    target_path = inputs_root / f"{prefix}_targets.parquet"
+    targets.to_parquet(target_path, index=False)
+    return {
+        f"{prefix}_predictions_path": str(prediction_path),
+        f"{prefix}_targets_path": str(target_path),
+    }
 
 
 def _write_training_log(*, output_root: Path, run_ts: str, report: dict) -> Path:

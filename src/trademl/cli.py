@@ -39,10 +39,21 @@ from trademl.dashboard.controller import (
     update_cluster_secrets,
     verify_recent_canonical_dates,
 )
-from trademl.data_node.training_control import (
-    resolve_training_target,
+from trademl.experiments import (
+    backtest_experiment_survivors,
+    compare_experiment,
+    evaluate_experiment,
+    experiment_status,
+    launch_experiment,
+    pause_experiment_supervisor,
+    plan_experiment,
+    propose_next_experiment_family,
+    render_experiment_report,
+    resume_experiment_supervisor,
+    run_experiment_until_idle,
+    stop_experiment_supervisor,
+    supervise_experiment,
 )
-from trademl.experiments import compare_experiment, experiment_status, launch_experiment, plan_experiment, render_experiment_report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -138,8 +149,27 @@ def main(argv: list[str] | None = None) -> int:
     experiments_plan.add_argument("--spec", required=True)
     experiments_launch = experiments_subparsers.add_parser("launch", help="Launch pending runs for an experiment.")
     experiments_launch.add_argument("--spec", required=True)
+    experiments_supervise = experiments_subparsers.add_parser("supervise", help="Run or spawn the bounded experiment supervisor.")
+    experiments_supervise.add_argument("--spec", required=True)
+    experiments_supervise.add_argument("--poll-seconds", type=int, default=None)
+    experiments_supervise.add_argument("--detach", action="store_true")
+    experiments_run_until_idle = experiments_subparsers.add_parser("run-until-idle", help="Keep launching experiment runs until the queue is drained.")
+    experiments_run_until_idle.add_argument("--spec", required=True)
+    experiments_run_until_idle.add_argument("--poll-seconds", type=int, default=30)
     experiments_status = experiments_subparsers.add_parser("status", help="Refresh experiment run status.")
     experiments_status.add_argument("--experiment", required=True)
+    experiments_pause = experiments_subparsers.add_parser("pause", help="Pause a running experiment supervisor.")
+    experiments_pause.add_argument("--experiment", required=True)
+    experiments_resume = experiments_subparsers.add_parser("resume", help="Resume a paused experiment supervisor.")
+    experiments_resume.add_argument("--experiment", required=True)
+    experiments_stop = experiments_subparsers.add_parser("stop", help="Stop an experiment supervisor.")
+    experiments_stop.add_argument("--experiment", required=True)
+    experiments_evaluate = experiments_subparsers.add_parser("evaluate", help="Evaluate completed runs for an experiment.")
+    experiments_evaluate.add_argument("--experiment", required=True)
+    experiments_backtest = experiments_subparsers.add_parser("backtest-survivors", help="Run backtests for predictive survivors.")
+    experiments_backtest.add_argument("--experiment", required=True)
+    experiments_propose = experiments_subparsers.add_parser("propose-next", help="Generate the next bounded experiment family proposal.")
+    experiments_propose.add_argument("--experiment", required=True)
     experiments_compare = experiments_subparsers.add_parser("compare", help="Compare completed experiment runs.")
     experiments_compare.add_argument("--experiment", required=True)
     experiments_report = experiments_subparsers.add_parser("report", help="Write experiment comparison reports.")
@@ -349,6 +379,23 @@ def _dispatch_experiments(args: argparse.Namespace) -> int:
         payload = launch_experiment(spec_path=Path(args.spec).expanduser(), **common)
         print(json.dumps(payload, indent=2, default=str))
         return 0
+    if args.experiments_command == "supervise":
+        payload = supervise_experiment(
+            spec_path=Path(args.spec).expanduser(),
+            poll_seconds=args.poll_seconds,
+            detach=bool(args.detach),
+            **common,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.experiments_command == "run-until-idle":
+        payload = run_experiment_until_idle(
+            spec_path=Path(args.spec).expanduser(),
+            poll_seconds=int(args.poll_seconds),
+            **common,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
     if args.experiments_command == "status":
         payload = experiment_status(
             experiment_id=args.experiment,
@@ -360,12 +407,79 @@ def _dispatch_experiments(args: argparse.Namespace) -> int:
         )
         print(json.dumps(payload, indent=2, default=str))
         return 0
+    if args.experiments_command == "pause":
+        payload = pause_experiment_supervisor(local_state=local_state, experiment_id=args.experiment)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.experiments_command == "resume":
+        payload = resume_experiment_supervisor(
+            experiment_id=args.experiment,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            env_path=env_path,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.experiments_command == "stop":
+        payload = stop_experiment_supervisor(local_state=local_state, experiment_id=args.experiment)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.experiments_command == "evaluate":
+        payload = evaluate_experiment(
+            experiment_id=args.experiment,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.experiments_command == "backtest-survivors":
+        payload = backtest_experiment_survivors(
+            experiment_id=args.experiment,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.experiments_command == "propose-next":
+        payload = propose_next_experiment_family(
+            experiment_id=args.experiment,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
     if args.experiments_command == "compare":
-        payload = compare_experiment(experiment_id=args.experiment, local_state=local_state)
+        payload = compare_experiment(
+            experiment_id=args.experiment,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.experiments_command == "report":
-        payload = render_experiment_report(experiment_id=args.experiment, local_state=local_state)
+        payload = render_experiment_report(
+            experiment_id=args.experiment,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
         print(json.dumps(payload, indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported experiments command: {args.experiments_command}")

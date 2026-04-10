@@ -136,6 +136,9 @@ def test_train_script_phase1_ridge_only_skips_lightgbm_artifacts(tmp_path: Path)
     report = json.loads((data_root / "reports" / "daily" / "2026-04-01.json").read_text(encoding="utf-8"))
     assert report["lightgbm"]["skipped"] is True
     assert not (data_root / "models" / "lightgbm").exists()
+    assert Path(report["artifacts"]["prices_path"]).exists()
+    assert Path(report["artifacts"]["ridge_predictions_path"]).exists()
+    assert Path(report["artifacts"]["ridge_targets_path"]).exists()
 
 
 def test_train_script_uses_report_date_for_coverage_gate_and_curated_window(tmp_path: Path) -> None:
@@ -269,6 +272,70 @@ def test_train_script_accepts_planner_backed_window_coverage_when_qc_is_stale(tm
     assert report["coverage"] == 1.0
 
 
+def test_train_script_accepts_pinned_phase1_freeze_when_remote_planner_db_is_unavailable(tmp_path: Path) -> None:
+    data_root = tmp_path / "workspace"
+    _write_training_dataset(data_root)
+    config = {
+        "data": {"green_threshold": 0.98},
+        "features": {
+            "price": {"momentum": [5, 20, 60, 126], "reversal": [1, 5], "drawdown": [20, 60]},
+            "volatility": {"realized": [20, 60], "idiosyncratic": [60]},
+            "liquidity": {"adv_dollar": [20], "amihud": [20]},
+            "controls": {"log_price": True},
+        },
+        "preprocessing": {"missing_threshold": 0.30},
+        "validation": {"initial_train_years": 1, "step": "6_months"},
+        "portfolio": {"cost_stress_multiplier": 2.0},
+    }
+    config_path = tmp_path / "train.yml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    qc_path = data_root / "data" / "qc" / "partition_status.parquet"
+    qc = pd.read_parquet(qc_path)
+    qc["status"] = "AMBER"
+    qc.to_parquet(qc_path, index=False)
+    pinned_date = str(pd.to_datetime(qc["date"]).max().date())
+
+    control_root = data_root / "control" / "state"
+    control_root.mkdir(parents=True, exist_ok=True)
+    (control_root / "phase1_freeze.json").write_text(
+        json.dumps(
+            {
+                "date": pinned_date,
+                "phase": 1,
+                "pinned": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report_date = pinned_date
+    subprocess.run(
+        [
+            sys.executable,
+            "src/scripts/train.py",
+            "--data-root",
+            str(data_root),
+            "--config",
+            str(config_path),
+            "--output-root",
+            str(data_root),
+            "--report-date",
+            report_date,
+            "--model-suite",
+            "ridge_only",
+        ],
+        check=True,
+        cwd=Path.cwd(),
+    )
+
+    report = json.loads((data_root / "reports" / "daily" / f"{report_date}.json").read_text(encoding="utf-8"))
+    assert report["qc_coverage"] == 0.0
+    assert report["planner_window_coverage"] is None
+    assert report["pinned_freeze_coverage"] == 1.0
+    assert report["coverage"] == 1.0
+
+
 def test_train_script_skips_zero_byte_curated_partitions(tmp_path: Path) -> None:
     data_root = tmp_path / "workspace"
     _write_training_dataset(data_root)
@@ -368,6 +435,9 @@ def test_backtest_script_writes_outputs(tmp_path: Path) -> None:
     assert (output_dir / "cost_attribution.parquet").exists()
     assert (output_dir / "ic_time_series.parquet").exists()
     assert (output_dir / "decile_returns.parquet").exists()
+    summary = json.loads((output_dir / "backtest_summary.json").read_text(encoding="utf-8"))
+    assert "net_return" in summary
+    assert "turnover" in summary
 
 
 def test_pi_wizard_initializes_state(tmp_path: Path) -> None:

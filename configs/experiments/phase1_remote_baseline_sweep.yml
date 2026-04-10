@@ -1,0 +1,35 @@
+experiment_id: phase1-remote-baseline-sweep
+phase: 1
+target: workstation-remote
+report_date_policy: phase1_freeze
+max_concurrent: 1
+supervision:
+  poll_seconds: 30
+  auto_backtest_survivors: true
+  auto_propose_next_family: true
+  max_retry_count: 2
+matrix:
+  model_suite:
+    - ridge_only
+    - full
+  validation.initial_train_years:
+    - 2
+    - 3
+predictive_gate:
+  min_rank_ic: 0.01
+  require_go_decision: true
+  require_all_years_positive: true
+  max_abs_placebo_ic: 0.10
+  min_cost_stress_net_return: 0.0
+backtest_gate:
+  min_net_return: 0.0
+  require_cost_positive: true
+backtest_profile:
+  name: phase1_primary
+proposal_policy:
+  family_size_cap: 6
+  allowed_dimensions:
+    - model_suite
+    - validation.initial_train_years
+    - data.window_years
+  max_generations: 1
