@@ -1021,6 +1021,8 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
     pinned_remaining = int(pinned_progress.get("remaining_units", 0))
     if pinned_remaining <= 0 and not bool(readiness.get("phase1", {}).get("ready")):
         pinned_remaining = int(bars_progress.get("remaining_units", max(0, canonical_expected - canonical_completed)))
+    if bool(readiness.get("phase1", {}).get("ready")):
+        pinned_remaining = 0
     canonical_ratio = min(1.0, canonical_completed / canonical_expected) if canonical_expected else 0.0
     training_critical_ratio = float(
         readiness.get("freeze_cutoff", {}).get(

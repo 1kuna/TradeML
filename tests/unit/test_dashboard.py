@@ -1303,6 +1303,68 @@ def test_collect_dashboard_live_snapshot_skips_support_file_scans(tmp_path: Path
     assert "vendor_throughput" in snapshot
 
 
+def test_collect_dashboard_live_snapshot_zeroes_pinned_remaining_when_phase1_ready(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                },
+                "vendors": {"alpaca": {"rpm": 150, "daily_cap": 10000}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 0, "symbols": ["AAPL"], "years": 1}, sort_keys=False),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    monkeypatch.setattr(dashboard_controller, "_read_runtime_state", lambda settings: {"pid": None})
+    monkeypatch.setattr(dashboard_controller, "_read_queue_counts", lambda db_path: {})
+    monkeypatch.setattr(dashboard_controller, "_read_partition_summary", lambda qc_path: {"counts": {}, "coverage_green": 1.0})
+    monkeypatch.setattr(dashboard_controller, "_raw_datapoints_from_qc", lambda summary: 0)
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_read_planner_summary",
+        lambda db_path: {
+            "progress": {"canonical_bars": {"expected_units": 100, "completed_units": 100, "remaining_units": 0}},
+            "backlog_progress": {
+                "phase1_pinned": {"remaining_units": 10},
+                "rolling": {"remaining_units": 12},
+                "repair": {"remaining_units": 3},
+            },
+        },
+    )
+    monkeypatch.setattr(dashboard_controller, "_read_budget_summary", lambda settings: {"rows": [], "checked_at": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_vendor_throughput", lambda db_path, budget_summary: {"rows": [], "checked_at": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_planner_eta", lambda db_path, planner_summary, vendor_throughput: {})
+    monkeypatch.setattr(
+        dashboard_controller,
+        "evaluate_training_gates",
+        lambda **kwargs: {
+            "phase1": {"ready": True, "blockers": []},
+            "freeze_cutoff": {"effective_window_coverage_ratio": 1.0},
+        },
+    )
+
+    snapshot = dashboard_controller.collect_dashboard_live_snapshot(settings)
+
+    assert snapshot["collection_status"]["phase1_pinned_remaining_units"] == 0
+    assert snapshot["collection_status"]["rolling_remaining_units"] == 12
+    assert snapshot["collection_status"]["repair_remaining_units"] == 3
+
+
 def test_update_worker_refreshes_wrapper_and_reports_paths(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     config_path = workspace / "node.yml"
