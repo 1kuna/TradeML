@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import signal
 import threading
+import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -159,8 +162,16 @@ class DataNodeService:
             day_value = pd.Timestamp(day).strftime("%Y-%m-%d")
             partition = self.paths.raw_equities / f"date={day_value}"
             partition.mkdir(parents=True, exist_ok=True)
-            merged = self._canonical_runtime._merge_partition_frame(partition=partition, frame=day_frame)
-            merged.to_parquet(partition / "data.parquet", index=False)
+            lock_path = partition / ".write.lock"
+            self._canonical_runtime._acquire_file_lock(lock_path)
+            try:
+                merged = self._canonical_runtime._merge_partition_frame(partition=partition, frame=day_frame)
+                tmp_path = partition / f"data.{uuid.uuid4().hex}.tmp"
+                merged.to_parquet(tmp_path, index=False)
+                os.replace(tmp_path, partition / "data.parquet")
+            finally:
+                with contextlib.suppress(OSError):
+                    lock_path.unlink()
             changed_dates.append(day_value)
             expected_rows = len(self.default_symbols) if self.default_symbols else len(merged)
             row_count = len(merged)
@@ -785,6 +796,9 @@ class DataNodeService:
                 )
 
             self._ensure_planner_backlog_seeded(trading_date=trading_date)
+            released = self._release_budget_blocked_canonical_tasks()
+            if released:
+                LOGGER.warning("released_budget_blocked_canonical_tasks count=%s", released)
 
             if self._should_run_collection(
                 trading_date=trading_date,

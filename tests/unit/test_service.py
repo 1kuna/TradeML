@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -1018,6 +1021,64 @@ def test_canonical_partial_success_is_immediately_reeligible_when_alternative_ve
     assert delta.total_seconds() < 60
 
 
+def test_canonical_partial_task_can_retry_same_vendor_after_stale_success(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    alpaca = _BackfillConnector("alpaca")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": alpaca},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::TECK::stale_success",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2025-12-16",
+        end_date="2025-12-16",
+        symbols=["TECK"],
+        eligible_vendors=["alpaca"],
+        payload={"scope_kind": "symbol_range", "trading_days": ["2025-12-16"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::TECK::stale_success",
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=["TECK"],
+        state={"scope_kind": "symbol_range"},
+    )
+    seeded = db.lease_vendor_attempt(
+        task_key="canonical::TECK::stale_success",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        vendor="alpaca",
+        lease_owner="worker-0",
+        payload={"symbols": ["TECK"], "start_date": "2025-12-16", "end_date": "2025-12-16"},
+    )
+    assert seeded is not None
+    db.mark_vendor_attempt_success(task_key="canonical::TECK::stale_success", vendor="alpaca", rows_returned=1)
+    db.mark_planner_task_partial("canonical::TECK::stale_success", error="remaining_units=1", backoff_minutes=0)
+
+    batch = service._canonical_runtime._lease_canonical_batch("alpaca")
+
+    assert len(batch) == 1
+    changed = service._canonical_runtime._process_canonical_planner_batch(batch=batch, vendor="alpaca", exchange="XNYS")
+
+    assert changed == ["2025-12-16"]
+    refreshed = db.get_planner_task("canonical::TECK::stale_success")
+    assert refreshed is not None
+    assert refreshed.status == "SUCCESS"
+    progress = db.fetch_planner_task_progress("canonical::TECK::stale_success")
+    assert progress is not None
+    assert progress.remaining_units == 0
+
+
 def test_canonical_vendor_budget_failure_does_not_back_off_other_available_vendors(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
@@ -1264,6 +1325,72 @@ def test_release_budget_blocked_canonical_tasks_clears_task_backoff_for_spendabl
     assert task.last_error == "released budget-blocked canonical task to alternate vendor"
 
 
+def test_release_budget_blocked_canonical_tasks_clears_task_backoff_for_reusable_success_vendor(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    alpaca = _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}}))
+    tiingo_budget = BudgetManager({"tiingo": {"rpm": 1, "daily_cap": 10}})
+    tiingo_budget.record_spend("tiingo", task_kind="FORWARD")
+    tiingo = _BudgetedBackfillConnector("tiingo", tiingo_budget)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": alpaca, "tiingo": tiingo},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::TECK::release",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2025-12-16",
+        end_date="2026-01-14",
+        symbols=["TECK"],
+        eligible_vendors=["alpaca", "tiingo"],
+        payload={"scope_kind": "symbol_range", "trading_days": ["2025-12-16"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::TECK::release",
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=["TECK"],
+        state={"scope_kind": "symbol_range"},
+    )
+    attempt = db.lease_vendor_attempt(
+        task_key="canonical::TECK::release",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        vendor="alpaca",
+        lease_owner="worker-0",
+        payload={"symbols": ["TECK"], "start_date": "2025-12-16", "end_date": "2026-01-14"},
+    )
+    assert attempt is not None
+    db.mark_vendor_attempt_success(task_key="canonical::TECK::release", vendor="alpaca", rows_returned=20)
+    db.mark_planner_task_partial(
+        "canonical::TECK::release",
+        error="tiingo: budget exhausted for vendor=tiingo",
+        backoff_minutes=30,
+    )
+    db.mark_vendor_attempt_failed(
+        task_key="canonical::TECK::release",
+        vendor="tiingo",
+        error="budget exhausted for vendor=tiingo",
+        backoff_minutes=30,
+    )
+
+    released = service._release_budget_blocked_canonical_tasks()
+    task = next(task for task in db.fetch_planner_tasks(task_family="canonical_bars") if task.task_key == "canonical::TECK::release")
+
+    assert released == 1
+    assert task.next_eligible_at is None
+    assert task.status == "PARTIAL"
+    assert task.last_error == "released budget-blocked canonical task to alternate vendor"
+
+
 def test_backfill_lane_widths_prioritize_alpaca_before_tiingo(tmp_path: Path) -> None:
     runtime = CanonicalRuntime(
         db=DataNodeDB(tmp_path / "control" / "node.sqlite"),
@@ -1279,6 +1406,55 @@ def test_backfill_lane_widths_prioritize_alpaca_before_tiingo(tmp_path: Path) ->
     )
 
     assert list(runtime._backfill_lane_widths())[:2] == ["alpaca", "tiingo"]
+
+
+def test_write_raw_partition_serializes_concurrent_same_day_writes(tmp_path: Path, monkeypatch) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    entered_stale_read = threading.Event()
+    original_merge = service._canonical_runtime._merge_partition_frame
+
+    def delayed_merge(*, partition: Path, frame: pd.DataFrame) -> pd.DataFrame:
+        if not (partition / "data.parquet").exists() and not entered_stale_read.is_set():
+            entered_stale_read.set()
+            time.sleep(0.2)
+        return original_merge(partition=partition, frame=frame)
+
+    monkeypatch.setattr(service._canonical_runtime, "_merge_partition_frame", delayed_merge)
+
+    base_row = {
+        "date": "2025-12-16",
+        "open": 10.0,
+        "high": 11.0,
+        "low": 9.0,
+        "close": 10.5,
+        "vwap": pd.NA,
+        "volume": 100,
+        "trade_count": pd.NA,
+        "ingested_at": pd.Timestamp.now(tz="UTC"),
+        "source_name": "alpaca",
+        "source_uri": "/bars",
+        "vendor_ts": pd.Timestamp("2025-12-16"),
+    }
+    frame_a = pd.DataFrame([{**base_row, "symbol": "AAPL"}])
+    frame_b = pd.DataFrame([{**base_row, "symbol": "MSFT"}])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_a = executor.submit(service._write_raw_partition, frame_a, source_name="alpaca")
+        assert entered_stale_read.wait(timeout=5)
+        future_b = executor.submit(service._write_raw_partition, frame_b, source_name="alpaca")
+        future_a.result(timeout=5)
+        future_b.result(timeout=5)
+
+    output = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "data.parquet")
+    assert set(output["symbol"]) == {"AAPL", "MSFT"}
 
 
 def test_load_corp_actions_reference_skips_corrupt_parquet(tmp_path: Path) -> None:

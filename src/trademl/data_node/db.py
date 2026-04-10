@@ -645,6 +645,7 @@ class DataNodeDB:
         vendor: str,
         lease_owner: str,
         payload: dict | None = None,
+        allow_success_retry: bool = False,
         lease_ttl_seconds: int = 90,
         now: datetime | None = None,
     ) -> VendorAttempt | None:
@@ -662,7 +663,7 @@ class DataNodeDB:
                 if row is not None:
                     status = str(row["status"])
                     lease_expiry = row["lease_expires_at"]
-                    if status == "SUCCESS":
+                    if status == "SUCCESS" and not allow_success_retry:
                         return None
                     if status == "LEASED" and lease_expiry and lease_expiry > lease_time and row["lease_owner"] != lease_owner:
                         return None

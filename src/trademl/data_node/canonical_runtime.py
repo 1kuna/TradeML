@@ -222,6 +222,7 @@ class CanonicalRuntime:
         leased_tasks: list[PlannerTask] = []
         symbols: list[str] = []
         for task in batch:
+            allow_success_retry = self._planner_task_vendor_success_reusable(task=task, vendor=vendor)
             attempt = self.db.lease_vendor_attempt(
                 task_key=task.task_key,
                 task_family=task.task_family,
@@ -229,6 +230,7 @@ class CanonicalRuntime:
                 vendor=vendor,
                 lease_owner=self.worker_id,
                 payload={"symbols": list(task.symbols), "start_date": task.start_date, "end_date": task.end_date},
+                allow_success_retry=allow_success_retry,
             )
             if attempt is None:
                 self.db.mark_planner_task_partial(task.task_key, error=f"{vendor}: attempt unavailable", backoff_minutes=5)
@@ -383,7 +385,9 @@ class CanonicalRuntime:
             attempt = attempts.get(candidate)
             if attempt is None:
                 return True
-            if attempt.status in {"SUCCESS", "PERMANENT_FAILED"}:
+            if attempt.status == "PERMANENT_FAILED":
+                continue
+            if attempt.status == "SUCCESS" and not self._planner_task_vendor_success_reusable(task=task, vendor=candidate):
                 continue
             return True
         return False
@@ -404,7 +408,9 @@ class CanonicalRuntime:
             attempt = attempts.get(candidate)
             if attempt is None:
                 return True
-            if attempt.status in {"SUCCESS", "PERMANENT_FAILED"}:
+            if attempt.status == "PERMANENT_FAILED":
+                continue
+            if attempt.status == "SUCCESS" and not self._planner_task_vendor_success_reusable(task=task, vendor=candidate):
                 continue
             if attempt.status == "LEASED" and attempt.lease_expires_at and attempt.lease_expires_at > now_iso and attempt.lease_owner != self.worker_id:
                 continue
@@ -437,7 +443,9 @@ class CanonicalRuntime:
             if attempt is None:
                 earliest_ready = now
                 break
-            if attempt.status in {"SUCCESS", "PERMANENT_FAILED"}:
+            if attempt.status == "PERMANENT_FAILED":
+                continue
+            if attempt.status == "SUCCESS" and not self._planner_task_vendor_success_reusable(task=task, vendor=candidate):
                 continue
             if attempt.status == "LEASED":
                 if attempt.lease_expires_at:
@@ -900,13 +908,24 @@ class CanonicalRuntime:
         for attempt in self.db.vendor_attempts_for_task(task.task_key):
             if attempt.vendor != vendor:
                 continue
-            if attempt.status in {"SUCCESS", "PERMANENT_FAILED"}:
+            if attempt.status == "PERMANENT_FAILED":
+                return False
+            if attempt.status == "SUCCESS" and not self._planner_task_vendor_success_reusable(task=task, vendor=vendor):
                 return False
             if attempt.status == "LEASED" and attempt.lease_expires_at and attempt.lease_expires_at > now_iso and attempt.lease_owner != self.worker_id:
                 return False
             if attempt.status == "FAILED" and attempt.next_eligible_at and attempt.next_eligible_at > now_iso:
                 return False
         return True
+
+    def _planner_task_vendor_success_reusable(self, *, task: PlannerTask, vendor: str) -> bool:
+        """Return whether an incomplete planner task may retry a vendor that previously succeeded."""
+        if task.status not in {"PARTIAL", "FAILED", "LEASED"}:
+            return False
+        if vendor not in task.eligible_vendors:
+            return False
+        progress = self.db.fetch_planner_task_progress(task.task_key)
+        return bool(progress is not None and progress.remaining_units > 0)
 
     @staticmethod
     def _capability_batch_size(capability) -> int:
