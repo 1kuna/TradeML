@@ -1348,6 +1348,35 @@ class DataNodeDB:
                 updated += int(cursor.rowcount)
         return updated
 
+    def count_repairable_stale_success_canonical_tasks(self, *, only_future_blocked: bool) -> int:
+        """Count incomplete canonical tasks blocked by stale budget failures despite prior success."""
+        now_iso = utc_now().isoformat()
+        where = [
+            "pt.task_family = 'canonical_bars'",
+            "pt.status IN ('PARTIAL', 'FAILED', 'LEASED')",
+            "pt.last_error LIKE '%budget exhausted%'",
+            "prog.remaining_units > 0",
+            "EXISTS (SELECT 1 FROM vendor_attempts va WHERE va.task_key = pt.task_key AND va.status = 'SUCCESS')",
+        ]
+        params: list[object] = []
+        if only_future_blocked:
+            where.append("pt.next_eligible_at IS NOT NULL")
+            where.append("pt.next_eligible_at > ?")
+            params.append(now_iso)
+        else:
+            where.append("(pt.next_eligible_at IS NULL OR pt.next_eligible_at <= ?)")
+            params.append(now_iso)
+        query = f"""
+            SELECT COUNT(*)
+            FROM planner_tasks pt
+            JOIN planner_task_progress prog
+              ON prog.task_key = pt.task_key
+            WHERE {' AND '.join(where)}
+        """
+        with self._connect() as connection:
+            row = connection.execute(query, params).fetchone()
+        return int(row[0] if row is not None else 0)
+
     def fetch_planner_task_progress(self, task_key: str) -> PlannerTaskProgress | None:
         """Return progress for a planner task."""
         with self._connect() as connection:

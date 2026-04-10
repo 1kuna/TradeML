@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 import yaml
 import sqlite3
 
@@ -124,6 +125,26 @@ def test_resolve_node_settings_autodetects_populated_worker_workspace(tmp_path: 
     assert settings.workspace_root == workspace
     assert settings.config_path == config_path
     assert settings.env_path == workspace / ".env"
+
+
+def test_resolve_node_settings_rejects_bare_data_root_when_worker_workspace_exists(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    worker_workspace = home / "trademl-node"
+    worker_workspace.mkdir(parents=True, exist_ok=True)
+    (worker_workspace / "node.yml").write_text(
+        yaml.safe_dump({"node": {"nas_mount": str(tmp_path / "nas"), "local_state": str(worker_workspace / "control")}}, sort_keys=False),
+        encoding="utf-8",
+    )
+    (worker_workspace / ".env").write_text("LOCAL_STATE=/tmp/control\n", encoding="utf-8")
+    data_root = tmp_path / "mnt" / "trademl"
+    data_root.mkdir(parents=True, exist_ok=True)
+    (data_root / "stage.yml").write_text(yaml.safe_dump({"current": 0, "symbols": ["AAPL"], "years": 1}, sort_keys=False), encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("TRADEML_WORKSPACE_ROOT", raising=False)
+
+    with pytest.raises(ValueError, match="does not look like a worker workspace"):
+        resolve_node_settings(workspace_root=data_root)
 
 
 def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -> None:

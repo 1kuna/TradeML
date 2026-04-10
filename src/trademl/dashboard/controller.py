@@ -23,15 +23,19 @@ from typing import Any
 import pandas as pd
 import yaml
 
-from trademl.calendars.exchange import get_trading_days
+from trademl.calendars.exchange import ExchangeCalendarStore, get_trading_days
 from trademl.connectors.base import BaseConnector, ConnectorError
 from trademl.data_node.audit import run_capability_audit
 from trademl.data_node.bootstrap import Stage0UniverseBuilder
+from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
+from trademl.data_node.curator import Curator
+from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.capabilities import default_macro_series, load_audit_state, provider_role_matrix
 from trademl.data_node.planner import plan_coverage_tasks
 from trademl.data_node.provider_contracts import clone_provider_contract_rows
 from trademl.data_node.runtime import build_connector, build_connectors, resolve_vendor_budgets
+from trademl.data_node.service import DataNodePaths, DataNodeService
 from trademl.data_node.training_control import evaluate_training_gates, read_training_runtime, shared_training_runtime_path
 from trademl.fleet.cluster import (
     ClusterCoordinator,
@@ -122,6 +126,12 @@ def resolve_node_settings(
     """Resolve dashboard settings from workspace files and defaults."""
     repo_root = Path(__file__).resolve().parents[3]
     resolved_workspace = _resolve_workspace_root(workspace_root=workspace_root)
+    _validate_explicit_workspace_root(
+        workspace_root=workspace_root,
+        resolved_workspace=resolved_workspace,
+        config_path=config_path,
+        env_path=env_path,
+    )
     resolved_config = (
         Path(config_path).expanduser()
         if config_path
@@ -163,6 +173,15 @@ def _resolve_workspace_root(*, workspace_root: str | Path | None = None) -> Path
     if env_workspace:
         return Path(env_workspace).expanduser()
 
+    scored = _scored_workspace_candidates()
+    if scored:
+        scored.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+        return scored[0][1]
+    return Path("~/trademl").expanduser()
+
+
+def _scored_workspace_candidates() -> list[tuple[int, Path]]:
+    """Return likely worker workspaces scored by local control-plane evidence."""
     candidates = [Path("~/trademl-node").expanduser(), Path("~/trademl").expanduser()]
     scored: list[tuple[int, Path]] = []
     for candidate in candidates:
@@ -179,10 +198,32 @@ def _resolve_workspace_root(*, workspace_root: str | Path | None = None) -> Path
             score += 1
         if score:
             scored.append((score, candidate))
-    if scored:
-        scored.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
-        return scored[0][1]
-    return Path("~/trademl").expanduser()
+    return scored
+
+
+def _validate_explicit_workspace_root(
+    *,
+    workspace_root: str | Path | None,
+    resolved_workspace: Path,
+    config_path: str | Path | None,
+    env_path: str | Path | None,
+) -> None:
+    """Fail loudly when a bare data root is passed as a worker workspace."""
+    if workspace_root is None or config_path is not None or env_path is not None:
+        return
+    if (resolved_workspace / "node.yml").exists() or (resolved_workspace / ".env").exists():
+        return
+    autodetected = _scored_workspace_candidates()
+    if not autodetected:
+        return
+    autodetected.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+    best_workspace = autodetected[0][1]
+    if best_workspace == resolved_workspace:
+        return
+    raise ValueError(
+        f"workspace_root={resolved_workspace} does not look like a worker workspace; "
+        f"use workspace_root={best_workspace} or pass --config/--env-file explicitly"
+    )
 
 
 def persist_node_settings(
@@ -745,6 +786,20 @@ def replan_coverage(settings: NodeSettings) -> dict[str, Any]:
         {"worker_id": settings.worker_id, "task_count": len(plan)},
     )
     return payload
+
+
+def repair_canonical_backlog(settings: NodeSettings, *, trading_date: str | None = None) -> dict[str, Any]:
+    """Run a one-shot canonical backlog repair pass against the local worker state."""
+    service = _service_from_settings(settings)
+    result = service.repair_canonical_backlog(
+        trading_date=trading_date or datetime.now(tz=UTC).date().isoformat()
+    )
+    append_cluster_event(
+        settings.cluster_paths,
+        "canonical_backlog_repaired",
+        {"worker_id": settings.worker_id, **result},
+    )
+    return result
 
 
 def _remove_worker_state(settings: NodeSettings) -> None:
@@ -1490,6 +1545,35 @@ def _runtime_inputs(settings: NodeSettings) -> tuple[dict[str, str], dict[str, d
     env_values = _read_env_file(settings.env_path)
     config = _read_yaml(settings.config_path)
     return env_values, resolve_vendor_budgets(config)
+
+
+def _service_from_settings(settings: NodeSettings) -> DataNodeService:
+    """Build a live data-node service instance from persisted worker settings."""
+    env_values, vendor_limits = _runtime_inputs(settings)
+    budgets = BudgetManager(vendor_limits, snapshot_path=settings.budget_path)
+    connectors = build_connectors(
+        env_values=env_values,
+        vendor_limits=vendor_limits,
+        budget_manager_factory=lambda _vendor: budgets,
+        sec_edgar_user_agent=env_values.get("SEC_EDGAR_USER_AGENT", "TradeML/0.1 test@example.com"),
+    )
+    stage = _read_yaml(settings.stage_path)
+    db = DataNodeDB(settings.db_path)
+    service = DataNodeService(
+        db=db,
+        connectors=connectors,
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(root=settings.reference_root / "calendars"),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=settings.nas_mount),
+        capability_audit_state=load_audit_state(_audit_report_path(settings)),
+        worker_id=settings.worker_id,
+        stage_years=int(stage.get("years", 5) or 5),
+    )
+    service.default_symbols = [str(symbol) for symbol in stage.get("symbols", []) if str(symbol).strip()]
+    return service
 
 
 def _connector_from_inputs(*, vendor: str, env_values: dict[str, str], vendor_limits: dict[str, dict[str, int]]) -> BaseConnector | None:

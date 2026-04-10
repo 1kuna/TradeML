@@ -16,6 +16,7 @@ from trademl.dashboard.controller import (
     join_cluster,
     leave_cluster,
     replan_coverage,
+    repair_canonical_backlog,
     rebuild_cluster_state,
     resolve_node_settings,
     restart_node,
@@ -93,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     node_subparsers.add_parser("uninstall", help="Remove local worker artifacts from this machine.")
     node_subparsers.add_parser("run-audit", help="Run live vendor capability canaries and persist the report.")
     node_subparsers.add_parser("replan-coverage", help="Materialize the current auxiliary coverage plan.")
+    repair_parser = node_subparsers.add_parser("repair-canonical", help="Repair stale partial canonical backlog state.")
+    repair_parser.add_argument("--date", default=None)
 
     args = parser.parse_args(argv)
     if args.command == "dashboard":
@@ -164,6 +167,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.node_command == "replan-coverage":
         print(json.dumps(replan_coverage(settings), indent=2, default=str))
+        return 0
+    if args.node_command == "repair-canonical":
+        print(json.dumps(repair_canonical_backlog(settings, trading_date=args.date), indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported node command: {args.node_command}")
 

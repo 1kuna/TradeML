@@ -386,6 +386,22 @@ class DataNodeService:
         if released:
             LOGGER.warning("released_budget_blocked_canonical_tasks count=%s", released)
 
+    def repair_canonical_backlog(self, *, trading_date: str | None = None) -> dict[str, object]:
+        """Run a one-shot canonical backlog repair pass and return before/after counts."""
+        as_of_date = trading_date or datetime.now(tz=UTC).date().isoformat()
+        before_future_blocked = self.db.count_repairable_stale_success_canonical_tasks(only_future_blocked=True)
+        before_all_blocked = self.db.count_repairable_stale_success_canonical_tasks(only_future_blocked=False)
+        self._seed_planner_tasks(trading_date=as_of_date)
+        after_future_blocked = self.db.count_repairable_stale_success_canonical_tasks(only_future_blocked=True)
+        after_all_blocked = self.db.count_repairable_stale_success_canonical_tasks(only_future_blocked=False)
+        return {
+            "trading_date": as_of_date,
+            "repairable_future_blocked_before": before_future_blocked,
+            "repairable_future_blocked_after": after_future_blocked,
+            "repairable_all_blocked_before": before_all_blocked,
+            "repairable_all_blocked_after": after_all_blocked,
+        }
+
     def _release_budget_blocked_canonical_tasks(self) -> int:
         """Clear poisoned task-level backoff when another canonical vendor can run now."""
         now_iso = datetime.now(tz=UTC).isoformat()

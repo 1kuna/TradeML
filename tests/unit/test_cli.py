@@ -185,6 +185,31 @@ def test_audit_and_replan_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> N
     assert json.loads(capsys.readouterr().out)["action"] == "replan"
 
 
+def test_repair_canonical_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "repair_canonical_backlog", lambda settings, trading_date=None: {"action": "repair", "date": trading_date})
+
+    assert cli.main(["node", "--workspace-root", str(workspace), "--config", str(config_path), "repair-canonical", "--date", "2026-04-10"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"action": "repair", "date": "2026-04-10"}
+
+
 def test_train_start_and_status_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     data_root = tmp_path / "nas"
     local_state = tmp_path / "train-state"
