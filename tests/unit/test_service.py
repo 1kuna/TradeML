@@ -1543,6 +1543,96 @@ def test_backfill_lane_widths_omit_temporarily_throttled_vendor(tmp_path: Path) 
     assert list(runtime._backfill_lane_widths()) == ["alpaca"]
 
 
+def test_backfill_lane_widths_persist_vendor_lane_health_state(tmp_path: Path) -> None:
+    alpaca_budget = BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})
+    tiingo_budget = BudgetManager({"tiingo": {"rpm": 10, "daily_cap": 100}})
+    for _ in range(3):
+        tiingo_budget.record_spend("tiingo", task_kind="FORWARD")
+        tiingo_budget.record_remote_rate_limit("tiingo")
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    runtime = CanonicalRuntime(
+        db=db,
+        connectors={
+            "alpaca": _BudgetedBackfillConnector("alpaca", alpaca_budget),
+            "tiingo": _BudgetedBackfillConnector("tiingo", tiingo_budget),
+        },
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+        capability_audit_state={},
+        worker_id="test",
+        default_symbols_getter=lambda: [],
+        stop_requested=lambda: False,
+        write_raw_partition_fn=lambda frame, source_name: [],
+    )
+
+    assert list(runtime._backfill_lane_widths()) == ["alpaca"]
+    lane = db.get_vendor_lane_health(vendor="tiingo", dataset="equities_eod")
+    assert lane is not None
+    assert lane.state == "COOLDOWN"
+
+
+def test_bootstrap_canonical_ledger_seeds_manifest_and_units(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16"
+    partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {"date": "2025-12-16", "symbol": "AAPL", "source_name": "alpaca"},
+            {"date": "2025-12-16", "symbol": "MSFT", "source_name": "alpaca"},
+        ]
+    ).to_parquet(partition / "data.parquet", index=False)
+
+    result = service.bootstrap_canonical_ledger()
+    manifest = db.get_raw_partition_manifest(dataset="equities_eod", trading_date="2025-12-16")
+    units = db.fetch_canonical_units_for_date(dataset="equities_eod", trading_date="2025-12-16")
+
+    assert result["bootstrapped_dates"] == 1
+    assert manifest is not None
+    assert manifest.status == "HEALTHY"
+    assert manifest.symbol_count == 2
+    assert sorted(unit.symbol for unit in units) == ["AAPL", "MSFT"]
+
+
+def test_repair_canonical_backlog_seeds_targeted_repair_tasks(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})),
+            "tiingo": _BudgetedBackfillConnector("tiingo", BudgetManager({"tiingo": {"rpm": 10, "daily_cap": 100}})),
+        },
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    service.default_symbols = ["AAPL", "MSFT"]
+    partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16"
+    partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"date": "2025-12-16", "symbol": "AAPL", "source_name": "alpaca"}]).to_parquet(
+        partition / "data.parquet",
+        index=False,
+    )
+    service.bootstrap_canonical_ledger()
+
+    result = service.repair_canonical_backlog(trading_date="2025-12-16", start_date="2025-12-16", end_date="2025-12-16")
+    repair_tasks = db.fetch_planner_tasks(task_family="canonical_repair")
+
+    assert result["missing_units"] >= 1
+    assert result["seeded_tasks"] == 1
+    assert len(repair_tasks) == 1
+    assert repair_tasks[0].planner_group == "canonical_repair"
+    assert repair_tasks[0].payload["backlog_class"] == "repair"
+
+
 def test_write_raw_partition_serializes_concurrent_same_day_writes(tmp_path: Path, monkeypatch) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

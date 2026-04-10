@@ -205,7 +205,7 @@ def plan_canonical_bar_tasks(
                 PlannedTask(
                     task_key=f"canonical_bars::equities_eod::{symbol_chunk_id}::{date_chunk_id}::{start_date}::{end_date}",
                     task_family="canonical_bars",
-                    planner_group="canonical_bars_backlog",
+                    planner_group="phase1_pinned_canonical" if in_freeze_window else "rolling_canonical",
                     dataset="equities_eod",
                     tier="A",
                     priority=5 if in_freeze_window else 10,
@@ -219,6 +219,7 @@ def plan_canonical_bar_tasks(
                     ),
                     payload={
                         "scope_kind": "symbol_range",
+                        "backlog_class": "phase1_pinned" if in_freeze_window else "rolling",
                         "symbol_chunk_id": symbol_chunk_id,
                         "date_chunk_id": date_chunk_id,
                         "symbol_batch_size": len(symbol_chunk),

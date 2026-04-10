@@ -379,3 +379,67 @@ def test_prune_planner_tasks_removes_stale_tasks_and_attempts(tmp_path: Path) ->
     assert database.get_planner_task("drop") is None
     assert database.fetch_planner_task_progress("drop") is None
     assert database.get_planner_task("keep") is not None
+
+
+def test_canonical_progress_uses_durable_unit_ledger(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+
+    database.replace_canonical_units_for_date(
+        dataset="equities_eod",
+        trading_date="2025-01-02",
+        symbols=["AAPL", "MSFT"],
+        partition_revision=1,
+        source_names={"AAPL": "alpaca", "MSFT": "alpaca"},
+    )
+    database.replace_canonical_units_for_date(
+        dataset="equities_eod",
+        trading_date="2025-01-03",
+        symbols=["AAPL"],
+        partition_revision=2,
+        source_names={"AAPL": "alpaca"},
+    )
+
+    progress = database.fetch_canonical_progress(
+        dataset="equities_eod",
+        symbols=["AAPL", "MSFT"],
+        trading_days=["2025-01-02", "2025-01-03"],
+    )
+
+    assert progress["expected_units"] == 4
+    assert progress["completed_units"] == 3
+    assert progress["remaining_units"] == 1
+    assert progress["completed_symbols"] == ["AAPL"]
+    assert progress["remaining_symbols"] == ["MSFT"]
+
+
+def test_raw_partition_manifest_and_vendor_lane_health_round_trip(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+
+    database.upsert_raw_partition_manifest(
+        dataset="equities_eod",
+        trading_date="2025-01-02",
+        partition_revision=3,
+        symbol_count=2,
+        row_count=2,
+        symbols=["AAPL", "MSFT"],
+        content_hash="abc123",
+        status="HEALTHY",
+    )
+    database.upsert_vendor_lane_health(
+        vendor="tiingo",
+        dataset="equities_eod",
+        state="COOLDOWN",
+        cooldown_until="2026-04-10T12:00:00+00:00",
+        recent_outbound_requests=4,
+        recent_remote_429s=4,
+    )
+
+    manifest = database.get_raw_partition_manifest(dataset="equities_eod", trading_date="2025-01-02")
+    lane = database.get_vendor_lane_health(vendor="tiingo", dataset="equities_eod")
+
+    assert manifest is not None
+    assert manifest.partition_revision == 3
+    assert manifest.symbols == ("AAPL", "MSFT")
+    assert lane is not None
+    assert lane.state == "COOLDOWN"
+    assert lane.recent_remote_429s == 4

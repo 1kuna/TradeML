@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import contextlib
+import hashlib
 import logging
 import os
 import threading
@@ -89,7 +90,7 @@ class CanonicalRuntime:
         scan_limit = max(256, batch_limit * 8)
         for page in range(16):
             page_candidates = self.db.fetch_planner_tasks(
-                task_family="canonical_bars",
+                task_families=("canonical_bars", "canonical_repair"),
                 statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
                 limit=scan_limit,
                 offset=page * scan_limit,
@@ -325,62 +326,38 @@ class CanonicalRuntime:
         trading_days = list(task.payload.get("trading_days", []))
         if not trading_days:
             trading_days = [day.isoformat() for day in get_trading_days(exchange, pd.Timestamp(task.start_date).date(), pd.Timestamp(task.end_date).date())]
-        return self._canonical_progress_for_scope(symbols=list(task.symbols), trading_days=trading_days)
+        return self._canonical_progress_for_scope(dataset=task.dataset, symbols=list(task.symbols), trading_days=trading_days)
 
     def _canonical_progress_for_scope(
         self,
         *,
+        dataset: str,
         symbols: list[str],
         trading_days: list[str],
-        coverage_index: dict[str, set[str]] | None = None,
     ) -> dict[str, object]:
-        """Compute canonical symbol-date coverage for a given task scope."""
-        symbol_set = {symbol.upper() for symbol in symbols}
-        present_pairs: set[tuple[str, str]] = set()
-        counts_by_symbol = {symbol.upper(): 0 for symbol in symbols}
-        if coverage_index is None:
-            coverage_index = self._build_canonical_coverage_index(trading_days=trading_days)
-        for symbol in symbol_set:
-            present_days = coverage_index.get(symbol, set())
-            for day in trading_days:
-                if day not in present_days:
-                    continue
-                pair = (day, symbol)
-                if pair in present_pairs:
-                    continue
-                present_pairs.add(pair)
-                counts_by_symbol[symbol] = counts_by_symbol.get(symbol, 0) + 1
-        completed_symbols = sorted(symbol for symbol, count in counts_by_symbol.items() if count >= len(trading_days))
-        remaining_symbols = sorted(symbol for symbol, count in counts_by_symbol.items() if count < len(trading_days))
-        expected_units = len(symbol_set) * len(trading_days)
-        completed_units = len(present_pairs)
-        remaining_units = max(0, expected_units - completed_units)
-        return {
-            "trading_days": trading_days,
-            "completed_symbols": completed_symbols,
-            "remaining_symbols": remaining_symbols,
-            "expected_units": expected_units,
-            "completed_units": completed_units,
-            "remaining_units": remaining_units,
-        }
+        """Compute canonical symbol-date coverage for a given task scope from the durable ledger."""
+        return self.db.fetch_canonical_progress(
+            dataset=dataset,
+            symbols=list(symbols),
+            trading_days=list(trading_days),
+        )
 
     def _canonical_batch_progress(self, *, tasks: list[PlannerTask], exchange: str) -> dict[str, dict[str, object]]:
-        """Compute canonical progress for a homogeneous task batch."""
-        trading_days = list(tasks[0].payload.get("trading_days", []))
-        if not trading_days:
-            trading_days = [
-                day.isoformat()
-                for day in get_trading_days(exchange, pd.Timestamp(tasks[0].start_date).date(), pd.Timestamp(tasks[0].end_date).date())
-            ]
-        coverage_index = self._build_canonical_coverage_index(trading_days=trading_days)
-        return {
-            task.task_key: self._canonical_progress_for_scope(
+        """Compute canonical progress for a homogeneous task batch from the durable ledger."""
+        progress: dict[str, dict[str, object]] = {}
+        for task in tasks:
+            trading_days = list(task.payload.get("trading_days", []))
+            if not trading_days:
+                trading_days = [
+                    day.isoformat()
+                    for day in get_trading_days(exchange, pd.Timestamp(task.start_date).date(), pd.Timestamp(task.end_date).date())
+                ]
+            progress[task.task_key] = self._canonical_progress_for_scope(
+                dataset=task.dataset,
                 symbols=list(task.symbols),
                 trading_days=trading_days,
-                coverage_index=coverage_index,
             )
-            for task in tasks
-        }
+        return progress
 
     def _canonical_task_has_remaining_vendors(self, task: PlannerTask, *, failed_vendor: str) -> bool:
         """Return whether another eligible vendor could still complete this canonical task."""
@@ -582,7 +559,7 @@ class CanonicalRuntime:
         return coverage
 
     def _write_raw_shard_partition(self, frame: pd.DataFrame, *, shard_id: str, source_name: str) -> list[str]:
-        """Write shard-specific raw partitions and merge them into the date partition."""
+        """Write immutable shard rows, then compact into the canonical raw partition."""
         changed_dates: list[str] = []
         for day, day_frame in frame.groupby("date"):
             day_value = pd.Timestamp(day).strftime("%Y-%m-%d")
@@ -598,7 +575,7 @@ class CanonicalRuntime:
         return changed_dates
 
     def _merge_raw_shards_for_date(self, day_value: str) -> Path:
-        """Merge shard parquet files into the canonical raw partition for a date."""
+        """Compact immutable shard files into the canonical raw partition and ledger."""
         partition = self.paths.raw_equities / f"date={day_value}"
         shard_root = partition / "shards"
         lock_path = partition / ".merge.lock"
@@ -606,14 +583,57 @@ class CanonicalRuntime:
         try:
             frames = [pd.read_parquet(path) for path in sorted(shard_root.glob("*.parquet"))]
             merged = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            merged = self._merge_partition_frame(partition=partition, frame=merged) if not merged.empty else pd.DataFrame()
             tmp_path = partition / f"data.{uuid.uuid4().hex}.tmp"
             merged.to_parquet(tmp_path, index=False)
             output = partition / "data.parquet"
             os.replace(tmp_path, output)
+            symbols = (
+                merged.get("symbol", pd.Series(dtype="string")).dropna().astype("string").str.upper().drop_duplicates().tolist()
+                if not merged.empty
+                else []
+            )
+            source_names = {}
+            if not merged.empty and "symbol" in merged.columns and "source_name" in merged.columns:
+                latest_sources = (
+                    merged.assign(symbol=merged["symbol"].astype("string").str.upper())
+                    .dropna(subset=["symbol"])
+                    .drop_duplicates(subset=["symbol"], keep="first")
+                )
+                source_names = {
+                    str(row["symbol"]).upper(): str(row["source_name"])
+                    for row in latest_sources[["symbol", "source_name"]].to_dict("records")
+                }
+            current_manifest = self.db.get_raw_partition_manifest(dataset="equities_eod", trading_date=day_value)
+            partition_revision = int(current_manifest.partition_revision + 1) if current_manifest is not None else 1
+            content_hash = self._partition_content_hash(symbols=symbols, row_count=len(merged))
+            self.db.replace_canonical_units_for_date(
+                dataset="equities_eod",
+                trading_date=day_value,
+                symbols=symbols,
+                partition_revision=partition_revision,
+                source_names=source_names,
+            )
+            self.db.upsert_raw_partition_manifest(
+                dataset="equities_eod",
+                trading_date=day_value,
+                partition_revision=partition_revision,
+                symbol_count=len(symbols),
+                row_count=len(merged),
+                symbols=symbols,
+                content_hash=content_hash,
+                status="HEALTHY",
+            )
             return output
         finally:
             with contextlib.suppress(OSError):
                 lock_path.unlink()
+
+    @staticmethod
+    def _partition_content_hash(*, symbols: list[str], row_count: int) -> str:
+        """Return a stable manifest hash for a compacted partition."""
+        payload = f"{row_count}|{'|'.join(sorted({str(symbol).upper() for symbol in symbols}))}"
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _acquire_file_lock(path: Path, *, stale_after_seconds: int = 15) -> None:
@@ -648,9 +668,13 @@ class CanonicalRuntime:
             connectors=self.connectors,
             audit_state=self.capability_audit_state,
         ):
-            if self._vendor_temporarily_throttled(capability.vendor):
+            lane_state = self._vendor_lane_state(capability.vendor, dataset=capability.dataset)
+            if lane_state in {"COOLDOWN", "DISABLED"}:
                 continue
-            widths[capability.vendor] = max(widths.get(capability.vendor, 0), int(capability.lane_width or 1))
+            lane_width = int(capability.lane_width or 1)
+            if lane_state == "DEGRADED":
+                lane_width = 1
+            widths[capability.vendor] = max(widths.get(capability.vendor, 0), lane_width)
             order_keys[capability.vendor] = min(
                 order_keys.get(capability.vendor, self._canonical_lane_order_key(capability.vendor, capability.priority)),
                 self._canonical_lane_order_key(capability.vendor, capability.priority),
@@ -907,6 +931,8 @@ class CanonicalRuntime:
         capability = self._canonical_capability(vendor)
         if capability is None:
             return False
+        if self._vendor_lane_state(vendor, dataset=task.dataset) in {"COOLDOWN", "DISABLED"}:
+            return False
         if vendor not in task.eligible_vendors:
             return False
         if task.status == "LEASED" and task.lease_expires_at and task.lease_expires_at > now_iso and task.lease_owner != self.worker_id:
@@ -957,7 +983,7 @@ class CanonicalRuntime:
         budget_manager = getattr(connector, "budget_manager", None)
         if budget_manager is None:
             return True
-        if self._vendor_temporarily_throttled(vendor):
+        if self._vendor_lane_state(vendor, dataset=dataset) in {"COOLDOWN", "DISABLED"}:
             return False
         contract = dataset_contract(vendor, dataset)
         request_units = max(1, int(getattr(contract, "request_cost_units", 1) or 1))
@@ -967,11 +993,52 @@ class CanonicalRuntime:
 
     def _vendor_temporarily_throttled(self, vendor: str) -> bool:
         """Return whether a vendor should be held out due to recent pure-throttle behavior."""
+        return self._vendor_lane_state(vendor, dataset="equities_eod") in {"COOLDOWN", "DISABLED"}
+
+    def _vendor_lane_state(self, vendor: str, *, dataset: str) -> str:
+        """Return and refresh the scheduler lane-health state for a vendor."""
+        now = datetime.now(tz=UTC)
         connector = self.connectors.get(vendor)
         budget_manager = getattr(connector, "budget_manager", None)
         if budget_manager is None:
-            return False
-        return bool(budget_manager.is_temporarily_throttled(vendor, minimum_events=3))
+            self.db.upsert_vendor_lane_health(vendor=vendor, dataset=dataset, state="HEALTHY")
+            return "HEALTHY"
+        snapshot = budget_manager.snapshot(now=now)
+        vendor_payload = (snapshot.get("vendors") or {}).get(vendor, {})
+        telemetry = vendor_payload.get("telemetry") or {}
+        window_counts = telemetry.get("window_counts") or {}
+        outbound = int(window_counts.get("outbound_requests", 0) or 0)
+        remote_429s = int(window_counts.get("remote_rate_limits", 0) or 0)
+        local_blocks = int(window_counts.get("local_budget_blocks", 0) or 0)
+        empty_valid = int(window_counts.get("empty_successes", 0) or 0)
+        permanent_failures = int(window_counts.get("permanent_failures", 0) or 0)
+        state = "HEALTHY"
+        cooldown_until: str | None = None
+        if permanent_failures >= 5 and outbound == 0:
+            state = "DISABLED"
+        elif remote_429s >= 3 and remote_429s >= max(3, outbound):
+            state = "COOLDOWN"
+            cooldown_until = (now + pd.Timedelta(minutes=5)).isoformat()
+        elif local_blocks >= 3 and outbound == 0:
+            state = "DEGRADED"
+        self.db.upsert_vendor_lane_health(
+            vendor=vendor,
+            dataset=dataset,
+            state=state,
+            cooldown_until=cooldown_until,
+            recent_outbound_requests=outbound,
+            recent_success_units=int(telemetry.get("totals", {}).get("logical_units", 0) or 0),
+            recent_remote_429s=remote_429s,
+            recent_local_budget_blocks=local_blocks,
+            recent_empty_valid=empty_valid,
+            recent_permanent_failures=permanent_failures,
+        )
+        lane_health = self.db.get_vendor_lane_health(vendor=vendor, dataset=dataset)
+        if lane_health is None:
+            return state
+        if lane_health.state == "COOLDOWN" and lane_health.cooldown_until and lane_health.cooldown_until > now.isoformat():
+            return "COOLDOWN"
+        return str(lane_health.state)
 
     @staticmethod
     def _canonical_empty_result_error(*, vendor: str, dataset: str) -> str:

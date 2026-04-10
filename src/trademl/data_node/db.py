@@ -170,11 +170,79 @@ class PlannerTaskProgress:
             return {}
 
 
+@dataclass(slots=True)
+class CanonicalUnit:
+    """Durable canonical symbol-date coverage unit."""
+
+    dataset: str
+    symbol: str
+    trading_date: str
+    status: str
+    source_name: str | None
+    task_key: str | None
+    written_at: str | None
+    partition_revision: int
+    last_error: str | None
+
+
+@dataclass(slots=True)
+class RawPartitionManifest:
+    """Metadata describing the compacted raw partition for a trading date."""
+
+    dataset: str
+    trading_date: str
+    partition_revision: int
+    symbol_count: int
+    row_count: int
+    symbols_json: str | None
+    content_hash: str | None
+    last_compacted_at: str | None
+    status: str
+
+    @property
+    def symbols(self) -> tuple[str, ...]:
+        """Return the compacted symbol set for this partition."""
+        if not self.symbols_json:
+            return ()
+        try:
+            raw = json.loads(self.symbols_json)
+        except json.JSONDecodeError:
+            return ()
+        return tuple(str(value) for value in raw)
+
+
+@dataclass(slots=True)
+class VendorLaneHealth:
+    """Durable scheduler health state for a vendor/dataset lane."""
+
+    vendor: str
+    dataset: str
+    state: str
+    cooldown_until: str | None
+    last_state_change: str
+    recent_outbound_requests: int
+    recent_success_units: int
+    recent_remote_429s: int
+    recent_local_budget_blocks: int
+    recent_empty_valid: int
+    recent_permanent_failures: int
+    updated_at: str
+
+
 class DataNodeDB:
     """Small transactional wrapper around the local SQLite state store."""
 
     REQUIRED_TABLES = frozenset(
-        {"backfill_queue", "partition_status", "vendor_attempts", "planner_tasks", "planner_task_progress"}
+        {
+            "backfill_queue",
+            "partition_status",
+            "vendor_attempts",
+            "planner_tasks",
+            "planner_task_progress",
+            "canonical_units",
+            "raw_partition_manifest",
+            "vendor_lane_health",
+        }
     )
 
     def __init__(self, path: str | Path) -> None:
@@ -317,6 +385,63 @@ class DataNodeDB:
                   remaining_symbols_json TEXT,
                   state_json           TEXT,
                   updated_at           TIMESTAMP NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS canonical_units (
+                  dataset              TEXT NOT NULL,
+                  symbol               TEXT NOT NULL,
+                  trading_date         DATE NOT NULL,
+                  status               TEXT NOT NULL,
+                  source_name          TEXT,
+                  task_key             TEXT,
+                  written_at           TIMESTAMP,
+                  partition_revision   INTEGER NOT NULL DEFAULT 0,
+                  last_error           TEXT,
+                  PRIMARY KEY (dataset, symbol, trading_date)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_canonical_units_date
+                ON canonical_units(dataset, trading_date, status)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS raw_partition_manifest (
+                  dataset              TEXT NOT NULL,
+                  trading_date         DATE NOT NULL,
+                  partition_revision   INTEGER NOT NULL DEFAULT 0,
+                  symbol_count         INTEGER NOT NULL DEFAULT 0,
+                  row_count            INTEGER NOT NULL DEFAULT 0,
+                  symbols_json         TEXT,
+                  content_hash         TEXT,
+                  last_compacted_at    TIMESTAMP,
+                  status               TEXT NOT NULL,
+                  PRIMARY KEY (dataset, trading_date)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vendor_lane_health (
+                  vendor                   TEXT NOT NULL,
+                  dataset                  TEXT NOT NULL,
+                  state                    TEXT NOT NULL,
+                  cooldown_until           TIMESTAMP,
+                  last_state_change        TIMESTAMP NOT NULL,
+                  recent_outbound_requests INTEGER NOT NULL DEFAULT 0,
+                  recent_success_units     INTEGER NOT NULL DEFAULT 0,
+                  recent_remote_429s       INTEGER NOT NULL DEFAULT 0,
+                  recent_local_budget_blocks INTEGER NOT NULL DEFAULT 0,
+                  recent_empty_valid       INTEGER NOT NULL DEFAULT 0,
+                  recent_permanent_failures INTEGER NOT NULL DEFAULT 0,
+                  updated_at               TIMESTAMP NOT NULL,
+                  PRIMARY KEY (vendor, dataset)
                 )
                 """
             )
@@ -528,6 +653,360 @@ class DataNodeDB:
                     utc_now().isoformat(),
                 ),
             )
+
+    def replace_canonical_units_for_date(
+        self,
+        *,
+        dataset: str,
+        trading_date: str,
+        symbols: list[str] | tuple[str, ...],
+        partition_revision: int,
+        source_names: dict[str, str] | None = None,
+        task_key: str | None = None,
+    ) -> None:
+        """Replace the durable symbol-date ledger for a single compacted partition."""
+        timestamp = utc_now().isoformat()
+        normalized = sorted({str(symbol).upper() for symbol in symbols if str(symbol).strip()})
+        with self._connect() as connection:
+            existing_rows = connection.execute(
+                """
+                SELECT symbol
+                FROM canonical_units
+                WHERE dataset = ? AND trading_date = ?
+                """,
+                (dataset, trading_date),
+            ).fetchall()
+            existing = {str(row["symbol"]).upper() for row in existing_rows}
+            missing = sorted(existing.difference(normalized))
+            if missing:
+                placeholders = ",".join("?" for _ in missing)
+                connection.execute(
+                    f"""
+                    UPDATE canonical_units
+                    SET status = 'MISSING',
+                        written_at = ?,
+                        partition_revision = ?,
+                        last_error = 'missing from compacted partition'
+                    WHERE dataset = ?
+                      AND trading_date = ?
+                      AND symbol IN ({placeholders})
+                    """,
+                    [timestamp, int(partition_revision), dataset, trading_date, *missing],
+                )
+            payloads = [
+                (
+                    dataset,
+                    symbol,
+                    trading_date,
+                    "WRITTEN",
+                    str((source_names or {}).get(symbol) or ""),
+                    task_key,
+                    timestamp,
+                    int(partition_revision),
+                    None,
+                )
+                for symbol in normalized
+            ]
+            connection.executemany(
+                """
+                INSERT INTO canonical_units (
+                  dataset, symbol, trading_date, status, source_name, task_key,
+                  written_at, partition_revision, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dataset, symbol, trading_date)
+                DO UPDATE SET
+                  status = excluded.status,
+                  source_name = excluded.source_name,
+                  task_key = COALESCE(excluded.task_key, canonical_units.task_key),
+                  written_at = excluded.written_at,
+                  partition_revision = excluded.partition_revision,
+                  last_error = excluded.last_error
+                """,
+                payloads,
+            )
+
+    def mark_canonical_units_status(
+        self,
+        *,
+        dataset: str,
+        trading_date: str,
+        symbols: list[str] | tuple[str, ...] | None,
+        status: str,
+        last_error: str | None = None,
+    ) -> int:
+        """Mark canonical units for a date/symbol scope with an explicit status."""
+        timestamp = utc_now().isoformat()
+        with self._connect() as connection:
+            params: list[object] = [status, last_error, timestamp, dataset, trading_date]
+            query = """
+                UPDATE canonical_units
+                SET status = ?,
+                    last_error = ?,
+                    written_at = ?
+                WHERE dataset = ?
+                  AND trading_date = ?
+            """
+            if symbols:
+                normalized = sorted({str(symbol).upper() for symbol in symbols})
+                placeholders = ",".join("?" for _ in normalized)
+                query += f" AND symbol IN ({placeholders})"
+                params.extend(normalized)
+            cursor = connection.execute(query, params)
+        return int(cursor.rowcount)
+
+    def fetch_canonical_progress(
+        self,
+        *,
+        dataset: str,
+        symbols: list[str] | tuple[str, ...],
+        trading_days: list[str] | tuple[str, ...],
+    ) -> dict[str, object]:
+        """Return canonical progress for a symbol/date scope from the durable ledger."""
+        normalized_symbols = sorted({str(symbol).upper() for symbol in symbols})
+        normalized_days = sorted({str(day) for day in trading_days})
+        counts_by_symbol = {symbol: 0 for symbol in normalized_symbols}
+        if not normalized_symbols or not normalized_days:
+            return {
+                "trading_days": normalized_days,
+                "completed_symbols": [],
+                "remaining_symbols": normalized_symbols,
+                "expected_units": len(normalized_symbols) * len(normalized_days),
+                "completed_units": 0,
+                "remaining_units": len(normalized_symbols) * len(normalized_days),
+            }
+        with self._connect() as connection:
+            symbol_placeholders = ",".join("?" for _ in normalized_symbols)
+            day_placeholders = ",".join("?" for _ in normalized_days)
+            rows = connection.execute(
+                f"""
+                SELECT symbol, trading_date
+                FROM canonical_units
+                WHERE dataset = ?
+                  AND status = 'WRITTEN'
+                  AND symbol IN ({symbol_placeholders})
+                  AND trading_date IN ({day_placeholders})
+                """,
+                [dataset, *normalized_symbols, *normalized_days],
+            ).fetchall()
+        completed_pairs: set[tuple[str, str]] = set()
+        for row in rows:
+            symbol = str(row["symbol"]).upper()
+            trading_date = str(row["trading_date"])
+            pair = (trading_date, symbol)
+            if pair in completed_pairs:
+                continue
+            completed_pairs.add(pair)
+            counts_by_symbol[symbol] = counts_by_symbol.get(symbol, 0) + 1
+        completed_symbols = sorted(symbol for symbol, count in counts_by_symbol.items() if count >= len(normalized_days))
+        remaining_symbols = sorted(symbol for symbol, count in counts_by_symbol.items() if count < len(normalized_days))
+        expected_units = len(normalized_symbols) * len(normalized_days)
+        completed_units = len(completed_pairs)
+        return {
+            "trading_days": normalized_days,
+            "completed_symbols": completed_symbols,
+            "remaining_symbols": remaining_symbols,
+            "expected_units": expected_units,
+            "completed_units": completed_units,
+            "remaining_units": max(0, expected_units - completed_units),
+        }
+
+    def fetch_canonical_units_for_date(
+        self,
+        *,
+        dataset: str,
+        trading_date: str,
+        statuses: tuple[str, ...] | None = None,
+    ) -> list[CanonicalUnit]:
+        """Return canonical units for a trading date."""
+        query = "SELECT * FROM canonical_units WHERE dataset = ? AND trading_date = ?"
+        params: list[object] = [dataset, trading_date]
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            query += f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        query += " ORDER BY symbol"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [CanonicalUnit(**dict(row)) for row in rows]
+
+    def upsert_raw_partition_manifest(
+        self,
+        *,
+        dataset: str,
+        trading_date: str,
+        partition_revision: int,
+        symbol_count: int,
+        row_count: int,
+        symbols: list[str] | tuple[str, ...],
+        content_hash: str | None,
+        status: str,
+        last_compacted_at: str | None = None,
+    ) -> None:
+        """Upsert the durable manifest row for a compacted raw partition."""
+        timestamp = last_compacted_at or utc_now().isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO raw_partition_manifest (
+                  dataset, trading_date, partition_revision, symbol_count, row_count,
+                  symbols_json, content_hash, last_compacted_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dataset, trading_date)
+                DO UPDATE SET
+                  partition_revision = excluded.partition_revision,
+                  symbol_count = excluded.symbol_count,
+                  row_count = excluded.row_count,
+                  symbols_json = excluded.symbols_json,
+                  content_hash = excluded.content_hash,
+                  last_compacted_at = excluded.last_compacted_at,
+                  status = excluded.status
+                """,
+                (
+                    dataset,
+                    trading_date,
+                    int(partition_revision),
+                    int(symbol_count),
+                    int(row_count),
+                    json.dumps(sorted({str(symbol).upper() for symbol in symbols}), sort_keys=True),
+                    content_hash,
+                    timestamp,
+                    status,
+                ),
+            )
+
+    def get_raw_partition_manifest(self, *, dataset: str, trading_date: str) -> RawPartitionManifest | None:
+        """Return the raw partition manifest for a date when present."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM raw_partition_manifest
+                WHERE dataset = ? AND trading_date = ?
+                """,
+                (dataset, trading_date),
+            ).fetchone()
+        return RawPartitionManifest(**dict(row)) if row is not None else None
+
+    def fetch_raw_partition_manifests(
+        self,
+        *,
+        dataset: str | None = None,
+        statuses: tuple[str, ...] | None = None,
+    ) -> list[RawPartitionManifest]:
+        """Return raw partition manifests filtered by dataset/status."""
+        query = "SELECT * FROM raw_partition_manifest"
+        clauses: list[str] = []
+        params: list[object] = []
+        if dataset:
+            clauses.append("dataset = ?")
+            params.append(dataset)
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY trading_date ASC"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [RawPartitionManifest(**dict(row)) for row in rows]
+
+    def mark_raw_partition_manifest_status(
+        self,
+        *,
+        dataset: str,
+        trading_date: str,
+        status: str,
+    ) -> None:
+        """Update only the manifest health status for a date."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE raw_partition_manifest
+                SET status = ?,
+                    last_compacted_at = ?
+                WHERE dataset = ? AND trading_date = ?
+                """,
+                (status, utc_now().isoformat(), dataset, trading_date),
+            )
+
+    def upsert_vendor_lane_health(
+        self,
+        *,
+        vendor: str,
+        dataset: str,
+        state: str,
+        cooldown_until: str | None = None,
+        recent_outbound_requests: int = 0,
+        recent_success_units: int = 0,
+        recent_remote_429s: int = 0,
+        recent_local_budget_blocks: int = 0,
+        recent_empty_valid: int = 0,
+        recent_permanent_failures: int = 0,
+    ) -> None:
+        """Persist the current scheduler health state for a vendor lane."""
+        timestamp = utc_now().isoformat()
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT state, last_state_change FROM vendor_lane_health WHERE vendor = ? AND dataset = ?",
+                (vendor, dataset),
+            ).fetchone()
+            last_state_change = timestamp
+            if existing is not None and str(existing["state"]) == state:
+                last_state_change = str(existing["last_state_change"])
+            connection.execute(
+                """
+                INSERT INTO vendor_lane_health (
+                  vendor, dataset, state, cooldown_until, last_state_change,
+                  recent_outbound_requests, recent_success_units, recent_remote_429s,
+                  recent_local_budget_blocks, recent_empty_valid, recent_permanent_failures, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(vendor, dataset)
+                DO UPDATE SET
+                  state = excluded.state,
+                  cooldown_until = excluded.cooldown_until,
+                  last_state_change = excluded.last_state_change,
+                  recent_outbound_requests = excluded.recent_outbound_requests,
+                  recent_success_units = excluded.recent_success_units,
+                  recent_remote_429s = excluded.recent_remote_429s,
+                  recent_local_budget_blocks = excluded.recent_local_budget_blocks,
+                  recent_empty_valid = excluded.recent_empty_valid,
+                  recent_permanent_failures = excluded.recent_permanent_failures,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    vendor,
+                    dataset,
+                    state,
+                    cooldown_until,
+                    last_state_change,
+                    int(recent_outbound_requests),
+                    int(recent_success_units),
+                    int(recent_remote_429s),
+                    int(recent_local_budget_blocks),
+                    int(recent_empty_valid),
+                    int(recent_permanent_failures),
+                    timestamp,
+                ),
+            )
+
+    def get_vendor_lane_health(self, *, vendor: str, dataset: str) -> VendorLaneHealth | None:
+        """Return current lane-health state for a vendor/dataset."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM vendor_lane_health WHERE vendor = ? AND dataset = ?",
+                (vendor, dataset),
+            ).fetchone()
+        return VendorLaneHealth(**dict(row)) if row is not None else None
+
+    def vendor_lane_health_map(self, *, dataset: str) -> dict[str, VendorLaneHealth]:
+        """Return lane-health rows keyed by vendor."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM vendor_lane_health WHERE dataset = ? ORDER BY vendor",
+                (dataset,),
+            ).fetchall()
+        return {str(row["vendor"]): VendorLaneHealth(**dict(row)) for row in rows}
 
     def fetch_partition_status(self) -> list[sqlite3.Row]:
         """Return the mirrored partition ledger for testing and sync."""
@@ -1414,6 +1893,24 @@ class DataNodeDB:
                 GROUP BY planner_tasks.task_family
                 """
             ).fetchall()
+            backlog_rows = connection.execute(
+                """
+                SELECT CASE
+                         WHEN planner_tasks.planner_group = 'phase1_pinned_canonical' THEN 'phase1_pinned'
+                         WHEN planner_tasks.planner_group = 'rolling_canonical' THEN 'rolling'
+                         WHEN planner_tasks.planner_group = 'canonical_repair' THEN 'repair'
+                         ELSE planner_tasks.planner_group
+                       END AS backlog_class,
+                       SUM(planner_task_progress.expected_units) AS expected_units,
+                       SUM(planner_task_progress.completed_units) AS completed_units,
+                       SUM(planner_task_progress.remaining_units) AS remaining_units
+                FROM planner_tasks
+                LEFT JOIN planner_task_progress
+                  ON planner_tasks.task_key = planner_task_progress.task_key
+                WHERE planner_tasks.task_family IN ('canonical_bars', 'canonical_repair')
+                GROUP BY backlog_class
+                """
+            ).fetchall()
         counts: dict[str, dict[str, int]] = {}
         for row in task_rows:
             family = str(row["task_family"])
@@ -1425,4 +1922,11 @@ class DataNodeDB:
                 "completed_units": int(row["completed_units"] or 0),
                 "remaining_units": int(row["remaining_units"] or 0),
             }
-        return {"counts": counts, "progress": progress}
+        backlog_progress: dict[str, dict[str, int]] = {}
+        for row in backlog_rows:
+            backlog_progress[str(row["backlog_class"])] = {
+                "expected_units": int(row["expected_units"] or 0),
+                "completed_units": int(row["completed_units"] or 0),
+                "remaining_units": int(row["remaining_units"] or 0),
+            }
+        return {"counts": counts, "progress": progress, "backlog_progress": backlog_progress}

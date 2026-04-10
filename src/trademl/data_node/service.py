@@ -87,6 +87,7 @@ class DataNodeService:
         self._reference_history: set[str] = set()
         self._price_check_history: set[str] = set()
         self._planner_seed_history: set[str] = set()
+        self._ledger_bootstrap_complete = False
         self._auxiliary_runtime = AuxiliaryRuntime(
             db=self.db,
             connectors=self.connectors,
@@ -157,25 +158,18 @@ class DataNodeService:
         return self.source_name, pd.DataFrame()
 
     def _write_raw_partition(self, frame: pd.DataFrame, *, source_name: str) -> list[str]:
-        changed_dates: list[str] = []
-        for day, day_frame in frame.groupby("date"):
-            day_value = pd.Timestamp(day).strftime("%Y-%m-%d")
-            partition = self.paths.raw_equities / f"date={day_value}"
-            partition.mkdir(parents=True, exist_ok=True)
-            lock_path = partition / ".write.lock"
-            self._canonical_runtime._acquire_file_lock(lock_path)
-            try:
-                merged = self._canonical_runtime._merge_partition_frame(partition=partition, frame=day_frame)
-                tmp_path = partition / f"data.{uuid.uuid4().hex}.tmp"
-                merged.to_parquet(tmp_path, index=False)
-                os.replace(tmp_path, partition / "data.parquet")
-            finally:
-                with contextlib.suppress(OSError):
-                    lock_path.unlink()
-            changed_dates.append(day_value)
-            expected_rows = len(self.default_symbols) if self.default_symbols else len(merged)
-            row_count = len(merged)
-            status = "GREEN" if row_count >= expected_rows else "AMBER"
+        shard_id = f"write-{uuid.uuid4().hex}"
+        changed_dates = self._canonical_runtime._write_raw_shard_partition(
+            frame,
+            shard_id=shard_id,
+            source_name=source_name,
+        )
+        for day_value in changed_dates:
+            manifest = self.db.get_raw_partition_manifest(dataset="equities_eod", trading_date=day_value)
+            row_count = int(manifest.row_count if manifest is not None else 0)
+            symbol_count = int(manifest.symbol_count if manifest is not None else 0)
+            expected_rows = len(self.default_symbols) if self.default_symbols else symbol_count
+            status = "GREEN" if symbol_count >= expected_rows else "AMBER"
             qc_code = "OK" if status == "GREEN" else "INCOMPLETE"
             self.db.update_partition_status(
                 source=source_name,
@@ -262,7 +256,7 @@ class DataNodeService:
         changed_dates: list[str] = []
         futures: dict[object, str] = {}
         canonical_lane_widths = self._canonical_runtime._backfill_lane_widths()
-        canonical_backlog_active = self.db.has_pending_planner_tasks(task_families=("canonical_bars",)) or self.db.has_pending_backfill()
+        canonical_backlog_active = self.db.has_pending_planner_tasks(task_families=("canonical_bars", "canonical_repair")) or self.db.has_pending_backfill()
         aux_lane_widths = {} if canonical_backlog_active else self._aux_lane_widths(task_kinds={"REFERENCE", "EVENT", "MACRO"})
         max_workers = max(1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values()))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -286,6 +280,8 @@ class DataNodeService:
         """Seed or refresh planner tasks from the current stage definition."""
         if not self.default_symbols:
             return
+        if not self._ledger_bootstrap_complete:
+            self.bootstrap_canonical_ledger()
         as_of_date = trading_date or datetime.now(tz=UTC).date().isoformat()
         freeze_cutoff = recommended_training_cutoff(
             data_root=self.paths.root,
@@ -304,7 +300,6 @@ class DataNodeService:
         canonical_task_keys = {task.task_key for task in planned if task.task_family == "canonical_bars"}
         if canonical_task_keys:
             self.db.prune_planner_tasks(task_families=("canonical_bars",), valid_task_keys=canonical_task_keys)
-        coverage_index = self._canonical_runtime._build_canonical_coverage_index() if any(task.task_family == "canonical_bars" for task in planned) else {}
         task_rows: list[dict[str, object]] = []
         progress_rows: list[dict[str, object]] = []
         canonical_task_map = {
@@ -342,9 +337,9 @@ class DataNodeService:
                 existing_task = canonical_task_map.get(task.task_key)
                 existing_progress = existing_progress_map.get(task.task_key)
                 progress_payload = self._canonical_runtime._canonical_progress_for_scope(
+                    dataset=task.dataset,
                     symbols=list(task.symbols),
                     trading_days=list(task.payload.get("trading_days", [])),
-                    coverage_index=coverage_index,
                 )
                 if (
                     existing_task is not None
@@ -382,16 +377,96 @@ class DataNodeService:
             reopened = self.db.reopen_planner_tasks(sorted(set(regressed_task_keys)), reason="canonical coverage regressed")
             if reopened:
                 LOGGER.warning("reopened_regressed_canonical_tasks count=%s", reopened)
+        repair_seeded = self._verify_and_seed_canonical_repairs(
+            trading_date=as_of_date,
+            changed_dates=None,
+            symbol_filter=None,
+            verify_only=False,
+        )
+        if repair_seeded.get("seeded_tasks", 0):
+            LOGGER.warning("seeded_canonical_repairs count=%s", repair_seeded["seeded_tasks"])
         released = self._release_budget_blocked_canonical_tasks()
         if released:
             LOGGER.warning("released_budget_blocked_canonical_tasks count=%s", released)
 
-    def repair_canonical_backlog(self, *, trading_date: str | None = None) -> dict[str, object]:
-        """Run a one-shot canonical backlog repair pass and return before/after counts."""
+    def bootstrap_canonical_ledger(self) -> dict[str, object]:
+        """Seed the durable canonical ledger from the current raw corpus once."""
+        manifests = self.db.fetch_raw_partition_manifests(dataset="equities_eod")
+        if manifests:
+            self._ledger_bootstrap_complete = True
+            return {"bootstrapped_dates": 0, "unreadable_dates": 0, "already_present": True}
+        raw_root = self.paths.raw_equities
+        if not raw_root.exists():
+            self._ledger_bootstrap_complete = True
+            return {"bootstrapped_dates": 0, "unreadable_dates": 0, "already_present": False}
+        bootstrapped = 0
+        unreadable = 0
+        for path in sorted(raw_root.glob("date=*/data.parquet")):
+            trading_date = path.parent.name.partition("=")[2]
+            try:
+                frame = pd.read_parquet(path, columns=["symbol", "source_name"])
+            except Exception:
+                unreadable += 1
+                self.db.upsert_raw_partition_manifest(
+                    dataset="equities_eod",
+                    trading_date=trading_date,
+                    partition_revision=1,
+                    symbol_count=0,
+                    row_count=0,
+                    symbols=[],
+                    content_hash=None,
+                    status="UNREADABLE",
+                )
+                continue
+            symbols = frame.get("symbol", pd.Series(dtype="string")).dropna().astype("string").str.upper().drop_duplicates().tolist()
+            sources = {}
+            if "symbol" in frame.columns and "source_name" in frame.columns:
+                normalized = frame.copy()
+                normalized["symbol"] = normalized["symbol"].astype("string").str.upper()
+                normalized = normalized.dropna(subset=["symbol"]).drop_duplicates(subset=["symbol"], keep="first")
+                sources = {str(row["symbol"]).upper(): str(row["source_name"]) for row in normalized[["symbol", "source_name"]].to_dict("records")}
+            self.db.replace_canonical_units_for_date(
+                dataset="equities_eod",
+                trading_date=trading_date,
+                symbols=symbols,
+                partition_revision=1,
+                source_names=sources,
+            )
+            self.db.upsert_raw_partition_manifest(
+                dataset="equities_eod",
+                trading_date=trading_date,
+                partition_revision=1,
+                symbol_count=len(symbols),
+                row_count=len(frame),
+                symbols=symbols,
+                content_hash=self._canonical_runtime._partition_content_hash(symbols=symbols, row_count=len(frame)),
+                status="HEALTHY",
+            )
+            bootstrapped += 1
+        self._ledger_bootstrap_complete = True
+        return {"bootstrapped_dates": bootstrapped, "unreadable_dates": unreadable, "already_present": False}
+
+    def repair_canonical_backlog(
+        self,
+        *,
+        trading_date: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        symbol: str | None = None,
+        verify_only: bool = False,
+    ) -> dict[str, object]:
+        """Seed targeted canonical repair work from manifest/ledger verification."""
         as_of_date = trading_date or datetime.now(tz=UTC).date().isoformat()
         before_future_blocked = self.db.count_repairable_stale_success_canonical_tasks(only_future_blocked=True)
         before_all_blocked = self.db.count_repairable_stale_success_canonical_tasks(only_future_blocked=False)
         self._seed_planner_tasks(trading_date=as_of_date)
+        verification = self._verify_and_seed_canonical_repairs(
+            trading_date=as_of_date,
+            start_date=start_date,
+            end_date=end_date,
+            symbol_filter=symbol,
+            verify_only=verify_only,
+        )
         after_future_blocked = self.db.count_repairable_stale_success_canonical_tasks(only_future_blocked=True)
         after_all_blocked = self.db.count_repairable_stale_success_canonical_tasks(only_future_blocked=False)
         return {
@@ -400,7 +475,220 @@ class DataNodeService:
             "repairable_future_blocked_after": after_future_blocked,
             "repairable_all_blocked_before": before_all_blocked,
             "repairable_all_blocked_after": after_all_blocked,
+            **verification,
         }
+
+    def _verify_and_seed_canonical_repairs(
+        self,
+        *,
+        trading_date: str,
+        changed_dates: list[str] | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        symbol_filter: str | None,
+        verify_only: bool,
+    ) -> dict[str, object]:
+        """Verify ledger/manifests against raw partitions and seed explicit repair tasks."""
+        manifests = self.db.fetch_raw_partition_manifests(dataset="equities_eod")
+        manifest_dates = [manifest.trading_date for manifest in manifests]
+        if start_date or end_date:
+            target_dates = [
+                date_value
+                for date_value in manifest_dates
+                if (start_date is None or date_value >= start_date) and (end_date is None or date_value <= end_date)
+            ]
+        elif changed_dates:
+            target_dates = sorted(set(changed_dates))
+        else:
+            target_dates = sorted(set(manifest_dates[-20:]))
+        if trading_date and trading_date not in target_dates:
+            target_dates.append(trading_date)
+        target_dates = sorted(set(target_dates))
+        repair_rows: list[dict[str, object]] = []
+        progress_rows: list[dict[str, object]] = []
+        unreadable_dates = 0
+        quarantined_units = 0
+        missing_units = 0
+        freeze_cutoff = recommended_training_cutoff(
+            data_root=self.paths.root,
+            expected_symbol_count=len(self.default_symbols),
+            as_of=trading_date,
+        )
+        freeze_end = pd.Timestamp(freeze_cutoff.get("date")).normalize() if freeze_cutoff.get("date") else None
+        freeze_start = (
+            (freeze_end - pd.DateOffset(years=max(1, int(self.stage_years)))).normalize()
+            if freeze_end is not None
+            else None
+        )
+        valid_repair_keys: set[str] = set()
+        for day_value in target_dates:
+            manifest = self.db.get_raw_partition_manifest(dataset="equities_eod", trading_date=day_value)
+            path = self.paths.raw_equities / f"date={day_value}" / "data.parquet"
+            if not path.exists():
+                if manifest is None:
+                    continue
+                expected_symbols = list(manifest.symbols) or list(self.default_symbols)
+                self.db.mark_raw_partition_manifest_status(dataset="equities_eod", trading_date=day_value, status="UNREADABLE")
+                self.db.mark_canonical_units_status(
+                    dataset="equities_eod",
+                    trading_date=day_value,
+                    symbols=expected_symbols,
+                    status="QUARANTINED",
+                    last_error="missing raw partition",
+                )
+                unreadable_dates += 1
+                quarantined_units += len(expected_symbols)
+                if not verify_only:
+                    seeded = self._seed_canonical_repair_tasks(
+                        trading_date=day_value,
+                        symbols=expected_symbols,
+                        freeze_start=freeze_start,
+                        freeze_end=freeze_end,
+                    )
+                    valid_repair_keys.update(seeded)
+                continue
+            try:
+                frame = pd.read_parquet(path, columns=["symbol"])
+            except Exception:
+                expected_symbols = list(manifest.symbols) if manifest is not None else list(self.default_symbols)
+                self.db.mark_raw_partition_manifest_status(dataset="equities_eod", trading_date=day_value, status="UNREADABLE")
+                self.db.mark_canonical_units_status(
+                    dataset="equities_eod",
+                    trading_date=day_value,
+                    symbols=expected_symbols,
+                    status="QUARANTINED",
+                    last_error="unreadable raw partition",
+                )
+                unreadable_dates += 1
+                quarantined_units += len(expected_symbols)
+                if not verify_only:
+                    seeded = self._seed_canonical_repair_tasks(
+                        trading_date=day_value,
+                        symbols=expected_symbols,
+                        freeze_start=freeze_start,
+                        freeze_end=freeze_end,
+                    )
+                    valid_repair_keys.update(seeded)
+                continue
+            actual_symbols = sorted(
+                frame.get("symbol", pd.Series(dtype="string")).dropna().astype("string").str.upper().drop_duplicates().tolist()
+            )
+            expected_symbols = list(self.default_symbols) if self.default_symbols else actual_symbols
+            if manifest is not None and manifest.symbols:
+                expected_symbols = sorted(set(expected_symbols).union(set(manifest.symbols)))
+            if symbol_filter:
+                symbol_upper = str(symbol_filter).upper()
+                expected_symbols = [value for value in expected_symbols if value == symbol_upper]
+                actual_symbols = [value for value in actual_symbols if value == symbol_upper]
+            missing_symbols = sorted(set(expected_symbols).difference(actual_symbols))
+            status = "HEALTHY" if not missing_symbols else "INCOMPLETE"
+            current_revision = manifest.partition_revision if manifest is not None else 0
+            self.db.upsert_raw_partition_manifest(
+                dataset="equities_eod",
+                trading_date=day_value,
+                partition_revision=max(1, int(current_revision)),
+                symbol_count=len(actual_symbols),
+                row_count=len(frame),
+                symbols=actual_symbols,
+                content_hash=self._canonical_runtime._partition_content_hash(symbols=actual_symbols, row_count=len(frame)),
+                status=status,
+            )
+            self.db.replace_canonical_units_for_date(
+                dataset="equities_eod",
+                trading_date=day_value,
+                symbols=actual_symbols,
+                partition_revision=max(1, int(current_revision)),
+            )
+            if missing_symbols:
+                self.db.mark_canonical_units_status(
+                    dataset="equities_eod",
+                    trading_date=day_value,
+                    symbols=missing_symbols,
+                    status="MISSING",
+                    last_error="manifest verification missing symbol",
+                )
+                missing_units += len(missing_symbols)
+                if not verify_only:
+                    seeded = self._seed_canonical_repair_tasks(
+                        trading_date=day_value,
+                        symbols=missing_symbols,
+                        freeze_start=freeze_start,
+                        freeze_end=freeze_end,
+                    )
+                    valid_repair_keys.update(seeded)
+        if not verify_only:
+            self.db.prune_planner_tasks(task_families=("canonical_repair",), valid_task_keys=valid_repair_keys)
+        return {
+            "verified_dates": len(target_dates),
+            "seeded_tasks": len(valid_repair_keys),
+            "unreadable_dates": unreadable_dates,
+            "quarantined_units": quarantined_units,
+            "missing_units": missing_units,
+            "verify_only": verify_only,
+        }
+
+    def _seed_canonical_repair_tasks(
+        self,
+        *,
+        trading_date: str,
+        symbols: list[str],
+        freeze_start: pd.Timestamp | None,
+        freeze_end: pd.Timestamp | None,
+        chunk_size: int = 25,
+    ) -> set[str]:
+        """Create deterministic repair tasks for a missing/quarantined symbol-date scope."""
+        if not symbols:
+            return set()
+        normalized = sorted({str(symbol).upper() for symbol in symbols})
+        in_freeze_window = (
+            freeze_start is not None
+            and freeze_end is not None
+            and pd.Timestamp(trading_date) >= freeze_start
+            and pd.Timestamp(trading_date) <= freeze_end
+        )
+        preferred_vendors = tuple(vendor for vendor in ("alpaca", "tiingo", "massive", "twelve_data") if vendor in self.connectors)
+        task_rows: list[dict[str, object]] = []
+        progress_rows: list[dict[str, object]] = []
+        task_keys: set[str] = set()
+        for index in range(0, len(normalized), max(1, chunk_size)):
+            chunk = normalized[index : index + max(1, chunk_size)]
+            task_key = f"canonical_repair::equities_eod::{trading_date}::{index // max(1, chunk_size):03d}"
+            task_rows.append(
+                {
+                    "task_key": task_key,
+                    "task_family": "canonical_repair",
+                    "planner_group": "canonical_repair",
+                    "dataset": "equities_eod",
+                    "tier": "A",
+                    "priority": 6 if in_freeze_window else 8,
+                    "start_date": trading_date,
+                    "end_date": trading_date,
+                    "symbols": chunk,
+                    "eligible_vendors": preferred_vendors,
+                    "output_name": "equities_bars",
+                    "payload": {
+                        "scope_kind": "symbol_range",
+                        "backlog_class": "repair",
+                        "trading_days": [trading_date],
+                        "repair": True,
+                    },
+                }
+            )
+            progress_rows.append(
+                {
+                    "task_key": task_key,
+                    "expected_units": len(chunk),
+                    "completed_units": 0,
+                    "remaining_units": len(chunk),
+                    "completed_symbols": [],
+                    "remaining_symbols": chunk,
+                    "state": {"scope_kind": "symbol_range", "backlog_class": "repair"},
+                }
+            )
+            task_keys.add(task_key)
+        self.db.bulk_upsert_planner_tasks(task_rows)
+        self.db.bulk_update_planner_task_progress(progress_rows)
+        return task_keys
 
     def _release_budget_blocked_canonical_tasks(self) -> int:
         """Clear poisoned task-level backoff when another canonical vendor can run now."""
@@ -410,7 +698,7 @@ class DataNodeService:
         limit = 512
         while True:
             candidates = self.db.fetch_planner_tasks(
-                task_family="canonical_bars",
+                task_families=("canonical_bars", "canonical_repair"),
                 statuses=("PARTIAL", "FAILED", "LEASED"),
                 limit=limit,
                 offset=page * limit,

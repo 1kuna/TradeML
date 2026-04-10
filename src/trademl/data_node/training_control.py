@@ -16,6 +16,7 @@ import pandas as pd
 import yaml
 
 from trademl.data_node.capabilities import default_macro_series
+from trademl.data_node.db import DataNodeDB
 from trademl.data_node.planner import training_readiness
 
 LOGGER = logging.getLogger(__name__)
@@ -102,9 +103,10 @@ def evaluate_training_gates(
         window_start=frozen_window.get("window_start"),
         window_end=frozen_window.get("window_end"),
     )
-    effective_window_ratio = max(
-        float(frozen_window.get("coverage_ratio", 0.0) or 0.0),
-        float(planner_window_ratio or 0.0),
+    effective_window_ratio = (
+        float(planner_window_ratio)
+        if planner_window_ratio is not None
+        else float(frozen_window.get("coverage_ratio", 0.0) or 0.0)
     )
     freeze_cutoff = {
         **freeze_cutoff,
@@ -175,9 +177,10 @@ def recommended_training_cutoff(
             "pin_path": str(phase_freeze_state_path(data_root=data_root, phase=phase)),
         }
 
-    raw_root = data_root / "data" / "raw" / "equities_bars"
     anchor = pd.Timestamp(as_of or date.today().isoformat()).normalize() - pd.Timedelta(days=lag_days)
-    if expected_symbol_count <= 0 or not raw_root.exists():
+    manifest_db = data_root / "control" / "node.sqlite"
+    raw_root = data_root / "data" / "raw" / "equities_bars"
+    if expected_symbol_count <= 0 or (not manifest_db.exists() and not raw_root.exists()):
         return {
             "date": None,
             "complete_symbols": 0,
@@ -188,17 +191,34 @@ def recommended_training_cutoff(
         }
     best_partial_date: str | None = None
     best_partial_symbols = 0
-    raw_files = sorted(raw_root.glob("date=*/data.parquet"), reverse=True)[:max_partitions]
-    for path in raw_files:
-        partition_date = path.parent.name.partition("=")[2]
+    manifests = []
+    if manifest_db.exists():
+        try:
+            manifests = DataNodeDB(manifest_db).fetch_raw_partition_manifests(dataset="equities_eod")
+        except sqlite3.OperationalError:
+            manifests = []
+    if manifests:
+        manifest_iter = (
+            (manifest.trading_date, int(manifest.symbol_count), manifest.status == "HEALTHY")
+            for manifest in sorted(manifests, key=lambda item: item.trading_date, reverse=True)[:max_partitions]
+        )
+    else:
+        raw_files = sorted(raw_root.glob("date=*/data.parquet"), reverse=True)[:max_partitions]
+        manifest_iter = []
+        for path in raw_files:
+            partition_date = path.parent.name.partition("=")[2]
+            try:
+                frame = pd.read_parquet(path, columns=["symbol"])
+            except Exception:
+                continue
+            complete_symbols = int(frame["symbol"].nunique()) if "symbol" in frame.columns else int(len(frame))
+            manifest_iter.append((partition_date, complete_symbols, True))
+    for partition_date, complete_symbols, healthy in manifest_iter:
         partition_ts = pd.Timestamp(partition_date)
         if partition_ts > anchor:
             continue
-        try:
-            frame = pd.read_parquet(path, columns=["symbol"])
-        except Exception:
+        if not healthy:
             continue
-        complete_symbols = int(frame["symbol"].nunique()) if "symbol" in frame.columns else int(len(frame))
         if complete_symbols >= expected_symbol_count:
             cutoff = {
                 "date": partition_date,
@@ -431,6 +451,7 @@ def _planner_bars_ratio(db_path: Path) -> float | None:
                 LEFT JOIN planner_task_progress
                   ON planner_tasks.task_key = planner_task_progress.task_key
                 WHERE planner_tasks.task_family = 'canonical_bars'
+                  AND planner_tasks.planner_group = 'phase1_pinned_canonical'
                 """
             ).fetchone()
     except sqlite3.OperationalError:
@@ -462,6 +483,7 @@ def _planner_window_ratio(
                 LEFT JOIN planner_task_progress
                   ON planner_tasks.task_key = planner_task_progress.task_key
                 WHERE planner_tasks.task_family = 'canonical_bars'
+                  AND planner_tasks.planner_group = 'phase1_pinned_canonical'
                   AND planner_tasks.start_date >= ?
                   AND planner_tasks.end_date <= ?
                 """,
