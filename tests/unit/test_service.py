@@ -1519,6 +1519,30 @@ def test_backfill_lane_widths_prioritize_alpaca_before_tiingo(tmp_path: Path) ->
     assert list(runtime._backfill_lane_widths())[:2] == ["alpaca", "tiingo"]
 
 
+def test_backfill_lane_widths_omit_temporarily_throttled_vendor(tmp_path: Path) -> None:
+    alpaca_budget = BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})
+    tiingo_budget = BudgetManager({"tiingo": {"rpm": 10, "daily_cap": 100}})
+    for _ in range(3):
+        tiingo_budget.record_spend("tiingo", task_kind="FORWARD")
+        tiingo_budget.record_remote_rate_limit("tiingo")
+    runtime = CanonicalRuntime(
+        db=DataNodeDB(tmp_path / "control" / "node.sqlite"),
+        connectors={
+            "alpaca": _BudgetedBackfillConnector("alpaca", alpaca_budget),
+            "tiingo": _BudgetedBackfillConnector("tiingo", tiingo_budget),
+        },
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+        capability_audit_state={},
+        worker_id="test",
+        default_symbols_getter=lambda: [],
+        stop_requested=lambda: False,
+        write_raw_partition_fn=lambda frame, source_name: [],
+    )
+
+    assert list(runtime._backfill_lane_widths()) == ["alpaca"]
+
+
 def test_write_raw_partition_serializes_concurrent_same_day_writes(tmp_path: Path, monkeypatch) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

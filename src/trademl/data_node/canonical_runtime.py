@@ -648,6 +648,8 @@ class CanonicalRuntime:
             connectors=self.connectors,
             audit_state=self.capability_audit_state,
         ):
+            if self._vendor_temporarily_throttled(capability.vendor):
+                continue
             widths[capability.vendor] = max(widths.get(capability.vendor, 0), int(capability.lane_width or 1))
             order_keys[capability.vendor] = min(
                 order_keys.get(capability.vendor, self._canonical_lane_order_key(capability.vendor, capability.priority)),
@@ -955,13 +957,21 @@ class CanonicalRuntime:
         budget_manager = getattr(connector, "budget_manager", None)
         if budget_manager is None:
             return True
-        if budget_manager.is_temporarily_throttled(vendor, minimum_events=3):
+        if self._vendor_temporarily_throttled(vendor):
             return False
         contract = dataset_contract(vendor, dataset)
         request_units = max(1, int(getattr(contract, "request_cost_units", 1) or 1))
         if contract is not None and str(contract.request_cost_basis) == "symbol":
             request_units *= max(1, int(symbol_count))
         return bool(budget_manager.can_spend(vendor, task_kind="FORWARD", units=request_units))
+
+    def _vendor_temporarily_throttled(self, vendor: str) -> bool:
+        """Return whether a vendor should be held out due to recent pure-throttle behavior."""
+        connector = self.connectors.get(vendor)
+        budget_manager = getattr(connector, "budget_manager", None)
+        if budget_manager is None:
+            return False
+        return bool(budget_manager.is_temporarily_throttled(vendor, minimum_events=3))
 
     @staticmethod
     def _canonical_empty_result_error(*, vendor: str, dataset: str) -> str:
