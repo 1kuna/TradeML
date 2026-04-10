@@ -684,8 +684,9 @@ HTML_PAGE = """<!doctype html>
       document.getElementById('metric-canonical').textContent = formatNumber(collection.canonical_completed_units ?? 0);
       const pinnedRemaining = collection.phase1_pinned_remaining_units;
       const rollingRemaining = collection.canonical_remaining_units ?? 0;
+      const repairRemaining = collection.repair_remaining_units ?? 0;
       document.getElementById('metric-remaining').textContent = readiness.ready
-        ? `Phase 1 complete · ${formatNumber(rollingRemaining)} rolling remaining`
+        ? `Phase 1 complete · ${formatNumber(rollingRemaining)} rolling / ${formatNumber(repairRemaining)} repair`
         : `${formatNumber(pinnedRemaining ?? rollingRemaining)} pinned remaining`;
       document.getElementById('metric-raw-rows').textContent = formatNumber(collection.raw_vendor_rows ?? 0);
       document.getElementById('metric-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
@@ -725,6 +726,8 @@ HTML_PAGE = """<!doctype html>
         ['Freeze cutoff', freezeCutoff.date ?? '-'],
         ['Pinned cutoff', freezeCutoff.pinned ? 'Yes' : 'No'],
         ['Critical coverage', `${collection.training_critical_percent ?? 0}%`],
+        ['Rolling remaining', formatNumber(collection.rolling_remaining_units ?? 0)],
+        ['Repair remaining', formatNumber(collection.repair_remaining_units ?? 0)],
       ]);
       document.getElementById('training-command').textContent = command || 'No training command available yet.';
       document.getElementById('readiness-json').textContent = JSON.stringify(readiness, null, 2);

@@ -788,15 +788,39 @@ def replan_coverage(settings: NodeSettings) -> dict[str, Any]:
     return payload
 
 
-def repair_canonical_backlog(settings: NodeSettings, *, trading_date: str | None = None) -> dict[str, Any]:
+def repair_canonical_backlog(
+    settings: NodeSettings,
+    *,
+    trading_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    symbol: str | None = None,
+    verify_only: bool = False,
+) -> dict[str, Any]:
     """Run a one-shot canonical backlog repair pass against the local worker state."""
     service = _service_from_settings(settings)
     result = service.repair_canonical_backlog(
-        trading_date=trading_date or datetime.now(tz=UTC).date().isoformat()
+        trading_date=trading_date or datetime.now(tz=UTC).date().isoformat(),
+        start_date=start_date,
+        end_date=end_date,
+        symbol=symbol,
+        verify_only=verify_only,
     )
     append_cluster_event(
         settings.cluster_paths,
         "canonical_backlog_repaired",
+        {"worker_id": settings.worker_id, **result},
+    )
+    return result
+
+
+def bootstrap_canonical_ledger(settings: NodeSettings) -> dict[str, Any]:
+    """Seed the durable canonical ledger from the current raw corpus."""
+    service = _service_from_settings(settings)
+    result = service.bootstrap_canonical_ledger()
+    append_cluster_event(
+        settings.cluster_paths,
+        "canonical_ledger_bootstrapped",
         {"worker_id": settings.worker_id, **result},
     )
     return result
@@ -985,9 +1009,18 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
     )
     progress = planner_summary.get("progress", {})
     bars_progress = progress.get("canonical_bars", {})
+    backlog_progress = planner_summary.get("backlog_progress", {})
+    pinned_progress = backlog_progress.get("phase1_pinned", {})
+    rolling_progress = backlog_progress.get("rolling", {})
+    repair_progress = backlog_progress.get("repair", {})
     canonical_expected = int(bars_progress.get("expected_units", 0))
     canonical_completed = int(bars_progress.get("completed_units", 0))
-    canonical_remaining = int(bars_progress.get("remaining_units", max(0, canonical_expected - canonical_completed)))
+    canonical_remaining = int(rolling_progress.get("remaining_units", 0)) + int(repair_progress.get("remaining_units", 0))
+    if canonical_remaining <= 0:
+        canonical_remaining = int(bars_progress.get("remaining_units", max(0, canonical_expected - canonical_completed)))
+    pinned_remaining = int(pinned_progress.get("remaining_units", 0))
+    if pinned_remaining <= 0 and not bool(readiness.get("phase1", {}).get("ready")):
+        pinned_remaining = int(bars_progress.get("remaining_units", max(0, canonical_expected - canonical_completed)))
     canonical_ratio = min(1.0, canonical_completed / canonical_expected) if canonical_expected else 0.0
     training_critical_ratio = float(
         readiness.get("freeze_cutoff", {}).get(
@@ -1002,7 +1035,9 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "canonical_completed_units": canonical_completed,
         "canonical_expected_units": canonical_expected,
         "canonical_remaining_units": canonical_remaining,
-        "phase1_pinned_remaining_units": 0 if bool(readiness.get("phase1", {}).get("ready")) else canonical_remaining,
+        "phase1_pinned_remaining_units": pinned_remaining,
+        "rolling_remaining_units": int(rolling_progress.get("remaining_units", 0)),
+        "repair_remaining_units": int(repair_progress.get("remaining_units", 0)),
         "raw_vendor_rows": int(raw_datapoints),
         "training_critical_percent": round(training_critical_ratio * 100.0, 1),
         "pending_tasks": int(queue_counts.get("PENDING", 0)) + int(queue_counts.get("PARTIAL", 0)) + int(queue_counts.get("LEASED", 0)),
@@ -1360,7 +1395,7 @@ def _summarize_planner_eta(
         if remaining <= 0:
             eta[family] = {"remaining_units": 0, "eta_minutes": 0.0}
             continue
-        if family == "canonical_bars":
+        if family in {"canonical_bars", "canonical_repair"}:
             rate = canonical_rate
         else:
             rate = family_completion_rate.get(family, 0.0)
@@ -1386,9 +1421,15 @@ def _build_collection_health(
 ) -> dict[str, dict[str, Any]]:
     """Build coherent collection-health sections from one shared input set."""
     progress = planner_summary.get("progress", {})
+    backlog_progress = planner_summary.get("backlog_progress", {})
     bars_progress = progress.get("canonical_bars", {})
     bars_expected = int(bars_progress.get("expected_units", 0))
     bars_completed = int(bars_progress.get("completed_units", 0))
+    pinned_remaining = int(backlog_progress.get("phase1_pinned", {}).get("remaining_units", 0))
+    rolling_remaining = int(backlog_progress.get("rolling", {}).get("remaining_units", 0))
+    repair_remaining = int(backlog_progress.get("repair", {}).get("remaining_units", 0))
+    if pinned_remaining <= 0 and int(bars_progress.get("remaining_units", 0)) > 0:
+        pinned_remaining = int(bars_progress.get("remaining_units", 0))
     global_bars_ratio = min(1.0, bars_completed / bars_expected) if bars_expected else 0.0
     frozen_bars_ratio = float(
         freeze_cutoff.get(
@@ -1409,7 +1450,7 @@ def _build_collection_health(
             "ratio": bars_ratio,
             "label": "Bars",
             "blocking": bars_ratio < 0.98,
-            "remaining_units": int(bars_progress.get("remaining_units", 0)),
+            "remaining_units": pinned_remaining,
             "eta_minutes": planner_eta.get("canonical_bars", {}).get("eta_minutes"),
         },
         "corp_actions": {
@@ -1484,7 +1525,9 @@ def _build_collection_health(
     expected = int(bars_expected or expected_datapoints or 0)
     collected = int(bars_completed or raw_datapoints)
     coverage_ratio = min(1.0, collected / expected) if expected > 0 else 0.0
-    remaining = max(0, expected - collected)
+    remaining = max(0, rolling_remaining + repair_remaining)
+    if remaining <= 0:
+        remaining = int(bars_progress.get("remaining_units", max(0, expected - collected)))
     training_critical = [
         dataset_coverage.get("canonical_bars", {}).get("ratio", 0.0),
         dataset_coverage.get("corp_actions", {}).get("ratio", 0.0),
@@ -1509,7 +1552,9 @@ def _build_collection_health(
         "canonical_completed_units": collected,
         "canonical_expected_units": expected,
         "canonical_remaining_units": remaining,
-        "phase1_pinned_remaining_units": 0 if phase1_ready else remaining,
+        "phase1_pinned_remaining_units": 0 if phase1_ready else pinned_remaining,
+        "rolling_remaining_units": rolling_remaining,
+        "repair_remaining_units": repair_remaining,
         "raw_vendor_rows": int(raw_datapoints),
         "pending_tasks": int(queue_counts.get("PENDING", 0)) + int(queue_counts.get("PARTIAL", 0)) + int(queue_counts.get("LEASED", 0)),
         "failed_tasks": int(queue_counts.get("FAILED", 0)),

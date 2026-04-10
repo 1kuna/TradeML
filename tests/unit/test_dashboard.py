@@ -467,7 +467,14 @@ def test_collect_dashboard_snapshot_uses_freeze_cutoff_for_training_ready_percen
 
 def test_build_collection_health_keeps_frozen_bars_and_collection_numbers_aligned() -> None:
     health = dashboard_controller._build_collection_health(
-        planner_summary={"progress": {"canonical_bars": {"expected_units": 1000, "completed_units": 996, "remaining_units": 4}}},
+        planner_summary={
+            "progress": {"canonical_bars": {"expected_units": 1000, "completed_units": 996, "remaining_units": 4}},
+            "backlog_progress": {
+                "phase1_pinned": {"expected_units": 1000, "completed_units": 1000, "remaining_units": 0},
+                "rolling": {"expected_units": 1000, "completed_units": 996, "remaining_units": 4},
+                "repair": {"expected_units": 0, "completed_units": 0, "remaining_units": 0},
+            },
+        },
         reference_files=["corp_actions.parquet", "listing_history.parquet", "delistings.parquet", "sec_filings.parquet", "fred_vintagedates.parquet"],
         macro_series=dashboard_controller.default_macro_series(),
         planner_eta={"canonical_bars": {"remaining_units": 4, "eta_minutes": 12.0}},
@@ -487,6 +494,35 @@ def test_build_collection_health_keeps_frozen_bars_and_collection_numbers_aligne
     assert health["collection_status"]["canonical_completed_units"] == 996
     assert health["collection_status"]["phase1_pinned_remaining_units"] == 0
     assert health["collection_status"]["raw_vendor_rows"] == 111
+
+
+def test_build_collection_health_separates_rolling_and_repair_remaining() -> None:
+    health = dashboard_controller._build_collection_health(
+        planner_summary={
+            "progress": {"canonical_bars": {"expected_units": 1000, "completed_units": 996, "remaining_units": 4}},
+            "backlog_progress": {
+                "phase1_pinned": {"expected_units": 1000, "completed_units": 1000, "remaining_units": 0},
+                "rolling": {"expected_units": 1000, "completed_units": 996, "remaining_units": 4},
+                "repair": {"expected_units": 2, "completed_units": 0, "remaining_units": 2},
+            },
+        },
+        reference_files=["corp_actions.parquet", "listing_history.parquet", "delistings.parquet", "sec_filings.parquet", "fred_vintagedates.parquet"],
+        macro_series=dashboard_controller.default_macro_series(),
+        planner_eta={"canonical_bars": {"remaining_units": 4, "eta_minutes": 12.0}, "canonical_repair": {"remaining_units": 2, "eta_minutes": 6.0}},
+        freeze_cutoff={"date": "2026-03-07", "effective_window_coverage_ratio": 1.0},
+        raw_dates=[],
+        expected_sessions=10,
+        partition_summary={"coverage_green": 0.0},
+        price_check_files=[],
+        raw_datapoints=111,
+        expected_datapoints=1000,
+        queue_counts={"PENDING": 2, "PARTIAL": 1, "LEASED": 3, "FAILED": 4},
+    )
+
+    assert health["collection_status"]["phase1_pinned_remaining_units"] == 0
+    assert health["collection_status"]["rolling_remaining_units"] == 4
+    assert health["collection_status"]["repair_remaining_units"] == 2
+    assert health["collection_status"]["canonical_remaining_units"] == 6
 
 
 def test_build_collection_health_uses_minimum_critical_ratio_for_training_ready() -> None:
