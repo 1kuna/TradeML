@@ -11,6 +11,15 @@ from pathlib import Path
 from train import run_training
 
 
+_TERMINAL_RUNTIME_KEYS = (
+    "assessment",
+    "error",
+    "finished_at",
+    "report_path",
+    "traceback",
+)
+
+
 def main() -> int:
     """Run one detached training job and persist lifecycle state."""
     parser = argparse.ArgumentParser(description="Run one TradeML training job.")
@@ -26,16 +35,11 @@ def main() -> int:
 
     local_runtime_path = Path(args.local_runtime_path)
     shared_runtime_path = Path(args.shared_runtime_path)
-    runtime = _read_runtime(local_runtime_path) or {}
-    runtime.update(
-        {
-            "phase": args.phase,
-            "status": "running",
-            "running": True,
-            "started_at": runtime.get("started_at") or datetime.now(tz=UTC).isoformat(),
-            "report_date": args.report_date,
-            "model_suite": args.model_suite,
-        }
+    runtime = _prepare_runtime_for_start(
+        _read_runtime(local_runtime_path) or {},
+        phase=args.phase,
+        report_date=args.report_date,
+        model_suite=args.model_suite,
     )
     _write_runtime(local_runtime_path, runtime)
     _write_runtime(shared_runtime_path, runtime)
@@ -49,27 +53,20 @@ def main() -> int:
             model_suite=args.model_suite,
         )
     except Exception as exc:
-        runtime.update(
-            {
-                "status": "failed",
-                "running": False,
-                "finished_at": datetime.now(tz=UTC).isoformat(),
-                "error": str(exc),
-                "traceback": traceback.format_exc(limit=20),
-            }
+        runtime = _prepare_runtime_for_failure(
+            runtime,
+            error=str(exc),
+            traceback_text=traceback.format_exc(limit=20),
         )
         _write_runtime(local_runtime_path, runtime)
         _write_runtime(shared_runtime_path, runtime)
         raise
 
-    runtime.update(
-        {
-            "status": "completed",
-            "running": False,
-            "finished_at": datetime.now(tz=UTC).isoformat(),
-            "report_path": str(Path(args.output_root) / "reports" / "daily" / f"{args.report_date}.json"),
-            "assessment": report.get("assessment", {}),
-        }
+    runtime = _prepare_runtime_for_success(
+        runtime,
+        output_root=Path(args.output_root),
+        report_date=args.report_date,
+        assessment=report.get("assessment", {}),
     )
     _write_runtime(local_runtime_path, runtime)
     _write_runtime(shared_runtime_path, runtime)
@@ -88,6 +85,72 @@ def _read_runtime(path: Path) -> dict:
 def _write_runtime(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _prepare_runtime_for_start(
+    runtime: dict,
+    *,
+    phase: int,
+    report_date: str,
+    model_suite: str,
+) -> dict:
+    payload = dict(runtime)
+    for key in _TERMINAL_RUNTIME_KEYS:
+        payload.pop(key, None)
+    payload.update(
+        {
+            "phase": phase,
+            "status": "running",
+            "running": True,
+            "started_at": datetime.now(tz=UTC).isoformat(),
+            "report_date": report_date,
+            "model_suite": model_suite,
+        }
+    )
+    return payload
+
+
+def _prepare_runtime_for_failure(
+    runtime: dict,
+    *,
+    error: str,
+    traceback_text: str,
+) -> dict:
+    payload = dict(runtime)
+    payload.update(
+        {
+            "status": "failed",
+            "running": False,
+            "finished_at": datetime.now(tz=UTC).isoformat(),
+            "error": error,
+            "traceback": traceback_text,
+        }
+    )
+    payload.pop("assessment", None)
+    payload.pop("report_path", None)
+    return payload
+
+
+def _prepare_runtime_for_success(
+    runtime: dict,
+    *,
+    output_root: Path,
+    report_date: str,
+    assessment: dict,
+) -> dict:
+    payload = dict(runtime)
+    payload.update(
+        {
+            "status": "completed",
+            "running": False,
+            "finished_at": datetime.now(tz=UTC).isoformat(),
+            "report_path": str(output_root / "reports" / "daily" / f"{report_date}.json"),
+            "assessment": assessment,
+        }
+    )
+    payload.pop("error", None)
+    payload.pop("traceback", None)
+    return payload
 
 
 if __name__ == "__main__":

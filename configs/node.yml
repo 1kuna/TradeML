@@ -18,6 +18,17 @@ stage:
     symbols: 500
     eod_years: 10
     green_promote_threshold: 0.98
+training:
+  default_target: workstation-remote
+training_targets:
+  workstation-remote:
+    kind: ssh
+    host: trademl-workstation-remote
+    user: openclaw
+    port: 22
+    repo_root: /Users/openclaw/TradeML
+    data_root: /Users/openclaw/atlas_mounts/nas
+    python_executable: /Users/openclaw/TradeML/.venv/bin/python
 vendors:
   alpaca:
     rpm: 190

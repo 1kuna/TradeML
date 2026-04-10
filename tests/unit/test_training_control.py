@@ -353,6 +353,46 @@ def test_launch_training_process_defaults_report_date_to_freeze_cutoff(tmp_path:
     assert "2026-04-02" in " ".join(seen["command"])
 
 
+def test_launch_training_process_uses_explicit_output_root_for_artifacts(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    (repo_root / "configs").mkdir(parents=True, exist_ok=True)
+    (repo_root / "configs" / "equities_xs.yml").write_text("data:\n  green_threshold: 0.9\n", encoding="utf-8")
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "local_state"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    output_root = tmp_path / "experiment_outputs" / "run_a"
+
+    monkeypatch.setattr(training_control, "training_preflight", lambda **kwargs: {"ok": True, "sample_rows": 5})
+
+    class _Proc:
+        pid = 4242
+
+    seen: dict[str, object] = {}
+
+    def fake_popen(command, **kwargs):  # noqa: ANN001
+        seen["command"] = command
+        return _Proc()
+
+    monkeypatch.setattr(training_control.subprocess, "Popen", fake_popen)
+
+    payload = launch_training_process(
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        phase=1,
+        model_suite="ridge_only",
+        python_executable="/usr/bin/python3",
+        report_date="2026-04-02",
+        output_root=output_root,
+    )
+
+    assert payload["output_root"] == str(output_root)
+    assert "--output-root" in seen["command"]
+    assert str(output_root) in seen["command"]
+
+
 def test_read_pinned_phase_freeze_logs_invalid_json(tmp_path: Path, caplog) -> None:
     freeze_path = phase_freeze_state_path(data_root=tmp_path, phase=1)
     freeze_path.parent.mkdir(parents=True, exist_ok=True)
@@ -473,6 +513,12 @@ training_targets:
     monkeypatch.setattr(training_control, "recommended_training_cutoff", lambda **kwargs: {"date": "2026-04-02"})
     monkeypatch.setattr(training_control, "_stage_symbol_count", lambda root: 500)
     monkeypatch.setattr(training_control, "_launch_remote_training_process", lambda **kwargs: 5151)
+    monkeypatch.setattr(training_control, "_resolve_default_report_date", lambda **kwargs: "2026-04-02")
+    monkeypatch.setattr(
+        training_control,
+        "_sync_remote_training_config",
+        lambda **kwargs: Path("/srv/trademl/control/configs/training_phase_1.yml"),
+    )
 
     payload = launch_training_process(
         repo_root=repo_root,
@@ -488,6 +534,114 @@ training_targets:
     assert payload["pid"] == 5151
     assert payload["target"] == "workstation-remote"
     assert json.loads(runtime_path.read_text(encoding="utf-8"))["remote_runtime_path"].endswith("training_phase_1.json")
+    assert payload["execution_config_path"] == "/srv/trademl/control/configs/training_phase_1.yml"
+
+
+def test_launch_training_process_remote_serializes_nested_preflight_paths(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    (repo_root / "configs").mkdir(parents=True, exist_ok=True)
+    (repo_root / "configs" / "equities_xs.yml").write_text("data:\n  green_threshold: 0.9\n", encoding="utf-8")
+    (repo_root / "configs" / "node.yml").write_text(
+        """
+training_targets:
+  workstation-remote:
+    host: 192.168.1.10
+    user: zach
+    repo_root: /srv/trademl
+    data_root: /srv/trademl-data
+    python_executable: /usr/bin/python3
+""".strip(),
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "local_state"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        training_control,
+        "training_preflight",
+        lambda **kwargs: {
+            "ok": True,
+            "resolved_target": {
+                "repo_root": Path("/srv/trademl"),
+                "data_root": Path("/srv/trademl-data"),
+            },
+        },
+    )
+    monkeypatch.setattr(training_control, "recommended_training_cutoff", lambda **kwargs: {"date": "2026-04-02"})
+    monkeypatch.setattr(training_control, "_stage_symbol_count", lambda root: 500)
+    monkeypatch.setattr(training_control, "_launch_remote_training_process", lambda **kwargs: 5151)
+    monkeypatch.setattr(training_control, "_resolve_default_report_date", lambda **kwargs: "2026-04-02")
+    monkeypatch.setattr(
+        training_control,
+        "_sync_remote_training_config",
+        lambda **kwargs: Path("/srv/trademl/control/configs/training_phase_1.yml"),
+    )
+
+    launch_training_process(
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        phase=1,
+        target="workstation-remote",
+        targets_config_path=repo_root / "configs" / "node.yml",
+    )
+
+    runtime_path = local_state / "training_runs" / "workstation-remote" / "training_phase_1.json"
+    payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    assert payload["preflight"]["resolved_target"]["repo_root"] == "/srv/trademl"
+    assert payload["preflight"]["resolved_target"]["data_root"] == "/srv/trademl-data"
+
+
+def test_launch_training_process_remote_defaults_report_date_from_remote_freeze(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    (repo_root / "configs").mkdir(parents=True, exist_ok=True)
+    (repo_root / "configs" / "equities_xs.yml").write_text("data:\n  green_threshold: 0.9\n", encoding="utf-8")
+    (repo_root / "configs" / "node.yml").write_text(
+        """
+training_targets:
+  workstation-remote:
+    host: 192.168.1.10
+    user: zach
+    repo_root: /srv/trademl
+    data_root: /srv/trademl-data
+    python_executable: /usr/bin/python3
+""".strip(),
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "local_state"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(training_control, "training_preflight", lambda **kwargs: {"ok": True})
+    monkeypatch.setattr(training_control, "_stage_symbol_count", lambda root: 500)
+    monkeypatch.setattr(training_control, "_launch_remote_training_process", lambda **kwargs: 5151)
+    monkeypatch.setattr(training_control, "_resolve_default_report_date", lambda **kwargs: "2026-03-09")
+    monkeypatch.setattr(
+        training_control,
+        "_sync_remote_training_config",
+        lambda **kwargs: Path("/srv/trademl/control/configs/training_phase_1.yml"),
+    )
+    monkeypatch.setattr(
+        training_control,
+        "_sync_remote_training_config",
+        lambda **kwargs: Path("/srv/trademl/control/configs/training_phase_1.yml"),
+    )
+
+    payload = launch_training_process(
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        phase=1,
+        target="workstation-remote",
+        targets_config_path=repo_root / "configs" / "node.yml",
+    )
+
+    assert payload["report_date"] == "2026-03-09"
 
 
 def test_training_status_snapshot_and_stop_use_remote_runtime(tmp_path: Path, monkeypatch) -> None:
@@ -516,22 +670,43 @@ training_targets:
                 "pid": 5151,
                 "target": "workstation-remote",
                 "status": "running",
-                "shared_runtime_path": str(data_root / "control" / "cluster" / "state" / "training_phase_1.json"),
+                "shared_runtime_path": "/srv/trademl-data/control/cluster/state/training_phase_1.json",
+                "remote_runtime_path": "/srv/trademl/control/training_phase_1.json",
                 "remote_log_path": "/srv/trademl/control/logs/training_phase_1.log",
             }
         ),
         encoding="utf-8",
     )
-    shared_runtime = data_root / "control" / "cluster" / "state" / "training_phase_1.json"
-    shared_runtime.parent.mkdir(parents=True, exist_ok=True)
-    shared_runtime.write_text(local_runtime.read_text(encoding="utf-8"), encoding="utf-8")
+    writes: list[str] = []
 
     def fake_ssh(_target, command, *, check=False):  # noqa: ANN001
         if "read_training_runtime" in command:
-            return type("R", (), {"returncode": 0, "stdout": '{"pid": 5151, "status": "running", "running": true, "host": "192.168.1.10"}\n', "stderr": ""})()
+            if "/srv/trademl-data/control/cluster/state/training_phase_1.json" in command:
+                return type(
+                    "R",
+                    (),
+                    {
+                        "returncode": 0,
+                        "stdout": '{"pid": 5151, "status": "running", "running": true, "host": "192.168.1.10", "report_date": "2026-03-09"}\n',
+                        "stderr": "",
+                    },
+                )()
+            if "/srv/trademl/control/training_phase_1.json" in command:
+                return type(
+                    "R",
+                    (),
+                    {
+                        "returncode": 0,
+                        "stdout": '{"pid": 5151, "status": "running", "running": true, "host": "192.168.1.10"}\n',
+                        "stderr": "",
+                    },
+                )()
         if command.startswith("tail -n"):
             return type("R", (), {"returncode": 0, "stdout": "line-1\nline-2\n", "stderr": ""})()
         if command.startswith("kill -TERM"):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if "_write_runtime_payload" in command:
+            writes.append(command)
             return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         raise AssertionError(command)
 
@@ -547,6 +722,8 @@ training_targets:
     )
 
     assert snapshot["runtime"]["pid"] == 5151
+    assert snapshot["runtime"]["remote_log_path"] == "/srv/trademl/control/logs/training_phase_1.log"
+    assert snapshot["shared"]["report_date"] == "2026-03-09"
     assert "line-2" in snapshot["log_tail"]
 
     stopped = stop_training_process(
@@ -560,3 +737,89 @@ training_targets:
 
     assert stopped["stopped"] is True
     assert stopped["runtime"]["status"] == "stopped"
+    assert any("/srv/trademl/control/training_phase_1.json" in command for command in writes)
+    assert any("/srv/trademl-data/control/cluster/state/training_phase_1.json" in command for command in writes)
+
+
+def test_training_status_snapshot_refreshes_local_mirror_from_remote_runtime(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    (repo_root / "configs").mkdir(parents=True, exist_ok=True)
+    (repo_root / "configs" / "node.yml").write_text(
+        """
+training_targets:
+  workstation-remote:
+    host: 192.168.1.10
+    user: zach
+    repo_root: /srv/trademl
+    data_root: /srv/trademl-data
+    python_executable: /usr/bin/python3
+""".strip(),
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "local_state"
+    local_runtime = local_state / "training_runs" / "workstation-remote" / "training_phase_1.json"
+    local_runtime.parent.mkdir(parents=True, exist_ok=True)
+    local_runtime.write_text(
+        json.dumps(
+            {
+                "phase": 1,
+                "pid": 5151,
+                "target": "workstation-remote",
+                "status": "starting",
+                "running": True,
+                "shared_runtime_path": str(data_root / "control" / "cluster" / "state" / "training_phase_1.json"),
+                "remote_log_path": "/srv/trademl/control/logs/training_phase_1.log",
+            }
+        ),
+        encoding="utf-8",
+    )
+    shared_runtime = data_root / "control" / "cluster" / "state" / "training_phase_1.json"
+    shared_runtime.parent.mkdir(parents=True, exist_ok=True)
+    shared_runtime.write_text(local_runtime.read_text(encoding="utf-8"), encoding="utf-8")
+
+    def fake_ssh(_target, command, *, check=False):  # noqa: ANN001
+        if "read_training_runtime" in command:
+            return type(
+                "R",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": json.dumps(
+                        {
+                            "pid": 5151,
+                            "status": "completed",
+                            "running": False,
+                            "host": "192.168.1.10",
+                            "finished_at": "2026-04-10T19:05:56.928912+00:00",
+                        }
+                    )
+                    + "\n",
+                    "stderr": "",
+                },
+            )()
+        if command.startswith("tail -n"):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        raise AssertionError(command)
+
+    monkeypatch.setattr(training_control, "_run_ssh_command", fake_ssh)
+
+    snapshot = training_status_snapshot(
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        phase=1,
+        target="workstation-remote",
+        targets_config_path=repo_root / "configs" / "node.yml",
+    )
+
+    mirrored = json.loads(local_runtime.read_text(encoding="utf-8"))
+    assert snapshot["runtime"]["status"] == "completed"
+    assert snapshot["local"]["status"] == "completed"
+    assert snapshot["local"]["running"] is False
+    assert snapshot["local"]["host"] == "192.168.1.10"
+    assert snapshot["local"]["remote_log_path"] == "/srv/trademl/control/logs/training_phase_1.log"
+    assert mirrored["status"] == "completed"
+    assert mirrored["running"] is False
+    assert mirrored["host"] == "192.168.1.10"
+    assert mirrored["remote_log_path"] == "/srv/trademl/control/logs/training_phase_1.log"

@@ -447,6 +447,7 @@ def training_preflight(
     targets_config_path: Path | None = None,
     target: str | None = None,
     python_executable: str = sys.executable,
+    execution_config_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run control-plane, target, and dataset preflight before launching long-running work."""
     repo_root = repo_root or config_path.parents[1]
@@ -463,8 +464,9 @@ def training_preflight(
         python_executable=python_executable,
     )
     control = {"ok": True, "config_path": str(config_path), "repo_root": str(repo_root)}
-    target_report = _target_preflight(target=resolved_target, config_filename=config_path.name)
-    dataset_report = _dataset_preflight(target=resolved_target, config_filename=config_path.name)
+    effective_config_path = execution_config_path or config_path
+    target_report = _target_preflight(target=resolved_target, config_path=effective_config_path)
+    dataset_report = _dataset_preflight(target=resolved_target, config_path=effective_config_path)
     ok = bool(control["ok"] and target_report.get("ok") and dataset_report.get("ok"))
     reason = None
     for report in (target_report, dataset_report):
@@ -500,6 +502,7 @@ def launch_training_process(
     targets_config_path: Path | None = None,
     runtime_name: str | None = None,
     config_path: Path | None = None,
+    output_root: Path | None = None,
 ) -> dict[str, Any]:
     """Launch or resume the background training process for a phase."""
     targets_config_path = targets_config_path or (repo_root / "configs" / "node.yml")
@@ -521,6 +524,13 @@ def launch_training_process(
     existing = read_training_runtime(path=runtime_path)
     if existing.get("running"):
         return existing
+    execution_config_path = config_path
+    if resolved_target.kind != "local":
+        execution_config_path = _sync_remote_training_config(
+            target=resolved_target,
+            local_config_path=config_path,
+            runtime_name=runtime_name,
+        )
 
     preflight = training_preflight(
         data_root=data_root,
@@ -530,16 +540,14 @@ def launch_training_process(
         targets_config_path=targets_config_path,
         target=resolved_target.name,
         python_executable=python_executable,
+        execution_config_path=execution_config_path,
     )
     if not preflight["ok"]:
         raise RuntimeError(f"phase {phase} training preflight failed: {preflight['reason']}")
     resolved_report_date = report_date
     if resolved_report_date is None:
-        freeze_cutoff = recommended_training_cutoff(
-            data_root=resolved_target.data_root,
-            expected_symbol_count=_stage_symbol_count(resolved_target.data_root),
-        )
-        resolved_report_date = freeze_cutoff.get("date") or date.today().isoformat()
+        resolved_report_date = _resolve_default_report_date(target=resolved_target, phase=phase)
+    resolved_output_root = output_root or resolved_target.data_root
 
     shared_runtime_path = shared_training_runtime_path(
         data_root=resolved_target.data_root,
@@ -570,7 +578,9 @@ def launch_training_process(
         "status": "starting",
         "started_at": datetime.now(tz=UTC).isoformat(),
         "config_path": str(config_path),
+        "execution_config_path": str(execution_config_path),
         "data_root": str(resolved_target.data_root),
+        "output_root": str(resolved_output_root),
         "report_date": resolved_report_date,
         "model_suite": model_suite or ("ridge_only" if phase == 1 else "full"),
         "log_path": str(log_path),
@@ -593,7 +603,7 @@ def launch_training_process(
             "--config",
             str(config_path),
             "--output-root",
-            str(resolved_target.data_root),
+            str(resolved_output_root),
             "--report-date",
             resolved_report_date,
             "--model-suite",
@@ -625,11 +635,12 @@ def launch_training_process(
     remote_pid = _launch_remote_training_process(
         target=resolved_target,
         phase=phase,
-        config_filename=config_path.name,
+        config_path=execution_config_path,
         report_date=resolved_report_date,
         model_suite=model_suite or ("ridge_only" if phase == 1 else "full"),
         shared_runtime_path=shared_runtime_path,
         runtime_name=runtime_name,
+        output_root=resolved_output_root,
     )
     runtime_payload["pid"] = remote_pid
     runtime_payload["command"] = ["ssh", resolved_target.host or "", str(remote_log_path)]
@@ -672,6 +683,8 @@ def training_status_snapshot(
     )
     local_runtime = read_training_runtime(path=local_path)
     shared_runtime = read_training_runtime(path=shared_path)
+    if resolved_target.kind != "local" and not shared_runtime:
+        shared_runtime = _remote_runtime_file_snapshot(target=resolved_target, path=shared_path)
     remote_runtime = _remote_runtime_snapshot(
         target=resolved_target,
         phase=phase,
@@ -679,13 +692,18 @@ def training_status_snapshot(
         local_runtime=local_runtime,
         shared_runtime=shared_runtime,
     )
-    effective = dict(shared_runtime or local_runtime)
+    effective = dict(local_runtime)
+    if shared_runtime:
+        effective.update(shared_runtime)
     if remote_runtime:
         effective.update({key: value for key, value in remote_runtime.items() if value is not None})
     if local_runtime.get("status") and not effective.get("status"):
         effective["status"] = local_runtime["status"]
     if "running" not in effective:
         effective["running"] = bool(local_runtime.get("running") or shared_runtime.get("running"))
+    if resolved_target.kind != "local" and effective and effective != local_runtime:
+        _write_runtime_payload(local_path, effective)
+        local_runtime = read_training_runtime(path=local_path)
     log_tail = _training_log_tail(
         target=resolved_target,
         phase=phase,
@@ -754,7 +772,17 @@ def stop_training_process(
     )
     _write_runtime_payload(local_path, runtime)
     shared_path = Path(str(runtime.get("shared_runtime_path") or shared_training_runtime_path(data_root=resolved_target.data_root, phase=phase, runtime_name=runtime_name)))
-    _write_runtime_payload(shared_path, runtime)
+    if resolved_target.kind == "local":
+        _write_runtime_payload(shared_path, runtime)
+    else:
+        remote_runtime_path = Path(
+            str(
+                runtime.get("remote_runtime_path")
+                or _remote_training_runtime_path(target=resolved_target, phase=phase, runtime_name=runtime_name)
+            )
+        )
+        _write_remote_runtime_payload(resolved_target, remote_runtime_path, runtime)
+        _write_remote_runtime_payload(resolved_target, shared_path, runtime)
     return {"stopped": True, "runtime": runtime, "target": snapshot["target"], "log_tail": snapshot["log_tail"]}
 
 
@@ -784,17 +812,17 @@ def training_log_tail(
     )
 
 
-def _dataset_preflight(*, target: TrainingTarget, config_filename: str) -> dict[str, Any]:
+def _dataset_preflight(*, target: TrainingTarget, config_path: Path) -> dict[str, Any]:
     """Run dataset-level preflight on the resolved execution target."""
     if target.kind == "local":
-        return _local_dataset_preflight(data_root=target.data_root, config_path=target.repo_root / "configs" / config_filename)
+        return _local_dataset_preflight(data_root=target.data_root, config_path=config_path)
     command = _remote_python_here_doc(
         target,
         f"""
 import json
 from pathlib import Path
 from trademl.data_node.training_control import _local_dataset_preflight
-print(json.dumps(_local_dataset_preflight(data_root=Path({target.data_root.as_posix()!r}), config_path=Path({(target.repo_root / 'configs' / config_filename).as_posix()!r}))))
+print(json.dumps(_local_dataset_preflight(data_root=Path({target.data_root.as_posix()!r}), config_path=Path({config_path.as_posix()!r}))))
 """,
     )
     result = _run_ssh_command(target, command)
@@ -825,10 +853,9 @@ def _local_dataset_preflight(*, data_root: Path, config_path: Path) -> dict[str,
     }
 
 
-def _target_preflight(*, target: TrainingTarget, config_filename: str) -> dict[str, Any]:
+def _target_preflight(*, target: TrainingTarget, config_path: Path) -> dict[str, Any]:
     """Verify that the requested training target is reachable and correctly configured."""
     if target.kind == "local":
-        config_path = target.repo_root / "configs" / config_filename
         return {
             "ok": bool(config_path.exists()),
             "target": target.name,
@@ -845,7 +872,7 @@ def _target_preflight(*, target: TrainingTarget, config_filename: str) -> dict[s
         [
             f"test -d {shlex.quote(str(target.repo_root))}",
             f"test -d {shlex.quote(str(target.data_root))}",
-            f"test -f {shlex.quote(str(target.repo_root / 'configs' / config_filename))}",
+            f"test -f {shlex.quote(str(config_path))}",
             f"{shlex.quote(target.python_executable)} -V",
         ]
     )
@@ -866,11 +893,12 @@ def _launch_remote_training_process(
     *,
     target: TrainingTarget,
     phase: int,
-    config_filename: str,
+    config_path: Path,
     report_date: str,
     model_suite: str,
     shared_runtime_path: Path,
     runtime_name: str | None,
+    output_root: Path,
 ) -> int:
     """Launch a detached training job on a remote SSH target."""
     remote_runtime_path = _remote_training_runtime_path(target=target, phase=phase, runtime_name=runtime_name)
@@ -890,9 +918,9 @@ def _launch_remote_training_process(
                     "--data-root",
                     shlex.quote(str(target.data_root)),
                     "--config",
-                    shlex.quote(str(target.repo_root / 'configs' / config_filename)),
+                    shlex.quote(str(config_path)),
                     "--output-root",
-                    shlex.quote(str(target.data_root)),
+                    shlex.quote(str(output_root)),
                     "--report-date",
                     shlex.quote(report_date),
                     "--model-suite",
@@ -932,13 +960,21 @@ def _remote_runtime_snapshot(
     remote_runtime_path = _remote_training_runtime_path(target=target, phase=phase, runtime_name=runtime_name)
     if remote_runtime_path is None:
         return {}
+    payload = _remote_runtime_file_snapshot(target=target, path=remote_runtime_path)
+    if not payload:
+        payload.update(shared_runtime or local_runtime)
+    return payload
+
+
+def _remote_runtime_file_snapshot(*, target: TrainingTarget, path: Path) -> dict[str, Any]:
+    """Read one runtime payload from a remote SSH target."""
     command = _remote_python_here_doc(
         target,
         f"""
 import json
 from pathlib import Path
 from trademl.data_node.training_control import read_training_runtime
-payload = read_training_runtime(path=Path({remote_runtime_path.as_posix()!r}))
+payload = read_training_runtime(path=Path({path.as_posix()!r}))
 print(json.dumps(payload))
 """,
     )
@@ -946,12 +982,23 @@ print(json.dumps(payload))
     if result.returncode != 0 or not result.stdout.strip():
         return {}
     try:
-        payload = json.loads(result.stdout.strip())
+        return json.loads(result.stdout.strip())
     except json.JSONDecodeError:
         return {}
-    if not payload:
-        payload.update(shared_runtime or local_runtime)
-    return payload
+
+
+def _write_remote_runtime_payload(target: TrainingTarget, path: Path, payload: dict[str, Any]) -> None:
+    """Write one runtime payload onto a remote SSH target."""
+    command = _remote_python_here_doc(
+        target,
+        f"""
+import json
+from pathlib import Path
+from trademl.data_node.training_control import _write_runtime_payload
+_write_runtime_payload(Path({path.as_posix()!r}), json.loads({json.dumps(_json_safe_payload(payload))!r}))
+""",
+    )
+    _run_ssh_command(target, command, check=True)
 
 
 def _training_log_tail(
@@ -1000,6 +1047,24 @@ def _remote_training_log_path(*, target: TrainingTarget, phase: int, runtime_nam
     return target.repo_root / "control" / "logs" / f"training_phase_{phase}.log"
 
 
+def _remote_training_config_path(*, target: TrainingTarget, local_config_path: Path, runtime_name: str | None) -> Path:
+    """Return the remote config path used for one target-backed run."""
+    if runtime_name:
+        return target.repo_root / "control" / "configs" / f"{runtime_name}.yml"
+    return target.repo_root / "control" / "configs" / local_config_path.name
+
+
+def _sync_remote_training_config(*, target: TrainingTarget, local_config_path: Path, runtime_name: str | None) -> Path:
+    """Copy the exact local config file to the remote training target."""
+    remote_config_path = _remote_training_config_path(
+        target=target,
+        local_config_path=local_config_path,
+        runtime_name=runtime_name,
+    )
+    _copy_file_to_remote(target=target, local_path=local_config_path, remote_path=remote_config_path)
+    return remote_config_path
+
+
 def _remote_python_here_doc(target: TrainingTarget, body: str) -> str:
     """Wrap a Python here-doc for remote execution."""
     return " && ".join(
@@ -1026,6 +1091,55 @@ def _run_ssh_command(target: TrainingTarget, command: str, *, check: bool = Fals
     if check and result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"ssh command failed for target={target.name}")
     return result
+
+
+def _copy_file_to_remote(*, target: TrainingTarget, local_path: Path, remote_path: Path) -> None:
+    """Copy one local file onto the remote SSH target."""
+    _run_ssh_command(target, f"mkdir -p {shlex.quote(str(remote_path.parent))}", check=True)
+    scp_command = ["scp", "-P", str(target.port)]
+    if target.identity_file is not None:
+        scp_command.extend(["-i", str(target.identity_file)])
+    scp_command.extend([str(local_path), f"{target.user}@{target.host}:{remote_path}"])
+    result = subprocess.run(  # noqa: S603
+        scp_command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"scp failed for target={target.name}")
+
+
+def _resolve_default_report_date(*, target: TrainingTarget, phase: int) -> str:
+    """Return the default report date for one execution target."""
+    if target.kind == "local":
+        freeze_cutoff = recommended_training_cutoff(
+            data_root=target.data_root,
+            expected_symbol_count=_stage_symbol_count(target.data_root),
+            phase=phase,
+        )
+        return str(freeze_cutoff.get("date") or date.today().isoformat())
+    command = _remote_python_here_doc(
+        target,
+        f"""
+import json
+from pathlib import Path
+from trademl.data_node.training_control import recommended_training_cutoff, _stage_symbol_count
+data_root = Path({target.data_root.as_posix()!r})
+payload = recommended_training_cutoff(
+    data_root=data_root,
+    expected_symbol_count=_stage_symbol_count(data_root),
+    phase={phase},
+)
+print(json.dumps(payload))
+""",
+    )
+    result = _run_ssh_command(target, command, check=True)
+    try:
+        payload = json.loads(result.stdout.strip() or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid remote report-date payload for target={target.name}: {exc}") from exc
+    return str(payload.get("date") or date.today().isoformat())
 
 
 def _raw_green_ratio(qc_path: Path) -> float | None:
@@ -1148,11 +1262,21 @@ def _is_process_running(pid: int) -> bool:
 
 def _write_runtime_payload(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(json.dumps(_json_safe_payload(payload), indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _hostname() -> str:
     return os.getenv("HOSTNAME") or os.uname().nodename
+
+
+def _json_safe_payload(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_payload(item) for item in value]
+    return value
 
 
 def _stage_symbol_count(data_root: Path) -> int:
