@@ -926,6 +926,73 @@ def test_lease_canonical_batch_scans_past_front_slice_starvation(tmp_path: Path)
     assert batch[0].symbols == ("SYM0256",)
 
 
+def test_lease_canonical_batch_prioritizes_small_partial_tail(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _MultiSymbolBackfillConnector("alpaca"),
+            "tiingo": _BackfillConnector("tiingo"),
+        },
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::older_fresh",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2026-03-16",
+        end_date="2026-04-10",
+        symbols=["BIG"],
+        eligible_vendors=["alpaca", "tiingo"],
+        payload={"scope_kind": "symbol_range", "trading_days": ["2026-03-16"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::older_fresh",
+        expected_units=19,
+        completed_units=0,
+        remaining_units=19,
+        remaining_symbols=["BIG"],
+        state={"scope_kind": "symbol_range"},
+    )
+    db.upsert_planner_task(
+        task_key="canonical::small_partial",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2026-03-16",
+        end_date="2026-04-10",
+        symbols=["TAIL"],
+        eligible_vendors=["alpaca", "tiingo"],
+        payload={"scope_kind": "symbol_range", "trading_days": ["2026-03-16"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::small_partial",
+        expected_units=19,
+        completed_units=17,
+        remaining_units=2,
+        remaining_symbols=["TAIL"],
+        state={"scope_kind": "symbol_range"},
+    )
+    db.mark_planner_task_partial(
+        "canonical::small_partial",
+        error="tiingo: budget exhausted for vendor=tiingo",
+        backoff_minutes=0,
+    )
+
+    batch = service._canonical_runtime._lease_canonical_batch("alpaca")
+
+    assert batch
+    assert batch[0].task_key == "canonical::small_partial"
+
+
 def test_permanent_vendor_failure_does_not_terminally_poison_task_when_alternatives_remain(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

@@ -83,6 +83,7 @@ class CanonicalRuntime:
             return []
         batch_limit = self._capability_batch_size(capability)
         now_iso = datetime.now(tz=UTC).isoformat()
+        progress_map = self.db.planner_task_progress_map()
         base_task: PlannerTask | None = None
         candidates: list[PlannerTask] = []
         scan_limit = max(256, batch_limit * 8)
@@ -95,6 +96,15 @@ class CanonicalRuntime:
             )
             if not page_candidates:
                 break
+            page_candidates.sort(
+                key=lambda task: (
+                    0 if task.status == "PARTIAL" else 1 if task.status == "FAILED" else 2 if task.status == "PENDING" else 3,
+                    progress_map.get(task.task_key).remaining_units if progress_map.get(task.task_key) is not None else 10**9,
+                    task.priority,
+                    task.created_at,
+                    task.task_key,
+                )
+            )
             candidates.extend(page_candidates)
             for candidate in page_candidates:
                 if not self._planner_task_vendor_eligible(candidate, vendor=vendor, now_iso=now_iso):
