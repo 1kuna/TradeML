@@ -388,6 +388,31 @@ class CanonicalRuntime:
             return True
         return False
 
+    def _canonical_task_has_spendable_vendor(self, task: PlannerTask, *, excluded_vendor: str | None = None) -> bool:
+        """Return whether another eligible vendor can plausibly run this task right now."""
+        now_iso = datetime.now(tz=UTC).isoformat()
+        attempts = {attempt.vendor: attempt for attempt in self.db.vendor_attempts_for_task(task.task_key)}
+        for candidate in task.eligible_vendors:
+            if candidate == excluded_vendor:
+                continue
+            if self._canonical_capability(candidate) is None:
+                continue
+            if not self._vendor_can_serve_canonical_task(vendor=candidate, task=task):
+                continue
+            if not self._vendor_has_local_budget(vendor=candidate, dataset=task.dataset, symbol_count=len(task.symbols)):
+                continue
+            attempt = attempts.get(candidate)
+            if attempt is None:
+                return True
+            if attempt.status in {"SUCCESS", "PERMANENT_FAILED"}:
+                continue
+            if attempt.status == "LEASED" and attempt.lease_expires_at and attempt.lease_expires_at > now_iso and attempt.lease_owner != self.worker_id:
+                continue
+            if attempt.status == "FAILED" and attempt.next_eligible_at and attempt.next_eligible_at > now_iso:
+                continue
+            return True
+        return False
+
     def _canonical_next_task_backoff_minutes(
         self,
         task: PlannerTask,
@@ -405,6 +430,8 @@ class CanonicalRuntime:
             if self._canonical_capability(candidate) is None:
                 continue
             if not self._vendor_can_serve_canonical_task(vendor=candidate, task=task):
+                continue
+            if not self._vendor_has_local_budget(vendor=candidate, dataset=task.dataset, symbol_count=len(task.symbols)):
                 continue
             attempt = attempts.get(candidate)
             if attempt is None:
@@ -597,13 +624,30 @@ class CanonicalRuntime:
     def _backfill_lane_widths(self) -> dict[str, int]:
         """Return the lane widths to use for canonical backfill vendors."""
         widths: dict[str, int] = {}
+        order_keys: dict[str, tuple[int, int, str]] = {}
         for capability in backfill_capabilities(
             dataset="equities_eod",
             connectors=self.connectors,
             audit_state=self.capability_audit_state,
         ):
             widths[capability.vendor] = max(widths.get(capability.vendor, 0), int(capability.lane_width or 1))
-        return widths
+            order_keys[capability.vendor] = min(
+                order_keys.get(capability.vendor, self._canonical_lane_order_key(capability.vendor, capability.priority)),
+                self._canonical_lane_order_key(capability.vendor, capability.priority),
+            )
+        return {vendor: widths[vendor] for vendor in sorted(widths, key=lambda vendor: order_keys[vendor])}
+
+    @staticmethod
+    def _canonical_lane_order_key(vendor: str, capability_priority: int) -> tuple[int, int, str]:
+        """Return the scheduler ordering for canonical vendor lanes."""
+        preferred = {
+            "alpaca": 0,
+            "tiingo": 1,
+            "twelve_data": 2,
+            "massive": 3,
+            "finnhub": 4,
+        }
+        return (preferred.get(vendor, 99), int(capability_priority), str(vendor))
 
     def _lease_next_task_for_vendor(self, vendor: str):
         """Lease the next legacy backfill task best served by a given vendor."""
@@ -851,6 +895,8 @@ class CanonicalRuntime:
             return False
         if capability.batching_mode == "single_symbol" and len(task.symbols) != 1:
             return False
+        if not self._vendor_has_local_budget(vendor=vendor, dataset=task.dataset, symbol_count=len(task.symbols)):
+            return False
         for attempt in self.db.vendor_attempts_for_task(task.task_key):
             if attempt.vendor != vendor:
                 continue
@@ -873,6 +919,18 @@ class CanonicalRuntime:
         if capability.batching_mode == "multi_symbol":
             return 100
         return 1
+
+    def _vendor_has_local_budget(self, *, vendor: str, dataset: str, symbol_count: int) -> bool:
+        """Return whether a canonical vendor can spend for the current request shape."""
+        connector = self.connectors.get(vendor)
+        budget_manager = getattr(connector, "budget_manager", None)
+        if budget_manager is None:
+            return True
+        contract = dataset_contract(vendor, dataset)
+        request_units = max(1, int(getattr(contract, "request_cost_units", 1) or 1))
+        if contract is not None and str(contract.request_cost_basis) == "symbol":
+            request_units *= max(1, int(symbol_count))
+        return bool(budget_manager.can_spend(vendor, task_kind="FORWARD", units=request_units))
 
     @staticmethod
     def _canonical_empty_result_error(*, vendor: str, dataset: str) -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+from trademl.data_node.budgets import BudgetManager
 
 from trademl.data_node.capabilities import default_macro_series
 from trademl.data_node.db import BackfillTask, VendorAttempt
@@ -132,6 +133,42 @@ def test_choose_vendor_for_canonical_task_retries_vendor_after_backoff_expires()
     )
 
     assert chosen == "tiingo"
+
+
+def test_choose_vendor_for_canonical_task_skips_budget_blocked_vendor() -> None:
+    class _BudgetedConnector:
+        def __init__(self, vendor_name: str, budget_manager: BudgetManager) -> None:
+            self.vendor_name = vendor_name
+            self.budget_manager = budget_manager
+
+    task = BackfillTask(
+        id=1,
+        dataset="equities_eod",
+        symbol="AAPL",
+        start_date="2025-12-16",
+        end_date="2026-01-14",
+        kind="GAP",
+        priority=1,
+        status="PENDING",
+        attempts=0,
+        next_not_before=None,
+        last_error=None,
+        created_at="2026-04-02T00:00:00+00:00",
+        updated_at="2026-04-02T00:00:00+00:00",
+    )
+    tiingo_budget = BudgetManager({"tiingo": {"rpm": 1, "daily_cap": 1}})
+    tiingo_budget.record_spend("tiingo", task_kind="FORWARD")
+    chosen = choose_vendor_for_canonical_task(
+        task=task,
+        connectors={
+            "alpaca": object(),
+            "tiingo": _BudgetedConnector("tiingo", tiingo_budget),
+        },
+        audit_state=None,
+        attempts=[],
+    )
+
+    assert chosen == "alpaca"
 
 
 def test_plan_auxiliary_tasks_includes_macro_and_reference_chunks(tmp_path: Path) -> None:

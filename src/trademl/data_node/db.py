@@ -1319,6 +1319,34 @@ class DataNodeDB:
                 reopened += int(cursor.rowcount)
         return reopened
 
+    def clear_planner_task_backoff(self, task_keys: list[str] | tuple[str, ...], *, reason: str) -> int:
+        """Clear task-level planner backoff while preserving vendor attempt history."""
+        if not task_keys:
+            return 0
+        timestamp = utc_now().isoformat()
+        updated = 0
+        with self._connect() as connection:
+            for index in range(0, len(task_keys), 500):
+                chunk = [str(task_key) for task_key in task_keys[index : index + 500]]
+                placeholders = ",".join("?" for _ in chunk)
+                cursor = connection.execute(
+                    f"""
+                    UPDATE planner_tasks
+                    SET status = CASE WHEN status = 'FAILED' THEN 'PARTIAL' ELSE status END,
+                        lease_owner = NULL,
+                        leased_at = NULL,
+                        lease_expires_at = NULL,
+                        next_eligible_at = NULL,
+                        last_error = ?,
+                        updated_at = ?
+                    WHERE task_key IN ({placeholders})
+                      AND status IN ('PARTIAL', 'FAILED', 'LEASED')
+                    """,
+                    [reason, timestamp, *chunk],
+                )
+                updated += int(cursor.rowcount)
+        return updated
+
     def fetch_planner_task_progress(self, task_key: str) -> PlannerTaskProgress | None:
         """Return progress for a planner task."""
         with self._connect() as connection:

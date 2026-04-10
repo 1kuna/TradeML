@@ -72,6 +72,13 @@ def choose_vendor_for_canonical_task(
     for capability in backfill_capabilities(dataset=task.dataset, connectors=connectors, audit_state=audit_state):
         if not _capability_supports_canonical_task(capability, task):
             continue
+        if not _vendor_has_local_budget(
+            connector=connectors.get(capability.vendor),
+            vendor=capability.vendor,
+            dataset=task.dataset,
+            symbol_count=1 if task.symbol is not None else int(getattr(capability, "preferred_batch_size", 1) or 1),
+        ):
+            continue
         if capability.vendor not in blocked:
             return capability.vendor
     return None
@@ -82,6 +89,21 @@ def _capability_supports_canonical_task(capability: VendorCapability, task: Back
     if task.symbol is None and capability.batching_mode == "single_symbol":
         return False
     return True
+
+
+def _vendor_has_local_budget(*, connector: object | None, vendor: str, dataset: str, symbol_count: int) -> bool:
+    """Return whether the connector's local budget manager can spend for this task shape now."""
+    budget_manager = getattr(connector, "budget_manager", None)
+    if budget_manager is None:
+        return True
+    can_spend = getattr(budget_manager, "can_spend", None)
+    if not callable(can_spend):
+        return True
+    contract = dataset_contract(vendor, dataset)
+    request_units = max(1, int(getattr(contract, "request_cost_units", 1) or 1))
+    if contract is not None and str(contract.request_cost_basis) == "symbol":
+        request_units *= max(1, int(symbol_count))
+    return bool(can_spend(vendor, task_kind="FORWARD", units=request_units))
 
 
 def plan_auxiliary_tasks(

@@ -11,6 +11,7 @@ from trademl.calendars.exchange import ExchangeCalendarStore
 from trademl.connectors.base import PermanentConnectorError, TemporaryConnectorError
 from trademl.data_node.auxiliary_runtime import AuxiliaryRuntime
 from trademl.data_node.auditor import PartitionAuditor
+from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.canonical_runtime import CanonicalRuntime
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
@@ -164,6 +165,12 @@ class _BackfillConnector:
                 }
             ]
         )
+
+
+class _BudgetedBackfillConnector(_BackfillConnector):
+    def __init__(self, vendor_name: str, budget_manager: BudgetManager) -> None:
+        super().__init__(vendor_name)
+        self.budget_manager = budget_manager
 
 
 class _MultiSymbolBackfillConnector:
@@ -1165,6 +1172,113 @@ def test_canonical_vendor_selection_skips_tiingo_before_supported_ticker_start_d
     assert changed == ["2021-07-01"]
     assert alpaca.calls == [("equities_eod", ["APLD"], "2021-07-01", "2021-07-29")]
     assert tiingo.calls == []
+
+
+def test_lease_canonical_batch_skips_budget_blocked_vendor_lane(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    tiingo_budget = BudgetManager({"tiingo": {"rpm": 1, "daily_cap": 10}})
+    tiingo_budget.record_spend("tiingo", task_kind="FORWARD")
+    alpaca = _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}}))
+    tiingo = _BudgetedBackfillConnector("tiingo", tiingo_budget)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": alpaca, "tiingo": tiingo},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::AAPL::budget",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2025-12-16",
+        end_date="2026-01-14",
+        symbols=["AAPL"],
+        eligible_vendors=["tiingo", "alpaca"],
+        payload={"scope_kind": "symbol_range", "trading_days": ["2025-12-16"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::AAPL::budget",
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=["AAPL"],
+        state={"scope_kind": "symbol_range"},
+    )
+
+    assert service._canonical_runtime._lease_canonical_batch("tiingo") == []
+    alpaca_batch = service._canonical_runtime._lease_canonical_batch("alpaca")
+    assert len(alpaca_batch) == 1
+    assert alpaca_batch[0].task_key == "canonical::AAPL::budget"
+
+
+def test_release_budget_blocked_canonical_tasks_clears_task_backoff_for_spendable_alternate(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    tiingo_budget = BudgetManager({"tiingo": {"rpm": 1, "daily_cap": 10}})
+    tiingo_budget.record_spend("tiingo", task_kind="FORWARD")
+    alpaca = _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}}))
+    tiingo = _BudgetedBackfillConnector("tiingo", tiingo_budget)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": alpaca, "tiingo": tiingo},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::AAPL::release",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2025-12-16",
+        end_date="2026-01-14",
+        symbols=["AAPL"],
+        eligible_vendors=["tiingo", "alpaca"],
+        payload={"scope_kind": "symbol_range", "trading_days": ["2025-12-16"]},
+    )
+    db.mark_planner_task_partial(
+        "canonical::AAPL::release",
+        error="tiingo: budget exhausted for vendor=tiingo",
+        backoff_minutes=30,
+    )
+    db.mark_vendor_attempt_failed(
+        task_key="canonical::AAPL::release",
+        vendor="tiingo",
+        error="budget exhausted for vendor=tiingo",
+        backoff_minutes=30,
+    )
+
+    released = service._release_budget_blocked_canonical_tasks()
+    task = next(task for task in db.fetch_planner_tasks(task_family="canonical_bars") if task.task_key == "canonical::AAPL::release")
+
+    assert released == 1
+    assert task.next_eligible_at is None
+    assert task.status == "PARTIAL"
+    assert task.last_error == "released budget-blocked canonical task to alternate vendor"
+
+
+def test_backfill_lane_widths_prioritize_alpaca_before_tiingo(tmp_path: Path) -> None:
+    runtime = CanonicalRuntime(
+        db=DataNodeDB(tmp_path / "control" / "node.sqlite"),
+        connectors={"alpaca": _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})),
+                    "tiingo": _BudgetedBackfillConnector("tiingo", BudgetManager({"tiingo": {"rpm": 10, "daily_cap": 100}}))},
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+        capability_audit_state={},
+        worker_id="test",
+        default_symbols_getter=lambda: [],
+        stop_requested=lambda: False,
+        write_raw_partition_fn=lambda frame, source_name: [],
+    )
+
+    assert list(runtime._backfill_lane_widths())[:2] == ["alpaca", "tiingo"]
 
 
 def test_load_corp_actions_reference_skips_corrupt_parquet(tmp_path: Path) -> None:

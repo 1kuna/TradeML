@@ -371,6 +371,39 @@ class DataNodeService:
             reopened = self.db.reopen_planner_tasks(sorted(set(regressed_task_keys)), reason="canonical coverage regressed")
             if reopened:
                 LOGGER.warning("reopened_regressed_canonical_tasks count=%s", reopened)
+        released = self._release_budget_blocked_canonical_tasks()
+        if released:
+            LOGGER.warning("released_budget_blocked_canonical_tasks count=%s", released)
+
+    def _release_budget_blocked_canonical_tasks(self) -> int:
+        """Clear poisoned task-level backoff when another canonical vendor can run now."""
+        now_iso = datetime.now(tz=UTC).isoformat()
+        releasable: list[str] = []
+        page = 0
+        limit = 512
+        while True:
+            candidates = self.db.fetch_planner_tasks(
+                task_family="canonical_bars",
+                statuses=("PARTIAL", "FAILED", "LEASED"),
+                limit=limit,
+                offset=page * limit,
+            )
+            if not candidates:
+                break
+            for task in candidates:
+                if not task.next_eligible_at or task.next_eligible_at <= now_iso:
+                    continue
+                last_error = str(task.last_error or "")
+                if "budget exhausted" not in last_error.lower():
+                    continue
+                failed_vendor = last_error.split(":", 1)[0].strip() if ":" in last_error else None
+                if self._canonical_runtime._canonical_task_has_spendable_vendor(task, excluded_vendor=failed_vendor):
+                    releasable.append(task.task_key)
+            page += 1
+        return self.db.clear_planner_task_backoff(
+            sorted(set(releasable)),
+            reason="released budget-blocked canonical task to alternate vendor",
+        )
 
     def _drain_canonical_lane(self, vendor: str, exchange: str) -> list[str]:
         """Drain canonical planner tasks for a single vendor lane."""
