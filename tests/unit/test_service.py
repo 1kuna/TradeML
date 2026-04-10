@@ -1344,6 +1344,50 @@ def test_lease_canonical_batch_skips_budget_blocked_vendor_lane(tmp_path: Path) 
     assert alpaca_batch[0].task_key == "canonical::AAPL::budget"
 
 
+def test_lease_canonical_batch_skips_temporarily_throttled_vendor_lane(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    tiingo_budget = BudgetManager({"tiingo": {"rpm": 10, "daily_cap": 100}})
+    for _ in range(3):
+        tiingo_budget.record_spend("tiingo", task_kind="FORWARD")
+        tiingo_budget.record_remote_rate_limit("tiingo")
+    alpaca = _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}}))
+    tiingo = _BudgetedBackfillConnector("tiingo", tiingo_budget)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": alpaca, "tiingo": tiingo},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::AAPL::throttle",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2025-12-16",
+        end_date="2026-01-14",
+        symbols=["AAPL"],
+        eligible_vendors=["tiingo", "alpaca"],
+        payload={"scope_kind": "symbol_range", "trading_days": ["2025-12-16"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::AAPL::throttle",
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=["AAPL"],
+        state={"scope_kind": "symbol_range"},
+    )
+
+    assert service._canonical_runtime._lease_canonical_batch("tiingo") == []
+    alpaca_batch = service._canonical_runtime._lease_canonical_batch("alpaca")
+    assert len(alpaca_batch) == 1
+    assert alpaca_batch[0].task_key == "canonical::AAPL::throttle"
+
+
 def test_release_budget_blocked_canonical_tasks_clears_task_backoff_for_spendable_alternate(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     tiingo_budget = BudgetManager({"tiingo": {"rpm": 1, "daily_cap": 10}})

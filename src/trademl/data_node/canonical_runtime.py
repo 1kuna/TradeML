@@ -955,6 +955,8 @@ class CanonicalRuntime:
         budget_manager = getattr(connector, "budget_manager", None)
         if budget_manager is None:
             return True
+        if budget_manager.is_temporarily_throttled(vendor, minimum_events=3):
+            return False
         contract = dataset_contract(vendor, dataset)
         request_units = max(1, int(getattr(contract, "request_cost_units", 1) or 1))
         if contract is not None and str(contract.request_cost_basis) == "symbol":

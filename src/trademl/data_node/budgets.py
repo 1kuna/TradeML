@@ -314,6 +314,18 @@ class BudgetManager:
             self.daily_requests = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
             self._persist_snapshot(now=current)
 
+    def is_temporarily_throttled(self, vendor: str, *, minimum_events: int = 3, now: datetime | None = None) -> bool:
+        """Return whether recent telemetry shows a vendor is fully rate-limited right now."""
+        with self._lock:
+            current = self._normalize(now)
+            self._trim_telemetry_windows(vendor, current)
+            windows = self.telemetry_windows[vendor]
+            outbound = len(windows["outbound_requests"])
+            remote_limits = len(windows["remote_rate_limits"])
+            if outbound < max(1, int(minimum_events)):
+                return False
+            return outbound == remote_limits
+
     def snapshot(self, now: datetime | None = None) -> dict[str, object]:
         """Return a JSON-serializable view of current budget usage."""
         with self._lock:
