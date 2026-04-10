@@ -682,7 +682,11 @@ HTML_PAGE = """<!doctype html>
       document.getElementById('metric-coverage').textContent = `${collection.coverage_percent ?? 0}%`;
       document.getElementById('metric-coverage-detail').textContent = `${formatNumber(collection.pending_tasks ?? 0)} pending`;
       document.getElementById('metric-canonical').textContent = formatNumber(collection.canonical_completed_units ?? 0);
-      document.getElementById('metric-remaining').textContent = `${formatNumber(collection.canonical_remaining_units ?? 0)} remaining`;
+      const pinnedRemaining = collection.phase1_pinned_remaining_units;
+      const rollingRemaining = collection.canonical_remaining_units ?? 0;
+      document.getElementById('metric-remaining').textContent = readiness.ready
+        ? `Phase 1 complete · ${formatNumber(rollingRemaining)} rolling remaining`
+        : `${formatNumber(pinnedRemaining ?? rollingRemaining)} pinned remaining`;
       document.getElementById('metric-raw-rows').textContent = formatNumber(collection.raw_vendor_rows ?? 0);
       document.getElementById('metric-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
       document.getElementById('metric-gate').textContent = readiness.ready ? 'Ready' : 'Blocked';

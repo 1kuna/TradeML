@@ -485,6 +485,7 @@ def test_build_collection_health_keeps_frozen_bars_and_collection_numbers_aligne
     assert health["collection_status"]["coverage_percent"] == 99.6
     assert health["collection_status"]["training_ready_percent"] == 100.0
     assert health["collection_status"]["canonical_completed_units"] == 996
+    assert health["collection_status"]["phase1_pinned_remaining_units"] == 0
     assert health["collection_status"]["raw_vendor_rows"] == 111
 
 
