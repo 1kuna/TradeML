@@ -1002,7 +1002,7 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "canonical_completed_units": canonical_completed,
         "canonical_expected_units": canonical_expected,
         "canonical_remaining_units": canonical_remaining,
-        "phase1_pinned_remaining_units": 0 if training_critical_ratio >= 0.999999 else canonical_remaining,
+        "phase1_pinned_remaining_units": 0 if bool(readiness.get("phase1", {}).get("ready")) else canonical_remaining,
         "raw_vendor_rows": int(raw_datapoints),
         "training_critical_percent": round(training_critical_ratio * 100.0, 1),
         "pending_tasks": int(queue_counts.get("PENDING", 0)) + int(queue_counts.get("PARTIAL", 0)) + int(queue_counts.get("LEASED", 0)),
@@ -1494,6 +1494,7 @@ def _build_collection_health(
         dataset_coverage.get("macro", {}).get("ratio", 0.0),
     ]
     readiness_ratio = min(training_critical) if training_critical else 0.0
+    phase1_ready = readiness_ratio >= 0.98
     collection_status = {
         "coverage_ratio": coverage_ratio,
         "coverage_percent": round(coverage_ratio * 100.0, 1),
@@ -1508,7 +1509,7 @@ def _build_collection_health(
         "canonical_completed_units": collected,
         "canonical_expected_units": expected,
         "canonical_remaining_units": remaining,
-        "phase1_pinned_remaining_units": 0 if readiness_ratio >= 0.999999 else remaining,
+        "phase1_pinned_remaining_units": 0 if phase1_ready else remaining,
         "raw_vendor_rows": int(raw_datapoints),
         "pending_tasks": int(queue_counts.get("PENDING", 0)) + int(queue_counts.get("PARTIAL", 0)) + int(queue_counts.get("LEASED", 0)),
         "failed_tasks": int(queue_counts.get("FAILED", 0)),
