@@ -200,3 +200,22 @@ def test_dispatch_action_routes_training_actions(tmp_path: Path, monkeypatch) ->
     assert preflight["action"] == "preflight"
     assert start["report_date"] == "2026-04-02"
     assert stop["action"] == "stop"
+
+
+def test_dispatch_action_routes_experiment_actions(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path)
+    monkeypatch.setattr(dashboard_server, "start_experiment_supervisor", lambda settings, *, spec_path, poll_seconds=None, detach=True: {"action": "supervise", "spec_path": spec_path, "detach": detach})
+    monkeypatch.setattr(dashboard_server, "pause_experiments", lambda settings, *, experiment_id: {"action": "pause", "experiment_id": experiment_id})
+    monkeypatch.setattr(dashboard_server, "resume_experiments", lambda settings, *, experiment_id: {"action": "resume", "experiment_id": experiment_id})
+    monkeypatch.setattr(dashboard_server, "stop_experiments", lambda settings, *, experiment_id: {"action": "stop", "experiment_id": experiment_id})
+    monkeypatch.setattr(dashboard_server, "evaluate_experiments", lambda settings, *, experiment_id: {"action": "evaluate", "experiment_id": experiment_id})
+    monkeypatch.setattr(dashboard_server, "backtest_experiments", lambda settings, *, experiment_id: {"action": "backtest", "experiment_id": experiment_id})
+    monkeypatch.setattr(dashboard_server, "propose_experiment_family", lambda settings, *, experiment_id: {"action": "propose", "experiment_id": experiment_id})
+
+    assert dashboard_server.dispatch_dashboard_action(settings, "experiments-supervise", {"spec_path": "configs/experiments/demo.yml", "detach": True})["action"] == "supervise"
+    assert dashboard_server.dispatch_dashboard_action(settings, "experiments-pause", {"experiment_id": "phase1"})["action"] == "pause"
+    assert dashboard_server.dispatch_dashboard_action(settings, "experiments-resume", {"experiment_id": "phase1"})["action"] == "resume"
+    assert dashboard_server.dispatch_dashboard_action(settings, "experiments-stop", {"experiment_id": "phase1"})["action"] == "stop"
+    assert dashboard_server.dispatch_dashboard_action(settings, "experiments-evaluate", {"experiment_id": "phase1"})["action"] == "evaluate"
+    assert dashboard_server.dispatch_dashboard_action(settings, "experiments-backtest", {"experiment_id": "phase1"})["action"] == "backtest"
+    assert dashboard_server.dispatch_dashboard_action(settings, "experiments-propose-next", {"experiment_id": "phase1"})["action"] == "propose"

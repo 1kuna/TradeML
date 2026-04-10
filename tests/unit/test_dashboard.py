@@ -1329,7 +1329,25 @@ def test_collect_dashboard_status_snapshot_includes_health_and_experiment_summar
     db.lease_planner_task_by_key(task_key="canonical_repair::equities_eod::2026-04-08::000", lease_owner="worker-1")
     experiment_root = workspace / "control" / "experiments" / "phase1"
     experiment_root.mkdir(parents=True, exist_ok=True)
-    (experiment_root / "summary.json").write_text(json.dumps({"experiment_id": "phase1", "run_count": 2}), encoding="utf-8")
+    (experiment_root / "summary.json").write_text(
+        json.dumps(
+            {
+                "experiment_id": "phase1",
+                "run_count": 2,
+                "evaluation_counts": {"SURVIVES_PREDICTIVE": 1},
+                "shortlist_count": 1,
+                "top_gate_failures": [["rank_ic<0.02", 2]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    supervisor_root = workspace / "control" / "experiment_supervisors"
+    supervisor_root.mkdir(parents=True, exist_ok=True)
+    (supervisor_root / "phase1.json").write_text(json.dumps({"experiment_id": "phase1", "status": "RUNNING"}), encoding="utf-8")
+    (experiment_root / "next_family_proposal.json").write_text(
+        json.dumps({"recommended_experiment_id": "phase1-next", "rationale": ["pivot ridge"], "spec_path": str(experiment_root / "next_family_proposal.yml")}),
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr(
         dashboard_controller,
@@ -1349,6 +1367,8 @@ def test_collect_dashboard_status_snapshot_includes_health_and_experiment_summar
     assert snapshot["health"]["recent_bad_dates"] == ["2026-04-08"]
     assert snapshot["health"]["vendor_lane_health"][0]["vendor"] == "alpaca"
     assert snapshot["experiment_summary"]["experiment_id"] == "phase1"
+    assert snapshot["health"]["experiment_supervisor"]["status"] == "RUNNING"
+    assert snapshot["health"]["proposal_summary"]["recommended_experiment_id"] == "phase1-next"
     assert snapshot["default_training_target"]["name"] == "local"
 
 

@@ -46,7 +46,18 @@ from trademl.data_node.training_control import (
     stop_training_process,
     launch_training_process,
 )
-from trademl.experiments import latest_experiment_summary
+from trademl.experiments import (
+    backtest_experiment_survivors,
+    evaluate_experiment,
+    latest_experiment_proposal,
+    latest_experiment_summary,
+    pause_experiment_supervisor,
+    propose_next_experiment_family,
+    read_experiment_supervisor_state,
+    resume_experiment_supervisor,
+    stop_experiment_supervisor,
+    supervise_experiment,
+)
 from trademl.fleet.cluster import (
     ClusterCoordinator,
     ClusterPaths,
@@ -1005,6 +1016,110 @@ def training_runtime_logs(
     )
 
 
+def start_experiment_supervisor(
+    settings: NodeSettings,
+    *,
+    spec_path: str,
+    poll_seconds: int | None = None,
+    detach: bool = True,
+) -> dict[str, Any]:
+    """Start the bounded experiment supervisor for a given spec."""
+    return supervise_experiment(
+        spec_path=Path(spec_path).expanduser(),
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        local_state=settings.local_state,
+        env_path=settings.env_path,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+        poll_seconds=poll_seconds,
+        detach=detach,
+    )
+
+
+def pause_experiments(
+    settings: NodeSettings,
+    *,
+    experiment_id: str,
+) -> dict[str, Any]:
+    """Pause a running experiment supervisor."""
+    return pause_experiment_supervisor(local_state=settings.local_state, experiment_id=experiment_id)
+
+
+def resume_experiments(
+    settings: NodeSettings,
+    *,
+    experiment_id: str,
+) -> dict[str, Any]:
+    """Resume a paused experiment supervisor."""
+    return resume_experiment_supervisor(
+        experiment_id=experiment_id,
+        local_state=settings.local_state,
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        env_path=settings.env_path,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+    )
+
+
+def stop_experiments(
+    settings: NodeSettings,
+    *,
+    experiment_id: str,
+) -> dict[str, Any]:
+    """Stop an experiment supervisor."""
+    return stop_experiment_supervisor(local_state=settings.local_state, experiment_id=experiment_id)
+
+
+def evaluate_experiments(
+    settings: NodeSettings,
+    *,
+    experiment_id: str,
+) -> dict[str, Any]:
+    """Evaluate completed runs for one experiment."""
+    return evaluate_experiment(
+        experiment_id=experiment_id,
+        local_state=settings.local_state,
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+    )
+
+
+def backtest_experiments(
+    settings: NodeSettings,
+    *,
+    experiment_id: str,
+) -> dict[str, Any]:
+    """Run backtests for predictive survivors in one experiment."""
+    return backtest_experiment_survivors(
+        experiment_id=experiment_id,
+        local_state=settings.local_state,
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+    )
+
+
+def propose_experiment_family(
+    settings: NodeSettings,
+    *,
+    experiment_id: str,
+) -> dict[str, Any]:
+    """Generate the next bounded experiment family for one experiment."""
+    return propose_next_experiment_family(
+        experiment_id=experiment_id,
+        local_state=settings.local_state,
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+    )
+
+
 def _remove_worker_state(settings: NodeSettings) -> None:
     for path in [
         settings.local_state,
@@ -1294,6 +1409,8 @@ def collect_dashboard_health_snapshot(
             "training_targets": [],
             "default_training_target": {},
             "experiment_summary": {},
+            "experiment_supervisor": {},
+            "proposal_summary": {},
             "planner_backlog": planner_summary.get("backlog_progress", {}),
         }
     repair_tasks = _summarize_repair_tasks(db)
@@ -1316,6 +1433,15 @@ def collect_dashboard_health_snapshot(
         for manifest in db.fetch_raw_partition_manifests(dataset="equities_eod", statuses=("INCOMPLETE", "UNREADABLE", "QUARANTINED"))
     ][-10:]
     experiment_summary = latest_experiment_summary(local_state=settings.local_state)
+    experiment_supervisor = (
+        read_experiment_supervisor_state(
+            local_state=settings.local_state,
+            experiment_id=str(experiment_summary.get("experiment_id")),
+        )
+        if experiment_summary.get("experiment_id")
+        else {}
+    )
+    proposal_summary = latest_experiment_proposal(local_state=settings.local_state)
     return {
         "repair_tasks": repair_tasks,
         "repair_drain_rate_per_min": repair_tasks["drain_rate_per_min"],
@@ -1326,6 +1452,8 @@ def collect_dashboard_health_snapshot(
         "training_targets": [asdict(target) for target in targets.values()],
         "default_training_target": asdict(default_target),
         "experiment_summary": experiment_summary,
+        "experiment_supervisor": experiment_supervisor,
+        "proposal_summary": proposal_summary,
         "planner_backlog": planner_summary.get("backlog_progress", {}),
     }
 

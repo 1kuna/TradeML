@@ -15,6 +15,7 @@ from typing import Any
 
 from trademl.dashboard.controller import (
     advance_collection_stage,
+    backtest_experiments,
     bootstrap_canonical_ledger,
     collect_dashboard_health_snapshot,
     collect_dashboard_live_snapshot,
@@ -25,19 +26,25 @@ from trademl.dashboard.controller import (
     install_service,
     join_cluster,
     leave_cluster,
+    pause_experiments,
     persist_node_settings,
+    propose_experiment_family,
     rebuild_cluster_state,
     replan_coverage,
     resolve_node_settings,
+    resume_experiments,
     restart_node,
     rotate_cluster_passphrase,
     lane_health,
+    evaluate_experiments,
     repair_canonical_backlog,
     repair_status,
     run_vendor_audit,
+    start_experiment_supervisor,
     start_node,
     start_training_run,
     stop_node,
+    stop_experiments,
     stop_training_run,
     training_preflight_status,
     training_runtime_logs,
@@ -556,6 +563,18 @@ HTML_PAGE = """<!doctype html>
               <div class="label">Latest Experiment</div>
               <div class="kv" id="experiment-summary"></div>
             </div>
+            <div style="margin-top:14px">
+              <div class="label">Experiment Supervisor</div>
+              <div class="kv" id="experiment-supervisor"></div>
+            </div>
+            <div style="margin-top:14px">
+              <div class="label">Evaluation Funnel</div>
+              <div class="kv" id="experiment-evaluation"></div>
+            </div>
+            <div style="margin-top:14px">
+              <div class="label">Next Family</div>
+              <div class="kv" id="proposal-summary"></div>
+            </div>
           </div>
           <div class="section-card">
             <h3 style="margin-bottom:12px">Readiness Detail</h3>
@@ -650,6 +669,23 @@ HTML_PAGE = """<!doctype html>
             <button id="bootstrap-ledger" class="secondary">Bootstrap Ledger</button>
             <button id="verify-canonical-repair" class="secondary">Verify Repair</button>
             <button id="run-canonical-repair">Run Repair</button>
+          </div>
+        </div>
+        <div class="section-card forms">
+          <h3>Experiment Automation</h3>
+          <input id="input-experiment-spec" placeholder="Experiment spec path" value="configs/experiments/phase1_remote_baseline_sweep.yml">
+          <input id="input-experiment-id" placeholder="Experiment ID">
+          <input id="input-experiment-poll-seconds" placeholder="Poll seconds" value="30">
+          <div class="form-row">
+            <button id="start-experiment-supervisor">Start Supervisor</button>
+            <button id="pause-experiment-supervisor" class="secondary">Pause</button>
+            <button id="resume-experiment-supervisor" class="secondary">Resume</button>
+            <button id="stop-experiment-supervisor" class="ghost">Stop</button>
+          </div>
+          <div class="form-row">
+            <button id="evaluate-experiment" class="secondary">Evaluate</button>
+            <button id="backtest-experiment">Backtest Survivors</button>
+            <button id="propose-next-experiment" class="secondary">Propose Next</button>
           </div>
         </div>
       </div>
@@ -779,6 +815,8 @@ HTML_PAGE = """<!doctype html>
       const leasedWork = health.leased_work || {};
       const repairTasks = health.repair_tasks || {};
       const experiment = snapshot.experiment_summary || {};
+      const supervisor = health.experiment_supervisor || {};
+      const proposal = health.proposal_summary || {};
       const command = (snapshot.suggested_training_commands || {}).phase1 || '';
       const readinessPill = document.getElementById('status-readiness-pill');
       readinessPill.textContent = phase1.ready ? 'Phase 1 ready' : 'Phase 1 blocked';
@@ -830,6 +868,25 @@ HTML_PAGE = """<!doctype html>
         ['Running', formatNumber((experiment.counts || {}).RUNNING ?? 0)],
         ['Completed', formatNumber((experiment.counts || {}).COMPLETED ?? 0)],
         ['Best candidate', experiment.best_candidate || experiment.best_run_id || '-'],
+      ]);
+      renderKeyValue('experiment-supervisor', [
+        ['Status', supervisor.status || '-'],
+        ['Heartbeat', supervisor.heartbeat_at || '-'],
+        ['Active runs', formatNumber((supervisor.active_run_ids || []).length)],
+        ['Last launch', supervisor.last_launch_at || '-'],
+        ['Last error', supervisor.last_error || '-'],
+      ]);
+      renderKeyValue('experiment-evaluation', [
+        ['Predictive survivors', formatNumber((experiment.evaluation_counts || {}).SURVIVES_PREDICTIVE ?? 0)],
+        ['Shortlisted', formatNumber(experiment.shortlist_count ?? 0)],
+        ['Rejected predictive', formatNumber((experiment.evaluation_counts || {}).REJECTED_PREDICTIVE ?? 0)],
+        ['Rejected backtest', formatNumber((experiment.evaluation_counts || {}).REJECTED_BACKTEST ?? 0)],
+        ['Top rejection', ((experiment.top_gate_failures || [])[0] || []).join(': ') || '-'],
+      ]);
+      renderKeyValue('proposal-summary', [
+        ['Recommended family', proposal.recommended_experiment_id || '-'],
+        ['Rationale', (proposal.rationale || []).join(' | ') || '-'],
+        ['Spec path', proposal.spec_path || '-'],
       ]);
       document.getElementById('status-updated').textContent = `Status refreshed ${new Date().toLocaleTimeString()}`;
       renderTable('coverage-table', snapshot.dataset_coverage ? Object.values(snapshot.dataset_coverage).map((details) => ({
@@ -1093,6 +1150,17 @@ HTML_PAGE = """<!doctype html>
       return payload;
     }
 
+    function experimentPayload() {
+      const payload = {};
+      const experimentId = document.getElementById('input-experiment-id').value.trim();
+      const specPath = document.getElementById('input-experiment-spec').value.trim();
+      const pollSeconds = document.getElementById('input-experiment-poll-seconds').value.trim();
+      if (experimentId) payload.experiment_id = experimentId;
+      if (specPath) payload.spec_path = specPath;
+      if (pollSeconds) payload.poll_seconds = Number(pollSeconds);
+      return payload;
+    }
+
     document.getElementById('bootstrap-ledger').addEventListener('click', async () => {
       try {
         setMessage('setup-message', 'Bootstrapping canonical ledger...', 'warn');
@@ -1144,6 +1212,118 @@ HTML_PAGE = """<!doctype html>
         await refreshStatus();
       } catch (error) {
         setMessage('setup-message', `Repair run failed: ${error.message}`, 'bad');
+      }
+    });
+
+    document.getElementById('start-experiment-supervisor').addEventListener('click', async () => {
+      try {
+        setMessage('setup-message', 'Starting experiment supervisor...', 'warn');
+        const result = await fetchJson('/api/actions/experiments-supervise', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({...experimentPayload(), detach: true}),
+        });
+        document.getElementById('setup-json').textContent = JSON.stringify(result, null, 2);
+        setMessage('setup-message', 'Experiment supervisor started', 'good');
+        await refreshStatus();
+      } catch (error) {
+        setMessage('setup-message', `Experiment supervisor failed: ${error.message}`, 'bad');
+      }
+    });
+
+    document.getElementById('pause-experiment-supervisor').addEventListener('click', async () => {
+      try {
+        setMessage('setup-message', 'Pausing experiment supervisor...', 'warn');
+        const result = await fetchJson('/api/actions/experiments-pause', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(experimentPayload()),
+        });
+        document.getElementById('setup-json').textContent = JSON.stringify(result, null, 2);
+        setMessage('setup-message', 'Experiment supervisor paused', 'good');
+        await refreshStatus();
+      } catch (error) {
+        setMessage('setup-message', `Pause failed: ${error.message}`, 'bad');
+      }
+    });
+
+    document.getElementById('resume-experiment-supervisor').addEventListener('click', async () => {
+      try {
+        setMessage('setup-message', 'Resuming experiment supervisor...', 'warn');
+        const result = await fetchJson('/api/actions/experiments-resume', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(experimentPayload()),
+        });
+        document.getElementById('setup-json').textContent = JSON.stringify(result, null, 2);
+        setMessage('setup-message', 'Experiment supervisor resumed', 'good');
+        await refreshStatus();
+      } catch (error) {
+        setMessage('setup-message', `Resume failed: ${error.message}`, 'bad');
+      }
+    });
+
+    document.getElementById('stop-experiment-supervisor').addEventListener('click', async () => {
+      try {
+        setMessage('setup-message', 'Stopping experiment supervisor...', 'warn');
+        const result = await fetchJson('/api/actions/experiments-stop', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(experimentPayload()),
+        });
+        document.getElementById('setup-json').textContent = JSON.stringify(result, null, 2);
+        setMessage('setup-message', 'Experiment supervisor stop requested', 'good');
+        await refreshStatus();
+      } catch (error) {
+        setMessage('setup-message', `Stop failed: ${error.message}`, 'bad');
+      }
+    });
+
+    document.getElementById('evaluate-experiment').addEventListener('click', async () => {
+      try {
+        setMessage('setup-message', 'Evaluating experiment...', 'warn');
+        const result = await fetchJson('/api/actions/experiments-evaluate', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(experimentPayload()),
+        });
+        document.getElementById('setup-json').textContent = JSON.stringify(result, null, 2);
+        setMessage('setup-message', 'Experiment evaluation complete', 'good');
+        await refreshStatus();
+      } catch (error) {
+        setMessage('setup-message', `Evaluation failed: ${error.message}`, 'bad');
+      }
+    });
+
+    document.getElementById('backtest-experiment').addEventListener('click', async () => {
+      try {
+        setMessage('setup-message', 'Running survivor backtests...', 'warn');
+        const result = await fetchJson('/api/actions/experiments-backtest', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(experimentPayload()),
+        });
+        document.getElementById('setup-json').textContent = JSON.stringify(result, null, 2);
+        setMessage('setup-message', 'Survivor backtests complete', 'good');
+        await refreshStatus();
+      } catch (error) {
+        setMessage('setup-message', `Backtest failed: ${error.message}`, 'bad');
+      }
+    });
+
+    document.getElementById('propose-next-experiment').addEventListener('click', async () => {
+      try {
+        setMessage('setup-message', 'Generating next experiment family...', 'warn');
+        const result = await fetchJson('/api/actions/experiments-propose-next', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(experimentPayload()),
+        });
+        document.getElementById('setup-json').textContent = JSON.stringify(result, null, 2);
+        setMessage('setup-message', 'Next experiment family ready', 'good');
+        await refreshStatus();
+      } catch (error) {
+        setMessage('setup-message', `Proposal failed: ${error.message}`, 'bad');
       }
     });
 
@@ -1369,6 +1549,25 @@ def dispatch_dashboard_action(settings: NodeSettings, action: str, payload: dict
             target=_optional_str(payload.get("target")),
             tail_lines=int(payload.get("tail_lines") or 50),
         )
+    if action == "experiments-supervise":
+        return start_experiment_supervisor(
+            settings,
+            spec_path=str(payload.get("spec_path") or (settings.repo_root / "configs" / "experiments" / "phase1_remote_baseline_sweep.yml")),
+            poll_seconds=int(payload["poll_seconds"]) if payload.get("poll_seconds") is not None else None,
+            detach=bool(payload.get("detach", True)),
+        )
+    if action == "experiments-pause":
+        return pause_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
+    if action == "experiments-resume":
+        return resume_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
+    if action == "experiments-stop":
+        return stop_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
+    if action == "experiments-evaluate":
+        return evaluate_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
+    if action == "experiments-backtest":
+        return backtest_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
+    if action == "experiments-propose-next":
+        return propose_experiment_family(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
     if action == "save-settings":
         return persist_node_settings(
             settings,
