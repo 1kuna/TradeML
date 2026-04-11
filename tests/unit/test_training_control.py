@@ -488,6 +488,34 @@ training_targets:
     assert payload["dataset"]["sample_rows"] == 12
 
 
+def test_local_dataset_preflight_uses_parquet_metadata_instead_of_full_read(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    config_path = repo_root / "configs" / "equities_xs.yml"
+    curated_path = tmp_path / "nas" / "data" / "curated" / "equities_ohlcv_adj" / "date=2026-04-09" / "data.parquet"
+    qc_path = tmp_path / "nas" / "data" / "qc" / "partition_status.parquet"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    curated_path.parent.mkdir(parents=True, exist_ok=True)
+    qc_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("data:\n  green_threshold: 0.9\n", encoding="utf-8")
+    pd.DataFrame({"date": ["2026-04-09"], "dataset": ["equities_eod"]}).to_parquet(qc_path, index=False)
+    pd.DataFrame({"symbol": ["AAA", "BBB"], "close": [1.0, 2.0]}).to_parquet(curated_path, index=False)
+
+    monkeypatch.setattr(
+        training_control.pd,
+        "read_parquet",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("full pandas parquet read should not run during local dataset preflight")),
+    )
+
+    payload = training_control._local_dataset_preflight(
+        data_root=tmp_path / "nas",
+        config_path=config_path,
+    )
+
+    assert payload["ok"] is True
+    assert payload["sample_rows"] == 2
+    assert payload["sample_date"] == "2026-04-09"
+
+
 def test_launch_training_process_remote_persists_controller_runtime(tmp_path: Path, monkeypatch) -> None:
     repo_root = tmp_path / "repo"
     (repo_root / "configs").mkdir(parents=True, exist_ok=True)

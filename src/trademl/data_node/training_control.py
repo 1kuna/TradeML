@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pyarrow.parquet as pq
 import yaml
 
 from trademl.data_node.capabilities import default_macro_series
@@ -842,13 +843,14 @@ def _local_dataset_preflight(*, data_root: Path, config_path: Path) -> dict[str,
     curated_files = sorted(curated_root.glob("date=*/data.parquet"))
     if not curated_files:
         return {"ok": False, "reason": f"no curated parquet files under {curated_root}"}
-    sample = pd.read_parquet(curated_files[-1])
-    if sample.empty:
+    sample_path = curated_files[-1]
+    sample_rows = int(pq.ParquetFile(sample_path).metadata.num_rows)
+    if sample_rows <= 0:
         return {"ok": False, "reason": "latest curated partition is empty"}
     return {
         "ok": True,
-        "sample_rows": int(len(sample)),
-        "sample_date": curated_files[-1].parent.name.partition("=")[2],
+        "sample_rows": sample_rows,
+        "sample_date": sample_path.parent.name.partition("=")[2],
         "qc_path": str(qc_path),
     }
 
