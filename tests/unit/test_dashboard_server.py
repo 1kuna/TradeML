@@ -62,7 +62,9 @@ def test_dashboard_server_serves_index_and_live_snapshot(tmp_path: Path, monkeyp
 
     assert "new EventSource('/api/live/stream')" in html
     assert "TradeML Operator Dashboard" in html
-    assert "Training Target" in html
+    assert "Quick Glance" in html
+    assert "Best Model So Far" in html
+    assert "Readiness Detail" not in html
     assert live_payload["runtime"]["pid"] == 123
     assert live_payload["training_readiness"]["phase1"]["ready"] is True
 

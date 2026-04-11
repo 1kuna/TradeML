@@ -393,6 +393,15 @@ HTML_PAGE = """<!doctype html>
       flex-wrap: wrap;
       align-items: center;
     }
+    .callout {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      background: rgba(8, 17, 28, 0.42);
+    }
+    #training-log-preview {
+      max-height: 220px;
+    }
     @media (max-width: 1180px) {
       .hero-grid {
         grid-template-columns: 1fr;
@@ -457,24 +466,18 @@ HTML_PAGE = """<!doctype html>
             <div class="badge" id="connection-badge">Connecting</div>
           </div>
           <div class="hero-status-line">
-            <div class="badge">Realtime node telemetry</div>
-            <div class="badge">Canonical collection priority</div>
-            <div class="badge">Training gate tracking</div>
-          </div>
-          <div class="nav">
-            <button class="active" data-section="status">Status</button>
-            <button class="ghost" data-section="budgets">Budgets</button>
-            <button class="ghost" data-section="setup">Setup</button>
-            <button class="ghost" data-section="logs">Logs</button>
+            <div class="badge">Collector live</div>
+            <div class="badge">Remote training ready</div>
+            <div class="badge">Experiment queue automation</div>
           </div>
         </div>
         <div class="actions-panel">
           <div class="summary-meta">
             <div>
-              <div class="label">Quick Control</div>
-              <div class="delta">Node lifecycle and collection control live here.</div>
+              <div class="label">Live Control</div>
+              <div class="delta">Only the controls that matter casually live here now.</div>
             </div>
-            <div class="badge">Live control plane</div>
+            <div class="badge">Quick glance mode</div>
           </div>
           <input id="cluster-passphrase" type="password" placeholder="Cluster passphrase">
           <div class="form-row">
@@ -482,29 +485,25 @@ HTML_PAGE = """<!doctype html>
             <button data-action="stop-node" class="secondary">Stop Node</button>
             <button data-action="restart-node" class="secondary">Restart Node</button>
           </div>
-          <div class="form-row">
-            <button data-action="run-vendor-audit" class="ghost">Run Audit</button>
-            <button data-action="replan-coverage" class="ghost">Replan Coverage</button>
-          </div>
           <span id="action-message" class="message"></span>
         </div>
       </div>
     </div>
 
     <div class="summary-grid">
-      <div class="card"><div class="label">Node Status</div><div class="value" id="metric-node-status">-</div><div class="delta mono" id="metric-node-detail">-</div></div>
-      <div class="card"><div class="label">Canonical Coverage</div><div class="value" id="metric-coverage">-</div><div class="delta" id="metric-coverage-detail">-</div></div>
-      <div class="card"><div class="label">Canonical Datapoints</div><div class="value" id="metric-canonical">-</div><div class="delta" id="metric-remaining">-</div></div>
-      <div class="card"><div class="label">Raw Vendor Rows</div><div class="value" id="metric-raw-rows">-</div><div class="delta" id="metric-updated">-</div></div>
-      <div class="card"><div class="label">Phase 1 Gate</div><div class="value" id="metric-gate">-</div><div class="delta" id="metric-gate-detail">-</div></div>
-      <div class="card"><div class="label">Bars ETA</div><div class="value" id="metric-eta">-</div><div class="delta" id="metric-freeze-cutoff">-</div></div>
+      <div class="card"><div class="label">Node</div><div class="value" id="metric-node-status">-</div><div class="delta mono" id="metric-node-detail">-</div></div>
+      <div class="card"><div class="label">Total Datapoints</div><div class="value" id="metric-coverage">-</div><div class="delta" id="metric-coverage-detail">-</div></div>
+      <div class="card"><div class="label">Phase 1</div><div class="value" id="metric-canonical">-</div><div class="delta" id="metric-remaining">-</div></div>
+      <div class="card"><div class="label">Research Queue</div><div class="value" id="metric-raw-rows">-</div><div class="delta" id="metric-updated">-</div></div>
+      <div class="card"><div class="label">Training</div><div class="value" id="metric-gate">-</div><div class="delta" id="metric-gate-detail">-</div></div>
+      <div class="card"><div class="label">Best Result</div><div class="value" id="metric-eta">-</div><div class="delta" id="metric-freeze-cutoff">-</div></div>
     </div>
 
     <section class="panel" id="section-status">
       <div class="toolbar">
         <div>
-          <h2>Status</h2>
-          <div class="small muted">Training gate, collection coverage, and vendor throughput.</div>
+          <h2>Quick Glance</h2>
+          <div class="small muted">Collector progress, training state, and research outcomes in one view.</div>
         </div>
         <span class="small muted" id="status-updated">Waiting for first snapshot</span>
       </div>
@@ -512,73 +511,64 @@ HTML_PAGE = """<!doctype html>
         <div class="stack">
           <div class="section-card">
             <div class="status-line">
-              <h3>Training Readiness</h3>
+              <h3>Progress Board</h3>
               <span class="pill" id="status-readiness-pill">Unknown</span>
             </div>
-            <div class="kv" id="training-summary"></div>
-            <div style="margin-top:14px">
-              <div class="label">Training Target</div>
-              <div class="form-row">
-                <select id="training-target"></select>
-                <button id="training-preflight" class="secondary">Preflight</button>
-                <button id="training-start">Start</button>
-                <button id="training-stop" class="ghost">Stop</button>
-              </div>
+            <div class="kv" id="progress-board"></div>
+          </div>
+          <div class="section-card forms">
+            <div class="status-line">
+              <h3>Training Desk</h3>
+              <span class="pill" id="training-status-pill">Idle</span>
             </div>
-            <div style="margin-top:14px">
-              <div class="label">Training Runtime</div>
-              <div class="kv" id="training-runtime-summary"></div>
+            <div class="form-row">
+              <select id="training-target"></select>
+              <button id="training-preflight" class="secondary">Preflight</button>
+              <button id="training-start">Start</button>
+              <button id="training-stop" class="ghost">Stop</button>
             </div>
-            <div style="margin-top:14px">
-              <div class="label">Phase 1 Command</div>
-              <pre id="training-command"></pre>
-            </div>
-            <div style="margin-top:14px">
-              <div class="label">Training Log Preview</div>
+            <div class="kv" id="training-runtime-summary"></div>
+            <div>
+              <div class="label">Live Log</div>
               <pre id="training-log-preview"></pre>
             </div>
           </div>
           <div class="section-card">
-            <h3 style="margin-bottom:12px">Training-Critical Coverage</h3>
-            <div class="table-wrap"><table id="coverage-table"></table></div>
+            <h3 style="margin-bottom:12px">Recent Runs</h3>
+            <div class="table-wrap"><table id="recent-runs-table"></table></div>
           </div>
         </div>
         <div class="stack">
           <div class="section-card">
-            <h3 style="margin-bottom:12px">Vendor Utilization</h3>
-            <div class="table-wrap"><table id="vendor-table"></table></div>
+            <h3 style="margin-bottom:12px">Best Model So Far</h3>
+            <div class="kv" id="winner-board"></div>
           </div>
           <div class="section-card">
-            <h3 style="margin-bottom:12px">Collector Health</h3>
-            <div class="kv" id="repair-health"></div>
-            <div style="margin-top:14px">
-              <div class="label">Leased Work</div>
-              <div class="kv" id="leased-work-summary"></div>
-            </div>
-            <div style="margin-top:14px">
-              <div class="label">Lane Health</div>
-              <div class="table-wrap"><table id="lane-health-table"></table></div>
-            </div>
-            <div style="margin-top:14px">
-              <div class="label">Latest Experiment</div>
-              <div class="kv" id="experiment-summary"></div>
-            </div>
-            <div style="margin-top:14px">
-              <div class="label">Experiment Supervisor</div>
-              <div class="kv" id="experiment-supervisor"></div>
-            </div>
-            <div style="margin-top:14px">
-              <div class="label">Evaluation Funnel</div>
-              <div class="kv" id="experiment-evaluation"></div>
-            </div>
-            <div style="margin-top:14px">
-              <div class="label">Next Family</div>
-              <div class="kv" id="proposal-summary"></div>
-            </div>
+            <h3 style="margin-bottom:12px">Research Pulse</h3>
+            <div class="kv" id="research-board"></div>
           </div>
           <div class="section-card">
-            <h3 style="margin-bottom:12px">Readiness Detail</h3>
-            <pre id="readiness-json"></pre>
+            <h3 style="margin-bottom:12px">Next Up</h3>
+            <div class="callout">
+              <div class="kv" id="next-board"></div>
+            </div>
+          </div>
+          <div class="section-card forms">
+            <h3>Research Controls</h3>
+            <input id="input-experiment-spec" placeholder="Experiment spec path" value="configs/experiments/phase1_remote_baseline_sweep.yml">
+            <input id="input-experiment-id" placeholder="Experiment ID">
+            <input id="input-experiment-poll-seconds" placeholder="Poll seconds" value="30">
+            <div class="form-row">
+              <button id="start-experiment-supervisor">Start Queue</button>
+              <button id="pause-experiment-supervisor" class="secondary">Pause</button>
+              <button id="resume-experiment-supervisor" class="secondary">Resume</button>
+              <button id="stop-experiment-supervisor" class="ghost">Stop</button>
+            </div>
+            <div class="form-row">
+              <button id="evaluate-experiment" class="secondary">Evaluate</button>
+              <button id="backtest-experiment">Backtest Survivors</button>
+              <button id="propose-next-experiment" class="secondary">Propose Next</button>
+            </div>
           </div>
         </div>
       </div>
@@ -671,23 +661,6 @@ HTML_PAGE = """<!doctype html>
             <button id="run-canonical-repair">Run Repair</button>
           </div>
         </div>
-        <div class="section-card forms">
-          <h3>Experiment Automation</h3>
-          <input id="input-experiment-spec" placeholder="Experiment spec path" value="configs/experiments/phase1_remote_baseline_sweep.yml">
-          <input id="input-experiment-id" placeholder="Experiment ID">
-          <input id="input-experiment-poll-seconds" placeholder="Poll seconds" value="30">
-          <div class="form-row">
-            <button id="start-experiment-supervisor">Start Supervisor</button>
-            <button id="pause-experiment-supervisor" class="secondary">Pause</button>
-            <button id="resume-experiment-supervisor" class="secondary">Resume</button>
-            <button id="stop-experiment-supervisor" class="ghost">Stop</button>
-          </div>
-          <div class="form-row">
-            <button id="evaluate-experiment" class="secondary">Evaluate</button>
-            <button id="backtest-experiment">Backtest Survivors</button>
-            <button id="propose-next-experiment" class="secondary">Propose Next</button>
-          </div>
-        </div>
       </div>
     </section>
 
@@ -713,9 +686,10 @@ HTML_PAGE = """<!doctype html>
   </div>
 
   <script>
-    const sections = ['status', 'budgets', 'setup', 'logs'];
+    const sections = ['status'];
     let activeSection = 'status';
     let currentLiveSnapshot = null;
+    let currentStatusSnapshot = null;
     let statusTimer = null;
     let setupLoaded = false;
     let logsLoaded = false;
@@ -735,6 +709,20 @@ HTML_PAGE = """<!doctype html>
       const days = Math.floor(hours / 24);
       const remainingHours = hours % 24;
       return `${days}d ${remainingHours}h`;
+    }
+
+    function formatDecimal(value, decimals=3) {
+      if (value === null || value === undefined || value === '') return '-';
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return '-';
+      return numeric.toFixed(decimals);
+    }
+
+    function formatPercent(value, decimals=1) {
+      if (value === null || value === undefined || value === '') return '-';
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return '-';
+      return `${numeric.toFixed(decimals)}%`;
     }
 
     function setMessage(id, text, level='') {
@@ -767,27 +755,26 @@ HTML_PAGE = """<!doctype html>
       const runtime = snapshot.runtime || {};
       const collection = snapshot.collection_status || {};
       const readiness = (snapshot.training_readiness || {}).phase1 || {};
-      const freezeCutoff = (snapshot.training_readiness || {}).freeze_cutoff || {};
-      const eta = (((snapshot.planner_eta || {}).canonical_bars) || {}).eta_minutes;
       document.getElementById('metric-node-status').textContent = runtime.running ? 'Running' : 'Stopped';
-      document.getElementById('metric-node-detail').textContent = runtime.pid ? `PID ${runtime.pid}` : 'No active PID';
-      document.getElementById('metric-coverage').textContent = `${collection.coverage_percent ?? 0}%`;
-      document.getElementById('metric-coverage-detail').textContent = `${formatNumber(collection.pending_tasks ?? 0)} pending`;
-      document.getElementById('metric-canonical').textContent = formatNumber(collection.canonical_completed_units ?? 0);
+      document.getElementById('metric-node-detail').textContent = runtime.pid ? `PID ${runtime.pid}` : 'Waiting for worker';
+      document.getElementById('metric-coverage').textContent = formatNumber(collection.raw_vendor_rows ?? 0);
+      document.getElementById('metric-coverage-detail').textContent = currentStatusSnapshot?.latest_raw_date
+        ? `Latest raw ${currentStatusSnapshot.latest_raw_date}`
+        : 'Waiting for raw data';
       const pinnedRemaining = collection.phase1_pinned_remaining_units;
-      const rollingRemaining = collection.canonical_remaining_units ?? 0;
+      const rollingRemaining = collection.rolling_remaining_units ?? 0;
       const repairRemaining = collection.repair_remaining_units ?? 0;
+      const totalRemaining = collection.canonical_remaining_units ?? (rollingRemaining + repairRemaining);
+      document.getElementById('metric-canonical').textContent = readiness.ready
+        ? 'Ready'
+        : formatPercent(collection.training_critical_percent ?? 0);
       document.getElementById('metric-remaining').textContent = readiness.ready
-        ? `Phase 1 complete · ${formatNumber(rollingRemaining)} rolling / ${formatNumber(repairRemaining)} repair`
-        : `${formatNumber(pinnedRemaining ?? rollingRemaining)} pinned remaining`;
-      document.getElementById('metric-raw-rows').textContent = formatNumber(collection.raw_vendor_rows ?? 0);
-      document.getElementById('metric-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
-      document.getElementById('metric-gate').textContent = readiness.ready ? 'Ready' : 'Blocked';
-      document.getElementById('metric-gate-detail').textContent = `${collection.training_critical_percent ?? 0}% critical coverage`;
-      document.getElementById('metric-eta').textContent = formatEta(eta);
-      document.getElementById('metric-freeze-cutoff').textContent = freezeCutoff.date ? `Freeze cutoff ${freezeCutoff.date}` : 'No freeze cutoff';
-      document.getElementById('budgets-updated').textContent = `Live snapshot ${new Date().toLocaleTimeString()}`;
-      renderBudgets(snapshot);
+        ? 'Pinned gate locked'
+        : `${formatNumber(pinnedRemaining ?? rollingRemaining)} pinned left`;
+      document.getElementById('metric-raw-rows').textContent = totalRemaining > 0
+        ? formatNumber(totalRemaining)
+        : 'Clear';
+      document.getElementById('metric-updated').textContent = `${formatNumber(collection.rolling_remaining_units ?? 0)} rolling · ${formatNumber(repairRemaining)} repair`;
     }
 
     function renderBudgets(snapshot) {
@@ -803,6 +790,7 @@ HTML_PAGE = """<!doctype html>
     }
 
     function renderStatus(snapshot) {
+      currentStatusSnapshot = snapshot;
       const collection = snapshot.collection_status || {};
       const readiness = snapshot.training_readiness || {};
       const phase1 = readiness.phase1 || {};
@@ -812,92 +800,120 @@ HTML_PAGE = """<!doctype html>
       const trainingRuntime = trainingStatus.runtime || trainingStatus || {};
       const defaultTarget = snapshot.default_training_target || {};
       const targets = snapshot.training_targets || [];
-      const leasedWork = health.leased_work || {};
       const repairTasks = health.repair_tasks || {};
       const experiment = snapshot.experiment_summary || {};
       const supervisor = health.experiment_supervisor || {};
       const proposal = health.proposal_summary || {};
-      const command = (snapshot.suggested_training_commands || {}).phase1 || '';
       const readinessPill = document.getElementById('status-readiness-pill');
       readinessPill.textContent = phase1.ready ? 'Phase 1 ready' : 'Phase 1 blocked';
       readinessPill.className = `pill ${phase1.ready ? 'good' : 'warn'}`;
+      const trainingPill = document.getElementById('training-status-pill');
+      const runtimeStatus = String(trainingRuntime.status || 'idle').toLowerCase();
+      trainingPill.textContent = trainingRuntime.running || runtimeStatus === 'running'
+        ? 'Training live'
+        : runtimeStatus === 'completed'
+          ? 'Last run complete'
+          : 'Idle';
+      trainingPill.className = `pill ${
+        trainingRuntime.running || runtimeStatus === 'running'
+          ? 'good'
+          : runtimeStatus === 'failed'
+            ? 'bad'
+            : 'warn'
+      }`;
       const targetSelect = document.getElementById('training-target');
       const selectedTarget = targetSelect.value || defaultTarget.name || '';
       targetSelect.innerHTML = targets.map((target) => {
         const selected = (target.name === selectedTarget || (!selectedTarget && target.default)) ? 'selected' : '';
         return `<option value="${target.name}" ${selected}>${target.label || target.name}</option>`;
       }).join('');
-      renderKeyValue('training-summary', [
+      renderKeyValue('progress-board', [
+        ['Total datapoints', formatNumber(snapshot.raw_datapoints ?? 0)],
         ['Latest raw date', snapshot.latest_raw_date ?? '-'],
-        ['Pending tasks', formatNumber(collection.pending_tasks ?? 0)],
-        ['Failed tasks', formatNumber(collection.failed_tasks ?? 0)],
+        ['Phase 1', phase1.ready ? 'Ready to train' : 'Still filling'],
         ['Freeze cutoff', freezeCutoff.date ?? '-'],
-        ['Pinned cutoff', freezeCutoff.pinned ? 'Yes' : 'No'],
         ['Critical coverage', `${collection.training_critical_percent ?? 0}%`],
+        ['Pinned remaining', formatNumber(collection.phase1_pinned_remaining_units ?? 0)],
         ['Rolling remaining', formatNumber(collection.rolling_remaining_units ?? 0)],
         ['Repair remaining', formatNumber(collection.repair_remaining_units ?? 0)],
+        ['Pending tasks', formatNumber(collection.pending_tasks ?? 0)],
+        ['Bars ETA', formatEta((((snapshot.planner_eta || {}).canonical_bars) || {}).eta_minutes)],
       ]);
       renderKeyValue('training-runtime-summary', [
         ['Target', trainingRuntime.target || defaultTarget.name || '-'],
         ['Status', trainingRuntime.status || '-'],
         ['Host', trainingRuntime.host || defaultTarget.host || '-'],
         ['PID', trainingRuntime.pid ? formatNumber(trainingRuntime.pid) : '-'],
+        ['Report date', trainingRuntime.report_date || freezeCutoff.date || '-'],
         ['Started', trainingRuntime.started_at || '-'],
         ['Finished', trainingRuntime.finished_at || '-'],
       ]);
-      document.getElementById('training-command').textContent = command || 'No training command available yet.';
       document.getElementById('training-log-preview').textContent = trainingStatus.log_tail || 'No training log available yet.';
-      document.getElementById('readiness-json').textContent = JSON.stringify(readiness, null, 2);
-      renderKeyValue('repair-health', [
-        ['Repair pending', formatNumber((repairTasks.counts || {}).PENDING ?? 0)],
-        ['Repair partial', formatNumber((repairTasks.counts || {}).PARTIAL ?? 0)],
-        ['Repair success', formatNumber((repairTasks.counts || {}).SUCCESS ?? 0)],
-        ['Repair remaining units', formatNumber(repairTasks.remaining_units ?? 0)],
-        ['Repair drain / min', repairTasks.drain_rate_per_min ?? 0],
-        ['Repair ETA', formatEta(health.repair_eta_minutes)],
-        ['Recent bad dates', (health.recent_bad_dates || []).join(', ') || '-'],
-      ]);
-      renderKeyValue('leased-work-summary', [
-        ['Pinned leased', formatNumber(((leasedWork.counts || {}).phase1_pinned) ?? 0)],
-        ['Rolling leased', formatNumber(((leasedWork.counts || {}).rolling) ?? 0)],
-        ['Repair leased', formatNumber(((leasedWork.counts || {}).repair) ?? 0)],
-      ]);
-      renderKeyValue('experiment-summary', [
+      renderKeyValue('winner-board', [
         ['Experiment', experiment.experiment_id || '-'],
-        ['Runs', formatNumber(experiment.run_count ?? 0)],
+        ['Best candidate', experiment.best_candidate || 'No winner yet'],
+        ['Primary score', formatDecimal(experiment.best_primary_score)],
+        ['Backtest net', formatDecimal(experiment.best_backtest_net_return)],
+        ['Decision', experiment.best_decision || 'No GO yet'],
+        ['Reason', experiment.best_decision_reason || '-'],
+      ]);
+      const queueActive = Boolean(supervisor.status || experiment.experiment_id);
+      renderKeyValue('research-board', [
+        ['Queue status', queueActive ? 'Active' : 'Idle'],
+        ['Runs', `${formatNumber(experiment.run_count ?? 0)} total`],
         ['Running', formatNumber((experiment.counts || {}).RUNNING ?? 0)],
         ['Completed', formatNumber((experiment.counts || {}).COMPLETED ?? 0)],
-        ['Best candidate', experiment.best_candidate || experiment.best_run_id || '-'],
-      ]);
-      renderKeyValue('experiment-supervisor', [
-        ['Status', supervisor.status || '-'],
-        ['Heartbeat', supervisor.heartbeat_at || '-'],
-        ['Active runs', formatNumber((supervisor.active_run_ids || []).length)],
-        ['Last launch', supervisor.last_launch_at || '-'],
-        ['Last error', supervisor.last_error || '-'],
-      ]);
-      renderKeyValue('experiment-evaluation', [
-        ['Predictive survivors', formatNumber((experiment.evaluation_counts || {}).SURVIVES_PREDICTIVE ?? 0)],
         ['Shortlisted', formatNumber(experiment.shortlist_count ?? 0)],
-        ['Rejected predictive', formatNumber((experiment.evaluation_counts || {}).REJECTED_PREDICTIVE ?? 0)],
-        ['Rejected backtest', formatNumber((experiment.evaluation_counts || {}).REJECTED_BACKTEST ?? 0)],
+        ['Predictive survivors', formatNumber((experiment.evaluation_counts || {}).SURVIVES_PREDICTIVE ?? 0)],
         ['Top rejection', ((experiment.top_gate_failures || [])[0] || []).join(': ') || '-'],
+        ['Repair ETA', formatEta(health.repair_eta_minutes)],
       ]);
-      renderKeyValue('proposal-summary', [
-        ['Recommended family', proposal.recommended_experiment_id || '-'],
-        ['Rationale', (proposal.rationale || []).join(' | ') || '-'],
-        ['Spec path', proposal.spec_path || '-'],
+      const runningRuns = formatNumber((experiment.counts || {}).RUNNING ?? 0);
+      const plannedRuns = formatNumber((experiment.counts || {}).PLANNED ?? 0);
+      let nextHeadline = 'Start the next research wave';
+      let nextReason = 'No active training run or queued experiment family right now.';
+      if (!phase1.ready) {
+        nextHeadline = 'Finish the pinned Phase 1 tail';
+        nextReason = `${formatNumber(collection.phase1_pinned_remaining_units ?? 0)} pinned units still block training readiness.`;
+      } else if (trainingRuntime.running || runtimeStatus === 'running') {
+        nextHeadline = 'Let the current training run finish';
+        nextReason = `${trainingRuntime.target || defaultTarget.name || 'remote target'} is actively training on ${trainingRuntime.host || defaultTarget.host || 'the current host'}.`;
+      } else if ((repairTasks.remaining_units ?? 0) > 0) {
+        nextHeadline = 'Clear the repair tail';
+        nextReason = `${formatNumber(repairTasks.remaining_units ?? 0)} repair units remain across ${(health.recent_bad_dates || []).length} flagged dates.`;
+      } else if ((experiment.counts || {}).RUNNING || (experiment.counts || {}).PLANNED || supervisor.status === 'RUNNING') {
+        nextHeadline = 'Drain the experiment queue';
+        nextReason = `${runningRuns} running and ${plannedRuns} planned in ${experiment.experiment_id || 'the current family'}.`;
+      } else if ((experiment.shortlist_count ?? 0) > 0) {
+        nextHeadline = 'Review the shortlist';
+        nextReason = `${formatNumber(experiment.shortlist_count ?? 0)} candidate runs survived the current research funnel.`;
+      } else if (proposal.recommended_experiment_id) {
+        nextHeadline = 'Launch the next bounded family';
+        nextReason = proposal.recommended_experiment_id;
+      }
+      renderKeyValue('next-board', [
+        ['Move', nextHeadline],
+        ['Why', nextReason],
+        ['Proposal', proposal.recommended_experiment_id || '-'],
+        ['Data lane', ((proposal.data_recommendations || [])[0]) || '-'],
       ]);
+      renderTable('recent-runs-table', (experiment.runs || []).slice(0, 6).map((run) => ({
+        run_id: run.run_id,
+        suite: run.model_suite,
+        stage: run.evaluation_stage || run.status,
+        shortlisted: run.shortlisted ? 'yes' : 'no',
+      })));
+      document.getElementById('metric-gate').textContent = trainingRuntime.running || runtimeStatus === 'running'
+        ? 'Running'
+        : trainingRuntime.status === 'completed'
+          ? 'Complete'
+          : 'Idle';
+      document.getElementById('metric-gate-detail').textContent = trainingRuntime.target || defaultTarget.name || 'No target selected';
+      document.getElementById('metric-eta').textContent = experiment.best_candidate || 'No winner';
+      document.getElementById('metric-freeze-cutoff').textContent = experiment.best_decision
+        ? `${experiment.best_decision} · ${formatDecimal(experiment.best_primary_score)}`
+        : 'No promoted run yet';
       document.getElementById('status-updated').textContent = `Status refreshed ${new Date().toLocaleTimeString()}`;
-      renderTable('coverage-table', snapshot.dataset_coverage ? Object.values(snapshot.dataset_coverage).map((details) => ({
-        dataset: details.label,
-        coverage_percent: `${Math.round((details.ratio || 0) * 1000) / 10}%`,
-        remaining_units: formatNumber(details.remaining_units || 0),
-        eta: formatEta(details.eta_minutes),
-        blocking: details.blocking ? 'yes' : 'no',
-      })) : []);
-      renderTable('vendor-table', (snapshot.vendor_throughput || {}).rows || []);
-      renderTable('lane-health-table', health.vendor_lane_health || []);
     }
 
     function renderSetup(snapshot) {
@@ -958,17 +974,7 @@ HTML_PAGE = """<!doctype html>
     }
 
     async function refreshActiveSection(force=false) {
-      if (activeSection === 'status') {
-        await refreshStatus();
-        return;
-      }
-      if (activeSection === 'setup') {
-        await refreshSetup(force);
-        return;
-      }
-      if (activeSection === 'logs') {
-        await refreshLogs(force);
-      }
+      await refreshStatus();
     }
 
     async function refreshLiveOnce() {
