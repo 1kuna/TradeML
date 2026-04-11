@@ -29,6 +29,39 @@ from trademl.data_node.training_control import (
     training_status_snapshot,
 )
 
+SPECIAL_MATRIX_DIMENSIONS = {"model_suite", "architecture_family", "feature_family", "data_profile"}
+
+ARCHITECTURE_FAMILY_PRESETS: dict[str, dict[str, Any]] = {
+    "linear_baseline": {"model_suite": "ridge_only", "config_overrides": {}},
+    "tree_challenger": {"model_suite": "full", "config_overrides": {}},
+}
+
+FEATURE_FAMILY_PRESETS: dict[str, dict[str, Any]] = {
+    "price_core": {
+        "config_overrides": {
+            "features.liquidity.adv_dollar": [],
+            "features.liquidity.amihud": [],
+        }
+    },
+    "price_liquidity": {"config_overrides": {}},
+    "price_short_horizon": {
+        "config_overrides": {
+            "features.price.momentum": [5, 20, 60],
+            "features.price.reversal": [1, 5],
+            "features.price.drawdown": [20],
+            "features.volatility.realized": [20],
+            "features.liquidity.adv_dollar": [],
+            "features.liquidity.amihud": [],
+        }
+    },
+}
+
+DATA_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
+    "phase1_default": {"config_overrides": {}},
+    "phase1_short_window": {"config_overrides": {"data.window_years": 3}},
+    "phase1_long_window": {"config_overrides": {"data.window_years": 7}},
+}
+
 
 def plan_experiment(
     *,
@@ -173,7 +206,7 @@ def launch_experiment(
     failed: list[dict[str, Any]] = []
     if available_slots <= 0:
         return {**status, "launched": launched, "failed": failed}
-    for manifest in status["runs"]:
+    for manifest in _load_run_manifests(local_state=local_state, experiment_id=experiment_id):
         if available_slots <= 0:
             break
         if not _run_ready_for_retry(manifest=manifest, supervision=supervision):
@@ -466,6 +499,7 @@ def supervise_experiment(
     experiment_id = str(plan["experiment_id"])
     spec = _load_spec(spec_path)
     supervision = _supervision_policy(spec)
+    proposal_policy = _proposal_policy(spec)
     resolved_poll = int(poll_seconds or supervision["poll_seconds"])
     if detach:
         return _spawn_supervisor_process(
@@ -575,8 +609,9 @@ def supervise_experiment(
             _write_supervisor_state(local_state=local_state, experiment_id=experiment_id, payload=state)
             continue
         if planned <= 0 and active <= 0:
+            chained = None
             if supervision["auto_propose_next_family"]:
-                propose_next_experiment_family(
+                proposal_result = propose_next_experiment_family(
                     experiment_id=experiment_id,
                     local_state=local_state,
                     repo_root=repo_root,
@@ -584,8 +619,24 @@ def supervise_experiment(
                     targets_config_path=targets_config_path,
                     python_executable=python_executable,
                 )
+                proposal = proposal_result.get("proposal") or {}
+                if proposal_policy["auto_launch_next_family"] and bool(proposal.get("chain_allowed")):
+                    chained = _spawn_supervisor_process(
+                        experiment_id=str(proposal["recommended_experiment_id"]),
+                        spec_path=Path(str(proposal["spec_path"])),
+                        repo_root=repo_root,
+                        data_root=data_root,
+                        local_state=local_state,
+                        env_path=env_path,
+                        python_executable=python_executable,
+                        poll_seconds=int(resolved_poll),
+                    )
+                    state["next_experiment_id"] = proposal["recommended_experiment_id"]
+                    state["next_supervisor_pid"] = chained["pid"]
             state["status"] = "COMPLETED"
             state["completed_at"] = datetime.now(tz=UTC).isoformat()
+            if chained is not None:
+                state["chained"] = chained
             _write_supervisor_state(local_state=local_state, experiment_id=experiment_id, payload=state)
             return state
         time.sleep(max(1, resolved_poll))
@@ -846,9 +897,41 @@ def _realize_matrix(matrix: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for combination in itertools.product(*values):
         matrix_values = {key: value for key, value in zip(keys, combination, strict=True)}
-        config_overrides = {key: value for key, value in matrix_values.items() if key != "model_suite"}
-        rows.append({"matrix_values": matrix_values, "config_overrides": config_overrides, "model_suite": matrix_values.get("model_suite")})
+        rows.append(_materialize_matrix_row(matrix_values))
     return rows
+
+
+def _materialize_matrix_row(matrix_values: dict[str, Any]) -> dict[str, Any]:
+    config_overrides: dict[str, Any] = {}
+    model_suite = matrix_values.get("model_suite")
+    architecture_family = matrix_values.get("architecture_family")
+    if architecture_family is not None:
+        preset = ARCHITECTURE_FAMILY_PRESETS.get(str(architecture_family))
+        if preset is None:
+            raise ValueError(f"unsupported architecture_family: {architecture_family}")
+        preset_model_suite = str(preset["model_suite"])
+        if model_suite is not None and str(model_suite) != preset_model_suite:
+            raise ValueError(f"matrix row conflicts between model_suite={model_suite!r} and architecture_family={architecture_family!r}")
+        model_suite = preset_model_suite
+        config_overrides.update(dict(preset.get("config_overrides") or {}))
+    feature_family = matrix_values.get("feature_family")
+    if feature_family is not None:
+        preset = FEATURE_FAMILY_PRESETS.get(str(feature_family))
+        if preset is None:
+            raise ValueError(f"unsupported feature_family: {feature_family}")
+        config_overrides.update(dict(preset.get("config_overrides") or {}))
+    data_profile = matrix_values.get("data_profile")
+    if data_profile is not None:
+        preset = DATA_PROFILE_PRESETS.get(str(data_profile))
+        if preset is None:
+            raise ValueError(f"unsupported data_profile: {data_profile}")
+        config_overrides.update(dict(preset.get("config_overrides") or {}))
+    config_overrides.update({key: value for key, value in matrix_values.items() if key not in SPECIAL_MATRIX_DIMENSIONS})
+    return {
+        "matrix_values": matrix_values,
+        "config_overrides": config_overrides,
+        "model_suite": model_suite,
+    }
 
 
 def _apply_overrides(base_config: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -890,8 +973,12 @@ def _proposal_policy(spec: dict[str, Any]) -> dict[str, Any]:
     policy = dict(spec.get("proposal_policy") or {})
     return {
         "family_size_cap": int(policy.get("family_size_cap", 6) or 6),
-        "allowed_dimensions": list(policy.get("allowed_dimensions") or ["model_suite", "validation.initial_train_years", "data.window_years"]),
+        "allowed_dimensions": list(
+            policy.get("allowed_dimensions")
+            or ["architecture_family", "feature_family", "validation.initial_train_years", "data_profile"]
+        ),
         "max_generations": int(policy.get("max_generations", 1) or 1),
+        "auto_launch_next_family": bool(policy.get("auto_launch_next_family", False)),
     }
 
 
@@ -916,11 +1003,27 @@ def _local_experiment_root(local_state: Path, experiment_id: str) -> Path:
 
 def _summary_run_row(manifest: dict[str, Any]) -> dict[str, Any]:
     return {
+        "experiment_id": manifest["experiment_id"],
         "run_id": manifest["run_id"],
+        "phase": manifest.get("phase"),
+        "target": manifest.get("target"),
+        "target_kind": manifest.get("target_kind"),
+        "report_date": manifest.get("report_date"),
         "status": manifest["status"],
         "model_suite": manifest["model_suite"],
         "matrix_values": manifest["matrix_values"],
+        "config_overrides": manifest.get("config_overrides", {}),
+        "config_path": manifest.get("config_path"),
+        "runtime_name": manifest.get("runtime_name"),
+        "local_runtime_path": manifest.get("local_runtime_path"),
+        "shared_runtime_path": manifest.get("shared_runtime_path"),
+        "output_root": manifest.get("output_root"),
+        "report_path": manifest.get("report_path"),
         "evaluation_stage": manifest.get("evaluation_stage"),
+        "failure_kind": manifest.get("failure_kind"),
+        "last_error": manifest.get("last_error"),
+        "retry_count": manifest.get("retry_count", 0),
+        "supervisor_history": manifest.get("supervisor_history", []),
         "shortlisted": bool(manifest.get("shortlisted")),
     }
 
@@ -984,6 +1087,10 @@ def _refresh_experiment_summary(*, local_state: Path, experiment_id: str, summar
     shortlist = []
     best_run_id = None
     best_candidate = None
+    best_primary_score = None
+    best_backtest_net_return = None
+    best_decision = None
+    best_decision_reason = None
     best_score = -10.0
     for run in runs:
         stage = str(run.get("evaluation_stage") or "PLANNED")
@@ -1004,6 +1111,10 @@ def _refresh_experiment_summary(*, local_state: Path, experiment_id: str, summar
             best_score = numeric
             best_run_id = run.get("run_id")
             best_candidate = run.get("model_suite")
+            best_primary_score = numeric
+            best_backtest_net_return = (run.get("backtest_summary") or {}).get("net_return")
+            best_decision = (run.get("assessment") or {}).get("decision")
+            best_decision_reason = (run.get("assessment") or {}).get("reason")
     supervisor = read_experiment_supervisor_state(local_state=local_state, experiment_id=experiment_id)
     proposal_path = _local_experiment_root(local_state, experiment_id) / "next_family_proposal.json"
     proposal_summary = json.loads(proposal_path.read_text(encoding="utf-8")) if proposal_path.exists() else {}
@@ -1018,6 +1129,10 @@ def _refresh_experiment_summary(*, local_state: Path, experiment_id: str, summar
         "shortlist_count": len(shortlist),
         "best_run_id": best_run_id,
         "best_candidate": best_candidate,
+        "best_primary_score": best_primary_score,
+        "best_backtest_net_return": best_backtest_net_return,
+        "best_decision": best_decision,
+        "best_decision_reason": best_decision_reason,
         "top_gate_failures": sorted(gate_failures.items(), key=lambda item: (-item[1], item[0]))[:5],
         "supervisor": supervisor,
         "proposal_summary": summary.get("proposal_summary") or proposal_summary,
@@ -1295,8 +1410,13 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
     predictive_survivors = [row for row in rows if row.get("evaluation_stage") == "SURVIVES_PREDICTIVE"]
     full_rows = [row for row in rows if row.get("model_suite") == "full"]
     ridge_rows = [row for row in rows if row.get("model_suite") == "ridge_only"]
+    policy = _proposal_policy(base_spec)
+    allowed_dimensions = set(policy["allowed_dimensions"])
+    current_generation = int(base_spec.get("generation", 0) or 0)
+    family_root = str(base_spec.get("family_root") or experiment_id)
+    next_generation = current_generation + 1
     next_spec = {
-        "experiment_id": f"{experiment_id}-next",
+        "experiment_id": f"{family_root}-g{next_generation}",
         "phase": int(base_spec.get("phase", 1) or 1),
         "target": base_spec.get("target"),
         "report_date_policy": str(base_spec.get("report_date_policy") or "phase1_freeze"),
@@ -1305,47 +1425,126 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
         "predictive_gate": dict(base_spec.get("predictive_gate") or {}),
         "backtest_gate": dict(base_spec.get("backtest_gate") or {}),
         "proposal_policy": dict(base_spec.get("proposal_policy") or {}),
+        "family_root": family_root,
+        "generation": next_generation,
+        "parent_experiment_id": experiment_id,
     }
     rationale: list[str] = []
+    next_matrix: dict[str, list[Any]]
+
+    ridge_score = max((float(row.get("primary_score") or 0.0) for row in ridge_rows), default=-1.0)
+    full_score = max((float(row.get("primary_score") or 0.0) for row in full_rows), default=-1.0)
+    dominant_architecture = "linear_baseline" if ridge_score >= full_score else "tree_challenger"
+
     if not predictive_survivors:
-        full_score = max((float(row.get("primary_score") or 0.0) for row in full_rows), default=-1.0)
-        ridge_score = max((float(row.get("primary_score") or 0.0) for row in ridge_rows), default=-1.0)
-        if ridge_score >= full_score:
-            next_spec["matrix"] = {
-                "model_suite": ["ridge_only"],
-                "validation.initial_train_years": [1, 2, 3],
-                "data.window_years": [3, 5],
-            }
-            rationale.append("all runs failed predictive gates, so the next family pivots toward ridge-centered validation and data-window variants")
+        next_matrix = _bounded_matrix(
+            allowed_dimensions=allowed_dimensions,
+            dominant_architecture=dominant_architecture,
+            initial_years=[2, 3],
+            feature_families=["price_core", "price_liquidity", "price_short_horizon"],
+            data_profiles=["phase1_default", "phase1_short_window", "phase1_long_window"],
+            family_size_cap=policy["family_size_cap"],
+        )
+        if dominant_architecture == "linear_baseline":
+            rationale.append("all runs failed predictive gates and ridge outperformed full, so the next family pivots to ridge-centered architecture and feature-family variants")
         else:
-            next_spec["matrix"] = {
-                "model_suite": ["full", "ridge_only"],
-                "validation.initial_train_years": [1, 2],
-                "data.window_years": [3, 5],
-            }
-            rationale.append("all runs failed predictive gates, so the next family widens validation and window depth without expanding backtests")
+            rationale.append("all runs failed predictive gates and the tree challenger was best, so the next family keeps that architecture while rotating feature families and data windows")
     elif predictive_survivors and not shortlisted:
         best = predictive_survivors[0]
-        next_spec["matrix"] = {
-            "model_suite": [str(best["model_suite"])],
-            "validation.initial_train_years": sorted({int(best["matrix_values"].get("validation.initial_train_years", 2)), 2, 3}),
-            "portfolio.cost_stress_multiplier": [2.0, 3.0],
-        }
-        rationale.append("a predictive survivor failed deeper backtest gates, so the next family tightens around the winning suite and cost profile")
+        best_architecture = _architecture_family_for_row(best)
+        next_matrix = _bounded_matrix(
+            allowed_dimensions=allowed_dimensions,
+            dominant_architecture=best_architecture,
+            initial_years=sorted({int(best["matrix_values"].get("validation.initial_train_years", 2) or 2), 2, 3}),
+            feature_families=[_feature_family_for_row(best), "price_core"],
+            data_profiles=["phase1_default"],
+            family_size_cap=policy["family_size_cap"],
+            extra_dimension=("portfolio.cost_stress_multiplier", [2.0, 3.0]),
+        )
+        rationale.append("a predictive survivor failed backtest gates, so the next family tightens around the winning architecture and stresses cost assumptions")
     else:
         best = shortlisted[0]
-        next_spec["matrix"] = {
-            "model_suite": [str(best["model_suite"])],
-            "validation.initial_train_years": sorted({int(best["matrix_values"].get("validation.initial_train_years", 2)), 2, 3}),
-            "data.window_years": [5, 7],
-        }
-        rationale.append("a shortlist candidate exists, so the next family expands around that winner instead of widening the whole search")
+        best_architecture = _architecture_family_for_row(best)
+        next_matrix = _bounded_matrix(
+            allowed_dimensions=allowed_dimensions,
+            dominant_architecture=best_architecture,
+            initial_years=sorted({int(best["matrix_values"].get("validation.initial_train_years", 2) or 2), 2, 3}),
+            feature_families=[_feature_family_for_row(best), "price_core"],
+            data_profiles=["phase1_default", "phase1_long_window"],
+            family_size_cap=policy["family_size_cap"],
+        )
+        rationale.append("a shortlist candidate exists, so the next family expands around that winner instead of reopening the whole search")
+    next_spec["matrix"] = next_matrix
+    chain_allowed = current_generation < policy["max_generations"]
+    data_recommendations = _data_expansion_recommendations(
+        predictive_survivors=predictive_survivors,
+        shortlisted=shortlisted,
+    )
     return {
         "experiment_id": experiment_id,
         "recommended_experiment_id": next_spec["experiment_id"],
         "rationale": rationale,
+        "data_recommendations": data_recommendations,
         "next_spec": next_spec,
+        "chain_allowed": chain_allowed,
+        "generation": next_generation,
     }
+
+
+def _bounded_matrix(
+    *,
+    allowed_dimensions: set[str],
+    dominant_architecture: str,
+    initial_years: list[int],
+    feature_families: list[str],
+    data_profiles: list[str],
+    family_size_cap: int,
+    extra_dimension: tuple[str, list[Any]] | None = None,
+) -> dict[str, list[Any]]:
+    matrix: dict[str, list[Any]] = {}
+    if "architecture_family" in allowed_dimensions:
+        matrix["architecture_family"] = [dominant_architecture]
+    else:
+        matrix["model_suite"] = [ARCHITECTURE_FAMILY_PRESETS[dominant_architecture]["model_suite"]]
+    if "feature_family" in allowed_dimensions:
+        max_features = max(1, family_size_cap // max(1, len(initial_years)))
+        matrix["feature_family"] = list(dict.fromkeys(feature_families))[:max_features]
+    if "validation.initial_train_years" in allowed_dimensions:
+        max_years = max(1, family_size_cap // max(1, len(matrix.get("feature_family", [1]))))
+        matrix["validation.initial_train_years"] = list(dict.fromkeys(initial_years))[:max_years]
+    if "data_profile" in allowed_dimensions:
+        current_size = _matrix_combination_count(matrix)
+        max_profiles = max(1, family_size_cap // max(1, current_size))
+        matrix["data_profile"] = list(dict.fromkeys(data_profiles))[:max_profiles]
+    if extra_dimension is not None:
+        key, values = extra_dimension
+        current_size = _matrix_combination_count(matrix)
+        max_values = max(1, family_size_cap // max(1, current_size))
+        matrix[key] = list(dict.fromkeys(values))[:max_values]
+    return matrix
+
+
+def _matrix_combination_count(matrix: dict[str, list[Any]]) -> int:
+    size = 1
+    for values in matrix.values():
+        size *= max(1, len(values))
+    return size
+
+
+def _architecture_family_for_row(row: dict[str, Any]) -> str:
+    matrix_values = dict(row.get("matrix_values") or {})
+    family = matrix_values.get("architecture_family")
+    if family:
+        return str(family)
+    return "tree_challenger" if str(row.get("model_suite")) == "full" else "linear_baseline"
+
+
+def _feature_family_for_row(row: dict[str, Any]) -> str:
+    matrix_values = dict(row.get("matrix_values") or {})
+    family = matrix_values.get("feature_family")
+    if family:
+        return str(family)
+    return "price_liquidity"
 
 
 def _write_next_family_proposal(*, local_state: Path, experiment_id: str, proposal: dict[str, Any]) -> dict[str, str]:
@@ -1362,6 +1561,7 @@ def _write_next_family_proposal(*, local_state: Path, experiment_id: str, propos
                 "",
                 f"- recommended_experiment_id: {proposal['recommended_experiment_id']}",
                 *[f"- rationale: {item}" for item in proposal["rationale"]],
+                *[f"- data_recommendation: {item}" for item in proposal.get("data_recommendations", [])],
                 "",
                 "```yaml",
                 yaml.safe_dump(proposal["next_spec"], sort_keys=False).rstrip(),
@@ -1468,6 +1668,23 @@ def _classify_failure(error: str) -> str:
     if any(token in lowered for token in ["missing qc parquet", "missing config", "no curated parquet"]):
         return "preflight"
     return "model"
+
+
+def _data_expansion_recommendations(*, predictive_survivors: list[dict[str, Any]], shortlisted: list[dict[str, Any]]) -> list[str]:
+    if shortlisted:
+        return [
+            "Add PIT-safe daily context next: FRED macro regime features and SEC filing-timing risk controls around the shortlisted family.",
+            "Stage ticker-tagged news aggregates as a separate daily research lane before attempting minute-level modeling.",
+        ]
+    if predictive_survivors:
+        return [
+            "Backtest survivors suggest the next leverage point is daily event context: SEC filing dates, earnings-risk flags, and macro regime features.",
+            "Keep minute bars and intraday/news alpha in a separate future lane until daily cost-adjusted winners exist.",
+        ]
+    return [
+        "Before adding more model complexity, compare price-only vs liquidity-inclusive families because free IEX-volume features may still be noisy.",
+        "The next data additions should be PIT-safe daily lanes: FRED macro pack, SEC filing dates, and news/event aggregates collected daily rather than minute-level alpha.",
+    ]
 
 
 def _is_local_process_running(pid: int) -> bool:
