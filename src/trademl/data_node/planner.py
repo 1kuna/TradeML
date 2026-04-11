@@ -120,8 +120,6 @@ def plan_auxiliary_tasks(
     if not stage_symbols:
         return []
     current_ts = pd.Timestamp(current_date or datetime.now(tz=UTC).date().isoformat()).normalize()
-    start_date = (current_ts - pd.DateOffset(years=max(1, int(stage_years)))).strftime("%Y-%m-%d")
-    end_date = current_ts.strftime("%Y-%m-%d")
     tasks: list[PlannedTask] = []
     company_ticker_map = _load_sec_company_tickers(data_root / "data" / "reference" / "sec_company_tickers.parquet")
     for capability in auxiliary_capabilities(connectors=connectors, audit_state=audit_state, include_research=include_research):
@@ -129,8 +127,8 @@ def plan_auxiliary_tasks(
             capability=capability,
             stage_symbols=stage_symbols,
             company_ticker_map=company_ticker_map,
-            start_date=start_date,
-            end_date=end_date,
+            current_ts=current_ts,
+            stage_years=stage_years,
         )
         tasks.extend(task_specs)
     return sorted(tasks, key=lambda task: (task.priority, task.task_key))
@@ -334,9 +332,10 @@ def _materialize_capability_tasks(
     capability: VendorCapability,
     stage_symbols: list[str],
     company_ticker_map: dict[str, str],
-    start_date: str,
-    end_date: str,
+    current_ts: pd.Timestamp,
+    stage_years: int,
 ) -> list[PlannedTask]:
+    start_date, end_date = _capability_window(capability=capability, current_ts=current_ts, stage_years=stage_years)
     if capability.task_kind == "MACRO":
         return [
             PlannedTask(
@@ -402,6 +401,17 @@ def _materialize_capability_tasks(
             )
         )
     return tasks
+
+
+def _capability_window(*, capability: VendorCapability, current_ts: pd.Timestamp, stage_years: int) -> tuple[str, str]:
+    end_ts = current_ts.normalize()
+    if capability.dataset == "equities_minute":
+        start_ts = end_ts - pd.Timedelta(days=5)
+    elif capability.dataset in {"news", "company_news"}:
+        start_ts = end_ts - pd.Timedelta(days=7)
+    else:
+        start_ts = end_ts - pd.DateOffset(years=max(1, int(stage_years)))
+    return start_ts.strftime("%Y-%m-%d"), end_ts.strftime("%Y-%m-%d")
 
 
 def training_readiness(

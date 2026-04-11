@@ -193,6 +193,33 @@ def test_plan_auxiliary_tasks_includes_macro_and_reference_chunks(tmp_path: Path
     assert len(macro_tasks) == len(default_macro_series())
 
 
+def test_plan_auxiliary_tasks_includes_research_archive_lanes_with_short_windows(tmp_path: Path) -> None:
+    reference_root = tmp_path / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"ticker": "AAPL", "cik_str": "320193"}]).to_parquet(reference_root / "sec_company_tickers.parquet", index=False)
+
+    tasks = plan_auxiliary_tasks(
+        data_root=tmp_path,
+        stage_symbols=["AAPL", "MSFT", "NVDA"],
+        stage_years=5,
+        connectors={"alpaca": object(), "tiingo": object(), "finnhub": object()},
+        audit_state=None,
+        include_research=True,
+        current_date="2026-04-10",
+    )
+
+    minute_tasks = [task for task in tasks if task.dataset == "equities_minute"]
+    tiingo_news_tasks = [task for task in tasks if task.dataset == "news"]
+    finnhub_news_tasks = [task for task in tasks if task.dataset == "company_news"]
+
+    assert minute_tasks
+    assert tiingo_news_tasks
+    assert finnhub_news_tasks
+    assert all(task.planner_group == "supplemental_research_backlog" for task in minute_tasks + tiingo_news_tasks + finnhub_news_tasks)
+    assert all(task.start_date == "2026-04-05" and task.end_date == "2026-04-10" for task in minute_tasks)
+    assert all(task.start_date == "2026-04-03" and task.end_date == "2026-04-10" for task in tiingo_news_tasks + finnhub_news_tasks)
+
+
 def test_plan_canonical_bar_tasks_uses_symbol_range_windows() -> None:
     tasks = plan_canonical_bar_tasks(
         stage_symbols=["AAPL", "MSFT", "NVDA"],

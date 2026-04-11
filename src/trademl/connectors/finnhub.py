@@ -41,6 +41,46 @@ class FinnhubConnector(HTTPConnector):
                 payload = self.request_json(endpoint="/api/v1/stock/profile2", endpoint_key="profile", params={"symbol": symbol}, logical_units=1)
                 frames.append(pd.DataFrame([payload]))
             return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if dataset == "company_news":
+            frames = []
+            for symbol in symbols:
+                payload = self.request_json(
+                    endpoint="/api/v1/company-news",
+                    endpoint_key="company_news",
+                    params={
+                        "symbol": symbol,
+                        "from": pd.Timestamp(start_date).strftime("%Y-%m-%d"),
+                        "to": pd.Timestamp(end_date).strftime("%Y-%m-%d"),
+                    },
+                    task_kind="OTHER",
+                    logical_units=1,
+                )
+                frame = pd.DataFrame(payload)
+                if frame.empty:
+                    continue
+                published = pd.to_datetime(frame.get("datetime"), unit="s", errors="coerce", utc=True)
+                normalized = pd.DataFrame(
+                    {
+                        "date": published.dt.date,
+                        "published_at": published,
+                        "crawled_at": pd.NaT,
+                        "news_id": pd.to_numeric(frame.get("id"), errors="coerce"),
+                        "headline": frame.get("headline", pd.Series(dtype="string")),
+                        "summary": frame.get("summary", pd.Series(dtype="string")),
+                        "url": frame.get("url", pd.Series(dtype="string")),
+                        "image_url": frame.get("image", pd.Series(dtype="string")),
+                        "category": frame.get("category", pd.Series(dtype="string")),
+                        "source": frame.get("source", pd.Series(dtype="string")),
+                        "symbol": symbol,
+                        "related_symbols": frame.get("related").map(_symbols_from_value),
+                        "tags": pd.Series([tuple()] * len(frame), dtype="object"),
+                        "source_name": self.vendor_name,
+                        "source_uri": "/api/v1/company-news",
+                        "ingested_at": pd.Timestamp.now(tz="UTC"),
+                    }
+                )
+                frames.append(normalized.dropna(subset=["published_at"]))
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=_news_columns())
         raise ValueError(f"unsupported dataset for finnhub: {dataset}")
 
     def _fetch_equities(
@@ -99,3 +139,31 @@ class FinnhubConnector(HTTPConnector):
             "source_uri",
             "vendor_ts",
         ]
+
+
+def _symbols_from_value(value: object) -> tuple[str, ...]:
+    text = str(value or "").strip()
+    if not text:
+        return ()
+    return tuple(sorted({part.strip().upper() for part in text.split(",") if part.strip()}))
+
+
+def _news_columns() -> list[str]:
+    return [
+        "date",
+        "published_at",
+        "crawled_at",
+        "news_id",
+        "headline",
+        "summary",
+        "url",
+        "image_url",
+        "category",
+        "source",
+        "symbol",
+        "related_symbols",
+        "tags",
+        "source_name",
+        "source_uri",
+        "ingested_at",
+    ]

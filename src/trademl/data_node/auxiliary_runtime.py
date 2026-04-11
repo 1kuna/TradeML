@@ -293,6 +293,7 @@ class AuxiliaryRuntime:
             stage_years=self._stage_years_getter(),
             connectors=self.connectors,
             audit_state=self.capability_audit_state,
+            include_research=True,
             current_date=trading_date,
         )
         macro_series: list[str] = []
@@ -330,14 +331,22 @@ class AuxiliaryRuntime:
         for job in auxiliary_capabilities(
             connectors=self.connectors,
             audit_state=self.capability_audit_state,
-            include_research=False,
+            include_research=True,
         ):
             if job.task_kind not in task_kinds:
                 continue
             profile = vendor_profile(job.vendor)
-            if canonical_pressure and profile is not None and profile.saturation_policy in {"canonical_first", "canonical_only"}:
+            if (
+                canonical_pressure
+                and job.task_kind != "RESEARCH_ONLY"
+                and profile is not None
+                and profile.saturation_policy in {"canonical_first", "canonical_only"}
+            ):
                 continue
-            widths[job.vendor] = max(widths.get(job.vendor, 0), int(job.lane_width or 1))
+            width = int(job.lane_width or 1)
+            if canonical_pressure and job.task_kind == "RESEARCH_ONLY":
+                width = 1
+            widths[job.vendor] = max(widths.get(job.vendor, 0), width)
         return widths
 
     @staticmethod
@@ -418,15 +427,20 @@ class AuxiliaryRuntime:
                 rows_returned=0,
                 state={},
             )
-        output = self.paths.reference_root / f"{job['output_name']}.parquet"
-        self._append_reference_frame(output, frame)
+        output_name = str(job["output_name"])
+        if output_name in {"equities_minute", "ticker_news"}:
+            outputs = self._append_partitioned_archive_frame(output_name=output_name, frame=frame)
+        else:
+            output = self.paths.reference_root / f"{output_name}.parquet"
+            self._append_reference_frame(output, frame)
+            outputs = [output]
         self.db.mark_vendor_attempt_success(task_key=effective_task_key, vendor=vendor, rows_returned=len(frame))
         return AuxiliaryExecutionResult(
-            outputs=[str(output)],
+            outputs=[str(path) for path in outputs],
             failures=[],
             deferred=0,
             rows_returned=len(frame),
-            state={"outputs": [str(output)]},
+            state={"outputs": [str(path) for path in outputs]},
         )
 
     def _execute_macro_auxiliary_job(
@@ -519,6 +533,34 @@ class AuxiliaryRuntime:
                 str(job.get("output_name", "")),
             ]
         )
+
+    def _append_partitioned_archive_frame(self, *, output_name: str, frame: pd.DataFrame) -> list[Path]:
+        if frame.empty:
+            return []
+        archive_root = self.paths.root / "data" / "raw" / output_name
+        written: list[Path] = []
+        for day_value, day_frame in frame.groupby("date", dropna=True):
+            if pd.isna(day_value):
+                continue
+            output = archive_root / f"date={pd.Timestamp(day_value).strftime('%Y-%m-%d')}" / "data.parquet"
+            lock_path = output.with_suffix(".lock")
+            self._acquire_file_lock(lock_path)
+            try:
+                if output.exists():
+                    existing = pd.read_parquet(output)
+                    combined = pd.concat([existing, day_frame], ignore_index=True)
+                else:
+                    combined = day_frame.copy()
+                combined = self._deduplicate_reference_frame(combined)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = output.with_suffix(output.suffix + f".{uuid.uuid4().hex}.tmp")
+                combined.to_parquet(tmp_path, index=False)
+                os.replace(tmp_path, output)
+                written.append(output)
+            finally:
+                with contextlib.suppress(OSError):
+                    lock_path.unlink()
+        return written
 
     @staticmethod
     def _acquire_file_lock(path: Path, *, stale_after_seconds: int = 15) -> None:

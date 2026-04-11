@@ -9,6 +9,7 @@ from trademl.data_node.capabilities import (
     canonical_qc_capabilities,
     capability_map,
     default_macro_series,
+    effective_capabilities,
     effective_enable_status,
     forward_capabilities,
     provider_role_matrix,
@@ -78,6 +79,27 @@ def test_reference_jobs_only_include_enabled_verified_lanes() -> None:
     assert all(job["dataset"] != "price_target" for job in jobs)
     assert any(job["dataset"] == "company_profile" for job in jobs)
     assert any(job["dataset"] == "filing_index" for job in jobs)
+
+
+def test_effective_capabilities_include_live_verified_research_lanes_only_when_requested() -> None:
+    capabilities = effective_capabilities(
+        connectors={"alpaca": object(), "tiingo": object(), "finnhub": object(), "twelve_data": object()},
+        include_research=False,
+    )
+    capability_ids = {capability.capability_id for capability in capabilities}
+    assert "alpaca.equities_minute.research" not in capability_ids
+    assert "tiingo.news.research" not in capability_ids
+    assert "finnhub.company_news.research" not in capability_ids
+
+    research_enabled = effective_capabilities(
+        connectors={"alpaca": object(), "tiingo": object(), "finnhub": object(), "twelve_data": object()},
+        include_research=True,
+    )
+    research_ids = {capability.capability_id for capability in research_enabled}
+    assert "alpaca.equities_minute.research" in research_ids
+    assert "tiingo.news.research" in research_ids
+    assert "finnhub.company_news.research" in research_ids
+    assert "twelve_data.price_target.research" not in research_ids
 
 
 def test_canonical_qc_capabilities_use_independent_backup_vendors_first() -> None:

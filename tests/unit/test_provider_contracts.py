@@ -22,6 +22,11 @@ def test_provider_contract_exposes_canonical_contracts() -> None:
     assert massive_reference.pagination_mode == "next_url"
     assert dataset_contract("fmp", "delistings").pagination_mode == "page"
     assert dataset_contract("fmp", "delistings").pagination_limit == 100
+    assert dataset_contract("alpaca", "equities_minute").pagination_mode == "page_token"
+    assert dataset_contract("alpaca", "equities_minute").pagination_limit == 10000
+    assert dataset_contract("alpaca", "equities_minute").critical_path_allowed is False
+    assert dataset_contract("tiingo", "news").max_batch_symbols == 50
+    assert dataset_contract("finnhub", "company_news").max_batch_symbols == 1
 
 
 def test_default_vendor_limits_are_derived_from_provider_contracts() -> None:

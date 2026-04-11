@@ -268,7 +268,8 @@ class DataNodeService:
         futures: dict[object, str] = {}
         canonical_lane_widths = self._canonical_runtime._backfill_lane_widths()
         canonical_backlog_active = self.db.has_pending_planner_tasks(task_families=("canonical_bars", "canonical_repair")) or self.db.has_pending_backfill()
-        aux_lane_widths = {} if canonical_backlog_active else self._aux_lane_widths(task_kinds={"REFERENCE", "EVENT", "MACRO"})
+        aux_task_kinds = {"RESEARCH_ONLY"} if canonical_backlog_active else {"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"}
+        aux_lane_widths = self._aux_lane_widths(task_kinds=aux_task_kinds)
         max_workers = max(1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values()))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for vendor, width in canonical_lane_widths.items():
@@ -305,6 +306,7 @@ class DataNodeService:
             stage_years=self.stage_years,
             connectors=self.connectors,
             audit_state=self.capability_audit_state,
+            include_research=True,
             current_date=as_of_date,
             freeze_report_date=freeze_cutoff.get("date"),
         )

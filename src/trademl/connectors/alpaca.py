@@ -41,6 +41,14 @@ class AlpacaConnector(HTTPConnector):
         end_date: str | date_type,
     ) -> pd.DataFrame:
         """Fetch normalized Alpaca bars."""
+        if dataset == "equities_minute":
+            return self._fetch_bars(
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+                timeframe="1Min",
+                endpoint_key="equities_minute",
+            )
         if dataset == "assets":
             payload = self.request_json(
                 base_url=self.trading_base_url,
@@ -96,22 +104,44 @@ class AlpacaConnector(HTTPConnector):
         if dataset != "equities_eod":
             raise ValueError(f"unsupported dataset for alpaca: {dataset}")
 
+        return self._fetch_bars(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            timeframe="1Day",
+            endpoint_key="equities_eod",
+        )
+
+    def _fetch_bars(
+        self,
+        *,
+        symbols: list[str],
+        start_date: str | date_type,
+        end_date: str | date_type,
+        timeframe: str,
+        endpoint_key: str,
+    ) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
-        start = pd.Timestamp(start_date).strftime("%Y-%m-%d")
-        end = pd.Timestamp(end_date).strftime("%Y-%m-%d")
+        if timeframe == "1Min":
+            start = f"{pd.Timestamp(start_date).strftime('%Y-%m-%d')}T00:00:00Z"
+            end = f"{pd.Timestamp(end_date).strftime('%Y-%m-%d')}T23:59:59Z"
+        else:
+            start = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+            end = pd.Timestamp(end_date).strftime("%Y-%m-%d")
         for batch in _chunked(symbols, 100):
             page_token: str | None = None
             while True:
                 payload = self.request_json(
                     endpoint="/v2/stocks/bars",
-                    endpoint_key="equities_eod",
+                    endpoint_key=endpoint_key,
                     params={
                         "symbols": ",".join(batch),
-                        "timeframe": "1Day",
+                        "timeframe": timeframe,
                         "start": start,
                         "end": end,
                         "adjustment": "raw",
                         "feed": "iex",
+                        "sort": "asc",
                         **({"page_token": page_token} if page_token else {}),
                     },
                     task_kind="FORWARD",
@@ -128,7 +158,7 @@ class AlpacaConnector(HTTPConnector):
                 if not page_token:
                     break
         if not frames:
-            self.budget_manager.record_empty_success(self.vendor_name, endpoint="equities_eod")
+            self.budget_manager.record_empty_success(self.vendor_name, endpoint=endpoint_key)
             return pd.DataFrame(columns=self._columns())
         bars_frame = pd.concat(frames, ignore_index=True)
         bars_frame["date"] = pd.to_datetime(bars_frame["t"]).dt.date
@@ -139,7 +169,7 @@ class AlpacaConnector(HTTPConnector):
         renamed = bars_frame.rename(
             columns={"o": "open", "h": "high", "l": "low", "c": "close", "vw": "vwap", "v": "volume", "n": "trade_count"}
         )
-        return renamed[self._columns()].sort_values(["date", "symbol"]).reset_index(drop=True)
+        return renamed[self._columns()].sort_values(["vendor_ts", "symbol"]).reset_index(drop=True)
 
     @staticmethod
     def _columns() -> list[str]:

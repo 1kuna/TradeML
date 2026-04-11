@@ -142,6 +142,54 @@ class _DelistingConnector:
         raise ValueError(dataset)
 
 
+class _NewsConnector:
+    def __init__(self, vendor_name: str) -> None:
+        self.vendor_name = vendor_name
+
+    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        ingested_at = pd.Timestamp("2026-04-10T13:36:00Z")
+        return pd.DataFrame(
+            [
+                {
+                    "date": end_date,
+                    "published_at": pd.Timestamp(f"{end_date}T13:30:00Z"),
+                    "crawled_at": pd.Timestamp(f"{end_date}T13:35:00Z"),
+                    "news_id": 1,
+                    "headline": "Alpha",
+                    "summary": "Summary",
+                    "url": "https://example.com/alpha",
+                    "image_url": "https://example.com/alpha.png",
+                    "category": "company_news",
+                    "source": "wire",
+                    "symbol": symbols[0],
+                    "related_symbols": tuple(symbols),
+                    "tags": ("ALPHA",),
+                    "source_name": self.vendor_name,
+                    "source_uri": "/news",
+                    "ingested_at": ingested_at,
+                },
+                {
+                    "date": end_date,
+                    "published_at": pd.Timestamp(f"{end_date}T13:30:00Z"),
+                    "crawled_at": pd.Timestamp(f"{end_date}T13:35:00Z"),
+                    "news_id": 1,
+                    "headline": "Alpha",
+                    "summary": "Summary",
+                    "url": "https://example.com/alpha",
+                    "image_url": "https://example.com/alpha.png",
+                    "category": "company_news",
+                    "source": "wire",
+                    "symbol": symbols[0],
+                    "related_symbols": tuple(symbols),
+                    "tags": ("ALPHA",),
+                    "source_name": self.vendor_name,
+                    "source_uri": "/news",
+                    "ingested_at": ingested_at,
+                },
+            ]
+        )
+
+
 class _BackfillConnector:
     def __init__(self, vendor_name: str) -> None:
         self.vendor_name = vendor_name
@@ -2174,7 +2222,7 @@ def test_run_cluster_forever_backfill_curates_only_changed_dates(tmp_path: Path)
     assert captured["changed_dates"] == ["2026-04-01", "2026-04-02"]
 
 
-def test_process_planner_queue_skips_auxiliary_lanes_while_canonical_backlog_exists(tmp_path: Path) -> None:
+def test_process_planner_queue_runs_research_trickle_while_canonical_backlog_exists(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.bulk_upsert_planner_tasks(
         [
@@ -2206,13 +2254,13 @@ def test_process_planner_queue_skips_auxiliary_lanes_while_canonical_backlog_exi
 
     service._seed_planner_tasks = lambda **kwargs: None  # type: ignore[method-assign]
     service._canonical_runtime._backfill_lane_widths = lambda: {"alpaca": 1}  # type: ignore[method-assign]
-    service._aux_lane_widths = lambda **kwargs: {"alpha_vantage": 1}  # type: ignore[method-assign]
+    service._aux_lane_widths = lambda **kwargs: {"alpha_vantage": 1} if kwargs.get("task_kinds") == {"RESEARCH_ONLY"} else {}  # type: ignore[method-assign]
     service._drain_canonical_lane = lambda vendor, exchange: calls.append(f"canonical:{vendor}") or []  # type: ignore[method-assign]
     service._drain_auxiliary_lane = lambda vendor: calls.append(f"aux:{vendor}") or []  # type: ignore[method-assign]
 
     service.process_planner_queue(exchange="XNYS")
 
-    assert calls == ["canonical:alpaca"]
+    assert calls == ["canonical:alpaca", "aux:alpha_vantage"]
 
 
 def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfill(tmp_path: Path) -> None:
@@ -2411,6 +2459,46 @@ def test_aux_lane_widths_hold_bar_first_vendors_back_when_canonical_backlog_exis
     assert widths["sec_edgar"] == 2
 
 
+def test_aux_lane_widths_allow_research_only_lanes_during_canonical_backlog(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _NoopConnector(),
+            "tiingo": _NewsConnector("tiingo"),
+            "finnhub": _NewsConnector("finnhub"),
+        },
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+    db.bulk_upsert_planner_tasks(
+        [
+            {
+                "task_key": "canonical_bars::equities_eod::00000::0000::2026-03-01::2026-03-31",
+                "task_family": "canonical_bars",
+                "planner_group": "rolling_canonical",
+                "dataset": "equities_eod",
+                "tier": "A",
+                "priority": 10,
+                "start_date": "2026-03-01",
+                "end_date": "2026-03-31",
+                "symbols": ["AAPL"],
+                "eligible_vendors": ["alpaca"],
+                "output_name": "equities_bars",
+                "payload": {"scope_kind": "symbol_range", "trading_days": ["2026-03-31"]},
+            }
+        ]
+    )
+
+    widths = service._aux_lane_widths(task_kinds={"RESEARCH_ONLY"})
+
+    assert widths["alpaca"] == 1
+    assert widths["tiingo"] == 1
+    assert widths["finnhub"] == 1
+
+
 def test_planned_auxiliary_work_materializes_reference_and_macro_tasks(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     reference_root = tmp_path / "data" / "reference"
@@ -2432,6 +2520,57 @@ def test_planned_auxiliary_work_materializes_reference_and_macro_tasks(tmp_path:
     datasets = {job["dataset"] for job in reference_jobs}
     assert "listings" in datasets
     assert "filing_index" in datasets
+
+
+def test_planned_auxiliary_work_includes_research_archive_jobs(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector(), "tiingo": _NewsConnector("tiingo"), "finnhub": _NewsConnector("finnhub")},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        stage_years=5,
+    )
+    service.default_symbols = ["AAPL", "MSFT"]
+
+    _macro_series, reference_jobs = service._auxiliary_runtime._planned_auxiliary_work(trading_date="2026-04-10")
+
+    datasets = {job["dataset"] for job in reference_jobs}
+    assert "equities_minute" in datasets
+    assert "news" in datasets
+    assert "company_news" in datasets
+
+
+def test_execute_auxiliary_job_writes_news_to_partitioned_archive(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"tiingo": _NewsConnector("tiingo")},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    result = service._auxiliary_runtime._execute_auxiliary_job(
+        {
+            "source": "tiingo",
+            "dataset": "news",
+            "symbols": ["AAPL"],
+            "start_date": "2026-04-09",
+            "end_date": "2026-04-10",
+            "output_name": "ticker_news",
+        }
+    )
+
+    output = tmp_path / "data" / "raw" / "ticker_news" / "date=2026-04-10" / "data.parquet"
+    stored = pd.read_parquet(output)
+
+    assert result.failures == []
+    assert result.outputs == [str(output)]
+    assert len(stored) == 1
+    assert stored.iloc[0]["symbol"] == "AAPL"
+    assert stored.iloc[0]["headline"] == "Alpha"
 
 
 def test_run_cluster_forever_reference_budget_failure_does_not_crash_worker(tmp_path: Path) -> None:

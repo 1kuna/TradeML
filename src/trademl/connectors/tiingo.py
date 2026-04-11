@@ -45,6 +45,8 @@ class TiingoConnector(HTTPConnector):
             )
         if dataset == "fundamentals":
             return self._fetch_fundamentals(symbols=symbols, start_date=start_date, end_date=end_date)
+        if dataset == "news":
+            return self._fetch_news(symbols=symbols)
         if dataset == "supported_tickers":
             payload = self.request_json(endpoint="/tiingo/daily", endpoint_key="supported_tickers", task_kind="OTHER")
             frame = pd.DataFrame(payload)
@@ -62,6 +64,44 @@ class TiingoConnector(HTTPConnector):
             )
             return normalized.dropna(subset=["symbol"]).drop_duplicates().sort_values("symbol").reset_index(drop=True)
         raise ValueError(f"unsupported dataset for tiingo: {dataset}")
+
+    def _fetch_news(self, *, symbols: list[str]) -> pd.DataFrame:
+        params: dict[str, str] = {}
+        if symbols:
+            params["tickers"] = ",".join(str(symbol).upper() for symbol in symbols)
+        payload = self.request_json(
+            endpoint="/tiingo/news",
+            endpoint_key="news",
+            params=params,
+            task_kind="OTHER",
+            logical_units=max(1, len(symbols)),
+        )
+        frame = pd.DataFrame(payload)
+        if frame.empty:
+            return pd.DataFrame(columns=_news_columns())
+        published = pd.to_datetime(frame.get("publishedDate"), errors="coerce", utc=True)
+        crawled = pd.to_datetime(frame.get("crawlDate"), errors="coerce", utc=True)
+        normalized = pd.DataFrame(
+            {
+                "date": published.dt.date,
+                "published_at": published,
+                "crawled_at": crawled,
+                "news_id": pd.to_numeric(frame.get("id"), errors="coerce"),
+                "headline": frame.get("title", pd.Series(dtype="string")),
+                "summary": frame.get("description", pd.Series(dtype="string")),
+                "url": frame.get("url", pd.Series(dtype="string")),
+                "image_url": frame.get("image", pd.Series(dtype="string")),
+                "category": pd.Series(["company_news"] * len(frame), dtype="string"),
+                "source": frame.get("source", pd.Series(dtype="string")),
+                "symbol": frame.get("tickers").map(_primary_symbol_from_value),
+                "related_symbols": frame.get("tickers").map(_symbols_from_value),
+                "tags": frame.get("tags").map(_symbols_from_value),
+                "source_name": self.vendor_name,
+                "source_uri": "/tiingo/news",
+                "ingested_at": pd.Timestamp.now(tz=UTC),
+            }
+        )
+        return normalized.dropna(subset=["published_at"]).reset_index(drop=True)
 
     def _fetch_equities(
         self,
@@ -257,3 +297,38 @@ def _normalize_optional_date(frame: pd.DataFrame, *column_names: str) -> pd.Seri
         if column_name in frame.columns:
             return pd.to_datetime(frame[column_name], errors="coerce")
     return pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+
+
+def _symbols_from_value(value: object) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple, set)):
+        return tuple(sorted({str(item).strip().upper() for item in value if str(item).strip()}))
+    text = str(value or "").strip()
+    if not text:
+        return ()
+    return tuple(sorted({part.strip().upper() for part in text.split(",") if part.strip()}))
+
+
+def _primary_symbol_from_value(value: object) -> str | None:
+    symbols = _symbols_from_value(value)
+    return symbols[0] if symbols else None
+
+
+def _news_columns() -> list[str]:
+    return [
+        "date",
+        "published_at",
+        "crawled_at",
+        "news_id",
+        "headline",
+        "summary",
+        "url",
+        "image_url",
+        "category",
+        "source",
+        "symbol",
+        "related_symbols",
+        "tags",
+        "source_name",
+        "source_uri",
+        "ingested_at",
+    ]

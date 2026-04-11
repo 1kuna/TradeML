@@ -81,6 +81,18 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 notes="REST bars support multi-symbol requests, limit up to 10000, next_page_token pagination, and X-RateLimit-* headers.",
             ),
             DatasetContract(
+                dataset="equities_minute",
+                endpoint_key="equities_minute",
+                max_batch_symbols=100,
+                pagination_mode="page_token",
+                pagination_limit=10000,
+                max_history_years=1,
+                retry_after_header="X-RateLimit-Reset",
+                critical_path_allowed=False,
+                docs_urls=("https://docs.alpaca.markets/reference/stockbars",),
+                notes="The same stock-bars endpoint supports 1Min bars with symbols, timeframe, start/end, limit, and page_token; use it as the rolling minute archive lane.",
+            ),
+            DatasetContract(
                 dataset="assets",
                 endpoint_key="assets",
                 max_batch_symbols=1,
@@ -134,6 +146,14 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 max_batch_symbols=1,
                 docs_urls=("https://www.tiingo.com/documentation/end-of-day",),
             ),
+            DatasetContract(
+                dataset="news",
+                endpoint_key="news",
+                max_batch_symbols=50,
+                pagination_mode="none",
+                docs_urls=("https://www.tiingo.com/documentation/news",),
+                notes="Tiingo news is a ticker-tagged feed suited to daily archive capture; use it as the broad primary financial-news lane.",
+            ),
         ),
     ),
     "twelve_data": ProviderContract(
@@ -162,6 +182,20 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                     "https://api.twelvedata.com/doc/swagger/openapi.json",
                 ),
                 notes="Comma-separated symbols are supported where allowed; batch credits are consumed per requested endpoint and quota exhaustion can return partial results.",
+            ),
+            DatasetContract(
+                dataset="equities_minute",
+                endpoint_key="equities_minute",
+                max_batch_symbols=1,
+                request_cost_basis="symbol",
+                pagination_mode="next_api_query",
+                max_history_years=1,
+                critical_path_allowed=False,
+                docs_urls=(
+                    "https://twelvedata.com/docs/llms/introduction.md",
+                    "https://api.twelvedata.com/doc/swagger/openapi.json",
+                ),
+                notes="The time_series endpoint supports intraday intervals like 1min and returns next_api_query metadata, but free-plan credits are tight so this is a secondary minute-archive lane.",
             ),
             DatasetContract(
                 dataset="dividends",
@@ -304,6 +338,13 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
         notes="Use as supplemental reference/research lane, not canonical bar closer; candle endpoint documents s=no_data as a valid empty response.",
         datasets=(
             DatasetContract(dataset="equities_eod", endpoint_key="equities_eod", max_batch_symbols=1, critical_path_allowed=False, docs_urls=("https://finnhub.io/docs/api/stock-candles",)),
+            DatasetContract(
+                dataset="company_news",
+                endpoint_key="company_news",
+                max_batch_symbols=1,
+                docs_urls=("https://finnhub.io/docs/api/company-news",),
+                notes="Company news is symbol-scoped and date-bounded, making it a useful supplemental historical news archive lane.",
+            ),
             DatasetContract(dataset="earnings_calendar", endpoint_key="earnings_calendar", max_batch_symbols=1, docs_urls=("https://finnhub.io/docs/api/company-earnings-calendar",)),
             DatasetContract(dataset="profile", endpoint_key="profile", max_batch_symbols=1, docs_urls=("https://finnhub.io/docs/api/company-profile2",)),
         ),

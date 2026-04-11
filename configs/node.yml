@@ -35,6 +35,7 @@ vendors:
     daily_cap: 273600
     datasets:
     - equities_eod
+    - equities_minute
     role: primary_bars
   tiingo:
     rpm: 158
@@ -45,6 +46,7 @@ vendors:
     - corp_actions_splits
     - fundamentals
     - supported_tickers
+    - news
     role: deep_history_bars
   twelve_data:
     rpm: 7
@@ -73,6 +75,7 @@ vendors:
     - equities_eod
     - earnings_calendar
     - company_profile
+    - company_news
     role: backup_bars
   alpha_vantage:
     rpm: 1

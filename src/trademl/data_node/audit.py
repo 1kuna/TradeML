@@ -168,9 +168,11 @@ def _sample_request(capability: VendorCapability, *, anchor: pd.Timestamp) -> tu
     annual_start = (anchor - pd.DateOffset(years=1)).strftime("%Y-%m-%d")
     if capability.dataset == "equities_eod":
         return recent_start, end_date, ["AAPL"]
+    if capability.dataset == "equities_minute":
+        return (anchor - pd.Timedelta(days=5)).strftime("%Y-%m-%d"), end_date, ["AAPL"]
     if capability.dataset in {"corp_actions", "reference_dividends", "reference_splits", "dividends", "splits"}:
         return annual_start, end_date, ["AAPL"]
-    if capability.dataset in {"financial_statements", "company_profile", "price_target", "insider_transactions", "news"}:
+    if capability.dataset in {"financial_statements", "company_profile", "price_target", "insider_transactions", "news", "company_news"}:
         return annual_start, end_date, ["AAPL"]
     if capability.dataset == "filing_index":
         return annual_start, end_date, ["320193"]

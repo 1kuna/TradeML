@@ -107,6 +107,41 @@ def test_alpaca_connector_normalizes_bars() -> None:
     assert frame.iloc[0]["volume"] == 10
 
 
+def test_alpaca_connector_normalizes_minute_bars() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "bars": {
+                        "AAPL": [
+                            {"t": "2026-04-09T14:31:00Z", "o": 100.0, "h": 101.0, "l": 99.5, "c": 100.5, "vw": 100.2, "v": 50, "n": 3}
+                        ]
+                    },
+                    "next_page_token": None,
+                },
+            )
+        ]
+    )
+    connector: BaseConnector = AlpacaConnector(
+        base_url="https://data.alpaca.markets",
+        trading_base_url="https://paper-api.alpaca.markets/v2",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    frame = connector.fetch("equities_minute", ["AAPL"], "2026-04-09", "2026-04-09")
+
+    assert frame.iloc[0]["symbol"] == "AAPL"
+    assert frame.iloc[0]["volume"] == 50
+    assert str(frame.iloc[0]["date"]) == "2026-04-09"
+    assert frame.iloc[0]["vendor_ts"].isoformat() == "2026-04-09T14:31:00+00:00"
+    assert session.calls[0][2]["timeframe"] == "1Min"
+    assert session.calls[0][2]["start"] == "2026-04-09T00:00:00Z"
+    assert session.calls[0][2]["end"] == "2026-04-09T23:59:59Z"
+
+
 def test_twelve_data_batch_fetch_records_weighted_request_telemetry() -> None:
     session = FakeSession(
         [
@@ -242,6 +277,71 @@ def test_finnhub_connector_normalizes_equities_and_earnings() -> None:
 
     assert bars.iloc[0]["close"] == 11
     assert earnings.iloc[0]["symbol"] == "AAPL"
+
+
+def test_tiingo_connector_normalizes_company_news() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                [
+                    {
+                        "id": 42,
+                        "publishedDate": "2026-04-09T13:30:00Z",
+                        "crawlDate": "2026-04-09T13:35:00Z",
+                        "title": "Apple launches something",
+                        "description": "Headline summary",
+                        "url": "https://example.com/apple",
+                        "image": "https://example.com/apple.png",
+                        "source": "ExampleWire",
+                        "tickers": ["AAPL", "MSFT"],
+                        "tags": ["technology", "hardware"],
+                    }
+                ],
+            )
+        ]
+    )
+    connector = TiingoConnector(base_url="https://api.tiingo.com", api_key="key", budget_manager=_budget_manager(), session=session)
+
+    frame = connector.fetch("news", ["AAPL", "MSFT"], "2026-04-09", "2026-04-09")
+
+    assert frame.iloc[0]["symbol"] == "AAPL"
+    assert frame.iloc[0]["related_symbols"] == ("AAPL", "MSFT")
+    assert frame.iloc[0]["tags"] == ("HARDWARE", "TECHNOLOGY")
+    assert frame.iloc[0]["headline"] == "Apple launches something"
+    assert session.calls[0][2]["tickers"] == "AAPL,MSFT"
+
+
+def test_finnhub_connector_normalizes_company_news() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                [
+                    {
+                        "id": 7,
+                        "datetime": 1775741400,
+                        "headline": "Apple supplier update",
+                        "summary": "Supplier summary",
+                        "url": "https://example.com/supplier",
+                        "image": "https://example.com/supplier.png",
+                        "category": "company",
+                        "source": "ExampleWire",
+                        "related": "AAPL,TSM",
+                    }
+                ],
+            )
+        ]
+    )
+    connector = FinnhubConnector(base_url="https://finnhub.io", api_key="key", budget_manager=_budget_manager(), session=session)
+
+    frame = connector.fetch("company_news", ["AAPL"], "2026-04-08", "2026-04-09")
+
+    assert frame.iloc[0]["symbol"] == "AAPL"
+    assert frame.iloc[0]["related_symbols"] == ("AAPL", "TSM")
+    assert frame.iloc[0]["category"] == "company"
+    assert session.calls[0][2]["from"] == "2026-04-08"
+    assert session.calls[0][2]["to"] == "2026-04-09"
 
 
 def test_alpha_vantage_and_fred_connectors() -> None:

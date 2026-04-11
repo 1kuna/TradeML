@@ -101,8 +101,13 @@ def effective_capabilities(
         status = effective_enable_status(capability, audit_state=audit_state)
         if status == "disabled":
             continue
-        if status == "research_only" and not include_research:
-            continue
+        if status == "research_only":
+            if not include_research:
+                continue
+            record = (audit_state or {}).get("capabilities", {}).get(capability.capability_id, {})
+            live_status = str(record.get("live_status", capability.live_status))
+            if live_status != "live_verified":
+                continue
         effective.append(capability)
     return effective
 
@@ -520,6 +525,29 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         lane_width=2,
         planner_group="canonical_bars_backlog",
         doc_urls=("https://finnhub.io/docs/api",),
+    ),
+    VendorCapability(
+        capability_id="alpaca.equities_minute.research",
+        vendor="alpaca",
+        dataset="equities_minute",
+        endpoint="/v2/stocks/bars",
+        auth_mode="headers",
+        batching_mode="multi_symbol",
+        pagination_mode="token",
+        task_kind="RESEARCH_ONLY",
+        tier="B",
+        enable_status="research_only",
+        doc_status="doc_verified",
+        live_status="live_verified",
+        expected_history_years=1,
+        required_fields=("date", "symbol", "open", "high", "low", "close", "volume", "vendor_ts"),
+        priority=205,
+        lane_width=1,
+        output_name="equities_minute",
+        planner_group="supplemental_research_backlog",
+        preferred_batch_size=100,
+        max_symbols_per_run=100,
+        doc_urls=("https://docs.alpaca.markets/reference/stockbars",),
     ),
     VendorCapability(
         capability_id="alpaca.assets.reference",
@@ -992,6 +1020,29 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         doc_urls=("https://finnhub.io/docs/api",),
     ),
     VendorCapability(
+        capability_id="tiingo.news.research",
+        vendor="tiingo",
+        dataset="news",
+        endpoint="/tiingo/news",
+        auth_mode="token_header",
+        batching_mode="multi_symbol",
+        pagination_mode="none",
+        task_kind="RESEARCH_ONLY",
+        tier="B",
+        enable_status="research_only",
+        doc_status="doc_verified",
+        live_status="live_verified",
+        expected_history_years=1,
+        required_fields=("published_at", "headline", "url"),
+        priority=255,
+        lane_width=1,
+        output_name="ticker_news",
+        planner_group="supplemental_research_backlog",
+        max_symbols_per_run=50,
+        rotation_key="tiingo:news",
+        doc_urls=("https://www.tiingo.com/documentation/news",),
+    ),
+    VendorCapability(
         capability_id="twelve_data.financial_statements.reference",
         vendor="twelve_data",
         dataset="financial_statements",
@@ -1013,6 +1064,29 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         max_symbols_per_run=20,
         rotation_key="twelve_data:financial_statements",
         doc_urls=("https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",),
+    ),
+    VendorCapability(
+        capability_id="finnhub.company_news.research",
+        vendor="finnhub",
+        dataset="company_news",
+        endpoint="/api/v1/company-news",
+        auth_mode="token_query",
+        batching_mode="single_symbol",
+        pagination_mode="none",
+        task_kind="RESEARCH_ONLY",
+        tier="B",
+        enable_status="research_only",
+        doc_status="doc_verified",
+        live_status="live_verified",
+        expected_history_years=1,
+        required_fields=("published_at", "headline", "url"),
+        priority=265,
+        lane_width=1,
+        output_name="ticker_news",
+        planner_group="supplemental_research_backlog",
+        max_symbols_per_run=25,
+        rotation_key="finnhub:company_news",
+        doc_urls=("https://finnhub.io/docs/api/company-news",),
     ),
     VendorCapability(
         capability_id="sec_edgar.companyfacts.reference",
@@ -1094,8 +1168,8 @@ _VENDOR_PROFILES: dict[str, VendorProfile] = {
         avoid_for=("deep-history saturation beyond current entitlement window",),
         saturation_policy="canonical_first",
         qc_policy="primary source only; do not use as the backup comparator",
-        documented_extra_lanes=("trading API metadata",),
-        notes="Use Alpaca to cover the fast moving edge and multi-symbol batching efficiently.",
+        documented_extra_lanes=("trading API metadata", "minute archive bars", "news"),
+        notes="Use Alpaca to cover the fast moving edge, minute archive capture, and multi-symbol batching efficiently.",
     ),
     "tiingo": VendorProfile(
         vendor="tiingo",
@@ -1104,8 +1178,8 @@ _VENDOR_PROFILES: dict[str, VendorProfile] = {
         avoid_for=("broad reference fanout", "price QC when minute/day budget is tight"),
         saturation_policy="canonical_only",
         qc_policy="optional tertiary bar QC only",
-        documented_extra_lanes=("fundamentals", "supported tickers"),
-        notes="Treat Tiingo as the history specialist and keep it focused on bar backfill.",
+        documented_extra_lanes=("fundamentals", "supported tickers", "ticker-tagged news", "IEX intraday"),
+        notes="Treat Tiingo as the history specialist and primary tagged-news archive lane while keeping it focused on PIT-safe daily research.",
     ),
     "twelve_data": VendorProfile(
         vendor="twelve_data",
