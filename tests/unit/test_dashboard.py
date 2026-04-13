@@ -13,7 +13,9 @@ import sqlite3
 import trademl.dashboard.controller as dashboard_controller
 from trademl.data_node.capabilities import default_macro_series
 from trademl.dashboard.controller import (
+    NodeSettings,
     advance_collection_stage,
+    collect_dashboard_game_snapshot,
     collect_dashboard_snapshot,
     join_cluster,
     replan_coverage,
@@ -1562,3 +1564,306 @@ def test_reset_and_uninstall_worker_manage_local_artifacts(tmp_path: Path, monke
 
     assert str(workspace) in uninstall_result["removed_paths"]
     assert not workspace.exists()
+
+
+def _write_training_report(nas_mount: Path, report_date: str, *, mean_rank_ic: float, decision: str) -> None:
+    daily_root = nas_mount / "reports" / "daily"
+    daily_root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "coverage": 0.99,
+        "ridge": {"mean_rank_ic": mean_rank_ic, "alpha": 0.5},
+        "assessment": {"decision": decision, "reason": "unit test"},
+        "model_suite": "ridge_only",
+    }
+    (daily_root / f"{report_date}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_experiment_training_report(
+    nas_mount: Path,
+    experiment_id: str,
+    run_id: str,
+    report_date: str,
+    *,
+    mean_rank_ic: float,
+    decision: str,
+) -> None:
+    report_root = nas_mount / "experiments" / experiment_id / "runs" / run_id / "reports" / "daily"
+    report_root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "coverage": 0.99,
+        "ridge": {"mean_rank_ic": mean_rank_ic, "alpha": 0.5},
+        "assessment": {"decision": decision, "reason": "unit test"},
+        "model_suite": "ridge_only",
+    }
+    (report_root / f"{report_date}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_read_training_run_history_returns_reports_newest_first(tmp_path: Path) -> None:
+    nas_mount = tmp_path / "nas"
+    _write_training_report(nas_mount, "2026-03-09", mean_rank_ic=0.032, decision="GO")
+    _write_training_report(nas_mount, "2026-03-16", mean_rank_ic=0.041, decision="GO")
+    _write_training_report(nas_mount, "2026-03-23", mean_rank_ic=0.018, decision="NO_GO")
+    # latest.json should be ignored so it does not duplicate the most recent dated entry
+    (nas_mount / "reports" / "daily" / "latest.json").write_text(
+        json.dumps({"ridge": {"mean_rank_ic": 0.018}, "assessment": {"decision": "NO_GO"}}),
+        encoding="utf-8",
+    )
+
+    settings = NodeSettings(
+        repo_root=tmp_path,
+        workspace_root=tmp_path / "workspace",
+        config_path=tmp_path / "workspace" / "node.yml",
+        env_path=tmp_path / "workspace" / ".env",
+        local_state=tmp_path / "workspace" / "control",
+        nas_mount=nas_mount,
+        nas_share="//nas/trademl",
+        collection_time_et="16:30",
+        maintenance_hour_local=2,
+        worker_id="worker-1",
+    )
+
+    history = dashboard_controller._read_training_run_history(settings, limit=5)
+
+    assert [row["run_ts"] for row in history] == ["2026-03-23", "2026-03-16", "2026-03-09"]
+    assert history[0]["decision"] == "NO_GO"
+    assert history[1]["mean_rank_ic"] == pytest.approx(0.041)
+    assert history[2]["decision"] == "GO"
+
+
+def test_read_training_run_history_prefers_per_run_experiment_reports(tmp_path: Path) -> None:
+    nas_mount = tmp_path / "nas"
+    _write_training_report(nas_mount, "2026-03-09", mean_rank_ic=0.011, decision="NO_GO")
+    _write_experiment_training_report(
+        nas_mount,
+        "phase1-family",
+        "run-alpha",
+        "2026-03-09",
+        mean_rank_ic=0.032,
+        decision="GO",
+    )
+    _write_experiment_training_report(
+        nas_mount,
+        "phase1-family",
+        "run-beta",
+        "2026-03-09",
+        mean_rank_ic=0.044,
+        decision="NO_GO",
+    )
+
+    settings = NodeSettings(
+        repo_root=tmp_path,
+        workspace_root=tmp_path / "workspace",
+        config_path=tmp_path / "workspace" / "node.yml",
+        env_path=tmp_path / "workspace" / ".env",
+        local_state=tmp_path / "workspace" / "control",
+        nas_mount=nas_mount,
+        nas_share="//nas/trademl",
+        collection_time_et="16:30",
+        maintenance_hour_local=2,
+        worker_id="worker-1",
+    )
+
+    history = dashboard_controller._read_training_run_history(settings, limit=5)
+
+    assert len(history) == 3
+    assert history[0]["run_id"] == "run-beta"
+    assert history[1]["run_id"] == "run-alpha"
+    assert history[2]["run_id"] is None
+    assert history[0]["mean_rank_ic"] == pytest.approx(0.044)
+    assert history[1]["decision"] == "GO"
+
+
+def test_read_training_run_history_empty_when_reports_missing(tmp_path: Path) -> None:
+    settings = NodeSettings(
+        repo_root=tmp_path,
+        workspace_root=tmp_path / "workspace",
+        config_path=tmp_path / "workspace" / "node.yml",
+        env_path=tmp_path / "workspace" / ".env",
+        local_state=tmp_path / "workspace" / "control",
+        nas_mount=tmp_path / "nas-does-not-exist",
+        nas_share="//nas/trademl",
+        collection_time_et="16:30",
+        maintenance_hour_local=2,
+        worker_id="worker-1",
+    )
+    assert dashboard_controller._read_training_run_history(settings) == []
+
+
+def test_collect_dashboard_game_snapshot_assembles_sections(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                },
+                "vendors": {"alpaca": {"rpm": 150, "daily_cap": 10000}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 0, "symbols": ["AAPL", "MSFT"], "years": 1}, sort_keys=False),
+        encoding="utf-8",
+    )
+    _write_training_report(nas_mount, "2026-03-09", mean_rank_ic=0.021, decision="GO")
+    _write_training_report(nas_mount, "2026-03-16", mean_rank_ic=0.047, decision="GO")
+    _write_training_report(nas_mount, "2026-03-23", mean_rank_ic=0.008, decision="NO_GO")
+
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    monkeypatch.setattr(dashboard_controller, "_read_runtime_state", lambda settings: {"pid": 4242, "started_at": "2026-04-10T12:00:00+00:00"})
+    monkeypatch.setattr(dashboard_controller, "_is_process_running", lambda pid: True)
+    monkeypatch.setattr(dashboard_controller, "_read_queue_counts", lambda db_path: {"PENDING": 3, "FAILED": 1})
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_read_partition_summary",
+        lambda qc_path: {"counts": {"GREEN": 5}, "coverage_green": 1.0, "latest_date": "2026-04-09", "raw_dates": ["2026-04-09"], "raw_datapoints": 987_654},
+    )
+    monkeypatch.setattr(dashboard_controller, "_readable_reference_files", lambda root: ["corp_actions.parquet", "listing_history.parquet", "delistings.parquet", "sec_filings.parquet", "fred_vintagedates.parquet", "earnings_calendar.parquet"])
+    monkeypatch.setattr(dashboard_controller, "_macro_series", lambda root: list(default_macro_series()))
+    monkeypatch.setattr(dashboard_controller, "_price_check_files", lambda root: ["price_checks_2026-04-09.parquet"])
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_read_planner_summary",
+        lambda db_path: {
+            "progress": {"canonical_bars": {"expected_units": 200, "completed_units": 150, "remaining_units": 50}},
+            "backlog_progress": {
+                "phase1_pinned": {"remaining_units": 10},
+                "rolling": {"remaining_units": 20},
+                "repair": {"remaining_units": 5},
+            },
+            "counts": {},
+        },
+    )
+    monkeypatch.setattr(dashboard_controller, "_read_budget_summary", lambda settings: {"rows": [], "checked_at": None})
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_summarize_vendor_throughput",
+        lambda db_path, budget_summary: {
+            "rows": [
+                {"vendor": "alpaca", "rows_per_min": 72.5, "outbound_requests_per_min": 14.0},
+                {"vendor": "tiingo", "rows_per_min": 48.25, "outbound_requests_per_min": 9.5},
+            ],
+            "checked_at": None,
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_summarize_planner_eta",
+        lambda db_path, planner_summary, vendor_throughput: {"canonical_bars": {"remaining_units": 50, "eta_minutes": 41.0}},
+    )
+    monkeypatch.setattr(
+        dashboard_controller,
+        "evaluate_training_gates",
+        lambda **kwargs: {
+            "phase1": {"ready": False, "blockers": ["bars_incomplete"]},
+            "freeze_cutoff": {"date": "2026-03-23", "effective_window_coverage_ratio": 0.72},
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_controller,
+        "read_training_runtime",
+        lambda path=None, local_state=None, phase=None: {
+            "status": "running",
+            "host": "mac-mini",
+            "started_at": "2026-04-10T15:30:00+00:00",
+            "report_date": "2026-03-23",
+            "assessment": {"decision": "NO_GO", "reason": "mean IC below target"},
+        },
+    )
+
+    snapshot = collect_dashboard_game_snapshot(settings)
+
+    assert set(snapshot.keys()) == {"node", "training", "missions", "phase1_gate", "updated_at"}
+
+    node = snapshot["node"]
+    assert node["label"] == settings.worker_id
+    assert node["running"] is True
+    assert node["rows_per_min"] == pytest.approx(120.75)
+    assert node["requests_per_min"] == pytest.approx(23.5)
+    assert node["rows_total"] == 987_654
+    assert node["eta_minutes"] == pytest.approx(41.0)
+    assert node["activity_pulse"] is True
+
+    training = snapshot["training"]
+    assert training["state"] == "running"
+    assert training["host"] == "mac-mini"
+    assert training["latest_run_ts"] == "2026-03-23"
+    assert training["latest_decision"] == "NO_GO"
+    assert training["best_rank_ic"] == pytest.approx(0.047)
+    assert training["best_run_ts"] == "2026-03-16"
+    assert training["streak_go"] == 0
+    assert training["total_runs"] == 3
+    assert training["sparkline"] == pytest.approx([0.021, 0.047, 0.008])
+    assert [row["run_ts"] for row in training["last_decisions"]] == ["2026-03-23", "2026-03-16", "2026-03-09"]
+
+    mission_keys = {mission["key"] for mission in snapshot["missions"]}
+    assert {"canonical_bars", "corp_actions", "listing_history", "delistings", "sec_filings", "macro"} <= mission_keys
+    statuses = [mission["status"] for mission in snapshot["missions"]]
+    assert statuses == sorted(statuses, key=lambda s: {"complete": 0, "in_progress": 1, "locked": 2}.get(s, 9))
+
+    gate = snapshot["phase1_gate"]
+    assert gate["ready"] is False
+    assert gate["blockers"] == ["bars_incomplete"]
+    assert gate["freeze_cutoff"] == "2026-03-23"
+    assert 0.0 <= gate["percent"] <= 100.0
+
+
+def test_collect_dashboard_game_snapshot_marks_idle_when_no_runs(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                },
+                "vendors": {"alpaca": {"rpm": 150, "daily_cap": 10000}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 0, "symbols": ["AAPL"], "years": 1}, sort_keys=False),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+
+    monkeypatch.setattr(dashboard_controller, "_read_runtime_state", lambda settings: {})
+    monkeypatch.setattr(dashboard_controller, "_is_process_running", lambda pid: False)
+    monkeypatch.setattr(dashboard_controller, "_read_queue_counts", lambda db_path: {})
+    monkeypatch.setattr(dashboard_controller, "_read_partition_summary", lambda qc_path: {"counts": {}, "coverage_green": 0.0, "latest_date": None, "raw_dates": [], "raw_datapoints": 0})
+    monkeypatch.setattr(dashboard_controller, "_readable_reference_files", lambda root: [])
+    monkeypatch.setattr(dashboard_controller, "_macro_series", lambda root: [])
+    monkeypatch.setattr(dashboard_controller, "_price_check_files", lambda root: [])
+    monkeypatch.setattr(dashboard_controller, "_read_planner_summary", lambda db_path: {"progress": {}, "backlog_progress": {}, "counts": {}})
+    monkeypatch.setattr(dashboard_controller, "_read_budget_summary", lambda settings: {"rows": [], "checked_at": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_vendor_throughput", lambda db_path, budget_summary: {"rows": [], "checked_at": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_planner_eta", lambda db_path, planner_summary, vendor_throughput: {})
+    monkeypatch.setattr(dashboard_controller, "evaluate_training_gates", lambda **kwargs: {"phase1": {"ready": False, "blockers": []}, "freeze_cutoff": {}})
+    monkeypatch.setattr(dashboard_controller, "read_training_runtime", lambda path=None, local_state=None, phase=None: {})
+
+    snapshot = collect_dashboard_game_snapshot(settings)
+
+    assert snapshot["node"]["running"] is False
+    assert snapshot["node"]["activity_pulse"] is False
+    assert snapshot["training"]["state"] == "idle"
+    assert snapshot["training"]["total_runs"] == 0
+    assert snapshot["training"]["sparkline"] == []
+    assert snapshot["phase1_gate"]["ready"] is False

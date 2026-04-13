@@ -38,8 +38,10 @@ from trademl.data_node.runtime import build_connector, build_connectors, resolve
 from trademl.data_node.service import DataNodePaths, DataNodeService
 from trademl.data_node.training_control import (
     evaluate_training_gates,
+    read_training_runtime,
     resolve_training_target,
     resolve_training_targets,
+    shared_training_runtime_path,
     training_log_tail,
     training_preflight,
     training_status_snapshot,
@@ -57,6 +59,16 @@ from trademl.experiments import (
     resume_experiment_supervisor,
     stop_experiment_supervisor,
     supervise_experiment,
+)
+from trademl.research import (
+    latest_research_program_summary,
+    pause_research_program,
+    read_research_program_state,
+    resume_research_program,
+    start_research_program,
+    steer_research_program,
+    stop_research_program,
+    write_research_review_packet,
 )
 from trademl.fleet.cluster import (
     ClusterCoordinator,
@@ -1120,6 +1132,113 @@ def propose_experiment_family(
     )
 
 
+def start_research_supervisor(
+    settings: NodeSettings,
+    *,
+    program_path: str,
+    poll_seconds: int | None = None,
+    detach: bool = True,
+) -> dict[str, Any]:
+    """Start a perpetual research program."""
+    return start_research_program(
+        program_path=Path(program_path).expanduser(),
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        local_state=settings.local_state,
+        env_path=settings.env_path,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+        poll_seconds=poll_seconds,
+        detach=detach,
+    )
+
+
+def pause_research(
+    settings: NodeSettings,
+    *,
+    program_id: str,
+) -> dict[str, Any]:
+    """Pause a research program."""
+    return pause_research_program(local_state=settings.local_state, program_id=program_id)
+
+
+def resume_research(
+    settings: NodeSettings,
+    *,
+    program_id: str,
+) -> dict[str, Any]:
+    """Resume a paused research program."""
+    return resume_research_program(
+        program_id=program_id,
+        local_state=settings.local_state,
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        env_path=settings.env_path,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+    )
+
+
+def stop_research(
+    settings: NodeSettings,
+    *,
+    program_id: str,
+) -> dict[str, Any]:
+    """Stop a research program."""
+    return stop_research_program(local_state=settings.local_state, program_id=program_id)
+
+
+def research_review_packet(
+    settings: NodeSettings,
+    *,
+    program_id: str,
+) -> dict[str, Any]:
+    """Write a review packet for one research program."""
+    return write_research_review_packet(
+        program_id=program_id,
+        local_state=settings.local_state,
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+    )
+
+
+def research_status(
+    settings: NodeSettings,
+    *,
+    program_id: str,
+) -> dict[str, Any]:
+    """Return one research program state payload."""
+    return read_research_program_state(local_state=settings.local_state, program_id=program_id)
+
+
+def steer_research(
+    settings: NodeSettings,
+    *,
+    program_id: str,
+    prefer_architecture_families: list[str] | None = None,
+    avoid_architecture_families: list[str] | None = None,
+    prefer_data_families: list[str] | None = None,
+    avoid_data_families: list[str] | None = None,
+    freeze_phase: int | None = None,
+    force_pivot: bool | None = None,
+    exploration_breadth: str | None = None,
+) -> dict[str, Any]:
+    """Persist steering hints for the research program."""
+    return steer_research_program(
+        local_state=settings.local_state,
+        program_id=program_id,
+        prefer_architecture_families=prefer_architecture_families,
+        avoid_architecture_families=avoid_architecture_families,
+        prefer_data_families=prefer_data_families,
+        avoid_data_families=avoid_data_families,
+        freeze_phase=freeze_phase,
+        force_pivot=force_pivot,
+        exploration_breadth=exploration_breadth,
+    )
+
+
 def _remove_worker_state(settings: NodeSettings) -> None:
     for path in [
         settings.local_state,
@@ -1385,6 +1504,264 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
     }
 
 
+def collect_dashboard_game_snapshot(settings: NodeSettings) -> dict[str, Any]:
+    """Collect the gamified HUD snapshot used by the Collector/Brain dashboard."""
+    runtime = _read_runtime_state(settings)
+    pid = runtime.get("pid")
+    running = isinstance(pid, int) and _is_process_running(pid)
+    runtime["running"] = running
+    uptime_seconds: float | None = None
+    if running and runtime.get("started_at"):
+        with contextlib.suppress(ValueError):
+            started_at = datetime.fromisoformat(str(runtime["started_at"]))
+            uptime_seconds = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
+
+    queue_counts = _read_queue_counts(settings.db_path)
+    partition_summary = _read_partition_summary(settings.qc_path)
+    raw_dates = _partition_dates_from_qc(partition_summary)
+    raw_datapoints = _raw_datapoints_from_qc(partition_summary)
+    reference_files = _readable_reference_files(settings.reference_root)
+    macro_series = _macro_series(settings.macro_root)
+    price_check_files = _price_check_files(settings.price_checks_root)
+    planner_summary = _read_planner_summary(settings.db_path)
+    budget_summary = _read_budget_summary(settings)
+    vendor_throughput = _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
+    planner_eta = _summarize_planner_eta(
+        settings.db_path,
+        planner_summary=planner_summary,
+        vendor_throughput=vendor_throughput,
+    )
+    stage = _read_yaml(settings.stage_path)
+    stage_symbols = stage.get("symbols", [])
+    stage_years = stage.get("years")
+    expected_sessions: int | None = None
+    expected_datapoints: int | None = None
+    if stage_years:
+        end = date.today()
+        start = (pd.Timestamp(end) - pd.DateOffset(years=int(stage_years))).date()
+        expected_sessions = len(get_trading_days("XNYS", start, end))
+        if expected_sessions and stage_symbols:
+            expected_datapoints = expected_sessions * len(stage_symbols)
+    readiness = evaluate_training_gates(
+        data_root=settings.nas_mount,
+        stage_symbol_count=len(stage_symbols),
+        stage_years=int(stage_years or 0),
+        planner_db_path=settings.db_path,
+    )
+    collection_health = _build_collection_health(
+        planner_summary=planner_summary,
+        reference_files=reference_files,
+        macro_series=macro_series,
+        planner_eta=planner_eta,
+        freeze_cutoff=readiness.get("freeze_cutoff", {}),
+        raw_dates=raw_dates,
+        expected_sessions=expected_sessions,
+        partition_summary=partition_summary,
+        price_check_files=price_check_files,
+        raw_datapoints=raw_datapoints,
+        expected_datapoints=expected_datapoints,
+        queue_counts=queue_counts,
+    )
+    dataset_coverage = collection_health["dataset_coverage"]
+    collection_status = collection_health["collection_status"]
+
+    rows_per_min = sum(float(row.get("rows_per_min", 0.0)) for row in vendor_throughput.get("rows", []))
+    requests_per_min = sum(
+        float(row.get("outbound_requests_per_min", 0.0)) for row in vendor_throughput.get("rows", [])
+    )
+    bars_eta = planner_eta.get("canonical_bars", {})
+    eta_minutes = bars_eta.get("eta_minutes")
+
+    node_payload = {
+        "label": settings.worker_id,
+        "running": running,
+        "uptime_seconds": uptime_seconds,
+        "rows_per_min": round(rows_per_min, 2),
+        "requests_per_min": round(requests_per_min, 2),
+        "rows_total": int(raw_datapoints),
+        "expected_datapoints": expected_datapoints or 0,
+        "coverage_percent": float(collection_status.get("coverage_percent", 0.0)),
+        "training_ready_percent": float(collection_status.get("training_ready_percent", 0.0)),
+        "eta_minutes": float(eta_minutes) if eta_minutes is not None else None,
+        "pending_tasks": int(collection_status.get("pending_tasks", 0)),
+        "failed_tasks": int(collection_status.get("failed_tasks", 0)),
+        "activity_pulse": rows_per_min > 0,
+    }
+
+    phase1_runtime_path = shared_training_runtime_path(data_root=settings.nas_mount, phase=1)
+    phase1_runtime = read_training_runtime(path=phase1_runtime_path)
+    training_state = _map_training_state(phase1_runtime)
+    history = _read_training_run_history(settings, limit=12)
+    latest = history[0] if history else {}
+    best = max(history, key=lambda row: row.get("mean_rank_ic", 0.0)) if history else {}
+    streak_go = 0
+    for row in history:
+        if str(row.get("decision", "")).upper() == "GO":
+            streak_go += 1
+        else:
+            break
+    sparkline = [float(row.get("mean_rank_ic", 0.0)) for row in reversed(history)]
+    last_decisions = [
+        {
+            "run_ts": row.get("run_ts"),
+            "decision": row.get("decision"),
+            "mean_rank_ic": row.get("mean_rank_ic"),
+            "model_suite": row.get("model_suite"),
+        }
+        for row in history[:8]
+    ]
+    training_payload = {
+        "host": phase1_runtime.get("host") or "mac-mini",
+        "state": training_state,
+        "started_at": phase1_runtime.get("started_at"),
+        "finished_at": phase1_runtime.get("finished_at"),
+        "report_date": phase1_runtime.get("report_date"),
+        "latest_rank_ic": float(latest.get("mean_rank_ic", 0.0)) if latest else 0.0,
+        "latest_decision": latest.get("decision") if latest else None,
+        "latest_run_ts": latest.get("run_ts") if latest else None,
+        "best_rank_ic": float(best.get("mean_rank_ic", 0.0)) if best else 0.0,
+        "best_run_ts": best.get("run_ts") if best else None,
+        "streak_go": streak_go,
+        "total_runs": len(history),
+        "last_decisions": last_decisions,
+        "sparkline": sparkline,
+        "assessment": phase1_runtime.get("assessment", {}),
+    }
+
+    mission_order = {"complete": 0, "in_progress": 1, "locked": 2}
+    missions: list[dict[str, Any]] = []
+    for key, payload in dataset_coverage.items():
+        ratio = float(payload.get("ratio", 0.0) or 0.0)
+        if ratio >= 0.999:
+            status = "complete"
+        elif ratio > 0.0:
+            status = "in_progress"
+        else:
+            status = "locked"
+        missions.append(
+            {
+                "key": key,
+                "label": payload.get("label", key),
+                "status": status,
+                "percent": round(min(1.0, ratio) * 100.0, 1),
+                "blocking": bool(payload.get("blocking", False)),
+                "eta_minutes": payload.get("eta_minutes"),
+                "remaining_units": int(payload.get("remaining_units", 0) or 0),
+            }
+        )
+    missions.sort(key=lambda mission: (mission_order.get(mission["status"], 9), -mission["percent"], mission["label"]))
+
+    phase1_ready = bool(readiness.get("phase1", {}).get("ready", False))
+    phase1_percent = float(collection_status.get("training_ready_percent", 0.0))
+    phase1_blockers = list(readiness.get("phase1", {}).get("blockers", []) or [])
+    freeze_cutoff_date = readiness.get("freeze_cutoff", {}).get("date")
+    phase1_gate = {
+        "ready": phase1_ready,
+        "percent": round(phase1_percent, 1),
+        "blockers": phase1_blockers,
+        "freeze_cutoff": freeze_cutoff_date,
+    }
+
+    return {
+        "node": node_payload,
+        "training": training_payload,
+        "missions": missions,
+        "phase1_gate": phase1_gate,
+        "updated_at": datetime.now(tz=UTC).isoformat(),
+    }
+
+
+def _map_training_state(runtime_payload: dict[str, Any]) -> str:
+    """Map the persisted training runtime payload to a gamified status label."""
+    if not runtime_payload:
+        return "idle"
+    status = str(runtime_payload.get("status", "")).lower()
+    if status == "completed":
+        finished_at = runtime_payload.get("finished_at")
+        if finished_at:
+            with contextlib.suppress(ValueError):
+                finished_dt = datetime.fromisoformat(str(finished_at))
+                if (datetime.now(tz=UTC) - finished_dt) <= timedelta(minutes=60):
+                    return "cooling_down"
+        return "idle"
+    if status in {"starting", "running", "failed", "stopped", "unknown"}:
+        return status
+    return status or "idle"
+
+
+def _read_training_run_history(settings: NodeSettings, *, limit: int = 12) -> list[dict[str, Any]]:
+    """Return the most recent training attempts sorted newest first.
+
+    Prefer per-run experiment artifacts under ``{nas}/experiments/*/runs/*/reports/daily/*.json``
+    so repeated runs on the same report date are preserved. Fall back to
+    ``{nas}/reports/daily/*.json`` for standalone/manual runs.
+    """
+    daily_root = settings.nas_mount / "reports" / "daily"
+    experiments_root = settings.nas_mount / "experiments"
+    if not daily_root.exists() and not experiments_root.exists():
+        return []
+
+    candidate_paths: list[Path] = []
+    if experiments_root.exists():
+        candidate_paths.extend(sorted(experiments_root.glob("*/runs/*/reports/daily/*.json")))
+    if daily_root.exists():
+        candidate_paths.extend(sorted(daily_root.glob("*.json")))
+
+    entries: list[dict[str, Any]] = []
+    for path in candidate_paths:
+        if path.stem == "latest":
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            stat = path.stat()
+        except (json.JSONDecodeError, OSError) as exc:
+            LOGGER.warning("invalid_training_report path=%s error=%s", path, exc)
+            continue
+        if not isinstance(payload, dict):
+            continue
+        run_id = None
+        experiment_id = None
+        parts = path.parts
+        if "experiments" in parts and "runs" in parts:
+            try:
+                experiment_idx = parts.index("experiments")
+                runs_idx = parts.index("runs")
+                experiment_id = parts[experiment_idx + 1]
+                run_id = parts[runs_idx + 1]
+            except (IndexError, ValueError):
+                run_id = None
+                experiment_id = None
+        ridge = payload.get("ridge", {}) if isinstance(payload.get("ridge"), dict) else {}
+        assessment = payload.get("assessment", {}) if isinstance(payload.get("assessment"), dict) else {}
+        entries.append(
+            {
+                "run_ts": path.stem,
+                "run_id": run_id,
+                "experiment_id": experiment_id,
+                "mean_rank_ic": float(ridge.get("mean_rank_ic", 0.0) or 0.0),
+                "decision": str(assessment.get("decision", "")).upper() or None,
+                "reason": assessment.get("reason"),
+                "coverage": float(payload.get("coverage", 0.0) or 0.0),
+                "model_suite": payload.get("model_suite"),
+                "_sort_date": path.stem,
+                "_sort_mtime": stat.st_mtime,
+            }
+        )
+    entries.sort(
+        key=lambda row: (
+            str(row.get("_sort_date") or ""),
+            float(row.get("_sort_mtime") or 0.0),
+            str(row.get("run_id") or ""),
+        ),
+        reverse=True,
+    )
+    trimmed = entries[:limit]
+    for row in trimmed:
+        row.pop("_sort_date", None)
+        row.pop("_sort_mtime", None)
+    return trimmed
+
+
 def collect_dashboard_health_snapshot(
     settings: NodeSettings,
     *,
@@ -1411,6 +1788,7 @@ def collect_dashboard_health_snapshot(
             "experiment_summary": {},
             "experiment_supervisor": {},
             "proposal_summary": {},
+            "research_program_summary": {},
             "planner_backlog": planner_summary.get("backlog_progress", {}),
         }
     repair_tasks = _summarize_repair_tasks(db)
@@ -1442,6 +1820,7 @@ def collect_dashboard_health_snapshot(
         else {}
     )
     proposal_summary = latest_experiment_proposal(local_state=settings.local_state)
+    research_program_summary = latest_research_program_summary(local_state=settings.local_state)
     return {
         "repair_tasks": repair_tasks,
         "repair_drain_rate_per_min": repair_tasks["drain_rate_per_min"],
@@ -1454,6 +1833,7 @@ def collect_dashboard_health_snapshot(
         "experiment_summary": experiment_summary,
         "experiment_supervisor": experiment_supervisor,
         "proposal_summary": proposal_summary,
+        "research_program_summary": research_program_summary,
         "planner_backlog": planner_summary.get("backlog_progress", {}),
     }
 
