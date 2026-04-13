@@ -642,3 +642,45 @@ def test_supervise_experiment_autochains_next_family_when_policy_allows(tmp_path
     assert state["status"] == "COMPLETED"
     assert state["next_experiment_id"] == "phase1-baselines-g1"
     assert spawned[0]["experiment_id"] == "phase1-baselines-g1"
+
+
+def test_experiment_status_skips_remote_polling_for_planned_runs(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    experiment_root = local_state / "experiments" / "phase1-baselines"
+    (experiment_root / "runs").mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "experiment_id": "phase1-baselines",
+        "run_id": "run-a",
+        "phase": 1,
+        "target": "workstation-remote",
+        "runtime_name": "experiment_phase1-baselines__run-a",
+        "status": "PLANNED",
+        "model_suite": "ridge_only",
+        "matrix_values": {"architecture_family": "linear_baseline"},
+        "config_path": str(tmp_path / "run-a.yml"),
+        "output_root": "/remote/output",
+        "report_path": "/remote/report.json",
+    }
+    (experiment_root / "runs" / "run-a.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (experiment_root / "summary.json").write_text(json.dumps({"experiment_id": "phase1-baselines"}), encoding="utf-8")
+
+    def unexpected_status_snapshot(**kwargs):  # noqa: ANN001
+        raise AssertionError("planned runs should not invoke training_status_snapshot")
+
+    def unexpected_report_load(**kwargs):  # noqa: ANN001
+        raise AssertionError("planned runs should not invoke report loading")
+
+    monkeypatch.setattr(experiments, "training_status_snapshot", unexpected_status_snapshot)
+    monkeypatch.setattr(experiments, "_load_report_payload", unexpected_report_load)
+
+    status = experiments.experiment_status(
+        experiment_id="phase1-baselines",
+        local_state=local_state,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert status["counts"] == {"PLANNED": 1}
+    assert status["runs"][0]["run_id"] == "run-a"

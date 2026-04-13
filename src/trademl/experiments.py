@@ -316,6 +316,14 @@ def experiment_status(
     summary = _read_experiment_summary(local_state=local_state, experiment_id=experiment_id)
     for path in sorted((local_root / "runs").glob("*.json")):
         manifest = json.loads(path.read_text(encoding="utf-8"))
+        current_status = str(manifest.get("status") or "PLANNED").upper()
+        if current_status == "PLANNED":
+            manifest["status"] = "PLANNED"
+            manifest.setdefault("runtime", {})
+            manifest.setdefault("log_tail", "")
+            _write_run_manifest(local_state=local_state, experiment_id=experiment_id, manifest=manifest)
+            runs.append(manifest)
+            continue
         snapshot = training_status_snapshot(
             repo_root=repo_root,
             data_root=data_root,
