@@ -345,3 +345,33 @@ def test_experiments_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     assert json.loads(capsys.readouterr().out)["action"] == "compare"
     assert cli.main(["experiments", "report", "--experiment", "phase1"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "report"
+
+
+def test_research_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
+    program_path = tmp_path / "program.yml"
+    program_path.write_text("program_id: perpetual\nphase_order: [1]\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "start_research_program", lambda program_path, **kwargs: {"action": "start", "program": str(program_path), "detach": kwargs.get("detach", False)})
+    monkeypatch.setattr(cli, "read_research_program_state", lambda local_state, program_id: {"action": "status", "program_id": program_id, "frontier": {"x": 1}})
+    monkeypatch.setattr(cli, "pause_research_program", lambda local_state, program_id: {"action": "pause", "program_id": program_id})
+    monkeypatch.setattr(cli, "resume_research_program", lambda program_id, **kwargs: {"action": "resume", "program_id": program_id})
+    monkeypatch.setattr(cli, "stop_research_program", lambda local_state, program_id: {"action": "stop", "program_id": program_id})
+    monkeypatch.setattr(cli, "latest_research_program_summary", lambda local_state: {"frontier": {"latest": True}})
+    monkeypatch.setattr(cli, "write_research_review_packet", lambda program_id, **kwargs: {"action": "review", "program_id": program_id})
+    monkeypatch.setattr(cli, "steer_research_program", lambda local_state, program_id, **kwargs: {"action": "steer", "program_id": program_id, "steering": kwargs})
+
+    assert cli.main(["research", "start", "--program", str(program_path), "--detach"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "start"
+    assert cli.main(["research", "status", "--program-id", "perpetual"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "status"
+    assert cli.main(["research", "pause", "--program-id", "perpetual"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "pause"
+    assert cli.main(["research", "resume", "--program-id", "perpetual"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "resume"
+    assert cli.main(["research", "stop", "--program-id", "perpetual"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "stop"
+    assert cli.main(["research", "frontier", "--program-id", "perpetual"]) == 0
+    assert json.loads(capsys.readouterr().out)["x"] == 1
+    assert cli.main(["research", "review-packet", "--program-id", "perpetual"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "review"
+    assert cli.main(["research", "steer", "--program-id", "perpetual", "--prefer-architecture", "tree_challenger", "--force-pivot"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "steer"

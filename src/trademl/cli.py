@@ -54,6 +54,16 @@ from trademl.experiments import (
     stop_experiment_supervisor,
     supervise_experiment,
 )
+from trademl.research import (
+    latest_research_program_summary,
+    pause_research_program,
+    read_research_program_state,
+    resume_research_program,
+    start_research_program,
+    steer_research_program,
+    stop_research_program,
+    write_research_review_packet,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -175,6 +185,37 @@ def main(argv: list[str] | None = None) -> int:
     experiments_report = experiments_subparsers.add_parser("report", help="Write experiment comparison reports.")
     experiments_report.add_argument("--experiment", required=True)
 
+    research_parser = subparsers.add_parser("research", help="Run perpetual research programs.")
+    research_parser.add_argument("--data-root", default=None)
+    research_parser.add_argument("--local-state", default=None)
+    research_parser.add_argument("--env-file", default=None)
+    research_subparsers = research_parser.add_subparsers(dest="research_command", required=True)
+    research_start = research_subparsers.add_parser("start", help="Start a research program supervisor.")
+    research_start.add_argument("--program", required=True)
+    research_start.add_argument("--poll-seconds", type=int, default=None)
+    research_start.add_argument("--detach", action="store_true")
+    research_status = research_subparsers.add_parser("status", help="Show research program state.")
+    research_status.add_argument("--program-id", required=True)
+    research_pause = research_subparsers.add_parser("pause", help="Pause a research program.")
+    research_pause.add_argument("--program-id", required=True)
+    research_resume = research_subparsers.add_parser("resume", help="Resume a research program.")
+    research_resume.add_argument("--program-id", required=True)
+    research_stop = research_subparsers.add_parser("stop", help="Stop a research program.")
+    research_stop.add_argument("--program-id", required=True)
+    research_frontier = research_subparsers.add_parser("frontier", help="Show the current program frontier summary.")
+    research_frontier.add_argument("--program-id", default=None)
+    research_review = research_subparsers.add_parser("review-packet", help="Write a research review packet.")
+    research_review.add_argument("--program-id", required=True)
+    research_steer = research_subparsers.add_parser("steer", help="Persist manual steering for a research program.")
+    research_steer.add_argument("--program-id", required=True)
+    research_steer.add_argument("--prefer-architecture", action="append", default=None)
+    research_steer.add_argument("--avoid-architecture", action="append", default=None)
+    research_steer.add_argument("--prefer-data-family", action="append", default=None)
+    research_steer.add_argument("--avoid-data-family", action="append", default=None)
+    research_steer.add_argument("--freeze-phase", type=int, default=None)
+    research_steer.add_argument("--force-pivot", action="store_true")
+    research_steer.add_argument("--exploration-breadth", default=None)
+
     args = parser.parse_args(argv)
     if args.command == "dashboard":
         return _launch_dashboard(args)
@@ -182,6 +223,8 @@ def main(argv: list[str] | None = None) -> int:
         return _dispatch_train(args)
     if args.command == "experiments":
         return _dispatch_experiments(args)
+    if args.command == "research":
+        return _dispatch_research(args)
     settings = resolve_node_settings(
         workspace_root=args.workspace_root,
         config_path=args.config,
@@ -483,6 +526,89 @@ def _dispatch_experiments(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported experiments command: {args.experiments_command}")
+
+
+def _dispatch_research(args: argparse.Namespace) -> int:
+    data_root = Path(args.data_root or os.getenv("TRADEML_DATA_ROOT") or os.getenv("NAS_MOUNT") or ".").expanduser()
+    local_state = Path(args.local_state or os.getenv("TRADEML_TRAIN_STATE") or "~/.trademl-training").expanduser()
+    env_path = Path(args.env_file).expanduser() if args.env_file else Path(".env")
+    repo_root = Path(__file__).resolve().parents[2]
+    targets_config_path = repo_root / "configs" / "node.yml"
+    common = {
+        "repo_root": repo_root,
+        "data_root": data_root,
+        "local_state": local_state,
+        "env_path": env_path,
+        "targets_config_path": targets_config_path,
+        "python_executable": sys.executable,
+    }
+    if args.research_command == "start":
+        payload = start_research_program(
+            program_path=Path(args.program).expanduser(),
+            poll_seconds=args.poll_seconds,
+            detach=bool(args.detach),
+            **common,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "status":
+        payload = read_research_program_state(local_state=local_state, program_id=args.program_id)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "pause":
+        payload = pause_research_program(local_state=local_state, program_id=args.program_id)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "resume":
+        payload = resume_research_program(
+            program_id=args.program_id,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            env_path=env_path,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "stop":
+        payload = stop_research_program(local_state=local_state, program_id=args.program_id)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "frontier":
+        payload = (
+            read_research_program_state(local_state=local_state, program_id=args.program_id)
+            if args.program_id
+            else latest_research_program_summary(local_state=local_state)
+        )
+        print(json.dumps(payload.get("frontier", payload), indent=2, default=str))
+        return 0
+    if args.research_command == "review-packet":
+        payload = write_research_review_packet(
+            program_id=args.program_id,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "steer":
+        payload = steer_research_program(
+            local_state=local_state,
+            program_id=args.program_id,
+            prefer_architecture_families=args.prefer_architecture,
+            avoid_architecture_families=args.avoid_architecture,
+            prefer_data_families=args.prefer_data_family,
+            avoid_data_families=args.avoid_data_family,
+            freeze_phase=args.freeze_phase,
+            force_pivot=bool(args.force_pivot),
+            exploration_breadth=args.exploration_breadth,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    raise SystemExit(f"unsupported research command: {args.research_command}")
 
 
 if __name__ == "__main__":
