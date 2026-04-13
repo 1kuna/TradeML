@@ -1,0 +1,102 @@
+program_id: perpetual-macmini
+target: workstation-remote
+phase_order:
+  - 1
+  - 2
+default_phase: 1
+report_date_policy: phase1_freeze
+max_concurrent: 1
+budget_policy:
+  max_total_runs: 250
+  max_total_hours: 168
+  max_consecutive_non_improving_families: 4
+  max_repeat_rejection_reason: 4
+  max_low_novelty_families: 3
+  min_novelty_score: 0.25
+  max_infra_failures: 3
+review_policy:
+  cadence_hours: 12
+steering_defaults:
+  exploration_breadth: normal
+search_policy:
+  allowed_dimensions:
+    - architecture_family
+    - feature_family
+    - data_family
+    - validation.initial_train_years
+    - data_profile
+phase_policies:
+  "1":
+    phase: 1
+    auto_unlock: true
+    allowed_dimensions:
+      - architecture_family
+      - feature_family
+      - data_family
+      - validation.initial_train_years
+      - data_profile
+    allowed_data_families:
+      - price_only
+      - price_plus_liquidity
+    family_size_cap: 6
+    max_generations: 12
+    max_phase_runs: 120
+    max_phase_hours: 120
+    unlock_gate:
+      require_shortlist: true
+      require_cost_positive: true
+    initial_matrix:
+      architecture_family:
+        - linear_baseline
+        - tree_challenger
+      feature_family:
+        - price_core
+        - price_liquidity
+        - price_short_horizon
+      data_family:
+        - price_only
+        - price_plus_liquidity
+      validation.initial_train_years:
+        - 2
+      data_profile:
+        - phase1_default
+        - phase1_short_window
+    predictive_gate:
+      min_rank_ic: 0.01
+      require_go_decision: true
+      require_all_years_positive: true
+      max_abs_placebo_ic: 0.10
+      min_cost_stress_net_return: 0.0
+    backtest_gate:
+      min_net_return: 0.0
+      require_cost_positive: true
+    backtest_profile:
+      name: phase1_primary
+  "2":
+    phase: 2
+    auto_unlock: false
+    allowed_dimensions:
+      - architecture_family
+      - feature_family
+      - data_family
+      - validation.initial_train_years
+      - data_profile
+    allowed_data_families:
+      - price_only
+    family_size_cap: 4
+    max_generations: 8
+    max_phase_runs: 80
+    max_phase_hours: 72
+    initial_matrix:
+      architecture_family:
+        - tree_challenger
+      feature_family:
+        - price_short_horizon
+      data_family:
+        - price_only
+      validation.initial_train_years:
+        - 2
+        - 3
+      data_profile:
+        - phase1_default
+        - phase1_long_window

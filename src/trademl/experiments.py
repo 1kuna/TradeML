@@ -29,7 +29,7 @@ from trademl.data_node.training_control import (
     training_status_snapshot,
 )
 
-SPECIAL_MATRIX_DIMENSIONS = {"model_suite", "architecture_family", "feature_family", "data_profile"}
+SPECIAL_MATRIX_DIMENSIONS = {"model_suite", "architecture_family", "feature_family", "data_profile", "data_family"}
 
 ARCHITECTURE_FAMILY_PRESETS: dict[str, dict[str, Any]] = {
     "linear_baseline": {"model_suite": "ridge_only", "config_overrides": {}},
@@ -60,6 +60,52 @@ DATA_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
     "phase1_default": {"config_overrides": {}},
     "phase1_short_window": {"config_overrides": {"data.window_years": 3}},
     "phase1_long_window": {"config_overrides": {"data.window_years": 7}},
+}
+
+DATA_FAMILY_PRESETS: dict[str, dict[str, Any]] = {
+    "price_only": {
+        "config_overrides": {
+            "features.liquidity.adv_dollar": [],
+            "features.liquidity.amihud": [],
+        },
+        "modeling_ready": True,
+        "required_datasets": ["equities_ohlcv_adj"],
+    },
+    "price_plus_liquidity": {
+        "config_overrides": {},
+        "modeling_ready": True,
+        "required_datasets": ["equities_ohlcv_adj"],
+    },
+    "price_plus_macro": {
+        "config_overrides": {},
+        "modeling_ready": False,
+        "required_datasets": ["equities_ohlcv_adj", "macros_fred_curated"],
+    },
+    "price_plus_events": {
+        "config_overrides": {},
+        "modeling_ready": False,
+        "required_datasets": ["equities_ohlcv_adj", "sec_events_curated"],
+    },
+    "price_plus_news": {
+        "config_overrides": {},
+        "modeling_ready": False,
+        "required_datasets": ["equities_ohlcv_adj", "ticker_news_curated"],
+    },
+    "minute_archive_derived": {
+        "config_overrides": {},
+        "modeling_ready": False,
+        "required_datasets": ["equities_ohlcv_adj", "equities_minute_curated"],
+    },
+    "filings_derived": {
+        "config_overrides": {},
+        "modeling_ready": False,
+        "required_datasets": ["equities_ohlcv_adj", "sec_filings_curated"],
+    },
+    "alt_reference_enriched": {
+        "config_overrides": {},
+        "modeling_ready": False,
+        "required_datasets": ["equities_ohlcv_adj", "alt_reference_curated"],
+    },
 }
 
 
@@ -926,6 +972,12 @@ def _materialize_matrix_row(matrix_values: dict[str, Any]) -> dict[str, Any]:
         if preset is None:
             raise ValueError(f"unsupported data_profile: {data_profile}")
         config_overrides.update(dict(preset.get("config_overrides") or {}))
+    data_family = matrix_values.get("data_family")
+    if data_family is not None:
+        preset = DATA_FAMILY_PRESETS.get(str(data_family))
+        if preset is None:
+            raise ValueError(f"unsupported data_family: {data_family}")
+        config_overrides.update(dict(preset.get("config_overrides") or {}))
     config_overrides.update({key: value for key, value in matrix_values.items() if key not in SPECIAL_MATRIX_DIMENSIONS})
     return {
         "matrix_values": matrix_values,
@@ -1415,6 +1467,7 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
     current_generation = int(base_spec.get("generation", 0) or 0)
     family_root = str(base_spec.get("family_root") or experiment_id)
     next_generation = current_generation + 1
+    current_matrix = dict(base_spec.get("matrix") or {})
     next_spec = {
         "experiment_id": f"{family_root}-g{next_generation}",
         "phase": int(base_spec.get("phase", 1) or 1),
@@ -1435,26 +1488,61 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
     ridge_score = max((float(row.get("primary_score") or 0.0) for row in ridge_rows), default=-1.0)
     full_score = max((float(row.get("primary_score") or 0.0) for row in full_rows), default=-1.0)
     dominant_architecture = "linear_baseline" if ridge_score >= full_score else "tree_challenger"
+    alternate_architecture = _alternate_architecture(dominant_architecture)
+    best_row = rows[0] if rows else {}
+    best_feature_family = _feature_family_for_row(best_row) if best_row else "price_core"
+    best_initial_year = int((best_row.get("matrix_values") or {}).get("validation.initial_train_years", 2) or 2) if best_row else 2
+    current_feature_families = [str(item) for item in current_matrix.get("feature_family", [])]
+    current_architecture_families = [str(item) for item in current_matrix.get("architecture_family", [])]
+    current_data_profiles = [str(item) for item in current_matrix.get("data_profile", [])]
+    current_initial_years = [int(item) for item in current_matrix.get("validation.initial_train_years", [])]
 
     if not predictive_survivors:
-        next_matrix = _bounded_matrix(
-            allowed_dimensions=allowed_dimensions,
-            dominant_architecture=dominant_architecture,
-            initial_years=[2, 3],
-            feature_families=["price_core", "price_liquidity", "price_short_horizon"],
-            data_profiles=["phase1_default", "phase1_short_window", "phase1_long_window"],
-            family_size_cap=policy["family_size_cap"],
-        )
-        if dominant_architecture == "linear_baseline":
-            rationale.append("all runs failed predictive gates and ridge outperformed full, so the next family pivots to ridge-centered architecture and feature-family variants")
+        if current_generation <= 0 or len(current_feature_families) > 1:
+            next_matrix = _bounded_matrix(
+                allowed_dimensions=allowed_dimensions,
+                architecture_families=[dominant_architecture],
+                initial_years=[2, 3],
+                feature_families=["price_core", "price_liquidity", "price_short_horizon"],
+                data_profiles=["phase1_default"],
+                family_size_cap=policy["family_size_cap"],
+            )
+            if dominant_architecture == "linear_baseline":
+                rationale.append("all runs failed predictive gates and ridge outperformed full, so the next family narrows to ridge and sweeps feature families")
+            else:
+                rationale.append("all runs failed predictive gates and the tree challenger led, so the next family narrows to trees and sweeps feature families")
+        elif len(current_architecture_families) > 1 and len(current_data_profiles) > 1 and len(current_feature_families) == 1:
+            next_matrix = _bounded_matrix(
+                allowed_dimensions=allowed_dimensions,
+                architecture_families=[dominant_architecture, alternate_architecture],
+                initial_years=current_initial_years or [best_initial_year],
+                feature_families=_next_feature_family_candidates(current_feature_families[0]),
+                data_profiles=["phase1_default"],
+                family_size_cap=policy["family_size_cap"],
+            )
+            next_matrix.pop("validation.initial_train_years", None)
+            rationale.append(
+                "architecture and window sweeps still failed, so the next family pivots to different feature lanes while keeping both core architectures in play"
+            )
         else:
-            rationale.append("all runs failed predictive gates and the tree challenger was best, so the next family keeps that architecture while rotating feature families and data windows")
+            next_matrix = _bounded_matrix(
+                allowed_dimensions=allowed_dimensions,
+                architecture_families=[dominant_architecture, alternate_architecture],
+                initial_years=[best_initial_year],
+                feature_families=[best_feature_family],
+                data_profiles=["phase1_default", "phase1_short_window", "phase1_long_window"],
+                family_size_cap=policy["family_size_cap"],
+            )
+            next_matrix.pop("validation.initial_train_years", None)
+            rationale.append(
+                "feature sweeps still failed predictive gates, so the next family compares architectures across data-window profiles around the best feature lane"
+            )
     elif predictive_survivors and not shortlisted:
         best = predictive_survivors[0]
         best_architecture = _architecture_family_for_row(best)
         next_matrix = _bounded_matrix(
             allowed_dimensions=allowed_dimensions,
-            dominant_architecture=best_architecture,
+            architecture_families=[best_architecture],
             initial_years=sorted({int(best["matrix_values"].get("validation.initial_train_years", 2) or 2), 2, 3}),
             feature_families=[_feature_family_for_row(best), "price_core"],
             data_profiles=["phase1_default"],
@@ -1467,7 +1555,7 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
         best_architecture = _architecture_family_for_row(best)
         next_matrix = _bounded_matrix(
             allowed_dimensions=allowed_dimensions,
-            dominant_architecture=best_architecture,
+            architecture_families=[best_architecture],
             initial_years=sorted({int(best["matrix_values"].get("validation.initial_train_years", 2) or 2), 2, 3}),
             feature_families=[_feature_family_for_row(best), "price_core"],
             data_profiles=["phase1_default", "phase1_long_window"],
@@ -1494,7 +1582,7 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
 def _bounded_matrix(
     *,
     allowed_dimensions: set[str],
-    dominant_architecture: str,
+    architecture_families: list[str],
     initial_years: list[int],
     feature_families: list[str],
     data_profiles: list[str],
@@ -1502,12 +1590,14 @@ def _bounded_matrix(
     extra_dimension: tuple[str, list[Any]] | None = None,
 ) -> dict[str, list[Any]]:
     matrix: dict[str, list[Any]] = {}
+    unique_architectures = list(dict.fromkeys(architecture_families))
     if "architecture_family" in allowed_dimensions:
-        matrix["architecture_family"] = [dominant_architecture]
+        matrix["architecture_family"] = unique_architectures[: max(1, min(len(unique_architectures), family_size_cap))]
     else:
-        matrix["model_suite"] = [ARCHITECTURE_FAMILY_PRESETS[dominant_architecture]["model_suite"]]
+        matrix["model_suite"] = [ARCHITECTURE_FAMILY_PRESETS[unique_architectures[0]]["model_suite"]]
     if "feature_family" in allowed_dimensions:
-        max_features = max(1, family_size_cap // max(1, len(initial_years)))
+        current_size = _matrix_combination_count(matrix)
+        max_features = max(1, family_size_cap // max(1, current_size * max(1, len(initial_years))))
         matrix["feature_family"] = list(dict.fromkeys(feature_families))[:max_features]
     if "validation.initial_train_years" in allowed_dimensions:
         max_years = max(1, family_size_cap // max(1, len(matrix.get("feature_family", [1]))))
@@ -1539,12 +1629,21 @@ def _architecture_family_for_row(row: dict[str, Any]) -> str:
     return "tree_challenger" if str(row.get("model_suite")) == "full" else "linear_baseline"
 
 
+def _alternate_architecture(family: str) -> str:
+    return "tree_challenger" if family == "linear_baseline" else "linear_baseline"
+
+
 def _feature_family_for_row(row: dict[str, Any]) -> str:
     matrix_values = dict(row.get("matrix_values") or {})
     family = matrix_values.get("feature_family")
     if family:
         return str(family)
     return "price_liquidity"
+
+
+def _next_feature_family_candidates(current_family: str) -> list[str]:
+    ordered = ["price_core", "price_liquidity", "price_short_horizon"]
+    return [family for family in ordered if family != current_family] or ordered
 
 
 def _write_next_family_proposal(*, local_state: Path, experiment_id: str, proposal: dict[str, Any]) -> dict[str, str]:

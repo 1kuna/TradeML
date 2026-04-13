@@ -228,6 +228,7 @@ def test_materialize_matrix_row_resolves_architecture_feature_and_data_profiles(
             "architecture_family": "linear_baseline",
             "feature_family": "price_core",
             "data_profile": "phase1_short_window",
+            "data_family": "price_only",
             "validation.initial_train_years": 3,
         }
     )
@@ -461,6 +462,125 @@ def test_propose_next_experiment_family_writes_bounded_spec(tmp_path: Path) -> N
     assert payload["proposal"]["chain_allowed"] is True
     assert payload["proposal"]["next_spec"]["matrix"]["architecture_family"] == ["linear_baseline"]
     assert "feature_family" in payload["proposal"]["next_spec"]["matrix"]
+
+
+def test_build_next_family_proposal_pivots_axes_after_feature_sweep(tmp_path: Path) -> None:
+    comparison = {
+        "rows": [
+            {
+                "model_suite": "ridge_only",
+                "primary_score": 0.004,
+                "evaluation_stage": "REJECTED_PREDICTIVE",
+                "matrix_values": {
+                    "architecture_family": "linear_baseline",
+                    "feature_family": "price_liquidity",
+                    "validation.initial_train_years": 3,
+                },
+            },
+            {
+                "model_suite": "full",
+                "primary_score": -0.002,
+                "evaluation_stage": "REJECTED_PREDICTIVE",
+                "matrix_values": {
+                    "architecture_family": "tree_challenger",
+                    "feature_family": "price_core",
+                    "validation.initial_train_years": 2,
+                },
+            },
+        ]
+    }
+    base_spec = {
+        "experiment_id": "phase1-macmini-autoloop-g2",
+        "phase": 1,
+        "target": "local",
+        "generation": 2,
+        "family_root": "phase1-macmini-autoloop",
+        "proposal_policy": {
+            "allowed_dimensions": [
+                "architecture_family",
+                "feature_family",
+                "validation.initial_train_years",
+                "data_profile",
+            ],
+            "family_size_cap": 6,
+            "max_generations": 4,
+            "auto_launch_next_family": True,
+        },
+    }
+
+    proposal = experiments._build_next_family_proposal(  # noqa: SLF001
+        experiment_id="phase1-macmini-autoloop-g2",
+        base_spec=base_spec,
+        comparison=comparison,
+    )
+
+    matrix = proposal["next_spec"]["matrix"]
+    assert matrix["feature_family"] == ["price_liquidity"]
+    assert sorted(matrix["architecture_family"]) == ["linear_baseline", "tree_challenger"]
+    assert matrix["data_profile"] == ["phase1_default", "phase1_short_window", "phase1_long_window"]
+    assert "validation.initial_train_years" not in matrix
+
+
+def test_build_next_family_proposal_pivots_feature_family_after_architecture_window_sweep() -> None:
+    comparison = {
+        "rows": [
+            {
+                "model_suite": "ridge_only",
+                "primary_score": -0.001,
+                "evaluation_stage": "REJECTED_PREDICTIVE",
+                "matrix_values": {
+                    "architecture_family": "linear_baseline",
+                    "feature_family": "price_liquidity",
+                    "data_profile": "phase1_default",
+                },
+            },
+            {
+                "model_suite": "full",
+                "primary_score": -0.003,
+                "evaluation_stage": "REJECTED_PREDICTIVE",
+                "matrix_values": {
+                    "architecture_family": "tree_challenger",
+                    "feature_family": "price_liquidity",
+                    "data_profile": "phase1_short_window",
+                },
+            },
+        ]
+    }
+    base_spec = {
+        "experiment_id": "phase1-macmini-autoloop-g3",
+        "phase": 1,
+        "target": "local",
+        "generation": 3,
+        "family_root": "phase1-macmini-autoloop",
+        "matrix": {
+            "architecture_family": ["linear_baseline", "tree_challenger"],
+            "feature_family": ["price_liquidity"],
+            "data_profile": ["phase1_default", "phase1_short_window", "phase1_long_window"],
+        },
+        "proposal_policy": {
+            "allowed_dimensions": [
+                "architecture_family",
+                "feature_family",
+                "validation.initial_train_years",
+                "data_profile",
+            ],
+            "family_size_cap": 6,
+            "max_generations": 6,
+            "auto_launch_next_family": True,
+        },
+    }
+
+    proposal = experiments._build_next_family_proposal(  # noqa: SLF001
+        experiment_id="phase1-macmini-autoloop-g3",
+        base_spec=base_spec,
+        comparison=comparison,
+    )
+
+    matrix = proposal["next_spec"]["matrix"]
+    assert sorted(matrix["architecture_family"]) == ["linear_baseline", "tree_challenger"]
+    assert sorted(matrix["feature_family"]) == ["price_core", "price_short_horizon"]
+    assert matrix["data_profile"] == ["phase1_default"]
+    assert "validation.initial_train_years" not in matrix
 
 
 def test_supervise_experiment_autochains_next_family_when_policy_allows(tmp_path: Path, monkeypatch) -> None:

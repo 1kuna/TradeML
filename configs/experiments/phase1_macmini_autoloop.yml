@@ -38,5 +38,5 @@ proposal_policy:
     - feature_family
     - validation.initial_train_years
     - data_profile
-  max_generations: 2
+  max_generations: 6
   auto_launch_next_family: true
