@@ -382,8 +382,10 @@ def write_research_review_packet(
         raise ValueError(f"no research program state for {program_id!r}")
     current_experiment_id = str(state.get("current_experiment_id") or "")
     experiment_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=current_experiment_id) if current_experiment_id else {}
-    comparison = (
-        compare_experiment(
+    completed_runs = int(((experiment_summary.get("counts") or {}).get("COMPLETED", 0)) or 0)
+    comparison = {"rows": [], "best": None}
+    if current_experiment_id and completed_runs > 0:
+        comparison = compare_experiment(
             experiment_id=current_experiment_id,
             local_state=local_state,
             repo_root=repo_root,
@@ -391,9 +393,6 @@ def write_research_review_packet(
             targets_config_path=targets_config_path,
             python_executable=python_executable,
         )
-        if current_experiment_id
-        else {"rows": [], "best": None}
-    )
     payload = {
         "program_id": program_id,
         "generated_at": datetime.now(tz=UTC).isoformat(),

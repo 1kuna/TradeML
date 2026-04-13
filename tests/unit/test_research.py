@@ -207,6 +207,46 @@ def test_write_review_packet_writes_json_and_markdown(tmp_path: Path) -> None:
     assert payload["best_candidate_summary"]["best_candidate"] == "full"
 
 
+def test_write_review_packet_skips_compare_without_completed_runs(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    program_path = _program_spec(tmp_path)
+    spec = research._load_research_program_spec(program_path)  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=program_path, poll_seconds=30)  # noqa: SLF001
+    state["current_experiment_id"] = "perpetual-macmini-p1-f001"
+    research._write_program_state(local_state=local_state, program_id="perpetual-macmini", payload=state)  # noqa: SLF001
+
+    experiment_root = local_state / "experiments" / "perpetual-macmini-p1-f001"
+    experiment_root.mkdir(parents=True, exist_ok=True)
+    (experiment_root / "summary.json").write_text(
+        json.dumps(
+            {
+                "experiment_id": "perpetual-macmini-p1-f001",
+                "counts": {"PLANNED": 24},
+                "top_gate_failures": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def unexpected_compare(**kwargs):  # noqa: ANN001
+        raise AssertionError("compare_experiment should not run without completed runs")
+
+    monkeypatch.setattr(research, "compare_experiment", unexpected_compare)
+
+    packet = research.write_research_review_packet(
+        program_id="perpetual-macmini",
+        local_state=local_state,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert Path(packet["json_path"]).exists()
+    payload = json.loads(Path(packet["json_path"]).read_text(encoding="utf-8"))
+    assert payload["comparison_best"] is None
+
+
 def test_update_frontier_memory_records_lane_coverage_and_best_scores(tmp_path: Path) -> None:
     spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
     state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
