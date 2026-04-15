@@ -74,6 +74,7 @@ class CanonicalRuntime:
         self._write_raw_partition_fn = write_raw_partition_fn
         self._logged_unreadable_paths: set[tuple[str, str]] = set()
         self._log_dedupe_lock = threading.Lock()
+        self._merge_lock = threading.Lock()
         self._vendor_symbol_floor_cache: dict[tuple[str, str], str | None] = {}
         self._tiingo_supported_ticker_cache: dict[str, tuple[str | None, str | None]] | None = None
 
@@ -594,55 +595,73 @@ class CanonicalRuntime:
         partition = self.paths.raw_equities / f"date={day_value}"
         shard_root = partition / "shards"
         lock_path = partition / ".merge.lock"
-        self._acquire_file_lock(lock_path)
-        try:
-            frames = [pd.read_parquet(path) for path in sorted(shard_root.glob("*.parquet"))]
-            merged = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-            merged = self._merge_partition_frame(partition=partition, frame=merged) if not merged.empty else pd.DataFrame()
-            tmp_path = partition / f"data.{uuid.uuid4().hex}.tmp"
-            merged.to_parquet(tmp_path, index=False)
-            output = partition / "data.parquet"
-            os.replace(tmp_path, output)
-            symbols = (
-                merged.get("symbol", pd.Series(dtype="string")).dropna().astype("string").str.upper().drop_duplicates().tolist()
-                if not merged.empty
-                else []
-            )
-            source_names = {}
-            if not merged.empty and "symbol" in merged.columns and "source_name" in merged.columns:
-                latest_sources = (
-                    merged.assign(symbol=merged["symbol"].astype("string").str.upper())
-                    .dropna(subset=["symbol"])
-                    .drop_duplicates(subset=["symbol"], keep="first")
+        with self._merge_lock:
+            self._acquire_file_lock(lock_path)
+            try:
+                output = partition / "data.parquet"
+                shard_paths = sorted(shard_root.glob("*.parquet"))
+                if not shard_paths:
+                    return output
+                existing = self._read_partition_frame(output) if output.exists() else pd.DataFrame()
+                merged = existing
+                shard_batch_size = 128
+                for index in range(0, len(shard_paths), shard_batch_size):
+                    batch_paths = shard_paths[index : index + shard_batch_size]
+                    batch_frames = [pd.read_parquet(path) for path in batch_paths]
+                    if not batch_frames:
+                        continue
+                    batch_frame = pd.concat(batch_frames, ignore_index=True)
+                    if merged.empty:
+                        merged = batch_frame
+                    else:
+                        merged = pd.concat([merged, batch_frame], ignore_index=True)
+                    merged = self._dedupe_partition_frame(merged)
+                tmp_path = partition / f"data.{uuid.uuid4().hex}.tmp"
+                merged.to_parquet(tmp_path, index=False)
+                os.replace(tmp_path, output)
+                for shard_path in shard_paths:
+                    with contextlib.suppress(OSError):
+                        shard_path.unlink()
+                symbols = (
+                    merged.get("symbol", pd.Series(dtype="string")).dropna().astype("string").str.upper().drop_duplicates().tolist()
+                    if not merged.empty
+                    else []
                 )
-                source_names = {
-                    str(row["symbol"]).upper(): str(row["source_name"])
-                    for row in latest_sources[["symbol", "source_name"]].to_dict("records")
-                }
-            current_manifest = self.db.get_raw_partition_manifest(dataset="equities_eod", trading_date=day_value)
-            partition_revision = int(current_manifest.partition_revision + 1) if current_manifest is not None else 1
-            content_hash = self._partition_content_hash(symbols=symbols, row_count=len(merged))
-            self.db.replace_canonical_units_for_date(
-                dataset="equities_eod",
-                trading_date=day_value,
-                symbols=symbols,
-                partition_revision=partition_revision,
-                source_names=source_names,
-            )
-            self.db.upsert_raw_partition_manifest(
-                dataset="equities_eod",
-                trading_date=day_value,
-                partition_revision=partition_revision,
-                symbol_count=len(symbols),
-                row_count=len(merged),
-                symbols=symbols,
-                content_hash=content_hash,
-                status="HEALTHY",
-            )
-            return output
-        finally:
-            with contextlib.suppress(OSError):
-                lock_path.unlink()
+                source_names = {}
+                if not merged.empty and "symbol" in merged.columns and "source_name" in merged.columns:
+                    latest_sources = (
+                        merged.assign(symbol=merged["symbol"].astype("string").str.upper())
+                        .dropna(subset=["symbol"])
+                        .drop_duplicates(subset=["symbol"], keep="first")
+                    )
+                    source_names = {
+                        str(row["symbol"]).upper(): str(row["source_name"])
+                        for row in latest_sources[["symbol", "source_name"]].to_dict("records")
+                    }
+                current_manifest = self.db.get_raw_partition_manifest(dataset="equities_eod", trading_date=day_value)
+                partition_revision = int(current_manifest.partition_revision + 1) if current_manifest is not None else 1
+                content_hash = self._partition_content_hash(symbols=symbols, row_count=len(merged))
+                self.db.replace_canonical_units_for_date(
+                    dataset="equities_eod",
+                    trading_date=day_value,
+                    symbols=symbols,
+                    partition_revision=partition_revision,
+                    source_names=source_names,
+                )
+                self.db.upsert_raw_partition_manifest(
+                    dataset="equities_eod",
+                    trading_date=day_value,
+                    partition_revision=partition_revision,
+                    symbol_count=len(symbols),
+                    row_count=len(merged),
+                    symbols=symbols,
+                    content_hash=content_hash,
+                    status="HEALTHY",
+                )
+                return output
+            finally:
+                with contextlib.suppress(OSError):
+                    lock_path.unlink()
 
     @staticmethod
     def _partition_content_hash(*, symbols: list[str], row_count: int) -> str:
@@ -1075,6 +1094,11 @@ class CanonicalRuntime:
         existing_path = partition / "data.parquet"
         existing = self._read_partition_frame(existing_path, empty_columns=frame.columns) if existing_path.exists() else pd.DataFrame(columns=frame.columns)
         combined = pd.concat([existing, frame], ignore_index=True)
+        return self._dedupe_partition_frame(combined)
+
+    def _dedupe_partition_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Deduplicate a combined raw partition frame using canonical vendor ordering."""
+        combined = frame.copy()
         if combined.empty:
             return combined
         if "vendor_ts" in combined.columns:

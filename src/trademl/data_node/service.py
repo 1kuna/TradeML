@@ -216,8 +216,9 @@ class DataNodeService:
         heartbeat_interval_seconds: float = 30.0,
     ) -> list[str]:
         """Compatibility wrapper that now drains the planner-native queue."""
+        seed_date = datetime.now(tz=UTC).date().isoformat()
         if len(self.default_symbols) > 1 and not self.db.has_pending_planner_tasks(task_families=("canonical_bars",)) and self.db.has_pending_backfill():
-            self._seed_planner_tasks()
+            self._ensure_planner_backlog_seeded(trading_date=seed_date)
             if self.db.has_pending_planner_tasks(task_families=("canonical_bars",)):
                 migrated = self.db.mark_legacy_datewide_backfill_migrated()
                 if migrated:
@@ -227,7 +228,7 @@ class DataNodeService:
                     heartbeat_interval_seconds=heartbeat_interval_seconds,
                 )
         if self.default_symbols and self.db.has_pending_datewide_backfill():
-            self._seed_planner_tasks()
+            self._ensure_planner_backlog_seeded(trading_date=seed_date)
             if self.db.has_pending_planner_tasks(task_families=("canonical_bars",)):
                 migrated = self.db.mark_legacy_datewide_backfill_migrated()
                 if migrated:
@@ -341,15 +342,19 @@ class DataNodeService:
         heartbeat_interval_seconds: float = 30.0,
     ) -> list[str]:
         """Process planner-native canonical and auxiliary work."""
-        self._seed_planner_tasks(trading_date=trading_date)
+        self._ensure_planner_backlog_seeded(
+            trading_date=trading_date or datetime.now(tz=UTC).date().isoformat()
+        )
         changed_dates: list[str] = []
         futures: dict[object, str] = {}
         canonical_lane_widths = self._canonical_runtime._backfill_lane_widths()
         canonical_backlog_active = self.db.has_pending_planner_tasks(task_families=("canonical_bars", "canonical_repair")) or self.db.has_pending_backfill()
-        aux_task_kinds = {"REFERENCE", "EVENT", "MACRO"}
-        if not canonical_backlog_active and not self._auxiliary_runtime._core_auxiliary_incomplete():
-            aux_task_kinds.add("RESEARCH_ONLY")
-        aux_lane_widths = self._aux_lane_widths(task_kinds=aux_task_kinds)
+        aux_lane_widths: dict[str, int] = {}
+        if not canonical_backlog_active:
+            aux_task_kinds = {"REFERENCE", "EVENT", "MACRO"}
+            if not self._auxiliary_runtime._core_auxiliary_incomplete():
+                aux_task_kinds.add("RESEARCH_ONLY")
+            aux_lane_widths = self._aux_lane_widths(task_kinds=aux_task_kinds)
         max_workers = max(1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values()))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for vendor, width in canonical_lane_widths.items():

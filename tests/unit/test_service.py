@@ -900,7 +900,7 @@ def test_process_planner_queue_survives_auxiliary_lane_exception(tmp_path: Path)
     )
 
     service.default_symbols = ["AAPL"]
-    service._seed_planner_tasks = lambda trading_date=None: None  # type: ignore[method-assign]
+    service._ensure_planner_backlog_seeded = lambda trading_date=None: None  # type: ignore[method-assign]
     service._canonical_runtime._backfill_lane_widths = lambda: {}  # type: ignore[method-assign]
     service._aux_lane_widths = lambda task_kinds=None: {"alpaca": 1}  # type: ignore[method-assign]
     service._drain_auxiliary_lane = lambda vendor: (_ for _ in ()).throw(RuntimeError("aux boom"))  # type: ignore[method-assign]
@@ -922,7 +922,7 @@ def test_process_planner_queue_heartbeats_while_waiting_on_pending_lane(tmp_path
     )
 
     service.default_symbols = ["AAPL"]
-    service._seed_planner_tasks = lambda trading_date=None: None  # type: ignore[method-assign]
+    service._ensure_planner_backlog_seeded = lambda trading_date=None: None  # type: ignore[method-assign]
     service._canonical_runtime._backfill_lane_widths = lambda: {"alpaca": 2}  # type: ignore[method-assign]
     service._aux_lane_widths = lambda task_kinds=None: {}  # type: ignore[method-assign]
 
@@ -1041,6 +1041,33 @@ def test_ensure_planner_backlog_seeded_refreshes_existing_backlog_once_per_day(t
     service._ensure_planner_backlog_seeded(trading_date="2026-04-03")
     service._ensure_planner_backlog_seeded(trading_date="2026-04-03")
     service._ensure_planner_backlog_seeded(trading_date="2026-04-04")
+
+    assert calls == ["2026-04-03", "2026-04-04"]
+
+
+def test_process_planner_queue_reuses_daily_seed_guard(tmp_path: Path, monkeypatch) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL", "MSFT"]
+
+    calls: list[str] = []
+
+    def fake_seed(*, trading_date: str | None = None) -> None:
+        calls.append(str(trading_date))
+
+    monkeypatch.setattr(service, "_seed_planner_tasks", fake_seed)
+    monkeypatch.setattr(service, "_drain_canonical_lane", lambda vendor, exchange: [])
+    monkeypatch.setattr(service, "_drain_auxiliary_lane", lambda vendor: [])
+
+    service.process_planner_queue(trading_date="2026-04-03")
+    service.process_planner_queue(trading_date="2026-04-03")
+    service.process_planner_queue(trading_date="2026-04-04")
 
     assert calls == ["2026-04-03", "2026-04-04"]
 
@@ -2037,15 +2064,16 @@ def test_write_raw_partition_serializes_concurrent_same_day_writes(tmp_path: Pat
         source_name="alpaca",
     )
     entered_stale_read = threading.Event()
-    original_merge = service._canonical_runtime._merge_partition_frame
+    original_dedupe = service._canonical_runtime._dedupe_partition_frame
 
-    def delayed_merge(*, partition: Path, frame: pd.DataFrame) -> pd.DataFrame:
+    def delayed_dedupe(frame: pd.DataFrame) -> pd.DataFrame:
+        partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16"
         if not (partition / "data.parquet").exists() and not entered_stale_read.is_set():
             entered_stale_read.set()
             time.sleep(0.2)
-        return original_merge(partition=partition, frame=frame)
+        return original_dedupe(frame)
 
-    monkeypatch.setattr(service._canonical_runtime, "_merge_partition_frame", delayed_merge)
+    monkeypatch.setattr(service._canonical_runtime, "_dedupe_partition_frame", delayed_dedupe)
 
     base_row = {
         "date": "2025-12-16",
@@ -2073,6 +2101,43 @@ def test_write_raw_partition_serializes_concurrent_same_day_writes(tmp_path: Pat
 
     output = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "data.parquet")
     assert set(output["symbol"]) == {"AAPL", "MSFT"}
+    assert list((tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "shards").glob("*.parquet")) == []
+
+
+def test_write_raw_partition_consumes_merged_shards(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    base_row = {
+        "date": "2025-12-16",
+        "open": 10.0,
+        "high": 11.0,
+        "low": 9.0,
+        "close": 10.5,
+        "vwap": pd.NA,
+        "volume": 100,
+        "trade_count": pd.NA,
+        "ingested_at": pd.Timestamp.now(tz="UTC"),
+        "source_name": "alpaca",
+        "source_uri": "/bars",
+        "vendor_ts": pd.Timestamp("2025-12-16"),
+    }
+
+    service._write_raw_partition(pd.DataFrame([{**base_row, "symbol": "AAPL"}]), source_name="alpaca")
+    shard_root = tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "shards"
+    assert list(shard_root.glob("*.parquet")) == []
+
+    service._write_raw_partition(pd.DataFrame([{**base_row, "symbol": "MSFT"}]), source_name="alpaca")
+    output = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "data.parquet")
+
+    assert set(output["symbol"]) == {"AAPL", "MSFT"}
+    assert list(shard_root.glob("*.parquet")) == []
 
 
 def test_load_corp_actions_reference_skips_corrupt_parquet(tmp_path: Path) -> None:
@@ -2385,7 +2450,7 @@ def test_run_cluster_forever_backfill_curates_only_changed_dates(tmp_path: Path)
     assert captured["changed_dates"] == ["2026-04-01", "2026-04-02"]
 
 
-def test_process_planner_queue_skips_research_archive_while_canonical_backlog_exists(tmp_path: Path) -> None:
+def test_process_planner_queue_skips_auxiliary_lanes_while_canonical_backlog_exists(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.bulk_upsert_planner_tasks(
         [
@@ -2414,16 +2479,18 @@ def test_process_planner_queue_skips_research_archive_while_canonical_backlog_ex
     )
     service.default_symbols = ["AAPL"]
     calls: list[str] = []
+    aux_task_kind_calls: list[set[str]] = []
 
-    service._seed_planner_tasks = lambda **kwargs: None  # type: ignore[method-assign]
+    service._ensure_planner_backlog_seeded = lambda **kwargs: None  # type: ignore[method-assign]
     service._canonical_runtime._backfill_lane_widths = lambda: {"alpaca": 1}  # type: ignore[method-assign]
-    service._aux_lane_widths = lambda **kwargs: {"alpha_vantage": 1} if kwargs.get("task_kinds") == {"RESEARCH_ONLY"} else {}  # type: ignore[method-assign]
+    service._aux_lane_widths = lambda **kwargs: aux_task_kind_calls.append(set(kwargs.get("task_kinds") or ())) or {"alpha_vantage": 1}  # type: ignore[method-assign]
     service._drain_canonical_lane = lambda vendor, exchange: calls.append(f"canonical:{vendor}") or []  # type: ignore[method-assign]
     service._drain_auxiliary_lane = lambda vendor: calls.append(f"aux:{vendor}") or []  # type: ignore[method-assign]
 
     service.process_planner_queue(exchange="XNYS")
 
     assert calls == ["canonical:alpaca"]
+    assert aux_task_kind_calls == []
 
 
 def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfill(tmp_path: Path) -> None:
