@@ -319,7 +319,7 @@ def _readable_reference_files(reference_root: Path) -> set[str]:
     readable: set[str] = set()
     for path in reference_root.glob("*.parquet"):
         try:
-            pd.read_parquet(path, columns=[])
+            pq.read_metadata(path)
         except Exception:
             continue
         readable.add(path.name)

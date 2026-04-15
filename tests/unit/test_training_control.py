@@ -60,6 +60,37 @@ def test_evaluate_training_gates_ignores_unreadable_reference_parquet(tmp_path: 
     assert "macro_vintages" in readiness["phase1"]["blockers"]
 
 
+def test_evaluate_training_gates_checks_reference_parquet_via_metadata_only(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    reference_root = tmp_path / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    for name in ["corp_actions", "listing_history", "delistings", "sec_filings", "ticker_changes", "fred_vintagedates"]:
+        pd.DataFrame([{"symbol": "AAPL"}]).to_parquet(reference_root / f"{name}.parquet", index=False)
+    qc_root = tmp_path / "data" / "qc"
+    qc_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"dataset": "equities_eod", "status": "GREEN"}]).to_parquet(qc_root / "partition_status.parquet", index=False)
+    for series in training_control.default_macro_series():
+        partition = tmp_path / "data" / "raw" / "macros_fred" / f"series={series}"
+        partition.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([{"series_id": series, "value": 1.0}]).to_parquet(partition / "data.parquet", index=False)
+
+    original_read_parquet = training_control.pd.read_parquet
+
+    def guarded_read_parquet(path, *args, **kwargs):  # noqa: ANN001
+        if Path(path).parent == reference_root:
+            raise AssertionError("reference readability should not call pandas.read_parquet")
+        return original_read_parquet(path, *args, **kwargs)
+
+    monkeypatch.setattr(training_control.pd, "read_parquet", guarded_read_parquet)
+
+    readiness = evaluate_training_gates(data_root=tmp_path, stage_symbol_count=500, stage_years=10)
+
+    assert "macro_vintages" not in readiness["phase1"]["blockers"]
+    assert "listing_history" not in readiness["phase1"]["blockers"]
+
+
 def test_recommended_training_cutoff_uses_latest_complete_raw_partition_before_lagged_anchor(tmp_path: Path) -> None:
     raw_root = tmp_path / "data" / "raw" / "equities_bars"
     for trading_date, symbols in {
