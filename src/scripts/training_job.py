@@ -27,7 +27,7 @@ def main() -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--report-date", required=True)
-    parser.add_argument("--model-suite", default="full", choices=["full", "ridge_only"])
+    parser.add_argument("--model-suite", default="full", choices=["full", "ridge_only", "advanced"])
     parser.add_argument("--phase", type=int, required=True)
     parser.add_argument("--local-runtime-path", required=True)
     parser.add_argument("--shared-runtime-path", required=True)

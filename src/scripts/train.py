@@ -8,6 +8,7 @@ import pickle
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import yaml
@@ -25,6 +26,14 @@ from trademl.validation.cpcv import combinatorially_purged_cv
 from trademl.validation.dsr import deflated_sharpe_ratio
 from trademl.validation.pbo import probability_of_backtest_overfitting
 from trademl.validation.walk_forward import expanding_walk_forward
+
+
+def _load_catboost_components():
+    """Load CatBoost components only when the advanced lane is selected."""
+
+    from trademl.models.catboost import CatBoostModel, tune_catboost_via_walk_forward
+
+    return CatBoostModel, tune_catboost_via_walk_forward
 
 
 def _resolve_effective_end_date(qc: pd.DataFrame, report_date: str | None) -> pd.Timestamp:
@@ -111,7 +120,7 @@ def run_training(
     model_suite: str = "full",
 ) -> dict:
     """Run the end-to-end training workflow and persist a report."""
-    if model_suite not in {"full", "ridge_only"}:
+    if model_suite not in {"full", "ridge_only", "advanced"}:
         raise ValueError(f"unsupported model suite: {model_suite}")
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -177,7 +186,7 @@ def run_training(
     ridge_folds = expanding_walk_forward(normalized, feature_cols, "label_5d", lambda: RidgeModel(alpha=ridge_alpha), validation_config)
     lgbm_params: dict | None = None
     lgbm_folds = []
-    if model_suite == "full":
+    if model_suite in {"full", "advanced"}:
         lgbm_params = tune_lightgbm_via_walk_forward(
             normalized,
             feature_cols,
@@ -193,9 +202,31 @@ def run_training(
             lambda: LightGBMModel(n_trials=0, best_params=lgbm_params),
             validation_config,
         )
+    catboost_params: dict | None = None
+    catboost_folds = []
+    if model_suite == "advanced":
+        CatBoostModel, tune_catboost_via_walk_forward = _load_catboost_components()
+        catboost_params = tune_catboost_via_walk_forward(
+            normalized,
+            feature_cols,
+            "label_5d",
+            expanding_walk_forward,
+            validation_config,
+            n_trials=5,
+        )
+        catboost_folds = expanding_walk_forward(
+            normalized,
+            feature_cols,
+            "label_5d",
+            lambda: CatBoostModel(n_trials=0, best_params=catboost_params),
+            validation_config,
+        )
 
     ridge_predictions = pd.concat([fold.predictions for fold in ridge_folds], ignore_index=True)
     lgbm_predictions = pd.concat([fold.predictions for fold in lgbm_folds], ignore_index=True) if lgbm_folds else pd.DataFrame()
+    catboost_predictions = (
+        pd.concat([fold.predictions for fold in catboost_folds], ignore_index=True) if catboost_folds else pd.DataFrame()
+    )
     cpcv_results = combinatorially_purged_cv(
         normalized.dropna(subset=["label_5d"]),
         feature_cols,
@@ -276,8 +307,26 @@ def run_training(
                 "mean_rank_ic": float(pd.Series([fold.rank_ic for fold in lgbm_folds]).mean()) if lgbm_folds else 0.0,
                 "decile_chart_data": {f"fold_{idx + 1}": fold.bucket_returns for idx, fold in enumerate(lgbm_folds)},
             }
-            if model_suite == "full"
+            if model_suite in {"full", "advanced"}
             else {"skipped": True, "reason": "ridge_only_phase1_baseline"}
+        ),
+        "catboost": (
+            {
+                "params": catboost_params or {},
+                "folds": [
+                    {
+                        "rank_ic": fold.rank_ic,
+                        "decile_spread": fold.decile_spread,
+                        "hit_rate": fold.hit_rate,
+                        "bucket_returns": fold.bucket_returns,
+                    }
+                    for fold in catboost_folds
+                ],
+                "mean_rank_ic": float(pd.Series([fold.rank_ic for fold in catboost_folds]).mean()) if catboost_folds else 0.0,
+                "decile_chart_data": {f"fold_{idx + 1}": fold.bucket_returns for idx, fold in enumerate(catboost_folds)},
+            }
+            if model_suite == "advanced"
+            else {"skipped": True, "reason": "advanced_lane_not_selected"}
         ),
         "diagnostics": diagnostics,
         "assessment": assessment,
@@ -291,16 +340,26 @@ def run_training(
             normalized=normalized,
             ridge_predictions=ridge_predictions,
             lgbm_predictions=lgbm_predictions,
+            catboost_predictions=catboost_predictions,
             model_suite=model_suite,
             ridge_model=RidgeModel(alpha=ridge_alpha).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"]),
             lgbm_model=(
                 LightGBMModel(n_trials=0, best_params=lgbm_params).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"])
-                if model_suite == "full" and lgbm_params is not None
+                if model_suite in {"full", "advanced"} and lgbm_params is not None
+                else None
+            ),
+            catboost_model=(
+                _load_catboost_components()[0](n_trials=0, best_params=catboost_params).fit(
+                    normalized[feature_cols].fillna(0.0),
+                    normalized["label_5d"],
+                )
+                if model_suite == "advanced" and catboost_params is not None
                 else None
             ),
             report_preview={
                 "ridge_mean_rank_ic": float(pd.Series([fold.rank_ic for fold in ridge_folds]).mean()) if ridge_folds else 0.0,
                 "lightgbm_mean_rank_ic": float(pd.Series([fold.rank_ic for fold in lgbm_folds]).mean()) if lgbm_folds else 0.0,
+                "catboost_mean_rank_ic": float(pd.Series([fold.rank_ic for fold in catboost_folds]).mean()) if catboost_folds else 0.0,
                 "coverage": coverage,
                 "ridge_alpha": ridge_alpha,
                 "model_suite": model_suite,
@@ -319,7 +378,7 @@ def main() -> int:
     parser.add_argument("--config", default="configs/equities_xs.yml")
     parser.add_argument("--output-root", default=".")
     parser.add_argument("--report-date", default=None)
-    parser.add_argument("--model-suite", default="full", choices=["full", "ridge_only"])
+    parser.add_argument("--model-suite", default="full", choices=["full", "ridge_only", "advanced"])
     args = parser.parse_args()
 
     report = run_training(
@@ -342,9 +401,11 @@ def _persist_run_artifacts(
     normalized: pd.DataFrame,
     ridge_predictions: pd.DataFrame,
     lgbm_predictions: pd.DataFrame,
+    catboost_predictions: pd.DataFrame,
     model_suite: str,
     ridge_model: RidgeModel,
     lgbm_model: LightGBMModel | None,
+    catboost_model: Any | None,
     report_preview: dict,
 ) -> dict[str, str]:
     artifacts: dict[str, str] = {}
@@ -354,12 +415,15 @@ def _persist_run_artifacts(
             panel=panel,
             ridge_predictions=ridge_predictions,
             lgbm_predictions=lgbm_predictions,
+            catboost_predictions=catboost_predictions,
             model_suite=model_suite,
         )
     )
     models = {"ridge": ridge_model}
     if lgbm_model is not None:
         models["lightgbm"] = lgbm_model
+    if catboost_model is not None:
+        models["catboost"] = catboost_model
     for model_name, model in models.items():
         run_dir = output_root / "models" / model_name / f"run_{run_ts}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -389,6 +453,7 @@ def _persist_backtest_inputs(
     panel: pd.DataFrame,
     ridge_predictions: pd.DataFrame,
     lgbm_predictions: pd.DataFrame,
+    catboost_predictions: pd.DataFrame,
     model_suite: str,
 ) -> dict[str, str]:
     inputs_root = output_root / "artifacts" / "backtest_inputs"
@@ -412,6 +477,11 @@ def _persist_backtest_inputs(
         artifacts.update(lgbm_payload)
         if model_suite == "full":
             primary_prefix = "lightgbm"
+    if not catboost_predictions.empty:
+        catboost_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="catboost", predictions=catboost_predictions)
+        artifacts.update(catboost_payload)
+        if model_suite == "advanced":
+            primary_prefix = "catboost"
     artifacts["primary_predictions_path"] = artifacts[f"{primary_prefix}_predictions_path"]
     artifacts["primary_targets_path"] = artifacts[f"{primary_prefix}_targets_path"]
     return artifacts
@@ -445,6 +515,7 @@ def _write_training_log(*, output_root: Path, run_ts: str, report: dict) -> Path
         f"window={report['window_start']}..{report['window_end']}",
         f"ridge_mean_rank_ic={report['ridge']['mean_rank_ic']:.4f}",
         f"lightgbm_mean_rank_ic={report.get('lightgbm', {}).get('mean_rank_ic', 0.0):.4f}",
+        f"catboost_mean_rank_ic={report.get('catboost', {}).get('mean_rank_ic', 0.0):.4f}",
         f"model_suite={report.get('model_suite', 'full')}",
         f"assessment={report['assessment']['decision']}",
         f"artifact_paths={json.dumps(report['artifacts'])}",
