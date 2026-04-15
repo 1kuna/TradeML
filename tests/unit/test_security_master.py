@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import trademl.reference.security_master as security_master
 from trademl.reference.security_master import build_listing_history, build_ticker_changes, rebuild_derived_references
 
 
@@ -96,3 +97,46 @@ def test_rebuild_derived_references_writes_listing_and_ticker_change_outputs(tmp
     assert reference_root / "ticker_changes.parquet" in outputs
     assert (reference_root / "listing_history.parquet").exists()
     assert (reference_root / "ticker_changes.parquet").exists()
+
+
+def test_rebuild_derived_references_skips_cached_universe_rebuild_when_inputs_unchanged(tmp_path: Path, monkeypatch) -> None:
+    reference_root = tmp_path / "data" / "reference"
+    raw_bars_root = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-04-01"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    raw_bars_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "symbol": "AAPL",
+                "name": "Apple Inc.",
+                "exchange": "NASDAQ",
+                "assetType": "Stock",
+                "ipoDate": "1980-12-12",
+                "delistingDate": None,
+                "status": "Active",
+            }
+        ]
+    ).to_parquet(reference_root / "listings.parquet", index=False)
+    pd.DataFrame(
+        [
+            {
+                "date": "2026-04-01",
+                "symbol": "AAPL",
+                "close": 100.0,
+                "volume": 1_000_000,
+            }
+        ]
+    ).to_parquet(raw_bars_root / "data.parquet", index=False)
+
+    first_outputs = rebuild_derived_references(reference_root)
+    assert (reference_root / ".derived_references_state.json").exists()
+
+    monkeypatch.setattr(
+        security_master,
+        "build_universe_snapshots",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("unexpected rebuild")),
+    )
+
+    second_outputs = rebuild_derived_references(reference_root)
+
+    assert first_outputs == second_outputs

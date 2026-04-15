@@ -1,11 +1,15 @@
-"""Derived free security-master builders for listing history and ticker changes."""
+"""Derived free security-master builders for Phase 2 reference artifacts."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import hashlib
+import json
 from pathlib import Path
 
 import pandas as pd
+
+from trademl.reference.universe import build_time_varying_universe
 
 
 def build_listing_history(
@@ -230,8 +234,295 @@ def build_ticker_changes(symbol_changes: pd.DataFrame, *, as_of: str | None = No
     return normalized[_ticker_change_columns()].drop_duplicates().sort_values(["change_date", "old_symbol", "new_symbol"]).reset_index(drop=True)
 
 
+def build_security_master(
+    *,
+    listing_history: pd.DataFrame,
+    ticker_changes: pd.DataFrame | None = None,
+    sec_company_tickers: pd.DataFrame | None = None,
+    as_of: str | None = None,
+) -> pd.DataFrame:
+    """Build a normalized security master with issuer linkage and rename continuity."""
+    if listing_history.empty:
+        return pd.DataFrame(columns=_security_master_columns())
+    verified_at = pd.Timestamp(as_of or datetime.now(tz=UTC))
+    listing = listing_history.copy()
+    listing["symbol"] = listing.get("symbol", pd.Series(dtype="string")).astype("string").str.strip().str.upper()
+    listing["ipo_date"] = _normalize_date_series(listing.get("ipo_date"))
+    listing["delist_date"] = _normalize_date_series(listing.get("delist_date"))
+
+    cik_map: dict[str, str] = {}
+    if sec_company_tickers is not None and not sec_company_tickers.empty:
+        ticker_col = "ticker" if "ticker" in sec_company_tickers.columns else "symbol"
+        cik_col = "cik_str" if "cik_str" in sec_company_tickers.columns else "cik"
+        cik_rows = sec_company_tickers[[ticker_col, cik_col]].dropna()
+        cik_map = {
+            str(row[ticker_col]).strip().upper(): str(row[cik_col]).strip()
+            for row in cik_rows.to_dict("records")
+            if str(row[ticker_col]).strip() and str(row[cik_col]).strip()
+        }
+
+    old_to_new: dict[str, tuple[str, str | None, pd.Timestamp | None]] = {}
+    if ticker_changes is not None and not ticker_changes.empty:
+        normalized_changes = ticker_changes.copy()
+        normalized_changes["old_symbol"] = normalized_changes.get("old_symbol", pd.Series(dtype="string")).astype("string").str.strip().str.upper()
+        normalized_changes["new_symbol"] = normalized_changes.get("new_symbol", pd.Series(dtype="string")).astype("string").str.strip().str.upper()
+        normalized_changes["change_date"] = _normalize_date_series(normalized_changes.get("change_date"))
+        normalized_changes["cik"] = normalized_changes.get("cik", pd.Series(dtype="string")).astype("string")
+        for row in normalized_changes.dropna(subset=["old_symbol", "new_symbol"]).to_dict("records"):
+            old_to_new[str(row["old_symbol"])] = (
+                str(row["new_symbol"]),
+                str(row["cik"]).strip() or None,
+                row.get("change_date"),
+            )
+
+    rows: list[dict[str, object]] = []
+    for row in listing.to_dict("records"):
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        chain_target, chain_cik, change_date = old_to_new.get(symbol, (symbol, None, None))
+        cik = chain_cik or cik_map.get(symbol) or cik_map.get(chain_target)
+        issuer_key = f"cik:{cik}" if cik else f"symbol:{chain_target}"
+        rows.append(
+            {
+                "issuer_key": issuer_key,
+                "cik": cik,
+                "symbol": symbol,
+                "primary_symbol": chain_target,
+                "name": row.get("name"),
+                "exchange": row.get("exchange"),
+                "asset_type": row.get("asset_type"),
+                "ipo_date": row.get("ipo_date"),
+                "delist_date": row.get("delist_date"),
+                "change_date": change_date,
+                "status": row.get("status"),
+                "sources": row.get("sources"),
+                "last_verified": verified_at,
+            }
+        )
+    return pd.DataFrame(rows, columns=_security_master_columns()).sort_values(
+        ["issuer_key", "symbol", "ipo_date"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def build_earnings_calendar_pit(*, earnings_frames: list[pd.DataFrame], as_of: str | None = None) -> pd.DataFrame:
+    """Build a normalized PIT earnings calendar from corroborating free sources."""
+    normalized: list[pd.DataFrame] = []
+    verified_at = pd.Timestamp(as_of or datetime.now(tz=UTC))
+    for frame in earnings_frames:
+        if frame is None or frame.empty:
+            continue
+        source = _first_nonempty(frame.get("source", pd.Series(dtype="string")))
+        normalized.append(
+            pd.DataFrame(
+                {
+                    "symbol": frame.get("symbol", frame.get("ticker", pd.Series(dtype="string"))).astype("string").str.strip().str.upper(),
+                    "earnings_date": _normalize_date_series(frame.get("date", frame.get("earnings_date"))),
+                    "fiscal_period": frame.get("fiscalDateEnding", frame.get("fiscal_period", pd.Series(dtype="string"))).astype("string"),
+                    "source": frame.get("source", pd.Series([source or "unknown"] * len(frame), dtype="string")).astype("string"),
+                    "last_verified": pd.Series([verified_at] * len(frame)),
+                }
+            )
+        )
+    if not normalized:
+        return pd.DataFrame(columns=_earnings_calendar_columns())
+    combined = pd.concat(normalized, ignore_index=True)
+    combined = combined.dropna(subset=["symbol", "earnings_date"])
+    if combined.empty:
+        return pd.DataFrame(columns=_earnings_calendar_columns())
+    grouped = (
+        combined.groupby(["symbol", "earnings_date", "fiscal_period"], dropna=False)
+        .agg(
+            source_count=("source", lambda values: len({str(value) for value in values if str(value)})),
+            sources=("source", lambda values: ",".join(sorted({str(value) for value in values if str(value)}))),
+            last_verified=("last_verified", "max"),
+        )
+        .reset_index()
+    )
+    return grouped[_earnings_calendar_columns()].sort_values(["earnings_date", "symbol"]).reset_index(drop=True)
+
+
+def build_fundamentals_daily(
+    *,
+    company_profiles: pd.DataFrame | None = None,
+    companyfacts: pd.DataFrame | None = None,
+    financial_statements: pd.DataFrame | None = None,
+    as_of: str | None = None,
+) -> pd.DataFrame:
+    """Build a normalized long-form daily fundamentals table from free sources."""
+    verified_at = pd.Timestamp(as_of or datetime.now(tz=UTC))
+    rows: list[dict[str, object]] = []
+    if company_profiles is not None and not company_profiles.empty:
+        for item in company_profiles.to_dict("records"):
+            symbol = str(item.get("ticker") or item.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            for metric in ("marketCapitalization", "shareOutstanding", "finnhubIndustry", "exchange", "country"):
+                if metric not in item or item.get(metric) in (None, ""):
+                    continue
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "metric_date": verified_at.normalize(),
+                        "metric_name": metric,
+                        "metric_value": str(item.get(metric)),
+                        "source": "finnhub",
+                        "last_verified": verified_at,
+                    }
+                )
+    if financial_statements is not None and not financial_statements.empty:
+        for item in financial_statements.to_dict("records"):
+            symbol = str(item.get("symbol") or "").strip().upper()
+            metric_date = pd.to_datetime(item.get("date"), errors="coerce")
+            if not symbol or pd.isna(metric_date):
+                continue
+            for key, value in item.items():
+                if key in {"symbol", "date", "statement_type", "source"} or value in (None, ""):
+                    continue
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "metric_date": metric_date.normalize(),
+                        "metric_name": f"{item.get('statement_type', 'statement')}:{key}",
+                        "metric_value": str(value),
+                        "source": str(item.get("source") or "twelve_data"),
+                        "last_verified": verified_at,
+                    }
+                )
+    if companyfacts is not None and not companyfacts.empty:
+        for item in companyfacts.to_dict("records"):
+            symbol = str(item.get("symbol") or item.get("ticker") or "").strip().upper()
+            metric_name = str(item.get("metric_name") or item.get("fact") or "").strip()
+            metric_value = item.get("metric_value", item.get("value"))
+            metric_date = pd.to_datetime(item.get("metric_date", item.get("date")), errors="coerce")
+            if not symbol or not metric_name or metric_value in (None, "") or pd.isna(metric_date):
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "metric_date": metric_date.normalize(),
+                    "metric_name": metric_name,
+                    "metric_value": str(metric_value),
+                    "source": str(item.get("source") or "sec_edgar"),
+                    "last_verified": verified_at,
+                }
+            )
+    if not rows:
+        return pd.DataFrame(columns=_fundamentals_daily_columns())
+    frame = pd.DataFrame(rows, columns=_fundamentals_daily_columns()).drop_duplicates(
+        subset=["symbol", "metric_date", "metric_name", "source", "metric_value"],
+        keep="last",
+    )
+    return frame.sort_values(["metric_date", "symbol", "metric_name"]).reset_index(drop=True)
+
+
+def build_sec_filing_index(*, filing_index: pd.DataFrame, sec_company_tickers: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Normalize SEC filings into a symbol-aware filing index."""
+    if filing_index.empty:
+        return pd.DataFrame(columns=_sec_filing_index_columns())
+    ticker_by_cik: dict[str, str] = {}
+    if sec_company_tickers is not None and not sec_company_tickers.empty:
+        ticker_col = "ticker" if "ticker" in sec_company_tickers.columns else "symbol"
+        cik_col = "cik_str" if "cik_str" in sec_company_tickers.columns else "cik"
+        ticker_by_cik = {
+            str(row[cik_col]).strip(): str(row[ticker_col]).strip().upper()
+            for row in sec_company_tickers[[ticker_col, cik_col]].dropna().to_dict("records")
+            if str(row[cik_col]).strip() and str(row[ticker_col]).strip()
+        }
+    normalized = pd.DataFrame(
+        {
+            "cik": filing_index.get("cik", pd.Series(dtype="string")).astype("string").str.strip(),
+            "symbol": filing_index.get("symbol", pd.Series(dtype="string")).astype("string").str.strip().str.upper(),
+            "form": filing_index.get("form", pd.Series(dtype="string")).astype("string"),
+            "filing_date": _normalize_date_series(filing_index.get("filingDate", filing_index.get("filing_date"))),
+            "accepted_at": filing_index.get("acceptanceDateTime", filing_index.get("accepted_at", pd.Series(dtype="string"))).astype("string"),
+            "accession_number": filing_index.get("accessionNumber", filing_index.get("accession_number", pd.Series(dtype="string"))).astype("string"),
+            "source": filing_index.get("source", pd.Series(["sec_edgar"] * len(filing_index), dtype="string")).astype("string"),
+        }
+    )
+    normalized["symbol"] = normalized["symbol"].fillna("")
+    normalized.loc[normalized["symbol"] == "", "symbol"] = normalized["cik"].map(ticker_by_cik).fillna("")
+    normalized = normalized.dropna(subset=["cik", "filing_date", "form"])
+    normalized = normalized.loc[normalized["cik"] != ""].copy()
+    return normalized[_sec_filing_index_columns()].drop_duplicates().sort_values(
+        ["filing_date", "cik", "form"],
+    ).reset_index(drop=True)
+
+
+def build_macro_vintages(
+    *,
+    vintagedates: pd.DataFrame | None = None,
+    macro_root: Path | None = None,
+) -> pd.DataFrame:
+    """Build a normalized macro vintage coverage table."""
+    if vintagedates is not None and not vintagedates.empty:
+        frame = pd.DataFrame(
+            {
+                "series_id": vintagedates.get("series_id", pd.Series(dtype="string")).astype("string"),
+                "vintage_date": _normalize_date_series(vintagedates.get("vintage_date")),
+                "source": vintagedates.get("source", pd.Series(["fred"] * len(vintagedates), dtype="string")).astype("string"),
+            }
+        ).dropna(subset=["series_id", "vintage_date"])
+        if not frame.empty:
+            return frame[_macro_vintages_columns()].drop_duplicates().sort_values(["series_id", "vintage_date"]).reset_index(drop=True)
+    if macro_root is None or not macro_root.exists():
+        return pd.DataFrame(columns=_macro_vintages_columns())
+    rows: list[dict[str, object]] = []
+    for path in sorted(macro_root.glob("series=*/data.parquet")):
+        series_id = path.parent.name.partition("=")[2]
+        try:
+            frame = pd.read_parquet(path, columns=["vintage_date"])
+        except Exception:
+            continue
+        if frame.empty or "vintage_date" not in frame.columns:
+            continue
+        for vintage_date in pd.to_datetime(frame["vintage_date"], errors="coerce").dropna().dt.normalize().unique():
+            rows.append({"series_id": series_id, "vintage_date": vintage_date, "source": "fred"})
+    if not rows:
+        return pd.DataFrame(columns=_macro_vintages_columns())
+    return pd.DataFrame(rows, columns=_macro_vintages_columns()).drop_duplicates().sort_values(["series_id", "vintage_date"]).reset_index(drop=True)
+
+
+def build_universe_snapshots(
+    *,
+    listing_history: pd.DataFrame,
+    daily_bars: pd.DataFrame,
+    top_n: int = 500,
+    rebalance_frequency: str = "MS",
+) -> pd.DataFrame:
+    """Build time-varying universe snapshots from listing history and daily bars."""
+    if listing_history.empty or daily_bars.empty:
+        return pd.DataFrame(columns=["date", "symbol", "avg_dollar_volume", "rank"])
+    bars = daily_bars.copy()
+    bars["date"] = pd.to_datetime(bars["date"], errors="coerce").dt.normalize()
+    if bars["date"].dropna().empty:
+        return pd.DataFrame(columns=["date", "symbol", "avg_dollar_volume", "rank"])
+    rebalance_dates = (
+        pd.Series(sorted(bars["date"].dropna().unique()))
+        .dt.to_period("M")
+        .drop_duplicates()
+        .dt.to_timestamp(how="start")
+        .tolist()
+        if rebalance_frequency == "MS"
+        else sorted(bars["date"].dropna().unique().tolist())
+    )
+    return build_time_varying_universe(
+        listing_history=listing_history,
+        daily_bars=bars,
+        rebalance_dates=rebalance_dates,
+        top_n=top_n,
+    )
+
+
 def rebuild_derived_references(reference_root: Path) -> list[Path]:
     """Rebuild normalized derived reference files from raw collected source files."""
+    state_path = reference_root / ".derived_references_state.json"
+    input_fingerprint = _derived_reference_input_fingerprint(reference_root)
+    cached_outputs = _cached_derived_reference_outputs(state_path=state_path, input_fingerprint=input_fingerprint)
+    if cached_outputs is not None:
+        return cached_outputs
+
     outputs: list[Path] = []
     listing_inputs = {
         "listings": _read_optional_parquet(reference_root / "listings.parquet"),
@@ -248,14 +539,169 @@ def rebuild_derived_references(reference_root: Path) -> list[Path]:
         output.parent.mkdir(parents=True, exist_ok=True)
         listing_history.to_parquet(output, index=False)
         outputs.append(output)
+    else:
+        listing_history = pd.DataFrame(columns=_listing_history_columns())
 
     symbol_changes = _read_optional_parquet(reference_root / "symbol_changes.parquet")
     if not symbol_changes.empty:
         output = reference_root / "ticker_changes.parquet"
         output.parent.mkdir(parents=True, exist_ok=True)
-        build_ticker_changes(symbol_changes).to_parquet(output, index=False)
+        ticker_changes = build_ticker_changes(symbol_changes)
+        ticker_changes.to_parquet(output, index=False)
         outputs.append(output)
+    else:
+        ticker_changes = _read_optional_parquet(reference_root / "ticker_changes.parquet")
+
+    sec_company_tickers = _read_optional_parquet(reference_root / "sec_company_tickers.parquet")
+    if not listing_history.empty:
+        output = reference_root / "security_master.parquet"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        build_security_master(
+            listing_history=listing_history,
+            ticker_changes=ticker_changes,
+            sec_company_tickers=sec_company_tickers,
+        ).to_parquet(output, index=False)
+        outputs.append(output)
+
+    earnings_frames = [
+        _read_optional_parquet(reference_root / "earnings_calendar.parquet"),
+        _read_optional_parquet(reference_root / "earnings_calendar_fmp.parquet"),
+        _read_optional_parquet(reference_root / "earnings_calendar_twelve_data.parquet"),
+    ]
+    if any(not frame.empty for frame in earnings_frames):
+        output = reference_root / "earnings_calendar_pit.parquet"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        build_earnings_calendar_pit(earnings_frames=earnings_frames).to_parquet(output, index=False)
+        outputs.append(output)
+
+    company_profiles = _read_optional_parquet(reference_root / "company_profiles.parquet")
+    companyfacts = _read_optional_parquet(reference_root / "sec_companyfacts.parquet")
+    financial_statements = _read_optional_parquet(reference_root / "financial_statements_twelve_data.parquet")
+    if any(not frame.empty for frame in (company_profiles, companyfacts, financial_statements)):
+        output = reference_root / "fundamentals_daily.parquet"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        build_fundamentals_daily(
+            company_profiles=company_profiles,
+            companyfacts=companyfacts,
+            financial_statements=financial_statements,
+        ).to_parquet(output, index=False)
+        outputs.append(output)
+
+    sec_filings = _read_optional_parquet(reference_root / "sec_filings.parquet")
+    if not sec_filings.empty:
+        output = reference_root / "sec_filing_index.parquet"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        build_sec_filing_index(filing_index=sec_filings, sec_company_tickers=sec_company_tickers).to_parquet(output, index=False)
+        outputs.append(output)
+
+    macro_root = reference_root.parent / "raw" / "macros_fred"
+    macro_vintages = build_macro_vintages(
+        vintagedates=_read_optional_parquet(reference_root / "fred_vintagedates.parquet"),
+        macro_root=macro_root,
+    )
+    if not macro_vintages.empty:
+        output = reference_root / "macro_vintages.parquet"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        macro_vintages.to_parquet(output, index=False)
+        outputs.append(output)
+
+    raw_bars_root = reference_root.parent / "raw" / "equities_bars"
+    if not listing_history.empty and raw_bars_root.exists():
+        daily_frames: list[pd.DataFrame] = []
+        for path in sorted(raw_bars_root.glob("date=*/data.parquet")):
+            try:
+                daily_frames.append(pd.read_parquet(path, columns=["date", "symbol", "close", "volume"]))
+            except Exception:
+                continue
+        if daily_frames:
+            snapshots = build_universe_snapshots(
+                listing_history=listing_history,
+                daily_bars=pd.concat(daily_frames, ignore_index=True),
+                top_n=500,
+            )
+            if not snapshots.empty:
+                snapshots_root = reference_root / "universe_snapshots"
+                snapshots_root.mkdir(parents=True, exist_ok=True)
+                for snapshot_date, frame in snapshots.groupby("date", dropna=True):
+                    path = snapshots_root / f"date={pd.Timestamp(snapshot_date).strftime('%Y-%m-%d')}" / "data.parquet"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    frame.sort_values(["rank", "symbol"]).to_parquet(path, index=False)
+                    outputs.append(path)
+    _write_derived_reference_state(
+        state_path=state_path,
+        input_fingerprint=input_fingerprint,
+        outputs=outputs,
+    )
     return outputs
+
+
+def _derived_reference_input_fingerprint(reference_root: Path) -> str:
+    """Return a cheap content fingerprint for derived-reference rebuild inputs."""
+    candidates: list[Path] = []
+    for name in (
+        "listings.parquet",
+        "alpaca_assets.parquet",
+        "delistings.parquet",
+        "universe.parquet",
+        "company_profiles.parquet",
+        "tiingo_tickers.parquet",
+        "twelve_data_stocks.parquet",
+        "symbol_changes.parquet",
+        "ticker_changes.parquet",
+        "sec_company_tickers.parquet",
+        "earnings_calendar.parquet",
+        "earnings_calendar_fmp.parquet",
+        "earnings_calendar_twelve_data.parquet",
+        "sec_companyfacts.parquet",
+        "financial_statements_twelve_data.parquet",
+        "sec_filings.parquet",
+        "fred_vintagedates.parquet",
+    ):
+        candidates.append(reference_root / name)
+    for pattern in (
+        "../raw/macros_fred/series=*/data.parquet",
+        "../raw/equities_bars/date=*/data.parquet",
+    ):
+        candidates.extend(sorted(reference_root.glob(pattern)))
+    digest = hashlib.sha1()
+    for path in sorted({candidate.resolve() for candidate in candidates if candidate.exists()}):
+        stat = path.stat()
+        digest.update(str(path).encode("utf-8"))
+        digest.update(str(stat.st_size).encode("utf-8"))
+        digest.update(str(stat.st_mtime_ns).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _cached_derived_reference_outputs(*, state_path: Path, input_fingerprint: str) -> list[Path] | None:
+    """Return cached derived-reference outputs when the input fingerprint is unchanged."""
+    if not state_path.exists():
+        return None
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if payload.get("input_fingerprint") != input_fingerprint:
+        return None
+    outputs = [Path(str(value)) for value in payload.get("outputs", [])]
+    if not all(path.exists() for path in outputs):
+        return None
+    return outputs
+
+
+def _write_derived_reference_state(*, state_path: Path, input_fingerprint: str, outputs: list[Path]) -> None:
+    """Persist the last successful derived-reference rebuild fingerprint."""
+    state_path.write_text(
+        json.dumps(
+            {
+                "input_fingerprint": input_fingerprint,
+                "outputs": [str(path) for path in outputs],
+                "updated_at": datetime.now(tz=UTC).isoformat(),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _read_optional_parquet(path: Path) -> pd.DataFrame:
@@ -327,3 +773,37 @@ def _listing_history_columns() -> list[str]:
 
 def _ticker_change_columns() -> list[str]:
     return ["old_symbol", "new_symbol", "change_date", "cik", "reason", "source", "last_verified"]
+
+
+def _security_master_columns() -> list[str]:
+    return [
+        "issuer_key",
+        "cik",
+        "symbol",
+        "primary_symbol",
+        "name",
+        "exchange",
+        "asset_type",
+        "ipo_date",
+        "delist_date",
+        "change_date",
+        "status",
+        "sources",
+        "last_verified",
+    ]
+
+
+def _earnings_calendar_columns() -> list[str]:
+    return ["symbol", "earnings_date", "fiscal_period", "source_count", "sources", "last_verified"]
+
+
+def _fundamentals_daily_columns() -> list[str]:
+    return ["symbol", "metric_date", "metric_name", "metric_value", "source", "last_verified"]
+
+
+def _sec_filing_index_columns() -> list[str]:
+    return ["cik", "symbol", "form", "filing_date", "accepted_at", "accession_number", "source"]
+
+
+def _macro_vintages_columns() -> list[str]:
+    return ["series_id", "vintage_date", "source"]

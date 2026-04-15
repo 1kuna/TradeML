@@ -12,7 +12,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -209,7 +209,12 @@ class DataNodeService:
             return []
         return self._write_raw_shard_partition(frame, shard_id=shard_id, source_name=source_name)
 
-    def process_backfill_queue(self) -> list[str]:
+    def process_backfill_queue(
+        self,
+        *,
+        heartbeat_fn: Callable[[], object] | None = None,
+        heartbeat_interval_seconds: float = 30.0,
+    ) -> list[str]:
         """Compatibility wrapper that now drains the planner-native queue."""
         if len(self.default_symbols) > 1 and not self.db.has_pending_planner_tasks(task_families=("canonical_bars",)) and self.db.has_pending_backfill():
             self._seed_planner_tasks()
@@ -217,19 +222,75 @@ class DataNodeService:
                 migrated = self.db.mark_legacy_datewide_backfill_migrated()
                 if migrated:
                     LOGGER.info("migrated_legacy_backfill_rows count=%s", migrated)
-                return self.process_planner_queue()
+                return self.process_planner_queue(
+                    heartbeat_fn=heartbeat_fn,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                )
         if self.default_symbols and self.db.has_pending_datewide_backfill():
             self._seed_planner_tasks()
             if self.db.has_pending_planner_tasks(task_families=("canonical_bars",)):
                 migrated = self.db.mark_legacy_datewide_backfill_migrated()
                 if migrated:
                     LOGGER.info("migrated_legacy_datewide_backfill count=%s", migrated)
-                return self.process_planner_queue()
+                return self.process_planner_queue(
+                    heartbeat_fn=heartbeat_fn,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                )
         if self.db.has_pending_backfill():
-            return self._process_legacy_backfill_queue()
-        return self.process_planner_queue()
+            return self._process_legacy_backfill_queue(
+                heartbeat_fn=heartbeat_fn,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+            )
+        return self.process_planner_queue(
+            heartbeat_fn=heartbeat_fn,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        )
 
-    def _process_legacy_backfill_queue(self) -> list[str]:
+    def _drain_lane_futures(
+        self,
+        futures: dict[object, str],
+        *,
+        heartbeat_fn: Callable[[], object] | None = None,
+        heartbeat_interval_seconds: float = 30.0,
+        wait_timeout_seconds: float = 0.5,
+    ) -> list[tuple[str, object]]:
+        """Drain lane futures without blocking heartbeats behind one slow lane."""
+        pending = dict(futures)
+        results: list[tuple[str, object]] = []
+        last_heartbeat = monotonic()
+        last_pending_log = monotonic()
+        while pending:
+            done, _pending = wait(list(pending), return_when=FIRST_COMPLETED, timeout=wait_timeout_seconds)
+            if not done:
+                now = monotonic()
+                if heartbeat_fn is not None and (now - last_heartbeat) >= heartbeat_interval_seconds:
+                    try:
+                        heartbeat_fn()
+                    except Exception:
+                        LOGGER.exception("planner_queue_heartbeat_failed worker_id=%s", self.worker_id)
+                    last_heartbeat = now
+                if (now - last_pending_log) >= max(5.0, heartbeat_interval_seconds):
+                    lane_counts: dict[str, int] = {}
+                    for lane in pending.values():
+                        lane_counts[lane] = lane_counts.get(lane, 0) + 1
+                    LOGGER.warning(
+                        "planner_queue_waiting worker_id=%s pending=%s",
+                        self.worker_id,
+                        lane_counts,
+                    )
+                    last_pending_log = now
+                continue
+            for future in done:
+                lane = pending.pop(future)
+                results.append((lane, future))
+        return results
+
+    def _process_legacy_backfill_queue(
+        self,
+        *,
+        heartbeat_fn: Callable[[], object] | None = None,
+        heartbeat_interval_seconds: float = 30.0,
+    ) -> list[str]:
         """Drain legacy date/symbol backfill rows during the migration window."""
         lane_widths = self._canonical_runtime._backfill_lane_widths()
         if not lane_widths:
@@ -253,22 +314,41 @@ class DataNodeService:
                     break
                 if not futures:
                     continue
-                done, _pending = wait(list(futures), return_when=FIRST_COMPLETED, timeout=0.1)
-                for future in done:
+                done = self._drain_lane_futures(
+                    futures,
+                    heartbeat_fn=heartbeat_fn,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                    wait_timeout_seconds=0.1,
+                )
+                for _lane, future in done:
                     changed_dates.extend(future.result())
                     futures.pop(future, None)
-            for future in list(futures):
+            for _lane, future in self._drain_lane_futures(
+                futures,
+                heartbeat_fn=heartbeat_fn,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                wait_timeout_seconds=0.1,
+            ):
                 changed_dates.extend(future.result())
         return sorted(set(changed_dates))
 
-    def process_planner_queue(self, *, trading_date: str | None = None, exchange: str = "XNYS") -> list[str]:
+    def process_planner_queue(
+        self,
+        *,
+        trading_date: str | None = None,
+        exchange: str = "XNYS",
+        heartbeat_fn: Callable[[], object] | None = None,
+        heartbeat_interval_seconds: float = 30.0,
+    ) -> list[str]:
         """Process planner-native canonical and auxiliary work."""
         self._seed_planner_tasks(trading_date=trading_date)
         changed_dates: list[str] = []
         futures: dict[object, str] = {}
         canonical_lane_widths = self._canonical_runtime._backfill_lane_widths()
         canonical_backlog_active = self.db.has_pending_planner_tasks(task_families=("canonical_bars", "canonical_repair")) or self.db.has_pending_backfill()
-        aux_task_kinds = {"RESEARCH_ONLY"} if canonical_backlog_active else {"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"}
+        aux_task_kinds = {"REFERENCE", "EVENT", "MACRO"}
+        if not canonical_backlog_active and not self._auxiliary_runtime._core_auxiliary_incomplete():
+            aux_task_kinds.add("RESEARCH_ONLY")
         aux_lane_widths = self._aux_lane_widths(task_kinds=aux_task_kinds)
         max_workers = max(1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values()))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -278,7 +358,11 @@ class DataNodeService:
             for vendor, width in aux_lane_widths.items():
                 for _ in range(max(1, width)):
                     futures[executor.submit(self._drain_auxiliary_lane, vendor)] = "auxiliary"
-            for future, task_type in futures.items():
+            for task_type, future in self._drain_lane_futures(
+                futures,
+                heartbeat_fn=heartbeat_fn,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+            ):
                 try:
                     result = future.result()
                 except Exception:
@@ -315,15 +399,18 @@ class DataNodeService:
             self.db.prune_planner_tasks(task_families=("canonical_bars",), valid_task_keys=canonical_task_keys)
         task_rows: list[dict[str, object]] = []
         progress_rows: list[dict[str, object]] = []
-        canonical_task_map = {
-            task.task_key: task
-            for task in self.db.fetch_planner_tasks(task_family="canonical_bars")
-        }
+        task_keys = [task.task_key for task in planned]
+        canonical_status_map = self.db.fetch_planner_task_status_map(
+            task_families=("canonical_bars",),
+            task_keys=task_keys,
+        )
+        existing_progress_counts = self.db.fetch_planner_task_progress_counts(task_keys)
         regressed_task_keys: list[str] = []
         for task in planned:
             task_family = task.task_family
             if task_family == "auxiliary":
                 task_family = self._planner_family_for_dataset(task.dataset)
+            backlog_class = self._planner_backlog_class(task_family=task_family, planner_group=task.planner_group)
             task_rows.append(
                 {
                     "task_key": task.task_key,
@@ -337,30 +424,36 @@ class DataNodeService:
                     "symbols": list(task.symbols),
                     "eligible_vendors": list(task.preferred_vendors),
                     "output_name": task.output_name,
-                    "payload": task.payload,
+                    "payload": {**dict(task.payload or {}), "backlog_class": backlog_class},
                 }
             )
         self.db.bulk_upsert_planner_tasks(task_rows)
-        existing_progress_map = self.db.planner_task_progress_map()
         for task in planned:
             task_family = task.task_family
             if task_family == "auxiliary":
                 task_family = self._planner_family_for_dataset(task.dataset)
             if task_family == "canonical_bars":
-                existing_task = canonical_task_map.get(task.task_key)
-                existing_progress = existing_progress_map.get(task.task_key)
+                existing_status = canonical_status_map.get(task.task_key)
+                existing_progress = existing_progress_counts.get(task.task_key)
+                # Startup seeding should trust already-settled coverage. Recent-date verification
+                # and explicit repair passes are the mechanisms that reopen stale canonical work.
+                if existing_status in {"SUCCESS", "PERMANENT_FAILED"} and existing_progress is not None:
+                    continue
                 progress_payload = self._canonical_runtime._canonical_progress_for_scope(
                     dataset=task.dataset,
                     symbols=list(task.symbols),
                     trading_days=list(task.payload.get("trading_days", [])),
                 )
                 if (
-                    existing_task is not None
-                    and existing_task.status in {"SUCCESS", "PERMANENT_FAILED"}
+                    existing_status in {"SUCCESS", "PERMANENT_FAILED"}
                     and int(progress_payload["remaining_units"]) > 0
                 ):
                     regressed_task_keys.append(task.task_key)
-                if existing_progress is not None and existing_progress.completed_units == progress_payload["completed_units"] and existing_progress.remaining_units == progress_payload["remaining_units"]:
+                if (
+                    existing_progress is not None
+                    and existing_progress[0] == progress_payload["completed_units"]
+                    and existing_progress[1] == progress_payload["remaining_units"]
+                ):
                     continue
                 progress_rows.append(
                     {
@@ -370,11 +463,14 @@ class DataNodeService:
                         "remaining_units": progress_payload["remaining_units"],
                         "completed_symbols": progress_payload["completed_symbols"],
                         "remaining_symbols": progress_payload["remaining_symbols"],
-                        "state": {"scope_kind": task.scope_kind},
+                        "state": {
+                            "scope_kind": task.scope_kind,
+                            "backlog_class": self._planner_backlog_class(task_family=task_family, planner_group=task.planner_group),
+                        },
                     }
                 )
             else:
-                if task.task_key in existing_progress_map:
+                if task.task_key in existing_progress_counts:
                     continue
                 progress_rows.append(
                     {
@@ -382,7 +478,10 @@ class DataNodeService:
                         "expected_units": 1,
                         "completed_units": 0,
                         "remaining_units": 1,
-                        "state": {"scope_kind": task.scope_kind},
+                        "state": {
+                            "scope_kind": task.scope_kind,
+                            "backlog_class": self._planner_backlog_class(task_family=task_family, planner_group=task.planner_group),
+                        },
                     }
                 )
         self.db.bulk_update_planner_task_progress(progress_rows)
@@ -1014,7 +1113,10 @@ class DataNodeService:
 
         def backfill_iteration(*, local_day: str, current_local: datetime, pending_backfill: bool) -> None:
             if self._acquire_backfill_singleton(coordinator=coordinator, bucket_key=local_day, pending_backfill=pending_backfill):
-                changed_dates = self.process_backfill_queue()
+                changed_dates = self.process_backfill_queue(
+                    heartbeat_fn=coordinator.heartbeat_worker,
+                    heartbeat_interval_seconds=float(getattr(coordinator, "heartbeat_interval_seconds", 30)),
+                )
                 if changed_dates:
                     self.curate_dates(
                         corp_actions=self.load_corp_actions_reference(),
@@ -1143,65 +1245,67 @@ class DataNodeService:
             current_et = current.astimezone(market_tz)
             current_local = current.astimezone()
             trading_date = current_et.date().isoformat()
+            try:
+                if before_iteration_fn is not None:
+                    before_iteration_fn(
+                        current=current,
+                        current_et=current_et,
+                        current_local=current_local,
+                        trading_date=trading_date,
+                    )
 
-            if before_iteration_fn is not None:
-                before_iteration_fn(
-                    current=current,
-                    current_et=current_et,
-                    current_local=current_local,
-                    trading_date=trading_date,
-                )
+                self._ensure_planner_backlog_seeded(trading_date=trading_date)
+                released = self._release_budget_blocked_canonical_tasks()
+                if released:
+                    LOGGER.warning("released_budget_blocked_canonical_tasks count=%s", released)
 
-            self._ensure_planner_backlog_seeded(trading_date=trading_date)
-            released = self._release_budget_blocked_canonical_tasks()
-            if released:
-                LOGGER.warning("released_budget_blocked_canonical_tasks count=%s", released)
-
-            if self._should_run_collection(
-                trading_date=trading_date,
-                current_et=current_et,
-                collection_hour=collection_hour,
-                collection_minute=collection_minute,
-                exchange=exchange,
-            ):
-                collect_fn(
+                if self._should_run_collection(
                     trading_date=trading_date,
                     current_et=current_et,
-                    current_local=current_local,
-                )
-                self._collection_history.add(trading_date)
-
-            local_day = current_local.date().isoformat()
-            pending_backfill = self.db.has_pending_planner_tasks() or self.db.has_pending_backfill()
-            should_run_backfill = self._should_run_maintenance(
-                local_day=local_day,
-                current_local=current_local,
-                maintenance_hour_local=maintenance_hour_local,
-            ) or (backfill_when_pending and pending_backfill)
-            if should_run_backfill:
-                backfill_fn(
-                    local_day=local_day,
-                    current_local=current_local,
-                    pending_backfill=pending_backfill,
-                )
-            if local_day not in self._verification_history and current_local.hour >= maintenance_hour_local:
-                verification = self.verify_recent_canonical_dates(days=7, verify_only=False)
-                if verification.get("seeded_tasks", 0):
-                    LOGGER.warning("seeded_canonical_repairs count=%s", verification["seeded_tasks"])
-                self._verification_history.add(local_day)
-
-            if (
-                after_backlog_clear_fn is not None
-                and not self.db.has_pending_planner_tasks(task_families=("canonical_bars",))
-                and not self.db.has_pending_backfill()
-            ):
-                anchor_date = self._latest_raw_date()
-                if anchor_date:
-                    after_backlog_clear_fn(
-                        trading_date=anchor_date,
+                    collection_hour=collection_hour,
+                    collection_minute=collection_minute,
+                    exchange=exchange,
+                ):
+                    collect_fn(
+                        trading_date=trading_date,
                         current_et=current_et,
                         current_local=current_local,
                     )
+                    self._collection_history.add(trading_date)
+
+                local_day = current_local.date().isoformat()
+                pending_backfill = self.db.has_pending_planner_tasks() or self.db.has_pending_backfill()
+                should_run_backfill = self._should_run_maintenance(
+                    local_day=local_day,
+                    current_local=current_local,
+                    maintenance_hour_local=maintenance_hour_local,
+                ) or (backfill_when_pending and pending_backfill)
+                if should_run_backfill:
+                    backfill_fn(
+                        local_day=local_day,
+                        current_local=current_local,
+                        pending_backfill=pending_backfill,
+                    )
+                if local_day not in self._verification_history and current_local.hour >= maintenance_hour_local:
+                    verification = self.verify_recent_canonical_dates(days=7, verify_only=False)
+                    if verification.get("seeded_tasks", 0):
+                        LOGGER.warning("seeded_canonical_repairs count=%s", verification["seeded_tasks"])
+                    self._verification_history.add(local_day)
+
+                if (
+                    after_backlog_clear_fn is not None
+                    and not self.db.has_pending_planner_tasks(task_families=("canonical_bars",))
+                    and not self.db.has_pending_backfill()
+                ):
+                    anchor_date = self._latest_raw_date()
+                    if anchor_date:
+                        after_backlog_clear_fn(
+                            trading_date=anchor_date,
+                            current_et=current_et,
+                            current_local=current_local,
+                        )
+            except Exception:
+                LOGGER.exception("scheduler_iteration_failed trading_date=%s", trading_date)
 
             if not self._stop_event.is_set():
                 sleep_fn(poll_seconds)
@@ -1336,6 +1440,25 @@ class DataNodeService:
         if dataset in {"macros_treasury", "vintagedates"}:
             return "macro"
         return "supplemental_research"
+
+    @staticmethod
+    def _planner_backlog_class(*, task_family: str, planner_group: str) -> str:
+        """Return the normalized backlog class used for scheduling and status."""
+        if planner_group == "phase1_pinned_canonical":
+            return "phase1_pinned"
+        if planner_group == "rolling_canonical":
+            return "rolling"
+        if planner_group == "canonical_repair" or task_family == "canonical_repair":
+            return "repair"
+        mapping = {
+            "canonical_bars": "canonical_bars",
+            "security_master": "security_master",
+            "corp_actions": "reference_events",
+            "events_filings": "reference_events",
+            "macro": "macro",
+            "supplemental_research": "research_archive",
+        }
+        return mapping.get(task_family, planner_group)
 
     @staticmethod
     def _rotate_symbols(symbols: list[str], *, limit: int, trading_date: str, rotation_key: str) -> list[str]:

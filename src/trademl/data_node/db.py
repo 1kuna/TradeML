@@ -1931,6 +1931,57 @@ class DataNodeDB:
             rows = connection.execute("SELECT * FROM planner_task_progress").fetchall()
         return {str(row["task_key"]): PlannerTaskProgress(**dict(row)) for row in rows}
 
+    def fetch_planner_task_status_map(
+        self,
+        *,
+        task_families: tuple[str, ...] | None = None,
+        task_keys: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, str]:
+        """Return planner task status keyed by task key for a filtered scope."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if task_families:
+            placeholders = ",".join("?" for _ in task_families)
+            clauses.append(f"task_family IN ({placeholders})")
+            params.extend(task_families)
+        if task_keys:
+            placeholders = ",".join("?" for _ in task_keys)
+            clauses.append(f"task_key IN ({placeholders})")
+            params.extend(str(task_key) for task_key in task_keys)
+        query = "SELECT task_key, status FROM planner_tasks"
+        if clauses:
+            query += f" WHERE {' AND '.join(clauses)}"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return {str(row["task_key"]): str(row["status"]) for row in rows}
+
+    def fetch_planner_task_progress_counts(
+        self,
+        task_keys: list[str] | tuple[str, ...],
+    ) -> dict[str, tuple[int, int]]:
+        """Return completed/remaining units keyed by task key for a targeted scope."""
+        if not task_keys:
+            return {}
+        rows: list[sqlite3.Row] = []
+        with self._connect() as connection:
+            for index in range(0, len(task_keys), 500):
+                chunk = [str(task_key) for task_key in task_keys[index : index + 500]]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    connection.execute(
+                        f"""
+                        SELECT task_key, completed_units, remaining_units
+                        FROM planner_task_progress
+                        WHERE task_key IN ({placeholders})
+                        """,
+                        chunk,
+                    ).fetchall()
+                )
+        return {
+            str(row["task_key"]): (int(row["completed_units"]), int(row["remaining_units"]))
+            for row in rows
+        }
+
     def planner_summary(self) -> dict[str, object]:
         """Return aggregate planner counts and progress."""
         with self._connect() as connection:
@@ -1956,9 +2007,18 @@ class DataNodeDB:
             backlog_rows = connection.execute(
                 """
                 SELECT CASE
+                         WHEN json_extract(planner_tasks.payload_json, '$.backlog_class') IS NOT NULL
+                           THEN json_extract(planner_tasks.payload_json, '$.backlog_class')
                          WHEN planner_tasks.planner_group = 'phase1_pinned_canonical' THEN 'phase1_pinned'
                          WHEN planner_tasks.planner_group = 'rolling_canonical' THEN 'rolling'
                          WHEN planner_tasks.planner_group = 'canonical_repair' THEN 'repair'
+                         WHEN planner_tasks.task_family = 'canonical_bars' THEN 'canonical_bars'
+                         WHEN planner_tasks.task_family = 'canonical_repair' THEN 'repair'
+                         WHEN planner_tasks.task_family = 'security_master' THEN 'security_master'
+                         WHEN planner_tasks.task_family = 'corp_actions' THEN 'reference_events'
+                         WHEN planner_tasks.task_family = 'events_filings' THEN 'reference_events'
+                         WHEN planner_tasks.task_family = 'macro' THEN 'macro'
+                         WHEN planner_tasks.task_family = 'supplemental_research' THEN 'research_archive'
                          ELSE planner_tasks.planner_group
                        END AS backlog_class,
                        SUM(planner_task_progress.expected_units) AS expected_units,
@@ -1967,7 +2027,6 @@ class DataNodeDB:
                 FROM planner_tasks
                 LEFT JOIN planner_task_progress
                   ON planner_tasks.task_key = planner_task_progress.task_key
-                WHERE planner_tasks.task_family IN ('canonical_bars', 'canonical_repair')
                 GROUP BY backlog_class
                 """
             ).fetchall()

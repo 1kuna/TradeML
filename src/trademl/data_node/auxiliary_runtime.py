@@ -123,7 +123,8 @@ class AuxiliaryRuntime:
                         failures.append(failure)
                     if result.deferred:
                         deferred[vendor] = deferred.get(vendor, 0) + int(result.deferred)
-        outputs.extend(rebuild_derived_references(self.paths.reference_root))
+        if outputs:
+            outputs.extend(rebuild_derived_references(self.paths.reference_root))
         deferred_messages = [f"{vendor}: deferred {count} jobs after budget exhaustion" for vendor, count in sorted(deferred.items())]
         return ReferenceCollectionResult(outputs=outputs, failures=failures, deferred=deferred_messages)
 
@@ -336,16 +337,11 @@ class AuxiliaryRuntime:
             if job.task_kind not in task_kinds:
                 continue
             profile = vendor_profile(job.vendor)
-            if (
-                canonical_pressure
-                and job.task_kind != "RESEARCH_ONLY"
-                and profile is not None
-                and profile.saturation_policy in {"canonical_first", "canonical_only"}
-            ):
+            if canonical_pressure and job.task_kind == "RESEARCH_ONLY":
+                continue
+            if canonical_pressure and profile is not None and profile.saturation_policy in {"canonical_first", "canonical_only"}:
                 continue
             width = int(job.lane_width or 1)
-            if canonical_pressure and job.task_kind == "RESEARCH_ONLY":
-                width = 1
             widths[job.vendor] = max(widths.get(job.vendor, 0), width)
         return widths
 

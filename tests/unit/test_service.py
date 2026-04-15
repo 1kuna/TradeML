@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import sqlite3
 
+import trademl.data_node.auxiliary_runtime as auxiliary_runtime_module
 from trademl.calendars.exchange import ExchangeCalendarStore
 from trademl.connectors.base import PermanentConnectorError, TemporaryConnectorError
 from trademl.data_node.auxiliary_runtime import AuxiliaryRuntime
@@ -408,7 +409,7 @@ def test_run_forever_does_not_drain_backlog_outside_maintenance_window(tmp_path:
 
     calls: list[str] = []
     service.run_cycle = lambda *args, **kwargs: calls.append("run_cycle")  # type: ignore[method-assign]
-    service.process_backfill_queue = lambda: calls.append("backfill") or []  # type: ignore[method-assign]
+    service.process_backfill_queue = lambda **kwargs: calls.append("backfill") or []  # type: ignore[method-assign]
     service.sync_partition_status = lambda: tmp_path / "data" / "qc" / "partition_status.parquet"  # type: ignore[method-assign]
 
     timestamps = iter(
@@ -546,6 +547,8 @@ def test_seed_planner_tasks_reopens_regressed_canonical_tasks(tmp_path: Path, mo
         lambda **kwargs: {"date": "2025-01-03", "coverage_ratio": 1.0},
     )
     monkeypatch.setattr(service_module, "plan_coverage_tasks", lambda **kwargs: [task])
+    with sqlite3.connect(db.path) as connection:
+        connection.execute("DELETE FROM planner_task_progress WHERE task_key = ?", (task.task_key,))
 
     service._seed_planner_tasks(trading_date="2025-01-04")
 
@@ -560,6 +563,78 @@ def test_seed_planner_tasks_reopens_regressed_canonical_tasks(tmp_path: Path, mo
     assert progress.remaining_units == 1
     assert progress.completed_units == 0
     assert attempts == []
+
+
+def test_seed_planner_tasks_skips_recomputing_settled_canonical_progress(tmp_path: Path, monkeypatch) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector(), "tiingo": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+    task = PlannedTask(
+        task_key="canonical::AAPL::2025-01-03",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2025-01-03",
+        end_date="2025-01-03",
+        symbols=("AAPL",),
+        output_name=None,
+        preferred_vendors=("alpaca", "tiingo"),
+        payload={"scope_kind": "symbol_range", "trading_days": ["2025-01-03"]},
+    )
+    db.upsert_planner_task(
+        task_key=task.task_key,
+        task_family=task.task_family,
+        planner_group=task.planner_group,
+        dataset=task.dataset,
+        tier=task.tier,
+        priority=task.priority,
+        start_date=task.start_date,
+        end_date=task.end_date,
+        symbols=task.symbols,
+        eligible_vendors=task.preferred_vendors,
+        payload=task.payload,
+    )
+    db.mark_planner_task_success(task.task_key)
+    db.update_planner_task_progress(
+        task_key=task.task_key,
+        expected_units=1,
+        completed_units=1,
+        remaining_units=0,
+        completed_symbols=["AAPL"],
+        remaining_symbols=[],
+        state={"scope_kind": "symbol_range"},
+    )
+
+    monkeypatch.setattr(
+        service_module,
+        "recommended_training_cutoff",
+        lambda **kwargs: {"date": "2025-01-03", "coverage_ratio": 1.0},
+    )
+    monkeypatch.setattr(service_module, "plan_coverage_tasks", lambda **kwargs: [task])
+    monkeypatch.setattr(
+        service._canonical_runtime,
+        "_canonical_progress_for_scope",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not recompute settled canonical task")),
+    )
+
+    service._seed_planner_tasks(trading_date="2025-01-04")
+
+    refreshed = db.get_planner_task(task.task_key)
+    progress = db.fetch_planner_task_progress(task.task_key)
+
+    assert refreshed is not None
+    assert refreshed.status == "SUCCESS"
+    assert progress is not None
+    assert progress.completed_units == 1
+    assert progress.remaining_units == 0
 
 
 def test_backfill_budget_exhaustion_defers_task_instead_of_marking_failed(tmp_path: Path) -> None:
@@ -835,6 +910,48 @@ def test_process_planner_queue_survives_auxiliary_lane_exception(tmp_path: Path)
     assert changed == []
 
 
+def test_process_planner_queue_heartbeats_while_waiting_on_pending_lane(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        worker_id="rpi-01",
+    )
+
+    service.default_symbols = ["AAPL"]
+    service._seed_planner_tasks = lambda trading_date=None: None  # type: ignore[method-assign]
+    service._canonical_runtime._backfill_lane_widths = lambda: {"alpaca": 2}  # type: ignore[method-assign]
+    service._aux_lane_widths = lambda task_kinds=None: {}  # type: ignore[method-assign]
+
+    release_slow_lane = threading.Event()
+    slow_lane_started = threading.Event()
+    heartbeat_calls: list[float] = []
+    lane_invocations = {"count": 0}
+
+    def drain_canonical_lane(vendor: str, exchange: str) -> list[str]:
+        lane_invocations["count"] += 1
+        if lane_invocations["count"] == 1:
+            slow_lane_started.set()
+            release_slow_lane.wait(timeout=1.0)
+            return ["2026-01-02"]
+        return ["2026-01-03"]
+
+    def heartbeat() -> None:
+        heartbeat_calls.append(time.monotonic())
+        release_slow_lane.set()
+
+    service._drain_canonical_lane = drain_canonical_lane  # type: ignore[method-assign]
+
+    changed = service.process_planner_queue(heartbeat_fn=heartbeat, heartbeat_interval_seconds=0.01)
+
+    assert slow_lane_started.is_set()
+    assert heartbeat_calls
+    assert changed == ["2026-01-02", "2026-01-03"]
+
+
 def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.enqueue_task("equities_eod", "AAPL", "2026-03-31", "2026-03-31", "GAP", 1)
@@ -848,7 +965,7 @@ def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(tmp_
     coordinator = _ClusterCoordinatorStub()
     calls: list[str] = []
 
-    def process_backfill_queue() -> list[str]:
+    def process_backfill_queue(**kwargs) -> list[str]:
         calls.append("process_backfill_queue")
         service.stop()
         return []
@@ -2080,7 +2197,7 @@ def test_run_cluster_forever_reruns_backfill_when_same_day_queue_is_reseeded(tmp
     coordinator.last_success["backfill"] = {"bucket": "2026-04-02", "updated_at": "2026-04-02T16:11:09+00:00"}
     calls: list[str] = []
 
-    def process_backfill_queue() -> list[str]:
+    def process_backfill_queue(**kwargs) -> list[str]:
         calls.append("process_backfill_queue")
         service.stop()
         return []
@@ -2118,7 +2235,7 @@ def test_run_cluster_forever_renews_backfill_lease_while_backlog_remains(tmp_pat
     coordinator.last_success["backfill"] = {"bucket": "2026-04-02", "updated_at": "2999-04-02T16:11:09+00:00"}
     calls: list[str] = []
 
-    def process_backfill_queue() -> list[str]:
+    def process_backfill_queue(**kwargs) -> list[str]:
         calls.append("process_backfill_queue")
         service.stop()
         return []
@@ -2197,7 +2314,7 @@ def test_run_cluster_forever_backfill_curates_only_changed_dates(tmp_path: Path)
     service.load_corp_actions_reference = lambda: pd.DataFrame()  # type: ignore[method-assign]
     service.sync_partition_status = lambda: tmp_path / "data" / "qc" / "partition_status.parquet"  # type: ignore[method-assign]
 
-    def process_backfill_queue() -> list[str]:
+    def process_backfill_queue(**kwargs) -> list[str]:
         return ["2026-04-01", "2026-04-02"]
 
     def capture_curate(*, corp_actions=None, changed_dates=None):  # noqa: ANN001
@@ -2222,7 +2339,7 @@ def test_run_cluster_forever_backfill_curates_only_changed_dates(tmp_path: Path)
     assert captured["changed_dates"] == ["2026-04-01", "2026-04-02"]
 
 
-def test_process_planner_queue_runs_research_trickle_while_canonical_backlog_exists(tmp_path: Path) -> None:
+def test_process_planner_queue_skips_research_archive_while_canonical_backlog_exists(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.bulk_upsert_planner_tasks(
         [
@@ -2260,7 +2377,7 @@ def test_process_planner_queue_runs_research_trickle_while_canonical_backlog_exi
 
     service.process_planner_queue(exchange="XNYS")
 
-    assert calls == ["canonical:alpaca", "aux:alpha_vantage"]
+    assert calls == ["canonical:alpaca"]
 
 
 def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfill(tmp_path: Path) -> None:
@@ -2459,7 +2576,7 @@ def test_aux_lane_widths_hold_bar_first_vendors_back_when_canonical_backlog_exis
     assert widths["sec_edgar"] == 2
 
 
-def test_aux_lane_widths_allow_research_only_lanes_during_canonical_backlog(tmp_path: Path) -> None:
+def test_aux_lane_widths_suppress_research_only_lanes_during_canonical_backlog(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
@@ -2494,9 +2611,7 @@ def test_aux_lane_widths_allow_research_only_lanes_during_canonical_backlog(tmp_
 
     widths = service._aux_lane_widths(task_kinds={"RESEARCH_ONLY"})
 
-    assert widths["alpaca"] == 1
-    assert widths["tiingo"] == 1
-    assert widths["finnhub"] == 1
+    assert widths == {}
 
 
 def test_planned_auxiliary_work_materializes_reference_and_macro_tasks(tmp_path: Path) -> None:
@@ -2613,6 +2728,45 @@ def test_run_cluster_forever_reference_budget_failure_does_not_crash_worker(tmp_
     )
 
     assert calls == ["price_checks"]
+
+
+def test_run_cluster_forever_heartbeat_failure_does_not_crash_worker(tmp_path: Path, caplog) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    class _FlakyCoordinator(_ClusterCoordinatorStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def heartbeat_worker(self) -> dict[str, str]:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("heartbeat exploded")
+            service.stop()
+            return {"worker_id": "worker-a"}
+
+    coordinator = _FlakyCoordinator()
+
+    service.run_cluster_forever(
+        coordinator=coordinator,  # type: ignore[arg-type]
+        symbols=["AAPL"],
+        exchange="XNYS",
+        collection_time_et="16:30",
+        maintenance_hour_local=23,
+        poll_seconds=0.0,
+        now_fn=lambda: datetime.fromisoformat("2026-03-31T18:00:00+00:00"),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert coordinator.calls >= 2
+    assert "scheduler_iteration_failed" in caplog.text
 
 
 def test_build_canonical_coverage_index_streams_partitions_and_skips_unreadable_ones(tmp_path: Path) -> None:
@@ -2803,6 +2957,27 @@ def test_collect_reference_data_rebuilds_security_master_outputs(tmp_path: Path)
 
     assert tmp_path / "data" / "reference" / "listing_history.parquet" in result.outputs
     assert tmp_path / "data" / "reference" / "ticker_changes.parquet" in result.outputs
+
+
+def test_collect_reference_data_skips_derived_rebuild_when_no_outputs(tmp_path: Path, monkeypatch) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector(), "alpha_vantage": _PartialReferenceConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    monkeypatch.setattr(
+        auxiliary_runtime_module,
+        "rebuild_derived_references",
+        lambda _reference_root: (_ for _ in ()).throw(AssertionError("unexpected rebuild")),
+    )
+
+    result = service.collect_reference_data([])
+
+    assert result.outputs == []
 
 
 def test_process_auxiliary_planner_task_marks_reference_success_and_deferred_consistently(tmp_path: Path) -> None:
