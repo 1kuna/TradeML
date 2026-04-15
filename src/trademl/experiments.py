@@ -224,7 +224,7 @@ def plan_experiment(
         "run_count": len(runs),
         "runs": [_summary_run_row(run) for run in runs],
     }
-    _write_experiment_summary(local_state=local_state, experiment_id=experiment_id, summary=summary)
+    _write_experiment_summary(local_state=local_state, experiment_id=experiment_id, summary=summary, data_root=data_root)
     return summary
 
 
@@ -413,7 +413,12 @@ def experiment_status(
         "run_count": len(runs),
         "runs": runs,
     }
-    return _refresh_experiment_summary(local_state=local_state, experiment_id=experiment_id, summary=summary)
+    return _refresh_experiment_summary(
+        local_state=local_state,
+        experiment_id=experiment_id,
+        summary=summary,
+        data_root=data_root,
+    )
 
 
 def evaluate_experiment(
@@ -565,6 +570,7 @@ def propose_next_experiment_family(
         local_state=local_state,
         experiment_id=experiment_id,
         summary={**summary, "proposal_summary": proposal | proposal_paths},
+        data_root=data_root,
     )
     return {**refreshed, "proposal": proposal | proposal_paths}
 
@@ -1108,10 +1114,63 @@ def _local_experiment_root(local_state: Path, experiment_id: str) -> Path:
     return local_state / "experiments" / experiment_id
 
 
+def _shared_experiment_root(data_root: Path, experiment_id: str) -> Path:
+    return data_root / "experiments" / experiment_id
+
+
+def _dashboard_summary_payload(summary: dict[str, Any], *, recent_limit: int = 16) -> dict[str, Any]:
+    runs = list(summary.get("runs") or [])
+    recent_runs = sorted(
+        (
+            _summary_run_row(run) if "status" in run else dict(run)
+            for run in runs
+            if isinstance(run, dict)
+        ),
+        key=lambda row: (
+            str(row.get("activity_at") or ""),
+            str(row.get("report_date") or ""),
+            str(row.get("run_id") or ""),
+        ),
+        reverse=True,
+    )[:recent_limit]
+    recent_runs = sorted(
+        recent_runs,
+        key=lambda row: (
+            str(row.get("activity_at") or ""),
+            str(row.get("report_date") or ""),
+            str(row.get("run_id") or ""),
+        ),
+        reverse=True,
+    )
+    supervisor = summary.get("supervisor") if isinstance(summary.get("supervisor"), dict) else {}
+    run_activity = max((str(row.get("activity_at") or "") for row in recent_runs), default="")
+    activity_at = (
+        supervisor.get("heartbeat_at")
+        or supervisor.get("updated_at")
+        or run_activity
+        or summary.get("updated_at")
+        or datetime.now(tz=UTC).isoformat()
+    )
+    return {
+        "experiment_id": summary.get("experiment_id"),
+        "updated_at": datetime.now(tz=UTC).isoformat(),
+        "activity_at": activity_at,
+        "best_run_id": summary.get("best_run_id"),
+        "best_candidate": summary.get("best_candidate"),
+        "best_primary_score": summary.get("best_primary_score"),
+        "best_backtest_net_return": summary.get("best_backtest_net_return"),
+        "best_decision": summary.get("best_decision"),
+        "best_decision_reason": summary.get("best_decision_reason"),
+        "shortlist_count": summary.get("shortlist_count"),
+        "recent_runs": recent_runs,
+    }
+
+
 def _summary_run_row(manifest: dict[str, Any]) -> dict[str, Any]:
     return {
         "experiment_id": manifest["experiment_id"],
         "run_id": manifest["run_id"],
+        "activity_at": _run_activity_at(manifest),
         "phase": manifest.get("phase"),
         "target": manifest.get("target"),
         "target_kind": manifest.get("target_kind"),
@@ -1129,10 +1188,32 @@ def _summary_run_row(manifest: dict[str, Any]) -> dict[str, Any]:
         "evaluation_stage": manifest.get("evaluation_stage"),
         "failure_kind": manifest.get("failure_kind"),
         "last_error": manifest.get("last_error"),
+        "assessment": manifest.get("assessment", {}),
+        "report_preview": manifest.get("report_preview", {}),
+        "backtest_summary": manifest.get("backtest_summary", {}),
         "retry_count": manifest.get("retry_count", 0),
         "supervisor_history": manifest.get("supervisor_history", []),
         "shortlisted": bool(manifest.get("shortlisted")),
     }
+
+
+def _run_activity_at(manifest: dict[str, Any]) -> str | None:
+    history = manifest.get("supervisor_history")
+    if isinstance(history, list):
+        timestamps = [
+            str(item.get("at"))
+            for item in history
+            if isinstance(item, dict) and item.get("at")
+        ]
+        if timestamps:
+            return max(timestamps)
+    runtime = manifest.get("runtime")
+    if isinstance(runtime, dict):
+        for key in ("finished_at", "started_at"):
+            if runtime.get(key):
+                return str(runtime[key])
+    report_date = manifest.get("report_date")
+    return str(report_date) if report_date else None
 
 
 def _preserved_manifest_state(existing: dict[str, Any]) -> dict[str, Any]:
@@ -1174,10 +1255,22 @@ def _read_experiment_summary(*, local_state: Path, experiment_id: str) -> dict[s
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _write_experiment_summary(*, local_state: Path, experiment_id: str, summary: dict[str, Any]) -> None:
+def _write_experiment_summary(
+    *,
+    local_state: Path,
+    experiment_id: str,
+    summary: dict[str, Any],
+    data_root: Path | None = None,
+) -> None:
     path = _local_experiment_root(local_state, experiment_id) / "summary.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(path, summary)
+    if data_root is not None:
+        shared_root = _shared_experiment_root(data_root, experiment_id)
+        shared_path = shared_root / "summary.json"
+        shared_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(shared_path, summary)
+        _atomic_write_json(shared_root / "dashboard_summary.json", _dashboard_summary_payload(summary))
 
 
 def _load_run_manifests(*, local_state: Path, experiment_id: str) -> list[dict[str, Any]]:
@@ -1185,7 +1278,13 @@ def _load_run_manifests(*, local_state: Path, experiment_id: str) -> list[dict[s
     return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(root.glob("*.json"))]
 
 
-def _refresh_experiment_summary(*, local_state: Path, experiment_id: str, summary: dict[str, Any]) -> dict[str, Any]:
+def _refresh_experiment_summary(
+    *,
+    local_state: Path,
+    experiment_id: str,
+    summary: dict[str, Any],
+    data_root: Path | None = None,
+) -> dict[str, Any]:
     existing = _read_experiment_summary(local_state=local_state, experiment_id=experiment_id)
     runs = summary.get("runs") or _load_run_manifests(local_state=local_state, experiment_id=experiment_id)
     counts = dict(summary.get("counts") or {})
@@ -1242,7 +1341,7 @@ def _refresh_experiment_summary(*, local_state: Path, experiment_id: str, summar
         "supervisor": supervisor,
         "proposal_summary": summary.get("proposal_summary") or proposal_summary,
     }
-    _write_experiment_summary(local_state=local_state, experiment_id=experiment_id, summary=merged)
+    _write_experiment_summary(local_state=local_state, experiment_id=experiment_id, summary=merged, data_root=data_root)
     return merged
 
 

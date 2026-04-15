@@ -760,6 +760,58 @@ def test_experiment_status_skips_remote_polling_for_completed_runs(tmp_path: Pat
     assert status["runs"][0]["run_id"] == "run-a"
 
 
+def test_experiment_status_writes_shared_summary_to_data_root(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    data_root = tmp_path / "nas"
+    experiment_root = local_state / "experiments" / "phase1-baselines"
+    (experiment_root / "runs").mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "experiment_id": "phase1-baselines",
+        "run_id": "run-a",
+        "phase": 1,
+        "target": "workstation-remote",
+        "runtime_name": "experiment_phase1-baselines__run-a",
+        "status": "COMPLETED",
+        "evaluation_stage": "REJECTED_PREDICTIVE",
+        "assessment": {"decision": "NO_GO", "reason": "bad ic"},
+        "report_preview": {"coverage": 0.98, "ridge_mean_rank_ic": 0.031},
+        "model_suite": "ridge_only",
+        "matrix_values": {"architecture_family": "linear_baseline"},
+        "config_path": str(tmp_path / "run-a.yml"),
+        "output_root": "/remote/output",
+        "report_path": "/remote/report.json",
+    }
+    (experiment_root / "runs" / "run-a.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (experiment_root / "summary.json").write_text(json.dumps({"experiment_id": "phase1-baselines"}), encoding="utf-8")
+
+    def unexpected_status_snapshot(**kwargs):  # noqa: ANN001
+        raise AssertionError("completed runs should not invoke training_status_snapshot")
+
+    monkeypatch.setattr(experiments, "training_status_snapshot", unexpected_status_snapshot)
+
+    experiments.experiment_status(
+        experiment_id="phase1-baselines",
+        local_state=local_state,
+        repo_root=tmp_path / "repo",
+        data_root=data_root,
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    shared_summary = json.loads((data_root / "experiments" / "phase1-baselines" / "summary.json").read_text(encoding="utf-8"))
+    dashboard_summary = json.loads(
+        (data_root / "experiments" / "phase1-baselines" / "dashboard_summary.json").read_text(encoding="utf-8")
+    )
+
+    assert shared_summary["experiment_id"] == "phase1-baselines"
+    assert shared_summary["runs"][0]["run_id"] == "run-a"
+    assert shared_summary["runs"][0]["assessment"]["decision"] == "NO_GO"
+    assert shared_summary["runs"][0]["report_preview"]["ridge_mean_rank_ic"] == pytest.approx(0.031)
+    assert dashboard_summary["experiment_id"] == "phase1-baselines"
+    assert dashboard_summary["recent_runs"][0]["run_id"] == "run-a"
+    assert dashboard_summary["recent_runs"][0]["assessment"]["decision"] == "NO_GO"
+
+
 def test_write_supervisor_state_is_atomic(tmp_path: Path, monkeypatch) -> None:
     local_state = tmp_path / "local"
     experiment_id = "phase1-baselines"
