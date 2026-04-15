@@ -715,8 +715,16 @@ def read_cluster_snapshot(*, nas_root: Path, worker_id: str | None = None) -> di
     }
 
 
-def render_systemd_unit(*, python_executable: str, config_path: Path, workspace_root: Path, env_path: Path) -> str:
+def render_systemd_unit(
+    *,
+    python_executable: str,
+    config_path: Path,
+    workspace_root: Path,
+    env_path: Path,
+    user_mode: bool = False,
+) -> str:
     """Render the systemd unit content for the worker service."""
+    wanted_by = "default.target" if user_mode else "multi-user.target"
     return "\n".join(
         [
             "[Unit]",
@@ -733,10 +741,34 @@ def render_systemd_unit(*, python_executable: str, config_path: Path, workspace_
             "RestartSec=15",
             "",
             "[Install]",
-            "WantedBy=multi-user.target",
+            f"WantedBy={wanted_by}",
             "",
         ]
     )
+
+
+def _systemctl_command(scope: str, *args: str) -> list[str]:
+    command = ["systemctl"]
+    if scope == "user":
+        command.append("--user")
+    command.extend(args)
+    return command
+
+
+def _classify_service_scope(path: Path) -> str:
+    resolved = path.expanduser()
+    if resolved == Path("/etc/systemd/system/trademl-node.service"):
+        return "system"
+    if resolved == Path("~/.config/systemd/user/trademl-node.service").expanduser():
+        return "user"
+    return "file"
+
+
+def _enable_service(scope: str, service_name: str) -> None:
+    if platform.system() != "Linux" or not shutil_which("systemctl"):
+        return
+    subprocess.run(_systemctl_command(scope, "daemon-reload"), check=False, capture_output=True, text=True)
+    subprocess.run(_systemctl_command(scope, "enable", service_name), check=False, capture_output=True, text=True)
 
 
 def install_systemd_service(
@@ -747,21 +779,67 @@ def install_systemd_service(
     env_path: Path,
     service_path: Path | None = None,
 ) -> dict[str, str]:
-    """Write the worker systemd unit, falling back to a local file if needed."""
-    target = service_path or Path("/etc/systemd/system/trademl-node.service")
-    unit = render_systemd_unit(
-        python_executable=python_executable,
-        config_path=config_path,
-        workspace_root=workspace_root,
-        env_path=env_path,
-    )
-    try:
+    """Write the worker systemd unit and prefer a real managed service when possible."""
+    if service_path is not None:
+        target = service_path.expanduser()
+        scope = _classify_service_scope(target)
+        unit = render_systemd_unit(
+            python_executable=python_executable,
+            config_path=config_path,
+            workspace_root=workspace_root,
+            env_path=env_path,
+            user_mode=scope == "user",
+        )
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(unit, encoding="utf-8")
+        if scope in {"system", "user"}:
+            _enable_service(scope, "trademl-node.service")
+        return {"service_path": str(target), "service_name": "trademl-node.service", "service_scope": scope}
+
+    system_target = Path("/etc/systemd/system/trademl-node.service")
+    try:
+        system_target.parent.mkdir(parents=True, exist_ok=True)
+        system_target.write_text(
+            render_systemd_unit(
+                python_executable=python_executable,
+                config_path=config_path,
+                workspace_root=workspace_root,
+                env_path=env_path,
+                user_mode=False,
+            ),
+            encoding="utf-8",
+        )
+        _enable_service("system", "trademl-node.service")
+        return {"service_path": str(system_target), "service_name": "trademl-node.service", "service_scope": "system"}
     except OSError:
-        target = workspace_root / "trademl-node.service"
-        target.write_text(unit, encoding="utf-8")
-    return {"service_path": str(target), "service_name": "trademl-node.service"}
+        user_target = Path("~/.config/systemd/user/trademl-node.service").expanduser()
+        try:
+            user_target.parent.mkdir(parents=True, exist_ok=True)
+            user_target.write_text(
+                render_systemd_unit(
+                    python_executable=python_executable,
+                    config_path=config_path,
+                    workspace_root=workspace_root,
+                    env_path=env_path,
+                    user_mode=True,
+                ),
+                encoding="utf-8",
+            )
+            _enable_service("user", "trademl-node.service")
+            return {"service_path": str(user_target), "service_name": "trademl-node.service", "service_scope": "user"}
+        except OSError:
+            target = workspace_root / "trademl-node.service"
+            target.write_text(
+                render_systemd_unit(
+                    python_executable=python_executable,
+                    config_path=config_path,
+                    workspace_root=workspace_root,
+                    env_path=env_path,
+                    user_mode=False,
+                ),
+                encoding="utf-8",
+            )
+            return {"service_path": str(target), "service_name": "trademl-node.service", "service_scope": "file"}
 
 
 def systemd_status(service_name: str = "trademl-node.service") -> dict[str, Any]:
@@ -770,26 +848,51 @@ def systemd_status(service_name: str = "trademl-node.service") -> dict[str, Any]
         return {"supported": False, "reason": "systemd is only supported on Linux"}
     if not shutil_which("systemctl"):
         return {"supported": False, "reason": "systemctl not found"}
-    result = subprocess.run(
-        ["systemctl", "show", service_name, "--no-page", "--property=LoadState,ActiveState,SubState,UnitFileState"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    payload = {"supported": True, "returncode": result.returncode, "service_name": service_name, "raw": result.stdout.strip()}
-    for line in result.stdout.splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            payload[key] = value
-    return payload
+    scope_payloads: dict[str, dict[str, Any]] = {}
+    chosen: dict[str, Any] | None = None
+    for scope in ("system", "user"):
+        result = subprocess.run(
+            _systemctl_command(scope, "show", service_name, "--no-page", "--property=LoadState,ActiveState,SubState,UnitFileState"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        payload = {
+            "supported": True,
+            "returncode": result.returncode,
+            "service_name": service_name,
+            "scope": scope,
+            "raw": result.stdout.strip(),
+        }
+        for line in result.stdout.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                payload[key] = value
+        scope_payloads[scope] = payload
+        load_state = str(payload.get("LoadState") or "")
+        unit_file_state = str(payload.get("UnitFileState") or "")
+        active_state = str(payload.get("ActiveState") or "")
+        if chosen is None and (
+            load_state not in {"", "not-found"}
+            or unit_file_state not in {"", "not-found"}
+            or active_state not in {"", "inactive", "failed"}
+        ):
+            chosen = payload
+    chosen = chosen or scope_payloads.get("system") or {"supported": True, "service_name": service_name, "scope": "system"}
+    return {**chosen, "scopes": scope_payloads}
 
 
-def systemd_journal_tail(service_name: str = "trademl-node.service", *, lines: int = 100) -> str:
+def systemd_journal_tail(service_name: str = "trademl-node.service", *, lines: int = 100, scope: str | None = None) -> str:
     """Return recent journal lines for the worker service when available."""
     if platform.system() != "Linux" or not shutil_which("journalctl"):
         return ""
+    resolved_scope = scope or str(systemd_status(service_name).get("scope") or "system")
+    command = ["journalctl"]
+    if resolved_scope == "user":
+        command.append("--user")
+    command.extend(["-u", service_name, "-n", str(lines), "--no-pager"])
     result = subprocess.run(
-        ["journalctl", "-u", service_name, "-n", str(lines), "--no-pager"],
+        command,
         check=False,
         capture_output=True,
         text=True,

@@ -86,6 +86,10 @@ from trademl.reference.universe import build_stage1_universe, build_time_varying
 LOGGER = logging.getLogger(__name__)
 
 
+def _systemctl_scope_args(scope: str | None) -> list[str]:
+    return ["--user"] if scope == "user" else []
+
+
 @dataclass(slots=True)
 class NodeSettings:
     """Resolved paths and settings for a dashboard-managed node."""
@@ -348,9 +352,12 @@ def start_node(
     """Start the data-node process in the background if it is not already running."""
     svc = systemd_status()
     if svc.get("supported") and svc.get("UnitFileState") not in {None, "not-found", "", "masked"}:
-        subprocess.run(["systemctl", "start", "trademl-node.service"], check=False)
+        scope = str(svc.get("scope") or "system")
+        service_name = str(svc.get("service_name") or "trademl-node.service")
+        subprocess.run(["systemctl", *_systemctl_scope_args(scope), "start", service_name], check=False)
         snapshot = collect_dashboard_snapshot(settings)
         snapshot["runtime"]["managed_by"] = "systemd"
+        snapshot["runtime"]["service_scope"] = scope
         return snapshot["runtime"]
     runtime = _read_runtime_state(settings)
     pid = runtime.get("pid")
@@ -422,10 +429,13 @@ def stop_node(settings: NodeSettings, *, timeout_seconds: float = 10.0) -> dict[
     """Stop the managed node process if it is running."""
     svc = systemd_status()
     if svc.get("supported") and svc.get("UnitFileState") not in {None, "not-found", "", "masked"}:
-        subprocess.run(["systemctl", "stop", "trademl-node.service"], check=False)
+        scope = str(svc.get("scope") or "system")
+        service_name = str(svc.get("service_name") or "trademl-node.service")
+        subprocess.run(["systemctl", *_systemctl_scope_args(scope), "stop", service_name], check=False)
         runtime = _read_runtime_state(settings)
         runtime["running"] = False
         runtime["managed_by"] = "systemd"
+        runtime["service_scope"] = scope
         _write_runtime_state(settings, runtime)
         return runtime
     runtime = _read_runtime_state(settings)
@@ -696,7 +706,12 @@ def uninstall_worker(settings: NodeSettings) -> dict[str, Any]:
 
     if platform.system() == "Linux" and shutil.which("systemctl"):
         subprocess.run(["systemctl", "disable", "--now", "trademl-node.service"], check=False)
-        for candidate in [Path("/etc/systemd/system/trademl-node.service"), settings.workspace_root / "trademl-node.service"]:
+        subprocess.run(["systemctl", "--user", "disable", "--now", "trademl-node.service"], check=False)
+        for candidate in [
+            Path("/etc/systemd/system/trademl-node.service"),
+            Path("~/.config/systemd/user/trademl-node.service").expanduser(),
+            settings.workspace_root / "trademl-node.service",
+        ]:
             if candidate.exists():
                 try:
                     candidate.unlink()
@@ -704,6 +719,7 @@ def uninstall_worker(settings: NodeSettings) -> dict[str, Any]:
                 except OSError:
                     pass
         subprocess.run(["systemctl", "daemon-reload"], check=False)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
 
     wrapper_path = Path.home() / ".local" / "bin" / "trademl"
     if wrapper_path.exists():
@@ -1374,6 +1390,7 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
         planner_summary=planner_summary,
         budget_summary=budget_summary,
         vendor_throughput=vendor_throughput,
+        include_cluster=False,
     )
     snapshot = {
         "settings": asdict(settings),
@@ -1507,13 +1524,17 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
 def collect_dashboard_game_snapshot(settings: NodeSettings) -> dict[str, Any]:
     """Collect the gamified HUD snapshot used by the Collector/Brain dashboard."""
     runtime = _read_runtime_state(settings)
+    cluster = read_cluster_snapshot(nas_root=settings.nas_mount, worker_id=settings.worker_id)
+    active_workers = list(cluster.get("active_workers") or [])
+    active_worker = next((item for item in active_workers if item.get("worker_id") == settings.worker_id), None)
     pid = runtime.get("pid")
-    running = isinstance(pid, int) and _is_process_running(pid)
+    running = bool(active_worker) or (isinstance(pid, int) and _is_process_running(pid))
     runtime["running"] = running
     uptime_seconds: float | None = None
-    if running and runtime.get("started_at"):
+    worker_started_at = active_worker.get("started_at") if isinstance(active_worker, dict) else None
+    if running and (worker_started_at or runtime.get("started_at")):
         with contextlib.suppress(ValueError):
-            started_at = datetime.fromisoformat(str(runtime["started_at"]))
+            started_at = datetime.fromisoformat(str(worker_started_at or runtime["started_at"]))
             uptime_seconds = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
 
     queue_counts = _read_queue_counts(settings.db_path)
@@ -1576,6 +1597,8 @@ def collect_dashboard_game_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "label": settings.worker_id,
         "running": running,
         "uptime_seconds": uptime_seconds,
+        "last_heartbeat": active_worker.get("last_heartbeat") if isinstance(active_worker, dict) else None,
+        "active_workers": [item.get("worker_id") for item in active_workers],
         "rows_per_min": round(rows_per_min, 2),
         "requests_per_min": round(requests_per_min, 2),
         "rows_total": int(raw_datapoints),
@@ -1768,11 +1791,13 @@ def collect_dashboard_health_snapshot(
     planner_summary: dict[str, Any] | None = None,
     budget_summary: dict[str, Any] | None = None,
     vendor_throughput: dict[str, Any] | None = None,
+    include_cluster: bool = True,
 ) -> dict[str, Any]:
     """Collect repair, lease, lane-health, training-target, and experiment status."""
     planner_summary = planner_summary or _read_planner_summary(settings.db_path)
     budget_summary = budget_summary or _read_budget_summary(settings)
     vendor_throughput = vendor_throughput or _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
+    cluster = read_cluster_snapshot(nas_root=settings.nas_mount, worker_id=settings.worker_id) if include_cluster else {}
     try:
         db = DataNodeDB(settings.db_path)
     except sqlite3.OperationalError:
@@ -1790,6 +1815,7 @@ def collect_dashboard_health_snapshot(
             "proposal_summary": {},
             "research_program_summary": {},
             "planner_backlog": planner_summary.get("backlog_progress", {}),
+            "cluster": cluster,
         }
     repair_tasks = _summarize_repair_tasks(db)
     leased_work = _summarize_leased_work(db)
@@ -1835,6 +1861,7 @@ def collect_dashboard_health_snapshot(
         "proposal_summary": proposal_summary,
         "research_program_summary": research_program_summary,
         "planner_backlog": planner_summary.get("backlog_progress", {}),
+        "cluster": cluster,
     }
 
 
@@ -2213,7 +2240,7 @@ def _build_collection_health(
     pinned_remaining = int(backlog_progress.get("phase1_pinned", {}).get("remaining_units", 0))
     rolling_remaining = int(backlog_progress.get("rolling", {}).get("remaining_units", 0))
     repair_remaining = int(backlog_progress.get("repair", {}).get("remaining_units", 0))
-    if pinned_remaining <= 0 and int(bars_progress.get("remaining_units", 0)) > 0:
+    if not backlog_progress and pinned_remaining <= 0 and int(bars_progress.get("remaining_units", 0)) > 0:
         pinned_remaining = int(bars_progress.get("remaining_units", 0))
     global_bars_ratio = min(1.0, bars_completed / bars_expected) if bars_expected else 0.0
     frozen_bars_ratio = float(
@@ -2252,6 +2279,20 @@ def _build_collection_health(
             "remaining_units": int(planner_eta.get("security_master", {}).get("remaining_units", 0)),
             "eta_minutes": planner_eta.get("security_master", {}).get("eta_minutes"),
         },
+        "security_master": {
+            "ratio": _bool_ratio("security_master.parquet" in reference_files),
+            "label": "Security Master",
+            "blocking": "security_master.parquet" not in reference_files,
+            "remaining_units": int(planner_eta.get("security_master", {}).get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("security_master", {}).get("eta_minutes"),
+        },
+        "ticker_changes": {
+            "ratio": _bool_ratio("ticker_changes.parquet" in reference_files),
+            "label": "Ticker Changes",
+            "blocking": "ticker_changes.parquet" not in reference_files,
+            "remaining_units": int(planner_eta.get("security_master", {}).get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("security_master", {}).get("eta_minutes"),
+        },
         "delistings": {
             "ratio": _bool_ratio("delistings.parquet" in reference_files),
             "label": "Delistings",
@@ -2267,18 +2308,32 @@ def _build_collection_health(
             "eta_minutes": planner_eta.get("events_filings", {}).get("eta_minutes"),
         },
         "macro": {
-            "ratio": min(1.0, macro_ratio) if "fred_vintagedates.parquet" in reference_files else 0.0,
+            "ratio": min(1.0, macro_ratio) if ("fred_vintagedates.parquet" in reference_files or "macro_vintages.parquet" in reference_files) else 0.0,
             "label": "Macro",
-            "blocking": "fred_vintagedates.parquet" not in reference_files or macro_ratio < 1.0,
+            "blocking": ("fred_vintagedates.parquet" not in reference_files and "macro_vintages.parquet" not in reference_files) or macro_ratio < 1.0,
             "remaining_units": int(planner_eta.get("macro", {}).get("remaining_units", 0)),
             "eta_minutes": planner_eta.get("macro", {}).get("eta_minutes"),
         },
         "earnings": {
-            "ratio": _bool_ratio("earnings_calendar.parquet" in reference_files),
+            "ratio": _bool_ratio("earnings_calendar_pit.parquet" in reference_files or "earnings_calendar.parquet" in reference_files),
             "label": "Earnings",
             "blocking": False,
-            "remaining_units": int(planner_eta.get("supplemental_research", {}).get("remaining_units", 0)),
-            "eta_minutes": planner_eta.get("supplemental_research", {}).get("eta_minutes"),
+            "remaining_units": int(planner_eta.get("reference_events", {}).get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("reference_events", {}).get("eta_minutes"),
+        },
+        "fundamentals": {
+            "ratio": _bool_ratio("fundamentals_daily.parquet" in reference_files),
+            "label": "Fundamentals",
+            "blocking": False,
+            "remaining_units": int(planner_eta.get("reference_events", {}).get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("reference_events", {}).get("eta_minutes"),
+        },
+        "universe_snapshots": {
+            "ratio": _bool_ratio("universe_snapshots" in reference_files),
+            "label": "Universe Snapshots",
+            "blocking": False,
+            "remaining_units": int(planner_eta.get("security_master", {}).get("remaining_units", 0)),
+            "eta_minutes": planner_eta.get("security_master", {}).get("eta_minutes"),
         },
     }
     eod_complete = bool(
@@ -2293,7 +2348,7 @@ def _build_collection_health(
         missing.append("reference datasets")
     if not macro_series:
         missing.append("macro series")
-    if "fred_vintagedates.parquet" not in reference_files:
+    if "fred_vintagedates.parquet" not in reference_files and "macro_vintages.parquet" not in reference_files:
         missing.append("macro vintages")
     if not price_check_files:
         missing.append("cross-vendor price checks")
@@ -2560,6 +2615,8 @@ def _readable_reference_files(root: Path) -> list[str]:
         except Exception:
             continue
         readable.append(path.name)
+    if (root / "universe_snapshots").exists():
+        readable.append("universe_snapshots")
     return readable
 
 

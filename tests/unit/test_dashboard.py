@@ -899,6 +899,57 @@ def test_start_node_marks_immediate_exit_as_not_running(tmp_path: Path, monkeypa
     assert persisted["running"] is False
 
 
+def test_start_node_uses_user_systemd_scope_when_available(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    commands: list[list[str]] = []
+
+    def _fake_run(command: list[str], **kwargs):
+        commands.append(command)
+
+        class _Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Result()
+
+    monkeypatch.setattr(
+        dashboard_controller,
+        "systemd_status",
+        lambda: {"supported": True, "scope": "user", "service_name": "trademl-node.service", "UnitFileState": "enabled"},
+    )
+    monkeypatch.setattr(dashboard_controller.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        dashboard_controller,
+        "collect_dashboard_snapshot",
+        lambda settings: {"runtime": {"running": True, "pid": 1, "log_path": str(settings.log_path)}},
+    )
+
+    runtime = start_node(settings)
+
+    assert ["systemctl", "--user", "start", "trademl-node.service"] in commands
+    assert runtime["managed_by"] == "systemd"
+    assert runtime["service_scope"] == "user"
+
+
 def test_seed_stage_backfill_logs_enqueue_failures(tmp_path: Path, monkeypatch, caplog) -> None:
     calls: list[str] = []
 

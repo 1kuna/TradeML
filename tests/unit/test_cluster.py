@@ -281,6 +281,51 @@ def test_render_and_install_systemd_service(tmp_path: Path) -> None:
     assert Path(result["service_path"]).exists()
 
 
+def test_install_systemd_service_falls_back_to_user_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace, _nas, config_path, env_path = _seed_workspace(tmp_path)
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+
+    real_write_text = Path.write_text
+    system_target = Path("/etc/systemd/system/trademl-node.service")
+    systemctl_calls: list[list[str]] = []
+
+    def _fake_write_text(self: Path, data: str, *args, **kwargs):
+        if self == system_target:
+            raise PermissionError("permission denied")
+        return real_write_text(self, data, *args, **kwargs)
+
+    def _fake_run(command: list[str], **kwargs):
+        systemctl_calls.append(command)
+
+        class _Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Result()
+
+    monkeypatch.setattr(Path, "write_text", _fake_write_text)
+    monkeypatch.setattr("trademl.fleet.cluster.subprocess.run", _fake_run)
+    monkeypatch.setattr("trademl.fleet.cluster.shutil_which", lambda command: "/bin/systemctl" if command == "systemctl" else None)
+    monkeypatch.setattr("trademl.fleet.cluster.platform.system", lambda: "Linux")
+
+    result = install_systemd_service(
+        python_executable="/usr/bin/python3",
+        config_path=config_path,
+        workspace_root=workspace,
+        env_path=env_path,
+    )
+
+    expected_path = home / ".config" / "systemd" / "user" / "trademl-node.service"
+    assert Path(result["service_path"]) == expected_path
+    assert result["service_scope"] == "user"
+    unit_text = expected_path.read_text(encoding="utf-8")
+    assert "WantedBy=default.target" in unit_text
+    assert ["systemctl", "--user", "daemon-reload"] in systemctl_calls
+    assert ["systemctl", "--user", "enable", "trademl-node.service"] in systemctl_calls
+
+
 def test_sync_shard_leases_does_not_release_singleton_leases(tmp_path: Path) -> None:
     workspace, nas, config_path, env_path = _seed_workspace(tmp_path)
     coordinator = ClusterCoordinator(
