@@ -25,6 +25,8 @@ from trademl.data_node.planner import training_readiness
 
 LOGGER = logging.getLogger(__name__)
 
+REMOTE_COMMAND_TIMEOUT_SECONDS = 60
+
 
 @dataclass(slots=True)
 class TrainingTarget:
@@ -109,6 +111,12 @@ def read_training_runtime(
     else:
         payload["running"] = status in {"starting", "running"}
     return payload
+
+
+def _runtime_pid(payload: dict[str, Any]) -> int | None:
+    """Return an integer runtime pid when present."""
+    pid = payload.get("pid")
+    return pid if isinstance(pid, int) else None
 
 
 def local_training_runtime_path(
@@ -266,15 +274,40 @@ def evaluate_training_gates(
     phase2_blockers = list(phase1["blockers"])
     if "ticker_changes.parquet" not in reference_files:
         phase2_blockers.append("ticker_changes")
+    if "security_master.parquet" not in reference_files:
+        phase2_blockers.append("security_master")
+    if "fundamentals_daily.parquet" not in reference_files:
+        phase2_blockers.append("fundamentals_daily")
+    if "earnings_calendar_pit.parquet" not in reference_files:
+        phase2_blockers.append("earnings_calendar_pit")
+    if "sec_filing_index.parquet" not in reference_files:
+        phase2_blockers.append("sec_filing_index")
+    if "universe_snapshots" not in reference_files:
+        phase2_blockers.append("universe_snapshots")
     if stage_symbol_count < 500:
         phase2_blockers.append("expanded_universe")
     if stage_years < 10:
         phase2_blockers.append("history_depth")
     if not _terminal_delisting_returns_present(reference_root / "delistings.parquet"):
         phase2_blockers.append("terminal_delisting_returns")
+    gap_report = {
+        "ready": not phase2_blockers,
+        "blockers": phase2_blockers,
+        "free_first_complete": not phase2_blockers,
+        "paid_upgrade_checkpoint": bool(phase2_blockers),
+        "recommended_paid_upgrades": (
+            [
+                "Norgate Data or Databento security master if delistings/ticker continuity remain leaky after free-vendor saturation.",
+                "Consolidated bars vendor if liquidity-sensitive features remain dominated by IEX-only bias.",
+            ]
+            if phase2_blockers
+            else []
+        ),
+    }
     return {
         "phase1": phase1,
         "phase2": {"ready": not phase2_blockers, "blockers": phase2_blockers},
+        "phase2_gap_report": gap_report,
         "freeze_cutoff": freeze_cutoff,
     }
 
@@ -290,6 +323,8 @@ def _readable_reference_files(reference_root: Path) -> set[str]:
         except Exception:
             continue
         readable.add(path.name)
+    if (reference_root / "universe_snapshots").exists():
+        readable.add("universe_snapshots")
     return readable
 
 
@@ -524,7 +559,22 @@ def launch_training_process(
     )
     existing = read_training_runtime(path=runtime_path)
     if existing.get("running"):
-        return existing
+        if resolved_target.kind == "local":
+            return existing
+        snapshot = training_status_snapshot(
+            repo_root=repo_root,
+            data_root=data_root,
+            local_state=local_state,
+            phase=phase,
+            target=resolved_target.name,
+            targets_config_path=targets_config_path,
+            python_executable=python_executable,
+            runtime_name=runtime_name,
+            tail_lines=20,
+        )
+        effective_existing = dict(snapshot.get("runtime") or {})
+        if effective_existing.get("running"):
+            return effective_existing
     execution_config_path = config_path
     if resolved_target.kind != "local":
         execution_config_path = _sync_remote_training_config(
@@ -702,6 +752,13 @@ def training_status_snapshot(
         effective["status"] = local_runtime["status"]
     if "running" not in effective:
         effective["running"] = bool(local_runtime.get("running") or shared_runtime.get("running"))
+    effective = _refresh_ssh_runtime_liveness(
+        target=resolved_target,
+        runtime=effective,
+        phase=phase,
+        runtime_name=runtime_name,
+        remote_runtime=remote_runtime,
+    )
     if resolved_target.kind != "local" and effective and effective != local_runtime:
         _write_runtime_payload(local_path, effective)
         local_runtime = read_training_runtime(path=local_path)
@@ -968,6 +1025,38 @@ def _remote_runtime_snapshot(
     return payload
 
 
+def _refresh_ssh_runtime_liveness(
+    *,
+    target: TrainingTarget,
+    runtime: dict[str, Any],
+    phase: int,
+    runtime_name: str | None,
+    remote_runtime: dict[str, Any],
+) -> dict[str, Any]:
+    """Force SSH-backed runtime truth to reflect remote process liveness."""
+    if target.kind == "local":
+        return runtime
+    payload = dict(runtime)
+    status = str(payload.get("status") or "").lower()
+    pid = _runtime_pid(payload)
+    if pid is None:
+        if status in {"starting", "running"} and not remote_runtime:
+            payload["running"] = False
+            payload["status"] = "failed"
+            payload.setdefault("error", "remote runtime missing for ssh-backed training run")
+        return payload
+    if status not in {"starting", "running"}:
+        return payload
+    running = _remote_process_running(target=target, pid=pid)
+    payload["running"] = running
+    if running:
+        return payload
+    payload["status"] = "failed"
+    payload["finished_at"] = payload.get("finished_at") or datetime.now(tz=UTC).isoformat()
+    payload.setdefault("error", "remote process is not running")
+    return payload
+
+
 def _remote_runtime_file_snapshot(*, target: TrainingTarget, path: Path) -> dict[str, Any]:
     """Read one runtime payload from a remote SSH target."""
     command = _remote_python_here_doc(
@@ -1084,12 +1173,19 @@ def _run_ssh_command(target: TrainingTarget, command: str, *, check: bool = Fals
         ssh_command.extend(["-i", str(target.identity_file)])
     ssh_command.append(f"{target.user}@{target.host}")
     ssh_command.append(command)
-    result = subprocess.run(  # noqa: S603
-        ssh_command,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(  # noqa: S603
+            ssh_command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        message = f"ssh command timed out for target={target.name}"
+        if check:
+            raise RuntimeError(message) from exc
+        return subprocess.CompletedProcess(ssh_command, 124, "", message)
     if check and result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"ssh command failed for target={target.name}")
     return result
@@ -1102,14 +1198,24 @@ def _copy_file_to_remote(*, target: TrainingTarget, local_path: Path, remote_pat
     if target.identity_file is not None:
         scp_command.extend(["-i", str(target.identity_file)])
     scp_command.extend([str(local_path), f"{target.user}@{target.host}:{remote_path}"])
-    result = subprocess.run(  # noqa: S603
-        scp_command,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(  # noqa: S603
+            scp_command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"scp timed out for target={target.name}") from exc
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"scp failed for target={target.name}")
+
+
+def _remote_process_running(*, target: TrainingTarget, pid: int) -> bool:
+    """Return whether an SSH-backed pid is still alive on the remote host."""
+    result = _run_ssh_command(target, f"kill -0 {int(pid)}")
+    return result.returncode == 0
 
 
 def _resolve_default_report_date(*, target: TrainingTarget, phase: int) -> str:

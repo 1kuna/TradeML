@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 import trademl.research as research
@@ -27,6 +28,7 @@ def _program_spec(tmp_path: Path) -> Path:
                     "max_infra_failures": 2,
                 },
                 "review_policy": {"cadence_hours": 12},
+                "search_policy": {"exhaustion_mode": "wait_for_new_data"},
                 "phase_policies": {
                     "1": {
                         "phase": 1,
@@ -66,6 +68,33 @@ def _program_spec(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def test_load_research_program_spec_normalizes_ssot_phase_aliases(tmp_path: Path) -> None:
+    path = tmp_path / "perpetual_ssot.yml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "program_id": "perpetual-macmini",
+                "ssot_phase_order": [1, 2],
+                "default_ssot_phase": 1,
+                "ssot_phase_policies": {
+                    "1": {"ssot_phase": 1, "campaign_track": "baseline"},
+                    "2": {"ssot_phase": 2, "campaign_track": "phase2_free_data"},
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    spec = research._load_research_program_spec(path)  # noqa: SLF001
+
+    assert spec["phase_order"] == [1, 2]
+    assert spec["ssot_phase_order"] == [1, 2]
+    assert spec["default_phase"] == 1
+    assert spec["default_ssot_phase"] == 1
+    assert spec["phase_policies"]["2"]["campaign_track"] == "phase2_free_data"
 
 
 def test_determine_program_transition_advances_phase_when_unlock_gate_met(tmp_path: Path) -> None:
@@ -163,6 +192,136 @@ def test_program_next_spec_respects_steering_preferences(tmp_path: Path) -> None
     assert next_spec["matrix"]["data_family"] == ["price_only"]
     assert next_spec["supervision"]["auto_propose_next_family"] is False
     assert next_spec["proposal_policy"]["auto_launch_next_family"] is False
+
+
+def test_determine_program_transition_waits_for_new_data_on_duplicate_low_novelty(tmp_path: Path, monkeypatch) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    phase_policy = research._phase_policy(spec=spec, phase=1)  # noqa: SLF001
+    duplicate_spec = research._make_experiment_spec_from_phase_policy(  # noqa: SLF001
+        spec=spec,
+        program_state=state,
+        phase_policy=phase_policy,
+        experiment_id="perpetual-macmini-p1-f002",
+        generation=1,
+    )
+    signature = research._family_signature(duplicate_spec)  # noqa: SLF001
+    frontier = research._empty_frontier()  # noqa: SLF001
+    frontier["tried_family_signatures"] = [signature]
+    monkeypatch.setattr(research, "_expanded_search_spec", lambda **kwargs: None)
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=frontier,
+        experiment_summary={"experiment_id": "perpetual-macmini-p1-f001", "shortlist_count": 0, "top_gate_failures": []},
+        proposal={"next_spec": duplicate_spec, "rationale": ["duplicate"]},
+    )
+
+    assert decision["action"] == "wait_for_data"
+    assert "waiting for new data revision" in decision["reason"]
+
+
+def test_determine_program_transition_waits_when_phase_budget_is_exhausted_in_perpetual_mode(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["phase_run_counts"] = {"1": 40}
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=research._empty_frontier(),  # noqa: SLF001
+        experiment_summary={"experiment_id": "perpetual-macmini-p1-f001", "shortlist_count": 0, "top_gate_failures": []},
+        proposal={},
+    )
+
+    assert decision["action"] == "wait_for_data"
+    assert "phase 1 run budget exhausted" in decision["reason"]
+
+
+def test_determine_program_transition_broadens_search_before_waiting(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=research._empty_frontier(),  # noqa: SLF001
+        experiment_summary={"experiment_id": "perpetual-macmini-p1-f001", "shortlist_count": 0, "top_gate_failures": []},
+        proposal={},
+    )
+
+    assert decision["action"] == "launch_family"
+    assert "broadening the bounded search frontier" in decision["reason"]
+    assert decision["next_spec"]["matrix"]["data_profile"] == ["phase1_default", "phase1_short_window", "phase1_long_window"]
+
+
+def test_resume_if_data_changed_launches_pending_spec(tmp_path: Path, monkeypatch) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["status"] = "WAITING_FOR_DATA"
+    state["last_seen_data_revision"] = "2026-03-09"
+    state["pending_next_spec"] = {
+        "experiment_id": "perpetual-macmini-p1-f002",
+        "phase": 1,
+        "matrix": {"architecture_family": ["linear_baseline"]},
+        "proposal_policy": {"auto_launch_next_family": False},
+        "supervision": {"auto_propose_next_family": False},
+    }
+    monkeypatch.setattr(research, "_current_data_revision", lambda **kwargs: "2026-03-10")
+
+    launched_payload = {"current_experiment_id": "perpetual-macmini-p1-f002", "active_experiment_supervisor": {"pid": 999}}
+    captured: dict[str, object] = {}
+
+    def fake_launch_program_family(**kwargs):  # noqa: ANN001
+        captured["next_spec"] = kwargs["next_spec"]
+        return launched_payload
+
+    monkeypatch.setattr(research, "_launch_program_family", fake_launch_program_family)
+
+    resumed = research._resume_if_data_changed(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    assert resumed == launched_payload
+    assert state["search_epoch"] == 1
+    assert state["last_seen_data_revision"] == "2026-03-10"
+    assert state["pending_next_spec"] is None
+    assert captured["next_spec"]["search_epoch"] == 1
+
+
+def test_ensure_program_state_refreshes_budget_caps_from_latest_spec(tmp_path: Path) -> None:
+    program_path = _program_spec(tmp_path)
+    spec = research._load_research_program_spec(program_path)  # noqa: SLF001
+    initial = research._initial_program_state(spec=spec, program_path=program_path, poll_seconds=30)  # noqa: SLF001
+    initial["budgets"]["runs_completed"] = 138
+    initial["budgets"]["max_total_runs"] = 250
+    initial["budgets"]["max_total_hours"] = 168
+    research._write_program_state(local_state=tmp_path, program_id="perpetual-macmini", payload=initial)  # noqa: SLF001
+
+    spec["budget_policy"]["max_total_runs"] = 5000
+    spec["budget_policy"]["max_total_hours"] = 720
+    refreshed = research._initial_program_state(spec=spec, program_path=program_path, poll_seconds=45)  # noqa: SLF001
+
+    merged = research._ensure_program_state(  # noqa: SLF001
+        local_state=tmp_path,
+        program_id="perpetual-macmini",
+        payload=refreshed,
+    )
+
+    assert merged["budgets"]["runs_completed"] == 138
+    assert merged["budgets"]["max_total_runs"] == 5000
+    assert merged["budgets"]["max_total_hours"] == 720
+    assert merged["poll_seconds"] == 45
+
 
 
 def test_write_review_packet_writes_json_and_markdown(tmp_path: Path) -> None:
@@ -323,3 +482,184 @@ def test_steer_research_program_persists_manual_overrides(tmp_path: Path) -> Non
     assert updated["steering"]["freeze_phase"] == 1
     assert updated["steering"]["force_pivot"] is True
     assert updated["steering"]["exploration_breadth"] == "high"
+
+
+def test_write_program_state_is_atomic(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    program_id = "perpetual-macmini"
+    state_path = local_state / "research_programs" / program_id / "program_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"status": "RUNNING"}), encoding="utf-8")
+
+    original_write_text = Path.write_text
+
+    def flaky_write_text(self: Path, data: str, *args, **kwargs):  # noqa: ANN001
+        if self.name.startswith(f"{state_path.name}.tmp-"):
+            original_write_text(self, "{", *args, **kwargs)
+            raise RuntimeError("simulated mid-write failure")
+        return original_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", flaky_write_text)
+
+    with pytest.raises(RuntimeError, match="mid-write failure"):
+        research._write_program_state(  # noqa: SLF001
+            local_state=local_state,
+            program_id=program_id,
+            payload={"status": "FAILED"},
+        )
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {"status": "RUNNING"}
+    assert list(state_path.parent.glob(f"{state_path.name}.tmp-*")) == []
+
+
+def test_spawn_program_supervisor_process_writes_bootstrap_state_before_launch(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    program_path = _program_spec(tmp_path)
+
+    observed: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 8765
+
+    def fake_popen(command, cwd, stdout, stderr, start_new_session):  # noqa: ANN001
+        state = research.read_research_program_state(local_state=local_state, program_id="perpetual-macmini")
+        observed["state_before_spawn"] = state
+        return FakeProcess()
+
+    monkeypatch.setattr(research.subprocess, "Popen", fake_popen)
+
+    payload = research._spawn_program_supervisor_process(  # noqa: SLF001
+        program_id="perpetual-macmini",
+        program_path=program_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    state_before_spawn = observed["state_before_spawn"]
+    assert isinstance(state_before_spawn, dict)
+    assert state_before_spawn["status"] == "STARTING"
+    assert state_before_spawn["pid"] is None
+    assert payload["pid"] == 8765
+    assert payload["status"] == "RUNNING"
+
+
+def test_spawn_program_supervisor_process_preserves_existing_frontier(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    program_path = _program_spec(tmp_path)
+    existing = {
+        "program_id": "perpetual-macmini",
+        "frontier": {"tried_family_signatures": ["abc"]},
+        "current_phase": 1,
+        "status": "STOPPED",
+    }
+    research._write_program_state(local_state=local_state, program_id="perpetual-macmini", payload=existing)  # noqa: SLF001
+
+    class FakeProcess:
+        pid = 2468
+
+    monkeypatch.setattr(research.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    payload = research._spawn_program_supervisor_process(  # noqa: SLF001
+        program_id="perpetual-macmini",
+        program_path=program_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    stored = json.loads((local_state / "research_programs" / "perpetual-macmini" / "program_state.json").read_text(encoding="utf-8"))
+    assert payload["pid"] == 2468
+    assert stored["frontier"]["tried_family_signatures"] == ["abc"]
+    assert stored["status"] == "RUNNING"
+    assert stored["stop_requested"] is False
+
+
+def test_spawn_program_supervisor_process_refreshes_budget_caps_from_spec(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    program_path = _program_spec(tmp_path)
+    existing = {
+        "program_id": "perpetual-macmini",
+        "budgets": {"runs_completed": 138, "max_total_runs": 250, "max_total_hours": 168},
+        "status": "STOPPED",
+        "stop_requested": True,
+    }
+    research._write_program_state(local_state=local_state, program_id="perpetual-macmini", payload=existing)  # noqa: SLF001
+
+    class FakeProcess:
+        pid = 1357
+
+    monkeypatch.setattr(research.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    payload = research._spawn_program_supervisor_process(  # noqa: SLF001
+        program_id="perpetual-macmini",
+        program_path=program_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        python_executable="/usr/bin/python3",
+        poll_seconds=45,
+    )
+
+    assert payload["budgets"]["runs_completed"] == 138
+    assert payload["budgets"]["max_total_runs"] == 50
+    assert payload["budgets"]["max_total_hours"] == 24
+    assert payload["poll_seconds"] == 45
+    assert payload["stop_requested"] is False
+
+
+def test_read_research_program_state_marks_dead_pid_stopped(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    state_path = local_state / "research_programs" / "perpetual-macmini" / "program_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"pid": 8765, "status": "STOPPING"}), encoding="utf-8")
+    monkeypatch.setattr(research, "_is_local_process_running", lambda pid: False)
+
+    payload = research.read_research_program_state(local_state=local_state, program_id="perpetual-macmini")
+
+    assert payload["status"] == "STOPPED"
+
+
+def test_supervise_research_program_clears_prior_stop_markers(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    program_path = _program_spec(tmp_path)
+    spec = research._load_research_program_spec(program_path)  # noqa: SLF001
+    stopped_state = research._initial_program_state(spec=spec, program_path=program_path, poll_seconds=30)  # noqa: SLF001
+    stopped_state["status"] = "STOPPED"
+    stopped_state["stop_reason"] = "old reason"
+    stopped_state["completed_at"] = "2026-04-13T00:00:00+00:00"
+    research._write_program_state(local_state=local_state, program_id="perpetual-macmini", payload=stopped_state)  # noqa: SLF001
+    monkeypatch.setattr(research, "_build_initial_phase_experiment_spec", lambda **kwargs: None)
+
+    result = research.supervise_research_program(
+        program_path=program_path,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=local_state,
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=1,
+    )
+
+    assert result["status"] == "STOPPED"
+    assert result["stop_reason"] == "no_initial_phase_spec"

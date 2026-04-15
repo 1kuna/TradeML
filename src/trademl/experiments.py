@@ -31,9 +31,22 @@ from trademl.data_node.training_control import (
 
 SPECIAL_MATRIX_DIMENSIONS = {"model_suite", "architecture_family", "feature_family", "data_profile", "data_family"}
 
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    """Atomically write JSON so concurrent readers never observe partial state."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        tmp_path.replace(path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp_path.unlink()
+
 ARCHITECTURE_FAMILY_PRESETS: dict[str, dict[str, Any]] = {
     "linear_baseline": {"model_suite": "ridge_only", "config_overrides": {}},
     "tree_challenger": {"model_suite": "full", "config_overrides": {}},
+    "advanced_challenger": {"model_suite": "advanced", "config_overrides": {}},
 }
 
 FEATURE_FAMILY_PRESETS: dict[str, dict[str, Any]] = {
@@ -192,7 +205,7 @@ def plan_experiment(
         manifest_path = runs_dir / f"{run_id}.json"
         existing = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
         merged = {**base_manifest, **_preserved_manifest_state(existing)}
-        manifest_path.write_text(json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8")
+        _atomic_write_json(manifest_path, merged)
         runs.append(merged)
 
     summary = {
@@ -324,6 +337,26 @@ def experiment_status(
             _write_run_manifest(local_state=local_state, experiment_id=experiment_id, manifest=manifest)
             runs.append(manifest)
             continue
+        if not _manifest_requires_runtime_refresh(manifest):
+            if current_status == "COMPLETED" and not manifest.get("assessment"):
+                report = _load_report_payload(
+                    manifest=manifest,
+                    local_state=local_state,
+                    repo_root=repo_root,
+                    data_root=data_root,
+                    targets_config_path=targets_config_path,
+                    python_executable=python_executable,
+                )
+                if report is not None:
+                    manifest["assessment"] = report.get("assessment", {})
+                    manifest["report_preview"] = {
+                        "coverage": report.get("coverage"),
+                        "ridge_mean_rank_ic": report.get("ridge", {}).get("mean_rank_ic"),
+                        "lightgbm_mean_rank_ic": report.get("lightgbm", {}).get("mean_rank_ic"),
+                    }
+                    _write_run_manifest(local_state=local_state, experiment_id=experiment_id, manifest=manifest)
+            runs.append(manifest)
+            continue
         snapshot = training_status_snapshot(
             repo_root=repo_root,
             data_root=data_root,
@@ -355,8 +388,16 @@ def experiment_status(
             }
         elif status == "FAILED":
             manifest["last_error"] = runtime.get("error") or manifest.get("last_error")
-            if not manifest.get("failure_kind"):
-                manifest["failure_kind"] = _classify_failure(str(manifest.get("last_error") or "training runtime failed"))
+            failure_detail = "\n".join(
+                part
+                for part in [
+                    str(manifest.get("last_error") or ""),
+                    str(snapshot.get("log_tail") or ""),
+                ]
+                if part
+            )
+            if not manifest.get("failure_kind") or str(manifest.get("failure_kind")) == "model":
+                manifest["failure_kind"] = _classify_failure(failure_detail or "training runtime failed")
         manifest["status"] = status
         manifest["runtime"] = runtime
         manifest["log_tail"] = snapshot.get("log_tail", "")
@@ -701,7 +742,13 @@ def read_experiment_supervisor_state(*, local_state: Path, experiment_id: str) -
     path = _supervisor_state_path(local_state=local_state, experiment_id=experiment_id)
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    pid = payload.get("pid")
+    status = str(payload.get("status") or "").upper()
+    if isinstance(pid, int) and status in {"RUNNING", "PAUSED", "STARTING", "STOPPING"} and not _is_local_process_running(pid):
+        payload["status"] = "STOPPED"
+        payload["active_run_ids"] = []
+    return payload
 
 
 def pause_experiment_supervisor(*, local_state: Path, experiment_id: str) -> dict[str, Any]:
@@ -871,7 +918,7 @@ def render_experiment_report(
     local_root = _local_experiment_root(local_state, experiment_id)
     json_path = local_root / "comparison.json"
     md_path = local_root / "comparison.md"
-    json_path.write_text(json.dumps(comparison, indent=2, sort_keys=True), encoding="utf-8")
+    _atomic_write_json(json_path, comparison)
     md_lines = [f"# Experiment {experiment_id}", ""]
     best = comparison.get("best")
     if best:
@@ -1117,7 +1164,7 @@ def _preserved_manifest_state(existing: dict[str, Any]) -> dict[str, Any]:
 def _write_run_manifest(*, local_state: Path, experiment_id: str, manifest: dict[str, Any]) -> None:
     path = _local_experiment_root(local_state, experiment_id) / "runs" / f"{manifest['run_id']}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    _atomic_write_json(path, manifest)
 
 
 def _read_experiment_summary(*, local_state: Path, experiment_id: str) -> dict[str, Any]:
@@ -1130,7 +1177,7 @@ def _read_experiment_summary(*, local_state: Path, experiment_id: str) -> dict[s
 def _write_experiment_summary(*, local_state: Path, experiment_id: str, summary: dict[str, Any]) -> None:
     path = _local_experiment_root(local_state, experiment_id) / "summary.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(summary, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    _atomic_write_json(path, summary)
 
 
 def _load_run_manifests(*, local_state: Path, experiment_id: str) -> list[dict[str, Any]]:
@@ -1160,9 +1207,7 @@ def _refresh_experiment_summary(*, local_state: Path, experiment_id: str, summar
         for failure in run.get("gate_failures", []) or []:
             gate_failures[str(failure)] = gate_failures.get(str(failure), 0) + 1
         preview = run.get("report_preview") or {}
-        score = preview.get("lightgbm_mean_rank_ic")
-        if score is None:
-            score = preview.get("ridge_mean_rank_ic")
+        score = _preview_primary_score(model_suite=str(run.get("model_suite") or ""), preview=preview)
         try:
             numeric = float(score or 0.0)
         except (TypeError, ValueError):
@@ -1230,7 +1275,7 @@ def _load_report_payload(
     if payload is None:
         return None
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    _atomic_write_json(cache_path, payload)
     return payload
 
 
@@ -1286,6 +1331,12 @@ else:
 
 
 def _primary_rank_ic(*, manifest: dict[str, Any], report: dict[str, Any]) -> float:
+    if manifest.get("model_suite") == "advanced":
+        catboost = report.get("catboost", {})
+        if not catboost.get("skipped"):
+            value = catboost.get("mean_rank_ic")
+            if value is not None:
+                return float(value)
     if manifest.get("model_suite") == "full":
         lightgbm = report.get("lightgbm", {})
         if not lightgbm.get("skipped"):
@@ -1293,6 +1344,18 @@ def _primary_rank_ic(*, manifest: dict[str, Any], report: dict[str, Any]) -> flo
             if value is not None:
                 return float(value)
     return float(report.get("ridge", {}).get("mean_rank_ic", 0.0) or 0.0)
+
+
+def _preview_primary_score(*, model_suite: str, preview: dict[str, Any]) -> float | None:
+    if model_suite == "advanced":
+        score = preview.get("catboost_mean_rank_ic")
+        if score is not None:
+            return score
+    if model_suite in {"full", "advanced"}:
+        score = preview.get("lightgbm_mean_rank_ic")
+        if score is not None:
+            return score
+    return preview.get("ridge_mean_rank_ic")
 
 
 def _evaluate_report(*, manifest: dict[str, Any], report: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any]:
@@ -1353,7 +1416,7 @@ def _write_evaluation_artifacts(*, local_state: Path, experiment_id: str, run_id
     root.mkdir(parents=True, exist_ok=True)
     json_path = root / f"{run_id}.evaluation.json"
     md_path = root / f"{run_id}.evaluation.md"
-    json_path.write_text(json.dumps(evaluation, indent=2, sort_keys=True), encoding="utf-8")
+    _atomic_write_json(json_path, evaluation)
     md_path.write_text(
         "\n".join(
             [
@@ -1468,8 +1531,6 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
     rows = list(comparison.get("rows") or [])
     shortlisted = [row for row in rows if row.get("shortlisted")]
     predictive_survivors = [row for row in rows if row.get("evaluation_stage") == "SURVIVES_PREDICTIVE"]
-    full_rows = [row for row in rows if row.get("model_suite") == "full"]
-    ridge_rows = [row for row in rows if row.get("model_suite") == "ridge_only"]
     policy = _proposal_policy(base_spec)
     allowed_dimensions = set(policy["allowed_dimensions"])
     current_generation = int(base_spec.get("generation", 0) or 0)
@@ -1492,19 +1553,27 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
     }
     rationale: list[str] = []
     next_matrix: dict[str, list[Any]]
-
-    ridge_score = max((float(row.get("primary_score") or 0.0) for row in ridge_rows), default=-1.0)
-    full_score = max((float(row.get("primary_score") or 0.0) for row in full_rows), default=-1.0)
-    dominant_architecture = "linear_baseline" if ridge_score >= full_score else "tree_challenger"
-    alternate_architecture = _alternate_architecture(dominant_architecture)
     best_row = rows[0] if rows else {}
     best_feature_family = _feature_family_for_row(best_row) if best_row else "price_core"
+    best_data_family = _data_family_for_row(best_row) if best_row else "price_only"
     best_initial_year = int((best_row.get("matrix_values") or {}).get("validation.initial_train_years", 2) or 2) if best_row else 2
     current_feature_families = [str(item) for item in current_matrix.get("feature_family", [])]
     current_architecture_families = [str(item) for item in current_matrix.get("architecture_family", [])]
     current_data_profiles = [str(item) for item in current_matrix.get("data_profile", [])]
+    current_data_families = [str(item) for item in current_matrix.get("data_family", [])]
     current_initial_years = [int(item) for item in current_matrix.get("validation.initial_train_years", [])]
+    allowed_data_families = _proposal_data_families(base_spec=base_spec, current_data_families=current_data_families)
+    allowed_architecture_families = _proposal_architecture_families(
+        base_spec=base_spec,
+        current_architecture_families=current_architecture_families,
+    )
 
+    architecture_scores = {
+        family: max((float(row.get("primary_score") or 0.0) for row in rows if _architecture_family_for_row(row) == family), default=-1.0)
+        for family in allowed_architecture_families
+    }
+    dominant_architecture = max(architecture_scores, key=architecture_scores.get, default="linear_baseline")
+    alternate_architectures = _alternate_architectures(dominant_architecture, allowed_architecture_families)
     if not predictive_survivors:
         if current_generation <= 0 or len(current_feature_families) > 1:
             next_matrix = _bounded_matrix(
@@ -1512,38 +1581,40 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
                 architecture_families=[dominant_architecture],
                 initial_years=[2, 3],
                 feature_families=["price_core", "price_liquidity", "price_short_horizon"],
+                data_families=allowed_data_families,
                 data_profiles=["phase1_default"],
                 family_size_cap=policy["family_size_cap"],
             )
-            if dominant_architecture == "linear_baseline":
-                rationale.append("all runs failed predictive gates and ridge outperformed full, so the next family narrows to ridge and sweeps feature families")
-            else:
-                rationale.append("all runs failed predictive gates and the tree challenger led, so the next family narrows to trees and sweeps feature families")
+            rationale.append(
+                f"all runs failed predictive gates, so the next family narrows to {dominant_architecture} while sweeping feature families across the currently modeling-ready data lanes"
+            )
         elif len(current_architecture_families) > 1 and len(current_data_profiles) > 1 and len(current_feature_families) == 1:
             next_matrix = _bounded_matrix(
                 allowed_dimensions=allowed_dimensions,
-                architecture_families=[dominant_architecture, alternate_architecture],
+                architecture_families=[dominant_architecture, *alternate_architectures],
                 initial_years=current_initial_years or [best_initial_year],
                 feature_families=_next_feature_family_candidates(current_feature_families[0]),
+                data_families=allowed_data_families,
                 data_profiles=["phase1_default"],
                 family_size_cap=policy["family_size_cap"],
             )
             next_matrix.pop("validation.initial_train_years", None)
             rationale.append(
-                "architecture and window sweeps still failed, so the next family pivots to different feature lanes while keeping both core architectures in play"
+                "architecture and window sweeps still failed, so the next family pivots to different feature and data-family lanes while keeping multiple architectures in play"
             )
         else:
             next_matrix = _bounded_matrix(
                 allowed_dimensions=allowed_dimensions,
-                architecture_families=[dominant_architecture, alternate_architecture],
+                architecture_families=[dominant_architecture, *alternate_architectures],
                 initial_years=[best_initial_year],
                 feature_families=[best_feature_family],
+                data_families=allowed_data_families,
                 data_profiles=["phase1_default", "phase1_short_window", "phase1_long_window"],
                 family_size_cap=policy["family_size_cap"],
             )
             next_matrix.pop("validation.initial_train_years", None)
             rationale.append(
-                "feature sweeps still failed predictive gates, so the next family compares architectures across data-window profiles around the best feature lane"
+                "feature sweeps still failed predictive gates, so the next family compares architectures and data-window profiles around the best surviving feature and data lane"
             )
     elif predictive_survivors and not shortlisted:
         best = predictive_survivors[0]
@@ -1553,11 +1624,12 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
             architecture_families=[best_architecture],
             initial_years=sorted({int(best["matrix_values"].get("validation.initial_train_years", 2) or 2), 2, 3}),
             feature_families=[_feature_family_for_row(best), "price_core"],
+            data_families=[_data_family_for_row(best), best_data_family],
             data_profiles=["phase1_default"],
             family_size_cap=policy["family_size_cap"],
             extra_dimension=("portfolio.cost_stress_multiplier", [2.0, 3.0]),
         )
-        rationale.append("a predictive survivor failed backtest gates, so the next family tightens around the winning architecture and stresses cost assumptions")
+        rationale.append("a predictive survivor failed backtest gates, so the next family tightens around the strongest architecture/data lane and stresses cost assumptions")
     else:
         best = shortlisted[0]
         best_architecture = _architecture_family_for_row(best)
@@ -1566,6 +1638,7 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
             architecture_families=[best_architecture],
             initial_years=sorted({int(best["matrix_values"].get("validation.initial_train_years", 2) or 2), 2, 3}),
             feature_families=[_feature_family_for_row(best), "price_core"],
+            data_families=[_data_family_for_row(best)],
             data_profiles=["phase1_default", "phase1_long_window"],
             family_size_cap=policy["family_size_cap"],
         )
@@ -1593,6 +1666,7 @@ def _bounded_matrix(
     architecture_families: list[str],
     initial_years: list[int],
     feature_families: list[str],
+    data_families: list[str],
     data_profiles: list[str],
     family_size_cap: int,
     extra_dimension: tuple[str, list[Any]] | None = None,
@@ -1607,8 +1681,15 @@ def _bounded_matrix(
         current_size = _matrix_combination_count(matrix)
         max_features = max(1, family_size_cap // max(1, current_size * max(1, len(initial_years))))
         matrix["feature_family"] = list(dict.fromkeys(feature_families))[:max_features]
+    if "data_family" in allowed_dimensions and data_families:
+        current_size = _matrix_combination_count(matrix)
+        max_data_families = max(1, family_size_cap // max(1, current_size * max(1, len(initial_years))))
+        matrix["data_family"] = list(dict.fromkeys(data_families))[:max_data_families]
     if "validation.initial_train_years" in allowed_dimensions:
-        max_years = max(1, family_size_cap // max(1, len(matrix.get("feature_family", [1]))))
+        max_years = max(
+            1,
+            family_size_cap // max(1, len(matrix.get("feature_family", [1])) * len(matrix.get("data_family", [1]))),
+        )
         matrix["validation.initial_train_years"] = list(dict.fromkeys(initial_years))[:max_years]
     if "data_profile" in allowed_dimensions:
         current_size = _matrix_combination_count(matrix)
@@ -1634,11 +1715,15 @@ def _architecture_family_for_row(row: dict[str, Any]) -> str:
     family = matrix_values.get("architecture_family")
     if family:
         return str(family)
-    return "tree_challenger" if str(row.get("model_suite")) == "full" else "linear_baseline"
+    model_suite = str(row.get("model_suite") or "")
+    if model_suite == "advanced":
+        return "advanced_challenger"
+    return "tree_challenger" if model_suite == "full" else "linear_baseline"
 
 
-def _alternate_architecture(family: str) -> str:
-    return "tree_challenger" if family == "linear_baseline" else "linear_baseline"
+def _alternate_architectures(family: str, allowed_families: list[str] | None = None) -> list[str]:
+    candidates = allowed_families or list(ARCHITECTURE_FAMILY_PRESETS)
+    return [candidate for candidate in candidates if candidate != family]
 
 
 def _feature_family_for_row(row: dict[str, Any]) -> str:
@@ -1647,6 +1732,34 @@ def _feature_family_for_row(row: dict[str, Any]) -> str:
     if family:
         return str(family)
     return "price_liquidity"
+
+
+def _data_family_for_row(row: dict[str, Any]) -> str:
+    matrix_values = dict(row.get("matrix_values") or {})
+    family = matrix_values.get("data_family")
+    if family:
+        return str(family)
+    return "price_plus_liquidity"
+
+
+def _proposal_data_families(*, base_spec: dict[str, Any], current_data_families: list[str]) -> list[str]:
+    phase = int(base_spec.get("phase", 1) or 1)
+    allowed = [
+        family
+        for family, preset in DATA_FAMILY_PRESETS.items()
+        if bool(preset.get("modeling_ready")) and (phase > 1 or family in {"price_only", "price_plus_liquidity"})
+    ]
+    ordered = list(dict.fromkeys(current_data_families + allowed))
+    return ordered or ["price_only"]
+
+
+def _proposal_architecture_families(*, base_spec: dict[str, Any], current_architecture_families: list[str]) -> list[str]:
+    phase = int(base_spec.get("ssot_phase", base_spec.get("phase", 1)) or 1)
+    allowed = ["linear_baseline", "tree_challenger"]
+    if phase > 1:
+        allowed.append("advanced_challenger")
+    ordered = list(dict.fromkeys(current_architecture_families + allowed))
+    return ordered or ["linear_baseline", "tree_challenger"]
 
 
 def _next_feature_family_candidates(current_family: str) -> list[str]:
@@ -1659,7 +1772,7 @@ def _write_next_family_proposal(*, local_state: Path, experiment_id: str, propos
     json_path = root / "next_family_proposal.json"
     md_path = root / "next_family_proposal.md"
     spec_path = root / "next_family_proposal.yml"
-    json_path.write_text(json.dumps(proposal, indent=2, sort_keys=True), encoding="utf-8")
+    _atomic_write_json(json_path, proposal)
     spec_path.write_text(yaml.safe_dump(proposal["next_spec"], sort_keys=False), encoding="utf-8")
     md_path.write_text(
         "\n".join(
@@ -1693,6 +1806,27 @@ def _spawn_supervisor_process(
 ) -> dict[str, Any]:
     log_path = _supervisor_log_path(local_state=local_state, experiment_id=experiment_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "experiment_id": experiment_id,
+        "spec_path": str(spec_path),
+        "pid": None,
+        "status": "STARTING",
+        "started_at": datetime.now(tz=UTC).isoformat(),
+        "heartbeat_at": datetime.now(tz=UTC).isoformat(),
+        "poll_seconds": poll_seconds,
+        "paused": False,
+        "stop_requested": False,
+        "active_run_ids": [],
+        "queue_counts": {},
+        "log_path": str(log_path),
+    }
+    existing = read_experiment_supervisor_state(local_state=local_state, experiment_id=experiment_id)
+    payload = {**existing, **payload}
+    if existing.get("queue_counts") and not payload.get("queue_counts"):
+        payload["queue_counts"] = existing["queue_counts"]
+    if existing.get("active_run_ids") and not payload.get("active_run_ids"):
+        payload["active_run_ids"] = existing["active_run_ids"]
+    _write_supervisor_state(local_state=local_state, experiment_id=experiment_id, payload=payload)
     command = [
         python_executable,
         "-m",
@@ -1712,20 +1846,9 @@ def _spawn_supervisor_process(
     ]
     with log_path.open("a", encoding="utf-8") as handle:
         process = subprocess.Popen(command, cwd=repo_root, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)  # noqa: S603
-    payload = {
-        "experiment_id": experiment_id,
-        "spec_path": str(spec_path),
-        "pid": process.pid,
-        "status": "RUNNING",
-        "started_at": datetime.now(tz=UTC).isoformat(),
-        "heartbeat_at": datetime.now(tz=UTC).isoformat(),
-        "poll_seconds": poll_seconds,
-        "paused": False,
-        "stop_requested": False,
-        "active_run_ids": [],
-        "queue_counts": {},
-        "log_path": str(log_path),
-    }
+    payload["pid"] = process.pid
+    payload["status"] = "RUNNING"
+    payload["heartbeat_at"] = datetime.now(tz=UTC).isoformat()
     _write_supervisor_state(local_state=local_state, experiment_id=experiment_id, payload=payload)
     return payload
 
@@ -1745,8 +1868,7 @@ def _supervisor_log_path(*, local_state: Path, experiment_id: str) -> Path:
 
 def _write_supervisor_state(*, local_state: Path, experiment_id: str, payload: dict[str, Any]) -> None:
     path = _supervisor_state_path(local_state=local_state, experiment_id=experiment_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    _atomic_write_json(path, payload)
 
 
 def _run_ready_for_retry(*, manifest: dict[str, Any], supervision: dict[str, Any]) -> bool:
@@ -1760,6 +1882,18 @@ def _run_ready_for_retry(*, manifest: dict[str, Any], supervision: dict[str, Any
     return int(manifest.get("retry_count", 0) or 0) < int(supervision["max_retry_count"])
 
 
+def _manifest_requires_runtime_refresh(manifest: dict[str, Any]) -> bool:
+    """Return whether this manifest still needs live runtime polling."""
+    status = str(manifest.get("status") or "").upper()
+    if status in {"RUNNING", "STARTING", "UNKNOWN"}:
+        return True
+    if status == "FAILED" and str(manifest.get("failure_kind") or "") == "infra":
+        return True
+    if status == "FAILED" and str(manifest.get("last_error") or "") == "remote process is not running":
+        return True
+    return False
+
+
 def _append_supervisor_event(manifest: dict[str, Any], *, event: str, payload: dict[str, Any]) -> None:
     history = list(manifest.get("supervisor_history") or [])
     history.append({"at": datetime.now(tz=UTC).isoformat(), "event": event, **payload})
@@ -1769,6 +1903,8 @@ def _append_supervisor_event(manifest: dict[str, Any], *, event: str, payload: d
 def _classify_failure(error: str) -> str:
     lowered = error.lower()
     if any(token in lowered for token in ["ssh", "permission denied", "connection refused", "connection reset", "host", "mount", "timed out", "no route"]):
+        return "infra"
+    if any(token in lowered for token in ["modulenotfounderror", "importerror", "no module named"]):
         return "infra"
     if "preflight failed" in lowered:
         return "preflight"

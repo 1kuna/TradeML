@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -731,6 +732,8 @@ training_targets:
                 )()
         if command.startswith("tail -n"):
             return type("R", (), {"returncode": 0, "stdout": "line-1\nline-2\n", "stderr": ""})()
+        if command.startswith("kill -0"):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         if command.startswith("kill -TERM"):
             return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         if "_write_runtime_payload" in command:
@@ -851,3 +854,141 @@ training_targets:
     assert mirrored["running"] is False
     assert mirrored["host"] == "192.168.1.10"
     assert mirrored["remote_log_path"] == "/srv/trademl/control/logs/training_phase_1.log"
+
+
+def test_training_status_snapshot_marks_missing_remote_pid_as_failed(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    (repo_root / "configs").mkdir(parents=True, exist_ok=True)
+    (repo_root / "configs" / "node.yml").write_text(
+        """
+training_targets:
+  workstation-remote:
+    host: 192.168.1.10
+    user: zach
+    repo_root: /srv/trademl
+    data_root: /srv/trademl-data
+    python_executable: /usr/bin/python3
+""".strip(),
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "local_state"
+    local_runtime = local_state / "training_runs" / "workstation-remote" / "training_phase_1.json"
+    local_runtime.parent.mkdir(parents=True, exist_ok=True)
+    local_runtime.write_text(
+        json.dumps(
+            {
+                "phase": 1,
+                "pid": 5151,
+                "target": "workstation-remote",
+                "status": "running",
+                "running": True,
+                "shared_runtime_path": str(data_root / "control" / "cluster" / "state" / "training_phase_1.json"),
+                "remote_log_path": "/srv/trademl/control/logs/training_phase_1.log",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_ssh(_target, command, *, check=False):  # noqa: ANN001
+        if "read_training_runtime" in command:
+            return type("R", (), {"returncode": 0, "stdout": "{}\n", "stderr": ""})()
+        if command.startswith("kill -0"):
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "missing"})()
+        if command.startswith("tail -n"):
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        raise AssertionError(command)
+
+    monkeypatch.setattr(training_control, "_run_ssh_command", fake_ssh)
+
+    snapshot = training_status_snapshot(
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        phase=1,
+        target="workstation-remote",
+        targets_config_path=repo_root / "configs" / "node.yml",
+    )
+
+    assert snapshot["runtime"]["running"] is False
+    assert snapshot["runtime"]["status"] == "failed"
+    assert "remote process is not running" in snapshot["runtime"]["error"]
+
+
+def test_launch_training_process_ignores_stale_remote_running_runtime(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    (repo_root / "configs").mkdir(parents=True, exist_ok=True)
+    config_path = repo_root / "configs" / "equities_xs.yml"
+    config_path.write_text("model: {}\n", encoding="utf-8")
+    (repo_root / "configs" / "node.yml").write_text(
+        """
+training_targets:
+  workstation-remote:
+    host: 192.168.1.10
+    user: zach
+    repo_root: /srv/trademl
+    data_root: /srv/trademl-data
+    python_executable: /usr/bin/python3
+""".strip(),
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "local_state"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    runtime_path = local_state / "training_runs" / "workstation-remote" / "training_phase_1.json"
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_path.write_text(
+        json.dumps({"pid": 5151, "status": "running", "running": True, "target": "workstation-remote"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        training_control,
+        "training_status_snapshot",
+        lambda **kwargs: {"runtime": {"pid": 5151, "status": "failed", "running": False}, "log_tail": "", "target": {"name": "workstation-remote"}},
+    )
+    monkeypatch.setattr(training_control, "_sync_remote_training_config", lambda **kwargs: Path("/srv/trademl/control/config.yml"))
+    monkeypatch.setattr(training_control, "training_preflight", lambda **kwargs: {"ok": True})
+    monkeypatch.setattr(training_control, "_resolve_default_report_date", lambda **kwargs: "2026-03-09")
+    monkeypatch.setattr(training_control, "_launch_remote_training_process", lambda **kwargs: 9999)
+
+    payload = launch_training_process(
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        phase=1,
+        target="workstation-remote",
+        targets_config_path=repo_root / "configs" / "node.yml",
+        config_path=config_path,
+    )
+
+    assert payload["pid"] == 9999
+    assert payload["status"] == "starting"
+
+
+def test_run_ssh_command_returns_timeout_completed_process(tmp_path: Path, monkeypatch) -> None:
+    target = training_control.TrainingTarget(
+        name="workstation-remote",
+        kind="ssh",
+        default=True,
+        host="192.168.1.10",
+        user="zach",
+        port=22,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "data",
+        python_executable="/usr/bin/python3",
+        env_path=None,
+        identity_file=None,
+        local_runtime_root=tmp_path / "state",
+    )
+
+    def fake_run(*args, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd="ssh", timeout=training_control.REMOTE_COMMAND_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(training_control.subprocess, "run", fake_run)
+
+    result = training_control._run_ssh_command(target, "echo hi")  # noqa: SLF001
+
+    assert result.returncode == 124
+    assert "timed out" in result.stderr

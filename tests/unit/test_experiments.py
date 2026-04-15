@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 import trademl.experiments as experiments
@@ -238,6 +239,39 @@ def test_materialize_matrix_row_resolves_architecture_feature_and_data_profiles(
     assert row["config_overrides"]["features.liquidity.amihud"] == []
     assert row["config_overrides"]["data.window_years"] == 3
     assert row["config_overrides"]["validation.initial_train_years"] == 3
+
+
+def test_primary_rank_ic_prefers_catboost_for_advanced_suite() -> None:
+    score = experiments._primary_rank_ic(  # noqa: SLF001
+        manifest={"model_suite": "advanced"},
+        report={
+            "ridge": {"mean_rank_ic": 0.01},
+            "lightgbm": {"mean_rank_ic": 0.02},
+            "catboost": {"mean_rank_ic": 0.05},
+        },
+    )
+
+    assert score == 0.05
+
+
+def test_classify_failure_treats_remote_import_bootstrap_as_infra() -> None:
+    kind = experiments._classify_failure(  # noqa: SLF001
+        "remote process is not running\n"
+        "Traceback (most recent call last):\n"
+        "ModuleNotFoundError: No module named 'trademl.models.catboost'\n"
+    )
+
+    assert kind == "infra"
+
+
+def test_manifest_requires_runtime_refresh_for_generic_remote_exit_wrapper() -> None:
+    assert experiments._manifest_requires_runtime_refresh(  # noqa: SLF001
+        {
+            "status": "FAILED",
+            "failure_kind": "model",
+            "last_error": "remote process is not running",
+        }
+    )
 
 
 def test_run_experiment_until_idle_drains_planned_runs_without_sleeping(tmp_path: Path, monkeypatch) -> None:
@@ -684,3 +718,159 @@ def test_experiment_status_skips_remote_polling_for_planned_runs(tmp_path: Path,
 
     assert status["counts"] == {"PLANNED": 1}
     assert status["runs"][0]["run_id"] == "run-a"
+
+
+def test_experiment_status_skips_remote_polling_for_completed_runs(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    experiment_root = local_state / "experiments" / "phase1-baselines"
+    (experiment_root / "runs").mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "experiment_id": "phase1-baselines",
+        "run_id": "run-a",
+        "phase": 1,
+        "target": "workstation-remote",
+        "runtime_name": "experiment_phase1-baselines__run-a",
+        "status": "COMPLETED",
+        "evaluation_stage": "REJECTED_PREDICTIVE",
+        "assessment": {"decision": "NO_GO"},
+        "model_suite": "ridge_only",
+        "matrix_values": {"architecture_family": "linear_baseline"},
+        "config_path": str(tmp_path / "run-a.yml"),
+        "output_root": "/remote/output",
+        "report_path": "/remote/report.json",
+    }
+    (experiment_root / "runs" / "run-a.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (experiment_root / "summary.json").write_text(json.dumps({"experiment_id": "phase1-baselines"}), encoding="utf-8")
+
+    def unexpected_status_snapshot(**kwargs):  # noqa: ANN001
+        raise AssertionError("completed runs should not invoke training_status_snapshot")
+
+    monkeypatch.setattr(experiments, "training_status_snapshot", unexpected_status_snapshot)
+
+    status = experiments.experiment_status(
+        experiment_id="phase1-baselines",
+        local_state=local_state,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert status["counts"] == {"COMPLETED": 1}
+    assert status["runs"][0]["run_id"] == "run-a"
+
+
+def test_write_supervisor_state_is_atomic(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    experiment_id = "phase1-baselines"
+    state_path = local_state / "experiment_supervisors" / f"{experiment_id}.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"status": "RUNNING"}), encoding="utf-8")
+
+    original_write_text = Path.write_text
+
+    def flaky_write_text(self: Path, data: str, *args, **kwargs):  # noqa: ANN001
+        if self.name.startswith(f"{state_path.name}.tmp-"):
+            original_write_text(self, "{", *args, **kwargs)
+            raise RuntimeError("simulated mid-write failure")
+        return original_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", flaky_write_text)
+
+    with pytest.raises(RuntimeError, match="mid-write failure"):
+        experiments._write_supervisor_state(  # noqa: SLF001
+            local_state=local_state,
+            experiment_id=experiment_id,
+            payload={"status": "FAILED"},
+        )
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {"status": "RUNNING"}
+    assert list(state_path.parent.glob(f"{state_path.name}.tmp-*")) == []
+
+
+def test_spawn_supervisor_process_writes_bootstrap_state_before_launch(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    env_path = tmp_path / ".env"
+    spec_path = tmp_path / "phase1.yml"
+    env_path.write_text("", encoding="utf-8")
+    spec_path.write_text("experiment_id: phase1-baselines\n", encoding="utf-8")
+
+    observed: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 4321
+
+    def fake_popen(command, cwd, stdout, stderr, start_new_session):  # noqa: ANN001
+        state = experiments.read_experiment_supervisor_state(local_state=local_state, experiment_id="phase1-baselines")
+        observed["state_before_spawn"] = state
+        return FakeProcess()
+
+    monkeypatch.setattr(experiments.subprocess, "Popen", fake_popen)
+
+    payload = experiments._spawn_supervisor_process(  # noqa: SLF001
+        experiment_id="phase1-baselines",
+        spec_path=spec_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    state_before_spawn = observed["state_before_spawn"]
+    assert isinstance(state_before_spawn, dict)
+    assert state_before_spawn["status"] == "STARTING"
+    assert state_before_spawn["pid"] is None
+    assert payload["pid"] == 4321
+    assert payload["status"] == "RUNNING"
+
+
+def test_spawn_supervisor_process_preserves_existing_state(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    env_path = tmp_path / ".env"
+    spec_path = tmp_path / "phase1.yml"
+    env_path.write_text("", encoding="utf-8")
+    spec_path.write_text("experiment_id: phase1-baselines\n", encoding="utf-8")
+    experiments._write_supervisor_state(  # noqa: SLF001
+        local_state=local_state,
+        experiment_id="phase1-baselines",
+        payload={"experiment_id": "phase1-baselines", "queue_counts": {"COMPLETED": 12}, "status": "STOPPED"},
+    )
+
+    class FakeProcess:
+        pid = 7654
+
+    monkeypatch.setattr(experiments.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    payload = experiments._spawn_supervisor_process(  # noqa: SLF001
+        experiment_id="phase1-baselines",
+        spec_path=spec_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    stored = experiments.read_experiment_supervisor_state(local_state=local_state, experiment_id="phase1-baselines")
+    assert payload["pid"] == 7654
+    assert stored["queue_counts"] == {"COMPLETED": 12}
+
+
+def test_read_experiment_supervisor_state_marks_dead_pid_stopped(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    path = local_state / "experiment_supervisors" / "phase1-baselines.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": 4321, "status": "STOPPING", "active_run_ids": ["run-a"]}), encoding="utf-8")
+    monkeypatch.setattr(experiments, "_is_local_process_running", lambda pid: False)
+
+    payload = experiments.read_experiment_supervisor_state(local_state=local_state, experiment_id="phase1-baselines")
+
+    assert payload["status"] == "STOPPED"
+    assert payload["active_run_ids"] == []
