@@ -369,6 +369,19 @@ def test_alpha_vantage_and_fred_connectors() -> None:
     assert "amount" in corp_actions.columns
     assert observations.iloc[0]["series_id"] == "DGS10"
     assert observations.iloc[0]["value"] == pytest.approx(4.2)
+    assert fred_session.calls[0][2]["limit"] == 10000
+
+
+def test_fred_vintagedates_uses_supported_limit() -> None:
+    fred_session = FakeSession(
+        [FakeResponse(200, {"vintage_dates": ["2024-01-02", "2024-01-03"]})]
+    )
+    fred = FredConnector(base_url="https://api.stlouisfed.org", api_key="key", budget_manager=_budget_manager(), session=fred_session)
+
+    vintages = fred.fetch("vintagedates", ["DGS10"], "2024-01-01", "2024-01-31")
+
+    assert vintages["series_id"].tolist() == ["DGS10", "DGS10"]
+    assert fred_session.calls[0][2]["limit"] == 10000
 
 
 def test_alpha_vantage_corp_actions_normalize_splits_and_dividends() -> None:

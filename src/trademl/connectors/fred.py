@@ -33,7 +33,7 @@ class FredConnector(HTTPConnector):
                 payload = self.request_json(
                     endpoint="/fred/series/vintagedates",
                     endpoint_key="vintagedates",
-                    params={"series_id": series_id, "limit": 100000},
+                    params={"series_id": series_id, "limit": 10000},
                     task_kind="OTHER",
                     logical_units=1,
                 )
@@ -63,7 +63,7 @@ class FredConnector(HTTPConnector):
                     "series_id": series_id,
                     "observation_start": pd.Timestamp(start_date).strftime("%Y-%m-%d"),
                     "observation_end": pd.Timestamp(end_date).strftime("%Y-%m-%d"),
-                    "limit": 100000,
+                    "limit": 10000,
                     "sort_order": "asc",
                 },
                 task_kind="OTHER",
