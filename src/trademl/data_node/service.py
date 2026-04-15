@@ -350,11 +350,18 @@ class DataNodeService:
         canonical_lane_widths = self._canonical_runtime._backfill_lane_widths()
         canonical_backlog_active = self.db.has_pending_planner_tasks(task_families=("canonical_bars", "canonical_repair")) or self.db.has_pending_backfill()
         aux_lane_widths: dict[str, int] = {}
-        if not canonical_backlog_active:
+        allow_aux_tail = canonical_backlog_active and self._allow_auxiliary_during_canonical_tail()
+        if (not canonical_backlog_active) or allow_aux_tail:
             aux_task_kinds = {"REFERENCE", "EVENT", "MACRO"}
             if not self._auxiliary_runtime._core_auxiliary_incomplete():
                 aux_task_kinds.add("RESEARCH_ONLY")
-            aux_lane_widths = self._aux_lane_widths(task_kinds=aux_task_kinds)
+            aux_lane_widths = self._aux_lane_widths(task_kinds=aux_task_kinds, canonical_pressure=False if allow_aux_tail else None)
+            if allow_aux_tail:
+                aux_lane_widths = {
+                    vendor: min(width, 1)
+                    for vendor, width in aux_lane_widths.items()
+                    if width > 0
+                }
         max_workers = max(1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values()))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for vendor, width in canonical_lane_widths.items():
@@ -376,6 +383,27 @@ class DataNodeService:
                 if task_type == "canonical":
                     changed_dates.extend(result)
         return sorted(set(changed_dates))
+
+    def _allow_auxiliary_during_canonical_tail(self) -> bool:
+        """Allow limited auxiliary work when only a tiny rolling-canonical tail remains."""
+        active = self.db.fetch_planner_tasks(
+            task_families=("canonical_bars", "canonical_repair"),
+            statuses=("LEASED", "PARTIAL", "PENDING", "FAILED"),
+            limit=8,
+        )
+        if not active or len(active) > 4:
+            return False
+        if any(task.task_family == "canonical_repair" or task.planner_group == "canonical_repair" for task in active):
+            return False
+        if any(task.planner_group != "rolling_canonical" for task in active):
+            return False
+        if any(task.status in {"PENDING", "FAILED"} for task in active):
+            return False
+        for task in active:
+            progress = self.db.fetch_planner_task_progress(task.task_key)
+            if progress is None or progress.remaining_units <= 0:
+                return False
+        return True
 
     def _seed_planner_tasks(self, *, trading_date: str | None = None) -> None:
         """Seed or refresh planner tasks from the current stage definition."""
@@ -1521,5 +1549,5 @@ class DataNodeService:
             return
         self.collect_forward_shard(trading_date=trading_date, symbols=shard.symbols, shard_id=shard.shard_id)
 
-    def _aux_lane_widths(self, *, task_kinds: set[str]) -> dict[str, int]:
-        return self._auxiliary_runtime._aux_lane_widths(task_kinds=task_kinds)
+    def _aux_lane_widths(self, *, task_kinds: set[str], canonical_pressure: bool | None = None) -> dict[str, int]:
+        return self._auxiliary_runtime._aux_lane_widths(task_kinds=task_kinds, canonical_pressure=canonical_pressure)

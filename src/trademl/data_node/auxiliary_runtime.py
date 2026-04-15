@@ -326,9 +326,13 @@ class AuxiliaryRuntime:
         available_macro = {path.name.partition("=")[2] for path in (self.paths.root / "data" / "raw" / "macros_fred").glob("series=*")}
         return not set(default_macro_series()).issubset(available_macro)
 
-    def _aux_lane_widths(self, *, task_kinds: set[str]) -> dict[str, int]:
+    def _aux_lane_widths(self, *, task_kinds: set[str], canonical_pressure: bool | None = None) -> dict[str, int]:
         widths: dict[str, int] = {}
-        canonical_pressure = self.db.has_pending_planner_tasks(task_families=("canonical_bars",)) or self.db.has_pending_backfill()
+        effective_canonical_pressure = (
+            self.db.has_pending_planner_tasks(task_families=("canonical_bars",)) or self.db.has_pending_backfill()
+            if canonical_pressure is None
+            else bool(canonical_pressure)
+        )
         for job in auxiliary_capabilities(
             connectors=self.connectors,
             audit_state=self.capability_audit_state,
@@ -337,9 +341,9 @@ class AuxiliaryRuntime:
             if job.task_kind not in task_kinds:
                 continue
             profile = vendor_profile(job.vendor)
-            if canonical_pressure and job.task_kind == "RESEARCH_ONLY":
+            if effective_canonical_pressure and job.task_kind == "RESEARCH_ONLY":
                 continue
-            if canonical_pressure and profile is not None and profile.saturation_policy in {"canonical_first", "canonical_only"}:
+            if effective_canonical_pressure and profile is not None and profile.saturation_policy in {"canonical_first", "canonical_only"}:
                 continue
             width = int(job.lane_width or 1)
             widths[job.vendor] = max(widths.get(job.vendor, 0), width)

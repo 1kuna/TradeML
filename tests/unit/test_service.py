@@ -902,7 +902,7 @@ def test_process_planner_queue_survives_auxiliary_lane_exception(tmp_path: Path)
     service.default_symbols = ["AAPL"]
     service._ensure_planner_backlog_seeded = lambda trading_date=None: None  # type: ignore[method-assign]
     service._canonical_runtime._backfill_lane_widths = lambda: {}  # type: ignore[method-assign]
-    service._aux_lane_widths = lambda task_kinds=None: {"alpaca": 1}  # type: ignore[method-assign]
+    service._aux_lane_widths = lambda task_kinds=None, canonical_pressure=None: {"alpaca": 1}  # type: ignore[method-assign]
     service._drain_auxiliary_lane = lambda vendor: (_ for _ in ()).throw(RuntimeError("aux boom"))  # type: ignore[method-assign]
 
     changed = service.process_planner_queue()
@@ -924,7 +924,7 @@ def test_process_planner_queue_heartbeats_while_waiting_on_pending_lane(tmp_path
     service.default_symbols = ["AAPL"]
     service._ensure_planner_backlog_seeded = lambda trading_date=None: None  # type: ignore[method-assign]
     service._canonical_runtime._backfill_lane_widths = lambda: {"alpaca": 2}  # type: ignore[method-assign]
-    service._aux_lane_widths = lambda task_kinds=None: {}  # type: ignore[method-assign]
+    service._aux_lane_widths = lambda task_kinds=None, canonical_pressure=None: {}  # type: ignore[method-assign]
 
     release_slow_lane = threading.Event()
     slow_lane_started = threading.Event()
@@ -2574,6 +2574,86 @@ def test_process_planner_queue_skips_auxiliary_lanes_while_canonical_backlog_exi
     assert aux_task_kind_calls == []
 
 
+def test_process_planner_queue_allows_limited_auxiliary_work_for_small_rolling_tail(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    tasks = [
+        {
+            "task_key": "canonical_bars::equities_eod::00361::0063::2026-03-16::2026-04-13",
+            "task_family": "canonical_bars",
+            "planner_group": "rolling_canonical",
+            "dataset": "equities_eod",
+            "tier": "A",
+            "priority": 10,
+            "start_date": "2026-03-16",
+            "end_date": "2026-04-13",
+            "symbols": ["HOLX"],
+            "eligible_vendors": ["alpaca", "massive"],
+            "output_name": "equities_bars",
+            "payload": {"scope_kind": "symbol_range", "trading_days": ["2026-04-08", "2026-04-09", "2026-04-10", "2026-04-13"]},
+        },
+        {
+            "task_key": "canonical_bars::equities_eod::00416::0063::2026-03-16::2026-04-13",
+            "task_family": "canonical_bars",
+            "planner_group": "rolling_canonical",
+            "dataset": "equities_eod",
+            "tier": "A",
+            "priority": 10,
+            "start_date": "2026-03-16",
+            "end_date": "2026-04-13",
+            "symbols": ["AL"],
+            "eligible_vendors": ["alpaca", "massive"],
+            "output_name": "equities_bars",
+            "payload": {"scope_kind": "symbol_range", "trading_days": ["2026-04-08", "2026-04-09", "2026-04-10", "2026-04-13"]},
+        },
+    ]
+    db.bulk_upsert_planner_tasks(tasks)
+    with db._connect() as connection:
+        connection.executemany(
+            """
+            UPDATE planner_tasks
+            SET status = 'PARTIAL',
+                next_eligible_at = NULL
+            WHERE task_key = ?
+            """,
+            [(task["task_key"],) for task in tasks],
+        )
+    db.bulk_update_planner_task_progress(
+        [
+            {
+                "task_key": task["task_key"],
+                "expected_units": 20,
+                "completed_units": 16,
+                "remaining_units": 4,
+                "completed_symbols": [],
+                "remaining_symbols": task["symbols"],
+                "state": {"scope_kind": "symbol_range"},
+            }
+            for task in tasks
+        ]
+    )
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector(), "alpha_vantage": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["HOLX", "AL"]
+    calls: list[str] = []
+    aux_task_kind_calls: list[set[str]] = []
+
+    service._ensure_planner_backlog_seeded = lambda **kwargs: None  # type: ignore[method-assign]
+    service._canonical_runtime._backfill_lane_widths = lambda: {"alpaca": 1}  # type: ignore[method-assign]
+    service._aux_lane_widths = lambda **kwargs: aux_task_kind_calls.append(set(kwargs.get("task_kinds") or ())) or {"alpha_vantage": 3}  # type: ignore[method-assign]
+    service._drain_canonical_lane = lambda vendor, exchange: calls.append(f"canonical:{vendor}") or []  # type: ignore[method-assign]
+    service._drain_auxiliary_lane = lambda vendor: calls.append(f"aux:{vendor}") or []  # type: ignore[method-assign]
+
+    service.process_planner_queue(exchange="XNYS")
+
+    assert calls == ["canonical:alpaca", "aux:alpha_vantage"]
+    assert aux_task_kind_calls == [{"REFERENCE", "EVENT", "MACRO"}]
+
+
 def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfill(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     raw_partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31"
@@ -2806,6 +2886,50 @@ def test_aux_lane_widths_suppress_research_only_lanes_during_canonical_backlog(t
     widths = service._aux_lane_widths(task_kinds={"RESEARCH_ONLY"})
 
     assert widths == {}
+
+
+def test_aux_lane_widths_can_ignore_canonical_pressure_override(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _NoopConnector(),
+            "twelve_data": _NoopConnector(),
+            "massive": _NoopConnector(),
+            "alpha_vantage": _NoopConnector(),
+            "fred": _FredConnector(),
+            "fmp": _NoopConnector(),
+            "sec_edgar": _NoopConnector(),
+        },
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+    db.bulk_upsert_planner_tasks(
+        [
+            {
+                "task_key": "canonical_bars::equities_eod::00000::0000::2026-03-01::2026-03-31",
+                "task_family": "canonical_bars",
+                "planner_group": "rolling_canonical",
+                "dataset": "equities_eod",
+                "tier": "A",
+                "priority": 10,
+                "start_date": "2026-03-01",
+                "end_date": "2026-03-31",
+                "symbols": ["AAPL"],
+                "eligible_vendors": ["alpaca", "twelve_data", "massive"],
+                "output_name": "equities_bars",
+                "payload": {"scope_kind": "symbol_range", "trading_days": ["2026-03-31"]},
+            }
+        ]
+    )
+
+    widths = service._aux_lane_widths(task_kinds={"REFERENCE", "EVENT", "MACRO"}, canonical_pressure=False)
+
+    assert widths["alpaca"] == 1
+    assert widths["massive"] == 1
+    assert widths["fred"] == 2
 
 
 def test_planned_auxiliary_work_materializes_reference_and_macro_tasks(tmp_path: Path) -> None:
