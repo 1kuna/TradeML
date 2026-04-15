@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pyarrow.parquet as pq
 import yaml
 
 from trademl.calendars.exchange import ExchangeCalendarStore, get_trading_days
@@ -1728,7 +1729,10 @@ def _read_training_run_history(settings: NodeSettings, *, limit: int = 12) -> li
     because they already contain the assessment/report preview fields the HUD
     needs and avoid a wide NAS report crawl on every refresh.
 
-    Prefer per-run experiment artifacts under ``{nas}/experiments/*/runs/*/reports/daily/*.json``
+    Prefer shared experiment summaries under ``{nas}/experiments/*/summary.json``
+    because they preserve repeated runs and avoid a wide report crawl on the Pi.
+
+    Fall back to per-run experiment artifacts under ``{nas}/experiments/*/runs/*/reports/daily/*.json``
     so repeated runs on the same report date are preserved. Fall back to
     ``{nas}/reports/daily/*.json`` for standalone/manual runs.
     """
@@ -1741,6 +1745,10 @@ def _read_training_run_history(settings: NodeSettings, *, limit: int = 12) -> li
     local_entries = _read_local_training_run_history(local_experiments_root, limit=limit)
     if local_entries:
         return local_entries
+
+    shared_entries = _read_shared_training_run_history(experiments_root, limit=limit)
+    if shared_entries:
+        return shared_entries
 
     candidate_paths: list[Path] = []
     if experiments_root.exists():
@@ -1868,6 +1876,88 @@ def _read_local_training_run_history(local_experiments_root: Path, *, limit: int
     )
     trimmed = entries[:limit]
     for row in trimmed:
+        row.pop("_sort_date", None)
+        row.pop("_sort_mtime", None)
+    return trimmed
+
+
+def _read_shared_training_run_history(experiments_root: Path, *, limit: int) -> list[dict[str, Any]]:
+    """Return recent run history from shared experiment summaries on the NAS."""
+    if not experiments_root.exists():
+        return []
+    dashboard_summary_paths = sorted(
+        experiments_root.glob("*/dashboard_summary.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    summary_paths = dashboard_summary_paths or sorted(
+        experiments_root.glob("*/summary.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    entries: list[dict[str, Any]] = []
+    seen_run_ids: set[tuple[str | None, str]] = set()
+    for path in summary_paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            stat = path.stat()
+        except (json.JSONDecodeError, OSError) as exc:
+            LOGGER.warning("invalid_shared_experiment_summary path=%s error=%s", path, exc)
+            continue
+        if not isinstance(payload, dict):
+            continue
+        experiment_id = str(payload.get("experiment_id") or path.parent.name)
+        activity_at = str(payload.get("activity_at") or payload.get("updated_at") or "")
+        runs = payload.get("recent_runs")
+        if not isinstance(runs, list):
+            runs = payload.get("runs")
+        if not isinstance(runs, list):
+            continue
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            run_id = str(run.get("run_id") or "")
+            if not run_id:
+                continue
+            report_preview = run.get("report_preview") if isinstance(run.get("report_preview"), dict) else {}
+            assessment = run.get("assessment") if isinstance(run.get("assessment"), dict) else {}
+            if not report_preview and not assessment:
+                continue
+            run_ts = str(run.get("report_date") or run_id)
+            dedupe_key = (run.get("report_date"), run_id)
+            if dedupe_key in seen_run_ids:
+                continue
+            seen_run_ids.add(dedupe_key)
+            entries.append(
+                {
+                    "run_ts": run_ts,
+                    "run_id": run_id,
+                    "experiment_id": experiment_id,
+                    "mean_rank_ic": float(report_preview.get("ridge_mean_rank_ic", 0.0) or 0.0),
+                    "decision": str(assessment.get("decision", "")).upper() or None,
+                    "reason": assessment.get("reason"),
+                    "coverage": float(report_preview.get("coverage", 0.0) or 0.0),
+                    "model_suite": run.get("model_suite"),
+                    "_run_activity_at": str(run.get("activity_at") or ""),
+                    "_activity_at": activity_at,
+                    "_sort_date": run_ts,
+                    "_sort_mtime": stat.st_mtime,
+                }
+            )
+    entries.sort(
+        key=lambda row: (
+            str(row.get("_run_activity_at") or ""),
+            str(row.get("_activity_at") or ""),
+            str(row.get("_sort_date") or ""),
+            float(row.get("_sort_mtime") or 0.0),
+            str(row.get("run_id") or ""),
+        ),
+        reverse=True,
+    )
+    trimmed = entries[:limit]
+    for row in trimmed:
+        row.pop("_run_activity_at", None)
+        row.pop("_activity_at", None)
         row.pop("_sort_date", None)
         row.pop("_sort_mtime", None)
     return trimmed
@@ -2668,7 +2758,7 @@ def _readable_reference_files(root: Path) -> list[str]:
     readable: list[str] = []
     for path in sorted(root.glob("*.parquet")):
         try:
-            pd.read_parquet(path, columns=[])
+            pq.read_metadata(path)
         except Exception:
             continue
         readable.append(path.name)

@@ -2588,6 +2588,8 @@ class DashboardSnapshotManager:
         self._consecutive_failures: dict[str, int] = {"game": 0, "live": 0, "status": 0}
         self._successful_builds: dict[str, bool] = {"game": False, "live": False, "status": False}
         self._refresh_intervals: dict[str, float] = {"game": 10.0, "live": 5.0, "status": 15.0}
+        self._eager_channels = {"game", "live"}
+        self._active_channels = set(self._eager_channels)
         self._builders: dict[str, Callable[[NodeSettings], dict[str, Any]]] = {
             "game": collect_dashboard_game_snapshot,
             "live": collect_dashboard_live_snapshot,
@@ -2597,7 +2599,7 @@ class DashboardSnapshotManager:
 
         for channel in self._builders:
             self._load_snapshot_from_disk(channel)
-        for channel in self._builders:
+        for channel in self._eager_channels:
             self._build_initial_snapshot(channel)
             self._next_refresh_at[channel] = time.monotonic() + self._refresh_intervals[channel]
         self._thread = threading.Thread(target=self._run_loop, name="dashboard-snapshots", daemon=True)
@@ -2619,6 +2621,7 @@ class DashboardSnapshotManager:
 
     def get_latest_or_not_ready(self, channel: str) -> tuple[HTTPStatus, dict[str, Any]]:
         """Return the latest payload or a compact not-ready response."""
+        self._ensure_channel_active(channel)
         payload = self.get_latest(channel)
         if payload is None:
             return (
@@ -2629,6 +2632,7 @@ class DashboardSnapshotManager:
 
     def refresh_once(self, channel: str) -> None:
         """Refresh a single channel immediately."""
+        self._ensure_channel_active(channel)
         self._refresh_channel(channel)
         self._next_refresh_at[channel] = time.monotonic() + self._refresh_intervals[channel]
 
@@ -2662,10 +2666,20 @@ class DashboardSnapshotManager:
         while not self._stop_event.wait(0.5):
             now = time.monotonic()
             for channel, interval in self._refresh_intervals.items():
+                if channel not in self._active_channels:
+                    continue
                 next_refresh_at = self._next_refresh_at.get(channel, now + interval)
                 if now >= next_refresh_at:
                     self._refresh_channel(channel)
                     self._next_refresh_at[channel] = time.monotonic() + interval
+
+    def _ensure_channel_active(self, channel: str) -> None:
+        if channel in self._active_channels:
+            return
+        self._active_channels.add(channel)
+        if self.get_latest(channel) is None:
+            self._build_initial_snapshot(channel)
+        self._next_refresh_at[channel] = time.monotonic() + self._refresh_intervals[channel]
 
     def _build_initial_snapshot(self, channel: str) -> None:
         try:

@@ -442,6 +442,66 @@ def test_dashboard_server_caches_status_snapshot_between_quick_requests(tmp_path
     assert "snapshot_health" in payload_a
 
 
+def test_dashboard_server_does_not_build_status_until_status_is_requested(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path)
+    calls = {"status": 0}
+
+    monkeypatch.setattr(
+        dashboard_server,
+        "collect_dashboard_game_snapshot",
+        lambda _: {
+            "node": {"label": "rpi-1", "running": True},
+            "training": {"state": "idle", "last_decisions": [], "sparkline": [], "total_runs": 0, "streak_go": 0},
+            "missions": [],
+            "phase1_gate": {"ready": True, "percent": 100.0, "blockers": [], "freeze_cutoff": "2026-03-09"},
+            "updated_at": "2026-04-10T16:30:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_server,
+        "collect_dashboard_live_snapshot",
+        lambda _: {
+            "runtime": {"running": True},
+            "collection_status": {},
+            "training_readiness": {},
+            "planner_eta": {},
+            "budget_summary": {},
+            "vendor_throughput": {"rows": []},
+        },
+    )
+
+    def fake_status_snapshot(_: NodeSettings) -> dict[str, object]:
+        calls["status"] += 1
+        return {
+            "runtime": {"running": True},
+            "collection_status": {"coverage_percent": 99.0},
+            "training_readiness": {"phase1": {"ready": True}},
+            "training_status": {"phase1": {"status": "idle"}},
+            "experiment_summary": {"experiment_id": "exp-status"},
+            "default_training_target": {"name": "workstation-remote"},
+            "training_targets": [],
+            "health": {"repair_tasks": {"counts": {}, "remaining_units": 0}},
+        }
+
+    monkeypatch.setattr(dashboard_server, "collect_dashboard_status_snapshot", fake_status_snapshot)
+
+    httpd = dashboard_server.create_dashboard_server("127.0.0.1", 0, settings=settings)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{httpd.server_port}"
+        game_payload = json.loads(urllib.request.urlopen(f"{base_url}/api/game", timeout=5).read().decode("utf-8"))
+        status_payload = json.loads(urllib.request.urlopen(f"{base_url}/api/status", timeout=5).read().decode("utf-8"))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+    assert game_payload["node"]["label"] == "rpi-1"
+    assert calls["status"] == 1
+    assert status_payload["experiment_summary"]["experiment_id"] == "exp-status"
+
+
 def test_dispatch_action_routes_restart_with_passphrase(tmp_path: Path, monkeypatch) -> None:
     settings = _test_settings(tmp_path)
     seen: dict[str, object] = {}

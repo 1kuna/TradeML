@@ -1802,6 +1802,176 @@ def test_read_training_run_history_prefers_local_experiment_manifests(tmp_path: 
     assert history[1]["decision"] == "GO"
 
 
+def test_read_training_run_history_prefers_shared_experiment_summaries(tmp_path: Path) -> None:
+    nas_mount = tmp_path / "nas"
+    experiments_root = nas_mount / "experiments" / "phase1-shared"
+    experiments_root.mkdir(parents=True, exist_ok=True)
+    (experiments_root / "dashboard_summary.json").write_text(
+        json.dumps(
+            {
+                "experiment_id": "phase1-shared",
+                "recent_runs": [
+                    {
+                        "experiment_id": "phase1-shared",
+                        "run_id": "run-alpha",
+                        "report_date": "2026-03-09",
+                        "model_suite": "ridge_only",
+                        "assessment": {"decision": "GO", "reason": "shared"},
+                        "report_preview": {"coverage": 0.98, "ridge_mean_rank_ic": 0.031},
+                    },
+                    {
+                        "experiment_id": "phase1-shared",
+                        "run_id": "run-beta",
+                        "report_date": "2026-03-16",
+                        "model_suite": "ridge_only",
+                        "assessment": {"decision": "NO_GO", "reason": "shared"},
+                        "report_preview": {"coverage": 0.99, "ridge_mean_rank_ic": 0.044},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_training_report(nas_mount, "2026-03-09", mean_rank_ic=0.011, decision="NO_GO")
+
+    settings = NodeSettings(
+        repo_root=tmp_path,
+        workspace_root=tmp_path / "workspace",
+        config_path=tmp_path / "workspace" / "node.yml",
+        env_path=tmp_path / "workspace" / ".env",
+        local_state=tmp_path / "workspace" / "control",
+        nas_mount=nas_mount,
+        nas_share="//nas/trademl",
+        collection_time_et="16:30",
+        maintenance_hour_local=2,
+        worker_id="worker-1",
+    )
+
+    history = dashboard_controller._read_training_run_history(settings, limit=5)
+
+    assert [row["run_id"] for row in history[:2]] == ["run-beta", "run-alpha"]
+    assert history[0]["experiment_id"] == "phase1-shared"
+    assert history[0]["mean_rank_ic"] == pytest.approx(0.044)
+    assert history[1]["decision"] == "GO"
+
+
+def test_read_training_run_history_orders_shared_summaries_by_activity_timestamp(tmp_path: Path) -> None:
+    nas_mount = tmp_path / "nas"
+    old_root = nas_mount / "experiments" / "phase1-old"
+    new_root = nas_mount / "experiments" / "phase1-new"
+    old_root.mkdir(parents=True, exist_ok=True)
+    new_root.mkdir(parents=True, exist_ok=True)
+    common_date = "2026-03-09"
+    (old_root / "dashboard_summary.json").write_text(
+        json.dumps(
+            {
+                "experiment_id": "phase1-old",
+                "activity_at": "2026-04-14T10:00:00+00:00",
+                "recent_runs": [
+                    {
+                        "experiment_id": "phase1-old",
+                        "run_id": "run-old",
+                        "report_date": common_date,
+                        "model_suite": "ridge_only",
+                        "assessment": {"decision": "NO_GO", "reason": "old"},
+                        "report_preview": {"coverage": 0.98, "ridge_mean_rank_ic": 0.011},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (new_root / "dashboard_summary.json").write_text(
+        json.dumps(
+            {
+                "experiment_id": "phase1-new",
+                "activity_at": "2026-04-15T10:00:00+00:00",
+                "recent_runs": [
+                    {
+                        "experiment_id": "phase1-new",
+                        "run_id": "run-new",
+                        "report_date": common_date,
+                        "model_suite": "ridge_only",
+                        "assessment": {"decision": "GO", "reason": "new"},
+                        "report_preview": {"coverage": 0.99, "ridge_mean_rank_ic": 0.044},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = NodeSettings(
+        repo_root=tmp_path,
+        workspace_root=tmp_path / "workspace",
+        config_path=tmp_path / "workspace" / "node.yml",
+        env_path=tmp_path / "workspace" / ".env",
+        local_state=tmp_path / "workspace" / "control",
+        nas_mount=nas_mount,
+        nas_share="//nas/trademl",
+        collection_time_et="16:30",
+        maintenance_hour_local=2,
+        worker_id="worker-1",
+    )
+
+    history = dashboard_controller._read_training_run_history(settings, limit=5)
+
+    assert history[0]["run_id"] == "run-new"
+    assert history[0]["decision"] == "GO"
+    assert history[1]["run_id"] == "run-old"
+
+
+def test_read_training_run_history_skips_shared_runs_without_result_payload(tmp_path: Path) -> None:
+    nas_mount = tmp_path / "nas"
+    experiments_root = nas_mount / "experiments" / "phase1-shared"
+    experiments_root.mkdir(parents=True, exist_ok=True)
+    (experiments_root / "dashboard_summary.json").write_text(
+        json.dumps(
+            {
+                "experiment_id": "phase1-shared",
+                "activity_at": "2026-04-15T10:00:00+00:00",
+                "recent_runs": [
+                    {
+                        "experiment_id": "phase1-shared",
+                        "run_id": "run-empty",
+                        "activity_at": "2026-04-15T10:00:00+00:00",
+                        "report_date": "2026-03-09",
+                        "model_suite": "ridge_only",
+                    },
+                    {
+                        "experiment_id": "phase1-shared",
+                        "run_id": "run-complete",
+                        "activity_at": "2026-04-15T09:00:00+00:00",
+                        "report_date": "2026-03-09",
+                        "model_suite": "ridge_only",
+                        "assessment": {"decision": "GO", "reason": "done"},
+                        "report_preview": {"coverage": 0.99, "ridge_mean_rank_ic": 0.044},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = NodeSettings(
+        repo_root=tmp_path,
+        workspace_root=tmp_path / "workspace",
+        config_path=tmp_path / "workspace" / "node.yml",
+        env_path=tmp_path / "workspace" / ".env",
+        local_state=tmp_path / "workspace" / "control",
+        nas_mount=nas_mount,
+        nas_share="//nas/trademl",
+        collection_time_et="16:30",
+        maintenance_hour_local=2,
+        worker_id="worker-1",
+    )
+
+    history = dashboard_controller._read_training_run_history(settings, limit=5)
+
+    assert [row["run_id"] for row in history] == ["run-complete"]
+    assert history[0]["decision"] == "GO"
+
+
 def test_read_training_run_history_empty_when_reports_missing(tmp_path: Path) -> None:
     settings = NodeSettings(
         repo_root=tmp_path,
@@ -2122,3 +2292,20 @@ def test_summarize_planner_eta_avoids_full_success_task_scan(tmp_path: Path, mon
 
     assert eta["reference_events"]["remaining_units"] == 10
     assert eta["reference_events"]["eta_minutes"] is not None
+
+
+def test_dashboard_readable_reference_files_uses_parquet_metadata_only(tmp_path: Path, monkeypatch) -> None:
+    reference_root = tmp_path / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"symbol": "AAPL"}]).to_parquet(reference_root / "listing_history.parquet", index=False)
+    (reference_root / "universe_snapshots").mkdir(parents=True, exist_ok=True)
+
+    def fail_pandas_parquet(*args, **kwargs):  # noqa: ANN001
+        raise AssertionError("dashboard reference scan should not call pandas.read_parquet")
+
+    monkeypatch.setattr(dashboard_controller.pd, "read_parquet", fail_pandas_parquet)
+
+    readable = dashboard_controller._readable_reference_files(reference_root)
+
+    assert "listing_history.parquet" in readable
+    assert "universe_snapshots" in readable
