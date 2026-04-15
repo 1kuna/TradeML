@@ -1091,6 +1091,52 @@ def test_lease_canonical_batch_scans_past_front_slice_starvation(tmp_path: Path)
     assert batch[0].symbols == ("SYM0256",)
 
 
+def test_lease_canonical_batch_avoids_full_progress_map_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _MultiSymbolBackfillConnector("alpaca"),
+            "tiingo": _BackfillConnector("tiingo"),
+        },
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::target",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2026-03-16",
+        end_date="2026-04-10",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca", "tiingo"],
+        payload={"scope_kind": "symbol_range", "trading_days": ["2026-03-16"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::target",
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=["AAPL"],
+        state={"scope_kind": "symbol_range"},
+    )
+
+    def fail_full_progress_map() -> dict[str, object]:
+        raise AssertionError("full planner_task_progress_map scan should not run")
+
+    monkeypatch.setattr(db, "planner_task_progress_map", fail_full_progress_map)
+
+    batch = service._canonical_runtime._lease_canonical_batch("alpaca")
+
+    assert batch
+    assert batch[0].task_key == "canonical::target"
+
+
 def test_lease_canonical_batch_prioritizes_small_partial_tail(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

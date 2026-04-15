@@ -168,6 +168,132 @@ def test_vendor_attempt_leasing_is_race_safe(tmp_path: Path) -> None:
     assert attempts[0].vendor == "alpaca"
 
 
+def test_fetch_vendor_attempts_filters_by_updated_after(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    first_now = db_module.utc_now()
+    monkeypatch.setattr(db_module, "utc_now", lambda: first_now)
+    leased = database.lease_vendor_attempt(
+        task_key="canonical::equities_eod::AAPL::2024-01-01::2024-01-31::GAP",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        vendor="alpaca",
+        lease_owner="worker-a",
+        payload={"symbols": ["AAPL"]},
+    )
+    assert leased is not None
+    database.mark_vendor_attempt_success(
+        task_key="canonical::equities_eod::AAPL::2024-01-01::2024-01-31::GAP",
+        vendor="alpaca",
+        rows_returned=22,
+    )
+
+    second_now = first_now + timedelta(minutes=20)
+    monkeypatch.setattr(db_module, "utc_now", lambda: second_now)
+    leased = database.lease_vendor_attempt(
+        task_key="canonical::equities_eod::MSFT::2024-01-01::2024-01-31::GAP",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        vendor="alpaca",
+        lease_owner="worker-a",
+        payload={"symbols": ["MSFT"]},
+    )
+    assert leased is not None
+    database.mark_vendor_attempt_success(
+        task_key="canonical::equities_eod::MSFT::2024-01-01::2024-01-31::GAP",
+        vendor="alpaca",
+        rows_returned=21,
+    )
+
+    recent = database.fetch_vendor_attempts(updated_after=(first_now + timedelta(minutes=10)).isoformat())
+
+    assert len(recent) == 1
+    assert recent[0].task_key.endswith("MSFT::2024-01-01::2024-01-31::GAP")
+
+
+def test_summarize_vendor_attempts_returns_counts_vendor_rows_and_recent_failures(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    leased = database.lease_vendor_attempt(
+        task_key="reference::listings::2026-04-02",
+        task_family="reference_events",
+        planner_group="reference_events_backlog",
+        vendor="alpaca",
+        lease_owner="worker-a",
+        payload={"dataset": "listings"},
+    )
+    assert leased is not None
+    database.mark_vendor_attempt_failed(
+        task_key="reference::listings::2026-04-02",
+        vendor="alpaca",
+        error="429",
+        backoff_minutes=30,
+    )
+
+    summary = database.summarize_vendor_attempts()
+
+    assert summary["counts"] == {"FAILED": 1}
+    assert summary["by_vendor"] == [
+        {
+            "vendor": "alpaca",
+            "total": 1,
+            "leased": 0,
+            "success": 0,
+            "failed": 1,
+            "permanent_failed": 0,
+            "latest_update": summary["by_vendor"][0]["latest_update"],
+        }
+    ]
+    assert summary["recent_failures"][0]["vendor"] == "alpaca"
+    assert summary["recent_failures"][0]["status"] == "FAILED"
+
+
+def test_count_planner_tasks_by_family_filters_by_status_and_updated_after(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    first_now = db_module.utc_now()
+    monkeypatch.setattr(db_module, "utc_now", lambda: first_now)
+    database.upsert_planner_task(
+        task_key="reference_events::earnings::2026-04-02",
+        task_family="reference_events",
+        planner_group="reference_events_backlog",
+        dataset="earnings",
+        tier="A",
+        priority=1,
+        start_date="2026-04-02",
+        end_date="2026-04-02",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        payload={"backlog_class": "reference_events"},
+    )
+    leased = database.lease_next_planner_task(lease_owner="worker-a", task_families=("reference_events",))
+    assert leased is not None
+    database.mark_planner_task_success(leased.task_key)
+
+    second_now = first_now + timedelta(minutes=20)
+    monkeypatch.setattr(db_module, "utc_now", lambda: second_now)
+    database.upsert_planner_task(
+        task_key="security_master::listings::2026-04-03",
+        task_family="security_master",
+        planner_group="security_master_backlog",
+        dataset="listings",
+        tier="A",
+        priority=1,
+        start_date="2026-04-03",
+        end_date="2026-04-03",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        payload={"backlog_class": "security_master"},
+    )
+    leased = database.lease_next_planner_task(lease_owner="worker-a", task_families=("security_master",))
+    assert leased is not None
+    database.mark_planner_task_success(leased.task_key)
+
+    counts = database.count_planner_tasks_by_family(
+        statuses=("SUCCESS",),
+        updated_after=(first_now + timedelta(minutes=10)).isoformat(),
+    )
+
+    assert counts == {"security_master": 1}
+
+
 def test_requeue_retryable_failures_moves_rate_limited_rows_back_to_pending(tmp_path: Path) -> None:
     database = DataNodeDB(tmp_path / "node.sqlite")
     retryable_id = database.enqueue_task("equities_eod", None, "2024-01-01", "2024-01-01", "GAP", 1)

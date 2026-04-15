@@ -1287,19 +1287,92 @@ class DataNodeDB:
             ).fetchall()
         return [VendorAttempt(**dict(row)) for row in rows]
 
-    def fetch_vendor_attempts(self, *, planner_group: str | None = None) -> list[VendorAttempt]:
+    def fetch_vendor_attempts(
+        self,
+        *,
+        planner_group: str | None = None,
+        updated_after: str | None = None,
+        limit: int | None = None,
+    ) -> list[VendorAttempt]:
         """Return all vendor attempts for dashboard/status views."""
+        query = "SELECT * FROM vendor_attempts"
+        clauses: list[str] = []
+        params: list[object] = []
+        if planner_group:
+            clauses.append("planner_group = ?")
+            params.append(planner_group)
+        if updated_after:
+            clauses.append("updated_at >= ?")
+            params.append(updated_after)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC, task_key, vendor"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
         with self._connect() as connection:
-            if planner_group:
-                rows = connection.execute(
-                    "SELECT * FROM vendor_attempts WHERE planner_group = ? ORDER BY updated_at DESC, task_key, vendor",
-                    (planner_group,),
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    "SELECT * FROM vendor_attempts ORDER BY updated_at DESC, task_key, vendor"
-                ).fetchall()
+            rows = connection.execute(query, params).fetchall()
         return [VendorAttempt(**dict(row)) for row in rows]
+
+    def summarize_vendor_attempts(self) -> dict[str, object]:
+        """Return aggregate vendor-attempt summary without loading the full table."""
+        with self._connect() as connection:
+            count_rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM vendor_attempts
+                GROUP BY status
+                """
+            ).fetchall()
+            vendor_rows = connection.execute(
+                """
+                SELECT vendor,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN status = 'LEASED' THEN 1 ELSE 0 END) AS leased,
+                       SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) AS success,
+                       SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed,
+                       SUM(CASE WHEN status = 'PERMANENT_FAILED' THEN 1 ELSE 0 END) AS permanent_failed,
+                       MAX(updated_at) AS latest_update
+                FROM vendor_attempts
+                GROUP BY vendor
+                ORDER BY vendor
+                """
+            ).fetchall()
+            failure_rows = connection.execute(
+                """
+                SELECT vendor, task_key, status, last_error, updated_at
+                FROM vendor_attempts
+                WHERE status IN ('FAILED', 'PERMANENT_FAILED')
+                  AND last_error IS NOT NULL
+                ORDER BY updated_at DESC
+                LIMIT 20
+                """
+            ).fetchall()
+        return {
+            "counts": {str(row["status"]): int(row["count"]) for row in count_rows},
+            "by_vendor": [
+                {
+                    "vendor": str(row["vendor"]),
+                    "total": int(row["total"] or 0),
+                    "leased": int(row["leased"] or 0),
+                    "success": int(row["success"] or 0),
+                    "failed": int(row["failed"] or 0),
+                    "permanent_failed": int(row["permanent_failed"] or 0),
+                    "latest_update": row["latest_update"],
+                }
+                for row in vendor_rows
+            ],
+            "recent_failures": [
+                {
+                    "vendor": str(row["vendor"]),
+                    "task_key": str(row["task_key"]),
+                    "status": str(row["status"]),
+                    "last_error": str(row["last_error"]),
+                    "updated_at": str(row["updated_at"]),
+                }
+                for row in failure_rows
+            ],
+        }
 
     def upsert_planner_task(
         self,
@@ -1477,6 +1550,7 @@ class DataNodeDB:
         task_families: tuple[str, ...] | None = None,
         planner_group: str | None = None,
         statuses: tuple[str, ...] | None = None,
+        updated_after: str | None = None,
         limit: int | None = None,
         offset: int | None = None,
     ) -> list[PlannerTask]:
@@ -1498,6 +1572,9 @@ class DataNodeDB:
             placeholders = ",".join("?" for _ in statuses)
             clauses.append(f"status IN ({placeholders})")
             params.extend(statuses)
+        if updated_after:
+            clauses.append("updated_at >= ?")
+            params.append(updated_after)
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY priority ASC, created_at ASC, task_key ASC"
@@ -2049,3 +2126,27 @@ class DataNodeDB:
                 "remaining_units": int(row["remaining_units"] or 0),
             }
         return {"counts": counts, "progress": progress, "backlog_progress": backlog_progress}
+
+    def count_planner_tasks_by_family(
+        self,
+        *,
+        statuses: tuple[str, ...] | None = None,
+        updated_after: str | None = None,
+    ) -> dict[str, int]:
+        """Return planner task counts grouped by family for a filtered scope."""
+        query = "SELECT task_family, COUNT(*) AS count FROM planner_tasks"
+        clauses: list[str] = []
+        params: list[object] = []
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        if updated_after:
+            clauses.append("updated_at >= ?")
+            params.append(updated_after)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " GROUP BY task_family"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return {str(row["task_family"]): int(row["count"]) for row in rows}
