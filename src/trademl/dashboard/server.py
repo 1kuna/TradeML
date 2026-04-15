@@ -2845,7 +2845,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._write_json(collect_dashboard_health_snapshot(self.server.settings))
             return
         if self.path == "/api/setup":
-            self._write_json(collect_dashboard_setup_snapshot(self.server.settings))
+            game_payload = self.server.snapshot_manager.get_latest("game") or {}
+            self._write_json(
+                collect_dashboard_setup_snapshot(
+                    self.server.settings,
+                    cluster_snapshot=game_payload.get("cluster"),
+                )
+            )
             return
         if self.path == "/api/logs":
             self._write_json(collect_dashboard_logs_snapshot(self.server.settings))

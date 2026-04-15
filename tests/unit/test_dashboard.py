@@ -448,6 +448,26 @@ def test_collect_dashboard_snapshot_uses_freeze_cutoff_for_training_ready_percen
     monkeypatch.setattr(dashboard_controller, "_summarize_planner_eta", lambda db_path, planner_summary, vendor_throughput: {})
     monkeypatch.setattr(dashboard_controller, "_read_runtime_state", lambda settings: {"pid": 1, "started_at": "2026-03-31T20:00:00+00:00"})
     monkeypatch.setattr(dashboard_controller, "_is_process_running", lambda pid: True)
+    monkeypatch.setattr(
+        dashboard_controller,
+        "read_cluster_snapshot",
+        lambda **kwargs: {
+            "workers": [
+                {
+                    "worker_id": settings.worker_id,
+                    "started_at": "2026-04-10T12:05:00+00:00",
+                    "last_heartbeat": "2026-04-10T12:10:00+00:00",
+                }
+            ],
+            "active_workers": [
+                {
+                    "worker_id": settings.worker_id,
+                    "started_at": "2026-04-10T12:05:00+00:00",
+                    "last_heartbeat": "2026-04-10T12:10:00+00:00",
+                }
+            ],
+        },
+    )
     monkeypatch.setattr(dashboard_controller, "evaluate_training_gates", lambda **kwargs: {
         "phase1": {"ready": True, "blockers": []},
         "phase2": {"ready": False, "blockers": ["history_depth"]},
@@ -1724,6 +1744,64 @@ def test_read_training_run_history_prefers_per_run_experiment_reports(tmp_path: 
     assert history[1]["decision"] == "GO"
 
 
+def test_read_training_run_history_prefers_local_experiment_manifests(tmp_path: Path) -> None:
+    nas_mount = tmp_path / "nas"
+    _write_training_report(nas_mount, "2026-03-09", mean_rank_ic=0.011, decision="NO_GO")
+    local_state = tmp_path / "workspace" / "control"
+    runs_root = local_state / "experiments" / "phase1-local" / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    first = runs_root / "run-alpha.json"
+    second = runs_root / "run-beta.json"
+    first.write_text(
+        json.dumps(
+            {
+                "experiment_id": "phase1-local",
+                "run_id": "run-alpha",
+                "report_date": "2026-03-09",
+                "model_suite": "ridge_only",
+                "assessment": {"decision": "GO", "reason": "local"},
+                "report_preview": {"coverage": 0.99, "ridge": {"mean_rank_ic": 0.032}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    second.write_text(
+        json.dumps(
+            {
+                "experiment_id": "phase1-local",
+                "run_id": "run-beta",
+                "report_date": "2026-03-16",
+                "model_suite": "ridge_only",
+                "assessment": {"decision": "NO_GO", "reason": "local"},
+                "report_preview": {"coverage": 0.99, "ridge": {"mean_rank_ic": 0.044}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    summary_path = local_state / "experiments" / "phase1-local" / "summary.json"
+    summary_path.write_text(json.dumps({"experiment_id": "phase1-local"}), encoding="utf-8")
+
+    settings = NodeSettings(
+        repo_root=tmp_path,
+        workspace_root=tmp_path / "workspace",
+        config_path=tmp_path / "workspace" / "node.yml",
+        env_path=tmp_path / "workspace" / ".env",
+        local_state=local_state,
+        nas_mount=nas_mount,
+        nas_share="//nas/trademl",
+        collection_time_et="16:30",
+        maintenance_hour_local=2,
+        worker_id="worker-1",
+    )
+
+    history = dashboard_controller._read_training_run_history(settings, limit=5)
+
+    assert [row["run_id"] for row in history[:2]] == ["run-beta", "run-alpha"]
+    assert history[0]["experiment_id"] == "phase1-local"
+    assert history[0]["mean_rank_ic"] == pytest.approx(0.044)
+    assert history[1]["decision"] == "GO"
+
+
 def test_read_training_run_history_empty_when_reports_missing(tmp_path: Path) -> None:
     settings = NodeSettings(
         repo_root=tmp_path,
@@ -1773,6 +1851,26 @@ def test_collect_dashboard_game_snapshot_assembles_sections(tmp_path: Path, monk
 
     monkeypatch.setattr(dashboard_controller, "_read_runtime_state", lambda settings: {"pid": 4242, "started_at": "2026-04-10T12:00:00+00:00"})
     monkeypatch.setattr(dashboard_controller, "_is_process_running", lambda pid: True)
+    monkeypatch.setattr(
+        dashboard_controller,
+        "read_cluster_snapshot",
+        lambda **kwargs: {
+            "workers": [
+                {
+                    "worker_id": settings.worker_id,
+                    "started_at": "2026-04-10T12:05:00+00:00",
+                    "last_heartbeat": "2026-04-10T12:10:00+00:00",
+                }
+            ],
+            "active_workers": [
+                {
+                    "worker_id": settings.worker_id,
+                    "started_at": "2026-04-10T12:05:00+00:00",
+                    "last_heartbeat": "2026-04-10T12:10:00+00:00",
+                }
+            ],
+        },
+    )
     monkeypatch.setattr(dashboard_controller, "_read_queue_counts", lambda db_path: {"PENDING": 3, "FAILED": 1})
     monkeypatch.setattr(
         dashboard_controller,
@@ -1834,11 +1932,13 @@ def test_collect_dashboard_game_snapshot_assembles_sections(tmp_path: Path, monk
 
     snapshot = collect_dashboard_game_snapshot(settings)
 
-    assert set(snapshot.keys()) == {"node", "training", "missions", "phase1_gate", "updated_at"}
+    assert set(snapshot.keys()) == {"node", "training", "missions", "phase1_gate", "cluster", "updated_at"}
 
     node = snapshot["node"]
     assert node["label"] == settings.worker_id
     assert node["running"] is True
+    assert node["cluster_active"] is True
+    assert node["process_running"] is True
     assert node["rows_per_min"] == pytest.approx(120.75)
     assert node["requests_per_min"] == pytest.approx(23.5)
     assert node["rows_total"] == 987_654
@@ -1866,6 +1966,7 @@ def test_collect_dashboard_game_snapshot_assembles_sections(tmp_path: Path, monk
     assert gate["ready"] is False
     assert gate["blockers"] == ["bars_incomplete"]
     assert gate["freeze_cutoff"] == "2026-03-23"
+    assert snapshot["cluster"]["active_workers"][0]["worker_id"] == settings.worker_id
     assert 0.0 <= gate["percent"] <= 100.0
 
 
@@ -1918,3 +2019,106 @@ def test_collect_dashboard_game_snapshot_marks_idle_when_no_runs(tmp_path: Path,
     assert snapshot["training"]["total_runs"] == 0
     assert snapshot["training"]["sparkline"] == []
     assert snapshot["phase1_gate"]["ready"] is False
+
+
+def test_read_vendor_attempt_summary_avoids_full_vendor_attempt_scan(tmp_path: Path, monkeypatch) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    leased = database.lease_vendor_attempt(
+        task_key="reference::listings::2026-04-02",
+        task_family="reference_events",
+        planner_group="reference_events_backlog",
+        vendor="alpaca",
+        lease_owner="worker-a",
+        payload={"dataset": "listings"},
+    )
+    assert leased is not None
+    database.mark_vendor_attempt_failed(
+        task_key="reference::listings::2026-04-02",
+        vendor="alpaca",
+        error="429",
+        backoff_minutes=30,
+    )
+
+    def fail_full_scan(self, *, planner_group=None):  # noqa: ANN001
+        raise AssertionError("full vendor_attempts scan should not run")
+
+    monkeypatch.setattr(DataNodeDB, "fetch_vendor_attempts", fail_full_scan)
+
+    summary = dashboard_controller._read_vendor_attempt_summary(Path(database.path))
+
+    assert summary["counts"]["FAILED"] == 1
+    assert summary["by_vendor"][0]["vendor"] == "alpaca"
+    assert summary["recent_failures"][0]["vendor"] == "alpaca"
+
+
+def test_summarize_vendor_throughput_filters_vendor_attempts_to_recent_window(tmp_path: Path, monkeypatch) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    leased = database.lease_vendor_attempt(
+        task_key="canonical::equities_eod::AAPL::2024-01-01::2024-01-31::GAP",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        vendor="alpaca",
+        lease_owner="worker-a",
+        payload={"symbols": ["AAPL"], "dataset": "equities_eod"},
+    )
+    assert leased is not None
+    database.mark_vendor_attempt_success(
+        task_key="canonical::equities_eod::AAPL::2024-01-01::2024-01-31::GAP",
+        vendor="alpaca",
+        rows_returned=22,
+    )
+
+    original_fetch_vendor_attempts = DataNodeDB.fetch_vendor_attempts
+
+    def guarded_fetch_vendor_attempts(self, *, planner_group=None, updated_after=None, limit=None):  # noqa: ANN001
+        assert updated_after is not None, "throughput helper should not scan all vendor attempts"
+        return original_fetch_vendor_attempts(
+            self,
+            planner_group=planner_group,
+            updated_after=updated_after,
+            limit=limit,
+        )
+
+    monkeypatch.setattr(DataNodeDB, "fetch_vendor_attempts", guarded_fetch_vendor_attempts)
+
+    throughput = dashboard_controller._summarize_vendor_throughput(
+        Path(database.path),
+        budget_summary={"rows": [{"vendor": "alpaca", "state": "available", "outbound_requests_60s": 1}]},
+    )
+
+    assert throughput["rows"][0]["vendor"] == "alpaca"
+    assert throughput["rows"][0]["rows_per_min"] > 0.0
+
+
+def test_summarize_planner_eta_avoids_full_success_task_scan(tmp_path: Path, monkeypatch) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    database.upsert_planner_task(
+        task_key="reference_events::earnings::2026-04-02",
+        task_family="reference_events",
+        planner_group="reference_events_backlog",
+        dataset="earnings",
+        tier="A",
+        priority=1,
+        start_date="2026-04-02",
+        end_date="2026-04-02",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        payload={"backlog_class": "reference_events"},
+    )
+    leased = database.lease_next_planner_task(lease_owner="worker-a", task_families=("reference_events",))
+    assert leased is not None
+    database.mark_planner_task_success(leased.task_key)
+
+    def fail_full_task_scan(self, **kwargs):  # noqa: ANN001
+        raise AssertionError("full planner_tasks success scan should not run")
+
+    monkeypatch.setattr(DataNodeDB, "fetch_planner_tasks", fail_full_task_scan)
+
+    eta = dashboard_controller._summarize_planner_eta(
+        Path(database.path),
+        planner_summary={"progress": {"reference_events": {"remaining_units": 10}}},
+        vendor_throughput={"rows": []},
+    )
+
+    assert eta["reference_events"]["remaining_units"] == 10
+    assert eta["reference_events"]["eta_minutes"] is not None

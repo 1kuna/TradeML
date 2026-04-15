@@ -66,6 +66,10 @@ def test_dashboard_server_serves_hud_and_game_snapshot(tmp_path: Path, monkeypat
                 {"key": "canonical_bars", "label": "Bars", "status": "in_progress", "percent": 72.4, "blocking": True, "eta_minutes": 192.0, "remaining_units": 12},
             ],
             "phase1_gate": {"ready": False, "percent": 72.4, "blockers": ["bars_incomplete"], "freeze_cutoff": "2026-03-09"},
+            "cluster": {
+                "workers": [{"worker_id": "rpi-01", "last_heartbeat": "2026-04-10T16:30:00+00:00"}],
+                "active_workers": [{"worker_id": "rpi-01", "last_heartbeat": "2026-04-10T16:30:00+00:00"}],
+            },
             "updated_at": "2026-04-10T16:30:00+00:00",
         },
     )
@@ -98,6 +102,7 @@ def test_dashboard_server_serves_hud_and_game_snapshot(tmp_path: Path, monkeypat
         operator_html = urllib.request.urlopen(f"{base_url}/operator", timeout=5).read().decode("utf-8")
         game_payload = json.loads(urllib.request.urlopen(f"{base_url}/api/game", timeout=5).read().decode("utf-8"))
         live_payload = json.loads(urllib.request.urlopen(f"{base_url}/api/live", timeout=5).read().decode("utf-8"))
+        setup_payload = json.loads(urllib.request.urlopen(f"{base_url}/api/setup", timeout=5).read().decode("utf-8"))
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -114,8 +119,63 @@ def test_dashboard_server_serves_hud_and_game_snapshot(tmp_path: Path, monkeypat
     assert game_payload["training"]["streak_go"] == 3
     assert game_payload["phase1_gate"]["freeze_cutoff"] == "2026-03-09"
     assert game_payload["missions"][0]["label"] == "Bars"
+    assert setup_payload["cluster"]["active_workers"][0]["worker_id"] == "rpi-01"
     assert live_payload["runtime"]["pid"] == 123
     assert live_payload["training_readiness"]["phase1"]["ready"] is True
+
+
+def test_dashboard_server_setup_reuses_cached_game_cluster_snapshot(tmp_path: Path, monkeypatch) -> None:
+    settings = _test_settings(tmp_path)
+    monkeypatch.setattr(
+        dashboard_server,
+        "collect_dashboard_game_snapshot",
+        lambda _: {
+            "node": {"label": "rpi-01", "running": True, "cluster_active": True, "process_running": True},
+            "training": {"state": "idle", "last_decisions": [], "sparkline": [], "total_runs": 0, "streak_go": 0},
+            "missions": [],
+            "phase1_gate": {"ready": True, "percent": 100.0, "blockers": [], "freeze_cutoff": "2026-03-09"},
+            "cluster": {
+                "workers": [{"worker_id": "rpi-01", "last_heartbeat": "2026-04-10T16:30:00+00:00"}],
+                "active_workers": [{"worker_id": "rpi-01", "last_heartbeat": "2026-04-10T16:30:00+00:00"}],
+            },
+            "updated_at": "2026-04-10T16:30:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_server,
+        "collect_dashboard_live_snapshot",
+        lambda _: {
+            "runtime": {"running": True},
+            "collection_status": {},
+            "training_readiness": {},
+            "planner_eta": {},
+            "budget_summary": {},
+            "vendor_throughput": {"rows": []},
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_server,
+        "collect_dashboard_setup_snapshot",
+        lambda resolved, *, cluster_snapshot=None: {
+            "cluster": cluster_snapshot,
+            "systemd": {"scope": "user"},
+            "nas": {"share": "//nas/trademl"},
+            "provider_contracts": [],
+        },
+    )
+
+    httpd = dashboard_server.create_dashboard_server("127.0.0.1", 0, settings=settings)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{httpd.server_port}"
+        setup_payload = json.loads(urllib.request.urlopen(f"{base_url}/api/setup", timeout=5).read().decode("utf-8"))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+    assert setup_payload["cluster"]["active_workers"][0]["worker_id"] == "rpi-01"
 
 
 def test_dashboard_server_caches_game_snapshot_between_quick_requests(tmp_path: Path, monkeypatch) -> None:

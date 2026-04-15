@@ -1521,14 +1521,20 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
     }
 
 
-def collect_dashboard_game_snapshot(settings: NodeSettings) -> dict[str, Any]:
+def collect_dashboard_game_snapshot(
+    settings: NodeSettings,
+    *,
+    cluster_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Collect the gamified HUD snapshot used by the Collector/Brain dashboard."""
     runtime = _read_runtime_state(settings)
-    cluster = read_cluster_snapshot(nas_root=settings.nas_mount, worker_id=settings.worker_id)
+    cluster = cluster_snapshot if cluster_snapshot is not None else read_cluster_snapshot(nas_root=settings.nas_mount, worker_id=settings.worker_id)
     active_workers = list(cluster.get("active_workers") or [])
     active_worker = next((item for item in active_workers if item.get("worker_id") == settings.worker_id), None)
     pid = runtime.get("pid")
-    running = bool(active_worker) or (isinstance(pid, int) and _is_process_running(pid))
+    cluster_active = bool(active_worker)
+    process_running = isinstance(pid, int) and _is_process_running(pid)
+    running = cluster_active or process_running
     runtime["running"] = running
     uptime_seconds: float | None = None
     worker_started_at = active_worker.get("started_at") if isinstance(active_worker, dict) else None
@@ -1596,6 +1602,8 @@ def collect_dashboard_game_snapshot(settings: NodeSettings) -> dict[str, Any]:
     node_payload = {
         "label": settings.worker_id,
         "running": running,
+        "cluster_active": cluster_active,
+        "process_running": process_running,
         "uptime_seconds": uptime_seconds,
         "last_heartbeat": active_worker.get("last_heartbeat") if isinstance(active_worker, dict) else None,
         "active_workers": [item.get("worker_id") for item in active_workers],
@@ -1690,6 +1698,7 @@ def collect_dashboard_game_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "training": training_payload,
         "missions": missions,
         "phase1_gate": phase1_gate,
+        "cluster": cluster,
         "updated_at": datetime.now(tz=UTC).isoformat(),
     }
 
@@ -1715,14 +1724,23 @@ def _map_training_state(runtime_payload: dict[str, Any]) -> str:
 def _read_training_run_history(settings: NodeSettings, *, limit: int = 12) -> list[dict[str, Any]]:
     """Return the most recent training attempts sorted newest first.
 
+    Prefer local experiment run manifests under ``{local_state}/experiments/*/runs/*.json``
+    because they already contain the assessment/report preview fields the HUD
+    needs and avoid a wide NAS report crawl on every refresh.
+
     Prefer per-run experiment artifacts under ``{nas}/experiments/*/runs/*/reports/daily/*.json``
     so repeated runs on the same report date are preserved. Fall back to
     ``{nas}/reports/daily/*.json`` for standalone/manual runs.
     """
+    local_experiments_root = settings.local_state / "experiments"
     daily_root = settings.nas_mount / "reports" / "daily"
     experiments_root = settings.nas_mount / "experiments"
-    if not daily_root.exists() and not experiments_root.exists():
+    if not local_experiments_root.exists() and not daily_root.exists() and not experiments_root.exists():
         return []
+
+    local_entries = _read_local_training_run_history(local_experiments_root, limit=limit)
+    if local_entries:
+        return local_entries
 
     candidate_paths: list[Path] = []
     if experiments_root.exists():
@@ -1767,6 +1785,76 @@ def _read_training_run_history(settings: NodeSettings, *, limit: int = 12) -> li
                 "coverage": float(payload.get("coverage", 0.0) or 0.0),
                 "model_suite": payload.get("model_suite"),
                 "_sort_date": path.stem,
+                "_sort_mtime": stat.st_mtime,
+            }
+        )
+    entries.sort(
+        key=lambda row: (
+            str(row.get("_sort_date") or ""),
+            float(row.get("_sort_mtime") or 0.0),
+            str(row.get("run_id") or ""),
+        ),
+        reverse=True,
+    )
+    trimmed = entries[:limit]
+    for row in trimmed:
+        row.pop("_sort_date", None)
+        row.pop("_sort_mtime", None)
+    return trimmed
+
+
+def _read_local_training_run_history(local_experiments_root: Path, *, limit: int) -> list[dict[str, Any]]:
+    """Return recent run history from local experiment manifests when available."""
+    if not local_experiments_root.exists():
+        return []
+    summary_paths = sorted(
+        local_experiments_root.glob("*/summary.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    candidate_paths: list[Path] = []
+    target_candidates = max(limit * 4, 16)
+    for summary_path in summary_paths:
+        runs_root = summary_path.parent / "runs"
+        if not runs_root.exists():
+            continue
+        candidate_paths.extend(
+            sorted(runs_root.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)[: max(limit * 2, 8)]
+        )
+        if len(candidate_paths) >= target_candidates:
+            break
+    entries: list[dict[str, Any]] = []
+    seen_run_ids: set[tuple[str | None, str]] = set()
+    for path in candidate_paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            stat = path.stat()
+        except (json.JSONDecodeError, OSError) as exc:
+            LOGGER.warning("invalid_local_training_manifest path=%s error=%s", path, exc)
+            continue
+        if not isinstance(payload, dict):
+            continue
+        run_id = str(payload.get("run_id") or path.stem)
+        experiment_id = str(payload.get("experiment_id") or path.parent.parent.name)
+        dedupe_key = (payload.get("report_date"), run_id)
+        if dedupe_key in seen_run_ids:
+            continue
+        seen_run_ids.add(dedupe_key)
+        report_preview = payload.get("report_preview") if isinstance(payload.get("report_preview"), dict) else {}
+        ridge = report_preview.get("ridge") if isinstance(report_preview.get("ridge"), dict) else {}
+        assessment = payload.get("assessment") if isinstance(payload.get("assessment"), dict) else {}
+        run_ts = str(payload.get("report_date") or path.stem)
+        entries.append(
+            {
+                "run_ts": run_ts,
+                "run_id": run_id,
+                "experiment_id": experiment_id,
+                "mean_rank_ic": float(ridge.get("mean_rank_ic", 0.0) or 0.0),
+                "decision": str(assessment.get("decision", "")).upper() or None,
+                "reason": assessment.get("reason"),
+                "coverage": float(report_preview.get("coverage", 0.0) or 0.0),
+                "model_suite": payload.get("model_suite"),
+                "_sort_date": run_ts,
                 "_sort_mtime": stat.st_mtime,
             }
         )
@@ -1865,7 +1953,11 @@ def collect_dashboard_health_snapshot(
     }
 
 
-def collect_dashboard_setup_snapshot(settings: NodeSettings) -> dict[str, Any]:
+def collect_dashboard_setup_snapshot(
+    settings: NodeSettings,
+    *,
+    cluster_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Collect slower NAS, cluster, and service state only when the setup view is open."""
     host = _extract_share_host(settings.nas_share)
     return {
@@ -1876,7 +1968,7 @@ def collect_dashboard_setup_snapshot(settings: NodeSettings) -> dict[str, Any]:
             "mount_path": str(settings.nas_mount),
             "mount_writable": _check_mount_writable(settings.nas_mount),
         },
-        "cluster": read_cluster_snapshot(nas_root=settings.nas_mount, worker_id=settings.worker_id),
+        "cluster": cluster_snapshot if cluster_snapshot is not None else read_cluster_snapshot(nas_root=settings.nas_mount, worker_id=settings.worker_id),
         "systemd": systemd_status(),
         "provider_contracts": clone_provider_contract_rows(),
     }
@@ -2057,44 +2149,10 @@ def _read_budget_summary(settings: NodeSettings) -> dict[str, Any]:
 def _read_vendor_attempt_summary(db_path: Path) -> dict[str, Any]:
     if not db_path.exists():
         return {"counts": {}, "by_vendor": [], "recent_failures": []}
-    attempts = DataNodeDB(db_path).fetch_vendor_attempts()
-    if not attempts:
+    try:
+        return DataNodeDB(db_path).summarize_vendor_attempts()
+    except sqlite3.OperationalError:
         return {"counts": {}, "by_vendor": [], "recent_failures": []}
-    count_by_status: dict[str, int] = {}
-    vendor_rows: dict[str, dict[str, Any]] = {}
-    recent_failures: list[dict[str, Any]] = []
-    for attempt in attempts:
-        count_by_status[attempt.status] = count_by_status.get(attempt.status, 0) + 1
-        row = vendor_rows.setdefault(
-            attempt.vendor,
-            {"vendor": attempt.vendor, "total": 0, "leased": 0, "success": 0, "failed": 0, "permanent_failed": 0, "latest_update": attempt.updated_at},
-        )
-        row["total"] += 1
-        row["latest_update"] = max(str(row["latest_update"]), attempt.updated_at)
-        if attempt.status == "LEASED":
-            row["leased"] += 1
-        elif attempt.status == "SUCCESS":
-            row["success"] += 1
-        elif attempt.status == "FAILED":
-            row["failed"] += 1
-        elif attempt.status == "PERMANENT_FAILED":
-            row["permanent_failed"] += 1
-        if attempt.status in {"FAILED", "PERMANENT_FAILED"} and attempt.last_error:
-            recent_failures.append(
-                {
-                    "vendor": attempt.vendor,
-                    "task_key": attempt.task_key,
-                    "status": attempt.status,
-                    "last_error": attempt.last_error,
-                    "updated_at": attempt.updated_at,
-                }
-            )
-    recent_failures.sort(key=lambda item: item["updated_at"], reverse=True)
-    return {
-        "counts": count_by_status,
-        "by_vendor": sorted(vendor_rows.values(), key=lambda item: item["vendor"]),
-        "recent_failures": recent_failures[:20],
-    }
 
 
 def _read_planner_summary(db_path: Path) -> dict[str, Any]:
@@ -2109,12 +2167,12 @@ def _read_planner_summary(db_path: Path) -> dict[str, Any]:
 def _summarize_vendor_throughput(db_path: Path, *, budget_summary: dict[str, Any], window_minutes: int = 15) -> dict[str, Any]:
     if not db_path.exists():
         return {"rows": [], "checked_at": None}
-    try:
-        attempts = DataNodeDB(db_path).fetch_vendor_attempts()
-    except sqlite3.OperationalError:
-        return {"rows": [], "checked_at": None}
     now = datetime.now(tz=UTC)
     cutoff = now - timedelta(minutes=window_minutes)
+    try:
+        attempts = DataNodeDB(db_path).fetch_vendor_attempts(updated_after=cutoff.isoformat())
+    except sqlite3.OperationalError:
+        return {"rows": [], "checked_at": None}
     budget_rows = {str(row["vendor"]): row for row in budget_summary.get("rows", [])}
     grouped: dict[str, dict[str, Any]] = {}
     for attempt in attempts:
@@ -2190,18 +2248,17 @@ def _summarize_planner_eta(
     rows = vendor_throughput.get("rows", [])
     canonical_rate = sum(float(row.get("rows_per_min", 0.0)) for row in rows)
     eta: dict[str, Any] = {}
+    cutoff = (datetime.now(tz=UTC) - timedelta(minutes=window_minutes)).isoformat()
     try:
-        completed_tasks = DataNodeDB(db_path).fetch_planner_tasks(statuses=("SUCCESS",))
+        family_completion_counts = DataNodeDB(db_path).count_planner_tasks_by_family(
+            statuses=("SUCCESS",),
+            updated_after=cutoff,
+        )
     except sqlite3.OperationalError:
-        completed_tasks = []
-    now = datetime.now(tz=UTC)
-    cutoff = now - timedelta(minutes=window_minutes)
-    family_completion_rate: dict[str, float] = {}
-    for task in completed_tasks:
-        updated_at = datetime.fromisoformat(task.updated_at)
-        if updated_at < cutoff:
-            continue
-        family_completion_rate[task.task_family] = family_completion_rate.get(task.task_family, 0.0) + (1.0 / window_minutes)
+        family_completion_counts = {}
+    family_completion_rate = {
+        family: float(count) / window_minutes for family, count in family_completion_counts.items()
+    }
     for family, payload in progress.items():
         remaining = int(payload.get("remaining_units", 0))
         if remaining <= 0:
