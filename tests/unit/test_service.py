@@ -1045,6 +1045,87 @@ def test_ensure_planner_backlog_seeded_refreshes_existing_backlog_once_per_day(t
     assert calls == ["2026-04-03", "2026-04-04"]
 
 
+def test_seed_planner_tasks_with_heartbeat_reports_progress_for_large_refresh(tmp_path: Path, monkeypatch) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+    service._ledger_bootstrap_complete = True
+
+    monkeypatch.setattr(
+        service_module,
+        "recommended_training_cutoff",
+        lambda **kwargs: {"date": "2026-04-03", "coverage_ratio": 1.0},
+    )
+    monkeypatch.setattr(
+        service_module,
+        "plan_coverage_tasks",
+        lambda **kwargs: [
+            PlannedTask(
+                task_key=f"security_master::{index:04d}",
+                task_family="security_master",
+                planner_group="security_master_backlog",
+                dataset="assets",
+                tier="A",
+                priority=10,
+                start_date="2026-04-03",
+                end_date="2026-04-03",
+                symbols=("AAPL",),
+                output_name="assets",
+                preferred_vendors=("alpaca",),
+                payload={"scope_kind": "symbol_range"},
+            )
+            for index in range(600)
+        ],
+    )
+    monkeypatch.setattr(
+        service,
+        "_verify_and_seed_canonical_repairs",
+        lambda **kwargs: {"seeded_tasks": 0},
+    )
+    monkeypatch.setattr(service, "_release_budget_blocked_canonical_tasks", lambda: 0)
+
+    heartbeats: list[str] = []
+    service._seed_planner_tasks_with_heartbeat(
+        trading_date="2026-04-03",
+        heartbeat_fn=lambda: heartbeats.append("beat"),
+        heartbeat_task_interval=100,
+    )
+
+    assert len(heartbeats) == 6
+
+
+def test_ensure_planner_backlog_seeded_with_heartbeat_refreshes_once_per_day(tmp_path: Path, monkeypatch) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL", "MSFT"]
+
+    calls: list[tuple[str | None, object | None]] = []
+
+    def fake_seed(*, trading_date: str | None = None, heartbeat_fn=None, heartbeat_task_interval: int = 256) -> None:  # noqa: ANN001
+        calls.append((trading_date, heartbeat_fn))
+
+    monkeypatch.setattr(service, "_seed_planner_tasks_with_heartbeat", fake_seed)
+
+    heartbeat = lambda: None
+    service._ensure_planner_backlog_seeded_with_heartbeat(trading_date="2026-04-03", heartbeat_fn=heartbeat)
+    service._ensure_planner_backlog_seeded_with_heartbeat(trading_date="2026-04-03", heartbeat_fn=heartbeat)
+    service._ensure_planner_backlog_seeded_with_heartbeat(trading_date="2026-04-04", heartbeat_fn=heartbeat)
+
+    assert calls == [("2026-04-03", heartbeat), ("2026-04-04", heartbeat)]
+
+
 def test_process_planner_queue_reuses_daily_seed_guard(tmp_path: Path, monkeypatch) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

@@ -150,8 +150,9 @@ def main() -> int:
     service.auditor.db = db
     active_symbols = symbols or manifest["stage"]["symbols"]
     service.default_symbols = list(active_symbols)
-    service._ensure_planner_backlog_seeded(
-        trading_date=(args.date or datetime.now(tz=UTC).date().isoformat())
+    service._ensure_planner_backlog_seeded_with_heartbeat(
+        trading_date=(args.date or datetime.now(tz=UTC).date().isoformat()),
+        heartbeat_fn=coordinator.heartbeat_worker,
     )
     service.run_cluster_forever(
         coordinator=coordinator,

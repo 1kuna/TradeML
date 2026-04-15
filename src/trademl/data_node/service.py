@@ -381,6 +381,17 @@ class DataNodeService:
         """Seed or refresh planner tasks from the current stage definition."""
         if not self.default_symbols:
             return
+        self._seed_planner_tasks_with_heartbeat(trading_date=trading_date, heartbeat_fn=None)
+
+    def _seed_planner_tasks_with_heartbeat(
+        self,
+        *,
+        trading_date: str | None = None,
+        heartbeat_fn: Callable[[], object] | None = None,
+        heartbeat_task_interval: int = 256,
+    ) -> None:
+        """Seed planner tasks, optionally heartbeating during long startup refreshes."""
+        heartbeat_every = max(1, int(heartbeat_task_interval))
         if not self._ledger_bootstrap_complete:
             self.bootstrap_canonical_ledger()
         as_of_date = trading_date or datetime.now(tz=UTC).date().isoformat()
@@ -433,7 +444,7 @@ class DataNodeService:
                 }
             )
         self.db.bulk_upsert_planner_tasks(task_rows)
-        for task in planned:
+        for index, task in enumerate(planned, start=1):
             task_family = task.task_family
             if task_family == "auxiliary":
                 task_family = self._planner_family_for_dataset(task.dataset)
@@ -489,6 +500,8 @@ class DataNodeService:
                         },
                     }
                 )
+            if heartbeat_fn is not None and index % heartbeat_every == 0:
+                heartbeat_fn()
         self.db.bulk_update_planner_task_progress(progress_rows)
         if regressed_task_keys:
             reopened = self.db.reopen_planner_tasks(sorted(set(regressed_task_keys)), reason="canonical coverage regressed")
@@ -1361,6 +1374,23 @@ class DataNodeService:
         if trading_date in self._planner_seed_history:
             return
         self._seed_planner_tasks(trading_date=trading_date)
+        self._planner_seed_history.add(trading_date)
+
+    def _ensure_planner_backlog_seeded_with_heartbeat(
+        self,
+        *,
+        trading_date: str,
+        heartbeat_fn: Callable[[], object] | None = None,
+    ) -> None:
+        """Refresh planner tasks once per day while preserving startup liveness."""
+        if not self.default_symbols:
+            return
+        if trading_date in self._planner_seed_history:
+            return
+        self._seed_planner_tasks_with_heartbeat(
+            trading_date=trading_date,
+            heartbeat_fn=heartbeat_fn,
+        )
         self._planner_seed_history.add(trading_date)
 
     def _should_run_maintenance(self, *, local_day: str, current_local: datetime, maintenance_hour_local: int) -> bool:
