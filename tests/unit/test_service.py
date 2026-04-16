@@ -1621,6 +1621,78 @@ def test_canonical_partial_task_can_retry_same_vendor_after_stale_success(tmp_pa
     assert progress.remaining_units == 0
 
 
+def test_canonical_partial_task_permanently_fails_when_retry_adds_no_new_coverage(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    alpaca = _BackfillConnector("alpaca")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": alpaca},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::TECK::dead_tail",
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2025-12-16",
+        end_date="2025-12-17",
+        symbols=["TECK"],
+        eligible_vendors=["alpaca"],
+        payload={"scope_kind": "symbol_range", "trading_days": ["2025-12-16", "2025-12-17"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::TECK::dead_tail",
+        expected_units=2,
+        completed_units=0,
+        remaining_units=2,
+        remaining_symbols=["TECK"],
+        state={"scope_kind": "symbol_range"},
+    )
+
+    first_batch = service._canonical_runtime._lease_canonical_batch("alpaca")
+
+    assert len(first_batch) == 1
+    first_changed = service._canonical_runtime._process_canonical_planner_batch(batch=first_batch, vendor="alpaca", exchange="XNYS")
+
+    assert first_changed == ["2025-12-16"]
+    first_refresh = db.get_planner_task("canonical::TECK::dead_tail")
+    assert first_refresh is not None
+    assert first_refresh.status == "PARTIAL"
+    first_progress = db.fetch_planner_task_progress("canonical::TECK::dead_tail")
+    assert first_progress is not None
+    assert first_progress.remaining_units == 1
+
+    released = db.clear_planner_task_backoff(
+        ["canonical::TECK::dead_tail"],
+        reason="test immediate stale retry",
+    )
+    assert released == 1
+    second_task = db.lease_planner_task_by_key(task_key="canonical::TECK::dead_tail", lease_owner=service.worker_id)
+
+    assert second_task is not None
+    second_changed = service._canonical_runtime._process_canonical_planner_batch(
+        batch=[second_task],
+        vendor="alpaca",
+        exchange="XNYS",
+    )
+
+    assert second_changed == ["2025-12-16"]
+    refreshed = db.get_planner_task("canonical::TECK::dead_tail")
+    assert refreshed is not None
+    assert refreshed.status == "PERMANENT_FAILED"
+    assert refreshed.last_error == "alpaca: no incremental canonical coverage"
+    attempts = {(attempt.vendor, attempt.status, attempt.last_error) for attempt in db.vendor_attempts_for_task("canonical::TECK::dead_tail")}
+    assert ("alpaca", "PERMANENT_FAILED", "no incremental canonical coverage") in attempts
+    progress = db.fetch_planner_task_progress("canonical::TECK::dead_tail")
+    assert progress is not None
+    assert progress.remaining_units == 1
+
+
 def test_canonical_vendor_budget_failure_does_not_back_off_other_available_vendors(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

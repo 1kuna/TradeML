@@ -246,6 +246,7 @@ class CanonicalRuntime:
         dataset = batch[0].dataset
         start_date = batch[0].start_date
         end_date = batch[0].end_date
+        prior_progress = {task.task_key: self.db.fetch_planner_task_progress(task.task_key) for task in batch}
         leased_tasks: list[PlannerTask] = []
         symbols: list[str] = []
         for task in batch:
@@ -292,8 +293,41 @@ class CanonicalRuntime:
         for task in leased_tasks:
             task_symbols = {symbol.upper() for symbol in task.symbols}
             task_rows = int(sum(1 for symbol in normalized_symbols if symbol in task_symbols))
+            progress_payload = progress_map[task.task_key]
             if task_rows > 0:
-                self.db.mark_vendor_attempt_success(task_key=task.task_key, vendor=vendor, rows_returned=task_rows)
+                self.db.update_planner_task_progress(
+                    task_key=task.task_key,
+                    expected_units=progress_payload["expected_units"],
+                    completed_units=progress_payload["completed_units"],
+                    remaining_units=progress_payload["remaining_units"],
+                    completed_symbols=progress_payload["completed_symbols"],
+                    remaining_symbols=progress_payload["remaining_symbols"],
+                    state={"trading_days": progress_payload["trading_days"], "scope_kind": task.payload.get("scope_kind", "symbol_range")},
+                )
+                if self._planner_task_progress_advanced(prior_progress=prior_progress[task.task_key], current_progress=progress_payload):
+                    self.db.mark_vendor_attempt_success(task_key=task.task_key, vendor=vendor, rows_returned=task_rows)
+                else:
+                    self.db.mark_vendor_attempt_failed(
+                        task_key=task.task_key,
+                        vendor=vendor,
+                        error="no incremental canonical coverage",
+                        backoff_minutes=0,
+                        permanent=True,
+                    )
+                    if self._canonical_task_has_remaining_vendors(task, failed_vendor=vendor):
+                        self.db.mark_planner_task_partial(
+                            task.task_key,
+                            error=f"{vendor}: no incremental canonical coverage",
+                            backoff_minutes=self._canonical_next_task_backoff_minutes(task, excluded_vendor=vendor, default_minutes=5),
+                        )
+                        continue
+                    self.db.mark_planner_task_failed(
+                        task.task_key,
+                        error=f"{vendor}: no incremental canonical coverage",
+                        backoff_minutes=15,
+                        permanent=True,
+                    )
+                    continue
             else:
                 empty_error = self._canonical_empty_result_error(vendor=vendor, dataset=task.dataset)
                 self.db.mark_vendor_attempt_failed(
@@ -317,16 +351,6 @@ class CanonicalRuntime:
                     permanent=True,
                 )
                 continue
-            progress_payload = progress_map[task.task_key]
-            self.db.update_planner_task_progress(
-                task_key=task.task_key,
-                expected_units=progress_payload["expected_units"],
-                completed_units=progress_payload["completed_units"],
-                remaining_units=progress_payload["remaining_units"],
-                completed_symbols=progress_payload["completed_symbols"],
-                remaining_symbols=progress_payload["remaining_symbols"],
-                state={"trading_days": progress_payload["trading_days"], "scope_kind": task.payload.get("scope_kind", "symbol_range")},
-            )
             if progress_payload["remaining_units"] == 0:
                 self.db.mark_planner_task_success(task.task_key)
             else:
@@ -998,6 +1022,15 @@ class CanonicalRuntime:
             return False
         progress = self.db.fetch_planner_task_progress(task.task_key)
         return bool(progress is not None and progress.remaining_units > 0)
+
+    @staticmethod
+    def _planner_task_progress_advanced(*, prior_progress: Any | None, current_progress: dict[str, object]) -> bool:
+        """Return whether a vendor fetch reduced the task's remaining canonical coverage."""
+        current_completed = int(current_progress.get("completed_units", 0) or 0)
+        current_remaining = int(current_progress.get("remaining_units", 0) or 0)
+        if prior_progress is None:
+            return current_completed > 0 or current_remaining == 0
+        return current_remaining < int(prior_progress.remaining_units) or current_completed > int(prior_progress.completed_units)
 
     @staticmethod
     def _capability_batch_size(capability) -> int:
