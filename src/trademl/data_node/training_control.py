@@ -229,6 +229,7 @@ def evaluate_training_gates(
     stage_symbol_count: int,
     stage_years: int,
     planner_db_path: Path | None = None,
+    qc_frame: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Evaluate Phase 1 and Phase 2 readiness from current NAS-backed artifacts."""
     reference_root = data_root / "data" / "reference"
@@ -236,11 +237,11 @@ def evaluate_training_gates(
     macro_root = data_root / "data" / "raw" / "macros_fred"
     macro_series = {path.name.partition("=")[2] for path in macro_root.glob("series=*")} if macro_root.exists() else set()
     qc_path = data_root / "data" / "qc" / "partition_status.parquet"
-    raw_green_ratio = _raw_green_ratio(qc_path)
+    raw_green_ratio = _raw_green_ratio(qc_path, qc_frame=qc_frame)
     resolved_planner_db = planner_db_path or (data_root / "control" / "node.sqlite")
     planner_ratio = _planner_bars_ratio(resolved_planner_db)
     freeze_cutoff = recommended_training_cutoff(data_root=data_root, expected_symbol_count=stage_symbol_count)
-    frozen_window = _frozen_window_bar_coverage(qc_path=qc_path, report_date=freeze_cutoff.get("date"))
+    frozen_window = _frozen_window_bar_coverage(qc_path=qc_path, report_date=freeze_cutoff.get("date"), qc_frame=qc_frame)
     planner_window_ratio = _planner_window_ratio(
         db_path=resolved_planner_db,
         window_start=frozen_window.get("window_start"),
@@ -433,15 +434,16 @@ def _frozen_window_bar_coverage(
     report_date: str | None,
     window_years: int = 5,
     source: str = "alpaca",
+    qc_frame: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
-    if report_date is None or not qc_path.exists():
+    if report_date is None:
         return {
             "coverage_ratio": 0.0,
             "missing_dates": [],
             "window_start": None,
             "window_end": report_date,
         }
-    frame = pd.read_parquet(qc_path)
+    frame = qc_frame if qc_frame is not None else _read_qc_frame(qc_path)
     if frame.empty:
         return {
             "coverage_ratio": 0.0,
@@ -1250,16 +1252,21 @@ print(json.dumps(payload))
     return str(payload.get("date") or date.today().isoformat())
 
 
-def _raw_green_ratio(qc_path: Path) -> float | None:
-    if not qc_path.exists():
-        return None
-    frame = pd.read_parquet(qc_path)
+def _raw_green_ratio(qc_path: Path, *, qc_frame: pd.DataFrame | None = None) -> float | None:
+    frame = qc_frame if qc_frame is not None else _read_qc_frame(qc_path)
     if frame.empty:
         return None
     equities = frame.loc[frame["dataset"] == "equities_eod"].copy()
     if equities.empty:
         return None
     return float((equities["status"] == "GREEN").mean())
+
+
+def _read_qc_frame(qc_path: Path) -> pd.DataFrame:
+    """Read the partition-status parquet once for readiness checks."""
+    if not qc_path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(qc_path)
 
 
 def _terminal_delisting_returns_present(path: Path) -> bool:

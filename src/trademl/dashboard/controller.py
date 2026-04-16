@@ -1300,7 +1300,8 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
         started_at = datetime.fromisoformat(str(runtime["started_at"]))
         runtime["uptime_seconds"] = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
     queue_counts = _read_queue_counts(settings.db_path)
-    partition_summary = _read_partition_summary(settings.qc_path)
+    qc_frame = _read_qc_frame(settings.qc_path)
+    partition_summary = _partition_summary_from_frame(qc_frame)
     raw_dates = _partition_dates_from_qc(partition_summary)
     curated_dates = _partition_dates(settings.curated_equities_root)
     raw_datapoints = _raw_datapoints_from_qc(partition_summary)
@@ -1337,6 +1338,7 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
         stage_symbol_count=len(stage_symbols),
         stage_years=int(stage_years or 0),
         planner_db_path=settings.db_path,
+        qc_frame=qc_frame,
     )
     collection_health = _build_collection_health(
         planner_summary=planner_summary,
@@ -1459,7 +1461,8 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
         started_at = datetime.fromisoformat(str(runtime["started_at"]))
         runtime["uptime_seconds"] = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
     queue_counts = _read_queue_counts(settings.db_path)
-    partition_summary = _read_partition_summary(settings.qc_path)
+    qc_frame = _read_qc_frame(settings.qc_path)
+    partition_summary = _partition_summary_from_frame(qc_frame)
     raw_datapoints = _raw_datapoints_from_qc(partition_summary)
     planner_summary = _read_planner_summary(settings.db_path)
     budget_summary = _read_budget_summary(settings)
@@ -1473,6 +1476,7 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
         stage_symbol_count=len(stage_symbols),
         stage_years=int(stage_years or 0),
         planner_db_path=settings.db_path,
+        qc_frame=qc_frame,
     )
     progress = planner_summary.get("progress", {})
     bars_progress = progress.get("canonical_bars", {})
@@ -1545,7 +1549,8 @@ def collect_dashboard_game_snapshot(
             uptime_seconds = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
 
     queue_counts = _read_queue_counts(settings.db_path)
-    partition_summary = _read_partition_summary(settings.qc_path)
+    qc_frame = _read_qc_frame(settings.qc_path)
+    partition_summary = _partition_summary_from_frame(qc_frame)
     raw_dates = _partition_dates_from_qc(partition_summary)
     raw_datapoints = _raw_datapoints_from_qc(partition_summary)
     reference_files = _readable_reference_files(settings.reference_root)
@@ -1575,6 +1580,7 @@ def collect_dashboard_game_snapshot(
         stage_symbol_count=len(stage_symbols),
         stage_years=int(stage_years or 0),
         planner_db_path=settings.db_path,
+        qc_frame=qc_frame,
     )
     collection_health = _build_collection_health(
         planner_summary=planner_summary,
@@ -2716,10 +2722,14 @@ def _read_queue_counts(db_path: Path) -> dict[str, int]:
     return counts
 
 
-def _read_partition_summary(qc_path: Path) -> dict[str, Any]:
+def _read_qc_frame(qc_path: Path) -> pd.DataFrame:
+    """Read the dashboard QC parquet once per snapshot."""
     if not qc_path.exists():
-        return {"counts": {}, "coverage_green": None, "latest_date": None, "raw_dates": [], "raw_datapoints": 0}
-    frame = pd.read_parquet(qc_path)
+        return pd.DataFrame()
+    return pd.read_parquet(qc_path)
+
+
+def _partition_summary_from_frame(frame: pd.DataFrame) -> dict[str, Any]:
     if frame.empty:
         return {"counts": {}, "coverage_green": None, "latest_date": None, "raw_dates": [], "raw_datapoints": 0}
     equities = frame.loc[frame["dataset"] == "equities_eod"].copy()
@@ -2738,6 +2748,11 @@ def _read_partition_summary(qc_path: Path) -> dict[str, Any]:
         "raw_dates": raw_dates,
         "raw_datapoints": raw_datapoints,
     }
+
+
+def _read_partition_summary(qc_path: Path) -> dict[str, Any]:
+    frame = _read_qc_frame(qc_path)
+    return _partition_summary_from_frame(frame)
 
 
 def _partition_dates(root: Path) -> list[str]:

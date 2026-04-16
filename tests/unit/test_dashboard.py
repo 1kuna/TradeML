@@ -2042,10 +2042,12 @@ def test_collect_dashboard_game_snapshot_assembles_sections(tmp_path: Path, monk
         },
     )
     monkeypatch.setattr(dashboard_controller, "_read_queue_counts", lambda db_path: {"PENDING": 3, "FAILED": 1})
+    qc_frame = pd.DataFrame([{"dataset": "equities_eod", "status": "GREEN", "source": "alpaca", "date": "2026-04-09", "row_count": 987_654}])
+    monkeypatch.setattr(dashboard_controller, "_read_qc_frame", lambda qc_path: qc_frame)
     monkeypatch.setattr(
         dashboard_controller,
-        "_read_partition_summary",
-        lambda qc_path: {"counts": {"GREEN": 5}, "coverage_green": 1.0, "latest_date": "2026-04-09", "raw_dates": ["2026-04-09"], "raw_datapoints": 987_654},
+        "_partition_summary_from_frame",
+        lambda frame: {"counts": {"GREEN": 5}, "coverage_green": 1.0, "latest_date": "2026-04-09", "raw_dates": ["2026-04-09"], "raw_datapoints": 987_654},
     )
     monkeypatch.setattr(dashboard_controller, "_readable_reference_files", lambda root: ["corp_actions.parquet", "listing_history.parquet", "delistings.parquet", "sec_filings.parquet", "fred_vintagedates.parquet", "earnings_calendar.parquet"])
     monkeypatch.setattr(dashboard_controller, "_macro_series", lambda root: list(default_macro_series()))
@@ -2138,6 +2140,77 @@ def test_collect_dashboard_game_snapshot_assembles_sections(tmp_path: Path, monk
     assert gate["freeze_cutoff"] == "2026-03-23"
     assert snapshot["cluster"]["active_workers"][0]["worker_id"] == settings.worker_id
     assert 0.0 <= gate["percent"] <= 100.0
+
+
+def test_collect_dashboard_game_snapshot_passes_qc_frame_to_training_gates(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                },
+                "vendors": {},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 0, "symbols": ["AAPL"], "years": 1}, sort_keys=False),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    qc_frame = pd.DataFrame([{"dataset": "equities_eod", "status": "GREEN", "source": "alpaca", "date": "2026-04-09", "row_count": 1}])
+
+    monkeypatch.setattr(dashboard_controller, "_read_runtime_state", lambda settings: {"pid": None, "started_at": None})
+    monkeypatch.setattr(dashboard_controller, "read_cluster_snapshot", lambda **kwargs: {"workers": [], "active_workers": []})
+    monkeypatch.setattr(dashboard_controller, "_read_queue_counts", lambda db_path: {})
+    monkeypatch.setattr(dashboard_controller, "_read_qc_frame", lambda qc_path: qc_frame)
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_partition_summary_from_frame",
+        lambda frame: {"counts": {"GREEN": 1}, "coverage_green": 1.0, "latest_date": "2026-04-09", "raw_dates": ["2026-04-09"], "raw_datapoints": 1},
+    )
+    monkeypatch.setattr(dashboard_controller, "_readable_reference_files", lambda root: [])
+    monkeypatch.setattr(dashboard_controller, "_macro_series", lambda root: [])
+    monkeypatch.setattr(dashboard_controller, "_price_check_files", lambda root: [])
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_read_planner_summary",
+        lambda db_path: {
+            "progress": {"canonical_bars": {"expected_units": 1, "completed_units": 1, "remaining_units": 0}},
+            "backlog_progress": {},
+            "counts": {},
+        },
+    )
+    monkeypatch.setattr(dashboard_controller, "_read_budget_summary", lambda settings: {"rows": [], "checked_at": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_vendor_throughput", lambda db_path, budget_summary: {"rows": [], "checked_at": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_planner_eta", lambda db_path, planner_summary, vendor_throughput: {})
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_build_collection_health",
+        lambda **kwargs: {"dataset_coverage": {}, "collection_status": {"coverage_percent": 100.0}},
+    )
+    captured: dict[str, object] = {}
+
+    def fake_evaluate_training_gates(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+        return {"phase1": {"ready": True, "blockers": []}, "freeze_cutoff": {}}
+
+    monkeypatch.setattr(dashboard_controller, "evaluate_training_gates", fake_evaluate_training_gates)
+    monkeypatch.setattr(dashboard_controller, "read_training_runtime", lambda path=None, local_state=None, phase=None: {})
+
+    collect_dashboard_game_snapshot(settings)
+
+    assert captured["qc_frame"] is qc_frame
 
 
 def test_collect_dashboard_game_snapshot_marks_idle_when_no_runs(tmp_path: Path, monkeypatch) -> None:

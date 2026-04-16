@@ -91,6 +91,51 @@ def test_evaluate_training_gates_checks_reference_parquet_via_metadata_only(
     assert "listing_history" not in readiness["phase1"]["blockers"]
 
 
+def test_evaluate_training_gates_uses_supplied_qc_frame_without_reloading_parquet(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    reference_root = tmp_path / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    for name in ["corp_actions", "listing_history", "delistings", "sec_filings", "ticker_changes", "fred_vintagedates"]:
+        pd.DataFrame([{"symbol": "AAPL"}]).to_parquet(reference_root / f"{name}.parquet", index=False)
+    for series in training_control.default_macro_series():
+        partition = tmp_path / "data" / "raw" / "macros_fred" / f"series={series}"
+        partition.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([{"series_id": series, "value": 1.0}]).to_parquet(partition / "data.parquet", index=False)
+    qc_frame = pd.DataFrame(
+        [
+            {"dataset": "equities_eod", "status": "GREEN", "source": "alpaca", "date": "2026-03-31", "row_count": 100},
+            {"dataset": "equities_eod", "status": "GREEN", "source": "alpaca", "date": "2026-04-01", "row_count": 100},
+        ]
+    )
+
+    monkeypatch.setattr(
+        training_control,
+        "recommended_training_cutoff",
+        lambda **kwargs: {"date": "2026-04-01", "complete_symbols": 500, "coverage_ratio": 1.0},
+    )
+
+    original_read_parquet = training_control.pd.read_parquet
+
+    def guarded_read_parquet(path, *args, **kwargs):  # noqa: ANN001
+        if Path(path) == tmp_path / "data" / "qc" / "partition_status.parquet":
+            raise AssertionError("supplied qc_frame should avoid re-reading partition_status.parquet")
+        return original_read_parquet(path, *args, **kwargs)
+
+    monkeypatch.setattr(training_control.pd, "read_parquet", guarded_read_parquet)
+
+    readiness = evaluate_training_gates(
+        data_root=tmp_path,
+        stage_symbol_count=500,
+        stage_years=10,
+        qc_frame=qc_frame,
+    )
+
+    assert readiness["freeze_cutoff"]["window_end"] == "2026-04-01"
+    assert readiness["freeze_cutoff"]["window_coverage_ratio"] == 1.0
+
+
 def test_recommended_training_cutoff_uses_latest_complete_raw_partition_before_lagged_anchor(tmp_path: Path) -> None:
     raw_root = tmp_path / "data" / "raw" / "equities_bars"
     for trading_date, symbols in {
