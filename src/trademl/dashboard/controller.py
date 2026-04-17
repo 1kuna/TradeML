@@ -39,6 +39,7 @@ from trademl.data_node.runtime import build_connector, build_connectors, resolve
 from trademl.data_node.service import DataNodePaths, DataNodeService
 from trademl.data_node.training_control import (
     evaluate_training_gates,
+    local_training_runtime_path,
     read_training_runtime,
     resolve_training_target,
     resolve_training_targets,
@@ -1365,6 +1366,17 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
         local_state=settings.local_state,
         python_executable=sys.executable,
     )
+    experiment_summary = latest_experiment_summary(local_state=settings.local_state)
+    experiment_supervisor = (
+        read_experiment_supervisor_state(
+            local_state=settings.local_state,
+            experiment_id=str(experiment_summary.get("experiment_id")),
+        )
+        if experiment_summary.get("experiment_id")
+        else {}
+    )
+    proposal_summary = latest_experiment_proposal(local_state=settings.local_state)
+    research_program_summary = latest_research_program_summary(local_state=settings.local_state)
     training_status = {
         "phase1": training_status_snapshot(
             repo_root=settings.repo_root,
@@ -1376,15 +1388,25 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
             python_executable=sys.executable,
             tail_lines=20,
         ),
-        "phase2": training_status_snapshot(
-            repo_root=settings.repo_root,
-            data_root=settings.nas_mount,
-            local_state=settings.local_state,
-            phase=2,
-            target=training_target.name,
-            targets_config_path=settings.config_path,
-            python_executable=sys.executable,
-            tail_lines=20,
+        "phase2": (
+            training_status_snapshot(
+                repo_root=settings.repo_root,
+                data_root=settings.nas_mount,
+                local_state=settings.local_state,
+                phase=2,
+                target=training_target.name,
+                targets_config_path=settings.config_path,
+                python_executable=sys.executable,
+                tail_lines=20,
+            )
+            if _status_snapshot_needs_phase_training_probe(
+                settings=settings,
+                phase=2,
+                target_name=training_target.name,
+                experiment_summary=experiment_summary,
+                research_program_summary=research_program_summary,
+            )
+            else _idle_training_status_snapshot(target=training_target)
         ),
     }
     train_operational_status = _summarize_train_operational_status(training_status=training_status, readiness=readiness)
@@ -1394,6 +1416,10 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
         budget_summary=budget_summary,
         vendor_throughput=vendor_throughput,
         include_cluster=False,
+        experiment_summary=experiment_summary,
+        experiment_supervisor=experiment_supervisor,
+        proposal_summary=proposal_summary,
+        research_program_summary=research_program_summary,
     )
     snapshot = {
         "settings": asdict(settings),
@@ -1976,6 +2002,10 @@ def collect_dashboard_health_snapshot(
     budget_summary: dict[str, Any] | None = None,
     vendor_throughput: dict[str, Any] | None = None,
     include_cluster: bool = True,
+    experiment_summary: dict[str, Any] | None = None,
+    experiment_supervisor: dict[str, Any] | None = None,
+    proposal_summary: dict[str, Any] | None = None,
+    research_program_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Collect repair, lease, lane-health, training-target, and experiment status."""
     planner_summary = planner_summary or _read_planner_summary(settings.db_path)
@@ -2020,8 +2050,8 @@ def collect_dashboard_health_snapshot(
         manifest.trading_date
         for manifest in db.fetch_raw_partition_manifests(dataset="equities_eod", statuses=("INCOMPLETE", "UNREADABLE", "QUARANTINED"))
     ][-10:]
-    experiment_summary = latest_experiment_summary(local_state=settings.local_state)
-    experiment_supervisor = (
+    experiment_summary = experiment_summary or latest_experiment_summary(local_state=settings.local_state)
+    experiment_supervisor = experiment_supervisor or (
         read_experiment_supervisor_state(
             local_state=settings.local_state,
             experiment_id=str(experiment_summary.get("experiment_id")),
@@ -2029,8 +2059,8 @@ def collect_dashboard_health_snapshot(
         if experiment_summary.get("experiment_id")
         else {}
     )
-    proposal_summary = latest_experiment_proposal(local_state=settings.local_state)
-    research_program_summary = latest_research_program_summary(local_state=settings.local_state)
+    proposal_summary = proposal_summary or latest_experiment_proposal(local_state=settings.local_state)
+    research_program_summary = research_program_summary or latest_research_program_summary(local_state=settings.local_state)
     return {
         "repair_tasks": repair_tasks,
         "repair_drain_rate_per_min": repair_tasks["drain_rate_per_min"],
@@ -2068,6 +2098,57 @@ def collect_dashboard_setup_snapshot(
         "systemd": systemd_status(),
         "provider_contracts": clone_provider_contract_rows(),
     }
+
+
+def _idle_training_status_snapshot(*, target: Any) -> dict[str, Any]:
+    """Return a compact idle payload when no live phase runtime should be probed."""
+    return {
+        "target": asdict(target),
+        "local": {},
+        "shared": {},
+        "remote": {},
+        "runtime": {"status": "idle", "running": False, "target": target.name},
+        "log_tail": "",
+    }
+
+
+def _status_snapshot_needs_phase_training_probe(
+    *,
+    settings: NodeSettings,
+    phase: int,
+    target_name: str,
+    experiment_summary: dict[str, Any],
+    research_program_summary: dict[str, Any],
+) -> bool:
+    """Return whether status should do a live training probe for one phase."""
+    resolved_target = resolve_training_target(
+        target_name=target_name,
+        targets_config_path=settings.config_path,
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        local_state=settings.local_state,
+        python_executable=sys.executable,
+    )
+    local_path = local_training_runtime_path(
+        local_state=resolved_target.local_runtime_root,
+        phase=phase,
+        runtime_name=None,
+        target_name=resolved_target.name,
+    )
+    shared_path = shared_training_runtime_path(
+        data_root=resolved_target.data_root,
+        phase=phase,
+        runtime_name=None,
+    )
+    if local_path.exists() or shared_path.exists():
+        return True
+    experiment_phase = experiment_summary.get("phase")
+    if experiment_phase is not None and int(experiment_phase) == phase:
+        return True
+    program_phase = research_program_summary.get("current_phase")
+    if program_phase is not None and int(program_phase) == phase:
+        return True
+    return False
 
 
 def collect_dashboard_logs_snapshot(settings: NodeSettings) -> dict[str, Any]:

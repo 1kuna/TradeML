@@ -1445,6 +1445,102 @@ def test_collect_dashboard_status_snapshot_includes_health_and_experiment_summar
     assert snapshot["default_training_target"]["name"] == "local"
 
 
+def test_collect_dashboard_status_snapshot_skips_inactive_phase2_probe(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 1, "symbols": ["AAPL"], "years": 5}, sort_keys=False),
+        encoding="utf-8",
+    )
+    DataNodeDB(workspace / "control" / "node.sqlite")
+
+    seen_phases: list[int] = []
+
+    def fake_training_status_snapshot(**kwargs):  # noqa: ANN001
+        seen_phases.append(int(kwargs["phase"]))
+        return {"runtime": {"status": "idle", "target": "local", "pid": None}, "log_tail": ""}
+
+    monkeypatch.setattr(dashboard_controller, "training_status_snapshot", fake_training_status_snapshot)
+    monkeypatch.setattr(
+        dashboard_controller,
+        "evaluate_training_gates",
+        lambda **kwargs: {"phase1": {"ready": True, "blockers": []}, "phase2": {"ready": False, "blockers": []}, "freeze_cutoff": {"date": "2026-04-02", "pinned": True}},
+    )
+    monkeypatch.setattr(dashboard_controller, "latest_experiment_summary", lambda **kwargs: {"experiment_id": "phase1", "phase": 1})
+    monkeypatch.setattr(dashboard_controller, "latest_research_program_summary", lambda **kwargs: {"program_id": "perpetual", "current_phase": 1})
+
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    snapshot = dashboard_controller.collect_dashboard_status_snapshot(settings)
+
+    assert seen_phases == [1]
+    assert snapshot["training_status"]["phase2"]["runtime"]["status"] == "idle"
+    assert snapshot["training_status"]["phase2"]["log_tail"] == ""
+
+
+def test_collect_dashboard_status_snapshot_probes_phase2_when_program_is_on_phase2(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 1, "symbols": ["AAPL"], "years": 5}, sort_keys=False),
+        encoding="utf-8",
+    )
+    DataNodeDB(workspace / "control" / "node.sqlite")
+
+    seen_phases: list[int] = []
+
+    def fake_training_status_snapshot(**kwargs):  # noqa: ANN001
+        seen_phases.append(int(kwargs["phase"]))
+        return {"runtime": {"status": "idle", "target": "local", "pid": None}, "log_tail": ""}
+
+    monkeypatch.setattr(dashboard_controller, "training_status_snapshot", fake_training_status_snapshot)
+    monkeypatch.setattr(
+        dashboard_controller,
+        "evaluate_training_gates",
+        lambda **kwargs: {"phase1": {"ready": True, "blockers": []}, "phase2": {"ready": False, "blockers": []}, "freeze_cutoff": {"date": "2026-04-02", "pinned": True}},
+    )
+    monkeypatch.setattr(dashboard_controller, "latest_experiment_summary", lambda **kwargs: {"experiment_id": "phase1", "phase": 1})
+    monkeypatch.setattr(dashboard_controller, "latest_research_program_summary", lambda **kwargs: {"program_id": "perpetual", "current_phase": 2})
+
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    dashboard_controller.collect_dashboard_status_snapshot(settings)
+
+    assert seen_phases == [1, 2]
+
+
 def test_collect_dashboard_live_snapshot_skips_support_file_scans(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     nas_mount = tmp_path / "nas"
