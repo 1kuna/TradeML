@@ -753,18 +753,27 @@ class CanonicalRuntime:
 
     def _lease_next_task_for_vendor(self, vendor: str):
         """Lease the next legacy backfill task best served by a given vendor."""
-        for candidate in self.db.peek_next_tasks(limit=64):
-            chosen = choose_vendor_for_canonical_task(
-                task=candidate,
-                connectors=self.connectors,
-                audit_state=self.capability_audit_state,
-                attempts=self.db.vendor_attempts_for_task(canonical_task_key(candidate)),
-            )
-            if chosen != vendor:
-                continue
-            leased = self.db.lease_task_by_id(candidate.id)
-            if leased is not None:
-                return leased
+        offset = 0
+        batch_size = 64
+        while True:
+            candidates = self.db.peek_next_tasks(limit=batch_size, offset=offset)
+            if not candidates:
+                return None
+            for candidate in candidates:
+                chosen = choose_vendor_for_canonical_task(
+                    task=candidate,
+                    connectors=self.connectors,
+                    audit_state=self.capability_audit_state,
+                    attempts=self.db.vendor_attempts_for_task(canonical_task_key(candidate)),
+                )
+                if chosen != vendor:
+                    continue
+                leased = self.db.lease_task_by_id(candidate.id)
+                if leased is not None:
+                    return leased
+            if len(candidates) < batch_size:
+                return None
+            offset += batch_size
         return None
 
     def _process_backfill_task_for_vendor(self, task, vendor: str) -> list[str]:
@@ -864,6 +873,7 @@ class CanonicalRuntime:
         reserved: set[str] = set()
         attempted_by_symbol: dict[str, set[str]] = defaultdict(set)
         unavailable_vendors: set[str] = set()
+        vendor_attempt_state: dict[str, dict[str, object]] = {}
         state_lock = threading.Lock()
 
         def claim_batch(vendor_name: str, batch_size: int) -> list[str]:
@@ -876,6 +886,29 @@ class CanonicalRuntime:
                     and vendor_name not in attempted_by_symbol[symbol.upper()]
                 ]
                 batch = available[:batch_size]
+                if batch and vendor_name not in vendor_attempt_state:
+                    attempt = self.db.lease_vendor_attempt(
+                        task_key=canonical_task_key(task),
+                        task_family="canonical",
+                        planner_group="canonical_bars_backlog",
+                        vendor=vendor_name,
+                        lease_owner=self.worker_id,
+                        payload={
+                            "dataset": task.dataset,
+                            "start_date": task.start_date,
+                            "end_date": task.end_date,
+                            "kind": task.kind,
+                            "scope_kind": "date_wide",
+                        },
+                    )
+                    if attempt is None:
+                        return []
+                    vendor_attempt_state[vendor_name] = {
+                        "rows_returned": 0,
+                        "error": None,
+                        "permanent": False,
+                        "backoff_minutes": 15,
+                    }
                 for symbol in batch:
                     symbol_key = symbol.upper()
                     reserved.add(symbol_key)
@@ -917,8 +950,21 @@ class CanonicalRuntime:
                     empty_error=None,
                 )
                 if not fetch_result.ok:
-                    if fetch_result.permanent or fetch_result.budget_exhausted:
-                        unavailable_vendors.add(capability.vendor)
+                    with state_lock:
+                        state = vendor_attempt_state.setdefault(
+                            capability.vendor,
+                            {
+                                "rows_returned": 0,
+                                "error": None,
+                                "permanent": False,
+                                "backoff_minutes": 15,
+                            },
+                        )
+                        state["error"] = fetch_result.error
+                        state["permanent"] = bool(fetch_result.permanent)
+                        state["backoff_minutes"] = int(fetch_result.backoff_minutes)
+                        if fetch_result.permanent or fetch_result.budget_exhausted:
+                            unavailable_vendors.add(capability.vendor)
                     release_batch(batch, completed=[])
                     return vendor_frames
                 frame = fetch_result.frame
@@ -927,6 +973,8 @@ class CanonicalRuntime:
                     continue
                 covered = frame.get("symbol", pd.Series(dtype="string")).dropna().astype("string").str.upper().unique().tolist()
                 release_batch(batch, completed=covered)
+                with state_lock:
+                    vendor_attempt_state[capability.vendor]["rows_returned"] = int(vendor_attempt_state[capability.vendor]["rows_returned"]) + len(frame)
                 vendor_frames.append(frame)
             return vendor_frames
 
@@ -942,6 +990,21 @@ class CanonicalRuntime:
         changed_dates: list[str] = []
         if frames:
             changed_dates = self._write_raw_partition_fn(pd.concat(frames, ignore_index=True), self.source_name)
+
+        task_key = canonical_task_key(task)
+        for vendor_name, state in vendor_attempt_state.items():
+            rows_returned = int(state.get("rows_returned", 0) or 0)
+            error = state.get("error")
+            if rows_returned > 0:
+                self.db.mark_vendor_attempt_success(task_key=task_key, vendor=vendor_name, rows_returned=rows_returned)
+                continue
+            self.db.mark_vendor_attempt_failed(
+                task_key=task_key,
+                vendor=vendor_name,
+                error=str(error or "empty date-wide backfill result"),
+                backoff_minutes=int(state.get("backoff_minutes", 15) or 15),
+                permanent=bool(state.get("permanent", False)),
+            )
 
         merged = self._read_existing_partition(date=task.start_date)
         merged_symbols = {

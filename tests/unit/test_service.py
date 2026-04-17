@@ -682,6 +682,26 @@ def test_lease_next_task_for_vendor_skips_single_symbol_vendors_for_datewide_bac
     assert alpaca_task.symbol is None
 
 
+def test_lease_next_task_for_vendor_scans_past_front_slice_when_vendor_matches_later_task(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    for index in range(64):
+        db.enqueue_task("equities_eod", f"SYM{index:03d}", "2025-01-01", "2025-01-02", "GAP", 1)
+    db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-02", "GAP", 1)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _BackfillConnector("alpaca"), "tiingo": _BackfillConnector("tiingo")},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+
+    leased = service._canonical_runtime._lease_next_task_for_vendor("alpaca")
+
+    assert leased is not None
+    assert leased.symbol is None
+
+
 def test_datewide_backfill_merges_parallel_vendor_results_and_marks_task_done(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     task_id = db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-01", "GAP", 1)
@@ -709,6 +729,31 @@ def test_datewide_backfill_merges_parallel_vendor_results_and_marks_task_done(tm
     assert status_row == ("DONE",)
     assert alpaca.calls
     assert tiingo.calls
+
+
+def test_datewide_backfill_persists_failed_vendor_attempts(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    task_id = db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-01", "GAP", 1)
+    leased = db.lease_task_by_id(task_id)
+    assert leased is not None
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _ForwardFailConnector("alpaca")},
+        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    service.default_symbols = ["AAPL", "MSFT"]
+
+    changed = service._canonical_runtime._process_backfill_task_for_vendor(leased, "alpaca")
+
+    assert changed == []
+    attempts = db.vendor_attempts_for_task("canonical::equities_eod::__ALL__::2025-01-01::2025-01-01::GAP")
+    assert len(attempts) == 1
+    assert attempts[0].vendor == "alpaca"
+    assert attempts[0].status == "FAILED"
+    assert attempts[0].last_error == "alpaca unavailable"
 
 
 def test_datewide_backfill_keeps_partial_progress_and_defers_remaining_symbols(tmp_path: Path) -> None:

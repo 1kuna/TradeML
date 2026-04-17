@@ -177,15 +177,32 @@ def plan_canonical_bar_tasks(
     tasks: list[PlannedTask] = []
     ordered_symbols = list(dict.fromkeys(str(symbol).upper() for symbol in stage_symbols))
     listing_windows = _load_listing_windows(data_root) if data_root is not None else {}
-    for symbol_index, symbol in enumerate(ordered_symbols):
-        symbol_chunk = (symbol,)
+    chunk_index = 0
+    index = 0
+    batch_limit = max(1, int(symbol_batch_size))
+    while index < len(ordered_symbols):
+        symbol = ordered_symbols[index]
         eligible_days = _eligible_trading_days(
             trading_days=trading_days,
             listing_window=listing_windows.get(symbol),
         )
         if not eligible_days:
+            index += 1
             continue
-        symbol_chunk_id = f"{symbol_index:05d}"
+        symbol_chunk: list[str] = [symbol]
+        next_index = index + 1
+        while next_index < len(ordered_symbols) and len(symbol_chunk) < batch_limit:
+            candidate = ordered_symbols[next_index]
+            candidate_days = _eligible_trading_days(
+                trading_days=trading_days,
+                listing_window=listing_windows.get(candidate),
+            )
+            if candidate_days != eligible_days:
+                break
+            symbol_chunk.append(candidate)
+            next_index += 1
+        symbol_chunk_tuple = tuple(symbol_chunk)
+        symbol_chunk_id = f"{chunk_index:05d}"
         for date_index in range(0, len(eligible_days), max(1, trading_day_chunk_size)):
             window = eligible_days[date_index : date_index + max(1, trading_day_chunk_size)]
             if not window:
@@ -209,7 +226,7 @@ def plan_canonical_bar_tasks(
                     priority=5 if in_freeze_window else 10,
                     start_date=start_date,
                     end_date=end_date,
-                    symbols=symbol_chunk,
+                    symbols=symbol_chunk_tuple,
                     output_name="equities_bars",
                     preferred_vendors=_canonical_vendors_for_window(
                         canonical_vendors=canonical_vendors,
@@ -220,12 +237,14 @@ def plan_canonical_bar_tasks(
                         "backlog_class": "phase1_pinned" if in_freeze_window else "rolling",
                         "symbol_chunk_id": symbol_chunk_id,
                         "date_chunk_id": date_chunk_id,
-                        "symbol_batch_size": len(symbol_chunk),
+                        "symbol_batch_size": len(symbol_chunk_tuple),
                         "trading_days": list(window),
                         "freeze_priority": in_freeze_window,
                     },
                 )
             )
+        chunk_index += 1
+        index = next_index
     return tasks
 
 

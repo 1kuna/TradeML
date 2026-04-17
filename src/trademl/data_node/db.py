@@ -509,7 +509,7 @@ class DataNodeDB:
             assert leased_row is not None
             return BackfillTask(**dict(leased_row))
 
-    def peek_next_tasks(self, *, limit: int = 25, now: datetime | None = None) -> list[BackfillTask]:
+    def peek_next_tasks(self, *, limit: int = 25, offset: int = 0, now: datetime | None = None) -> list[BackfillTask]:
         """Return eligible tasks without leasing them."""
         lease_time = (now or utc_now()).isoformat()
         with self._connect() as connection:
@@ -521,8 +521,9 @@ class DataNodeDB:
                   AND COALESCE(next_not_before, '1970-01-01T00:00:00+00:00') <= ?
                 ORDER BY priority ASC, created_at ASC, id ASC
                 LIMIT ?
+                OFFSET ?
                 """,
-                (lease_time, limit),
+                (lease_time, limit, offset),
             ).fetchall()
         return [BackfillTask(**dict(row)) for row in rows]
 

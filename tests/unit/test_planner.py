@@ -237,6 +237,8 @@ def test_plan_canonical_bar_tasks_uses_symbol_range_windows() -> None:
     assert first.preferred_vendors == ("tiingo", "alpaca")
     assert len(first.symbols) <= 2
     assert len(first.payload["trading_days"]) <= 10
+    assert any(task.symbols == ("AAPL", "MSFT") for task in tasks)
+    assert any(task.symbols == ("NVDA",) for task in tasks)
 
 
 def test_plan_canonical_bar_tasks_expands_and_prioritizes_frozen_training_window() -> None:
