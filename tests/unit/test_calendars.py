@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
+import trademl.calendars.exchange as exchange_module
 from trademl.calendars.exchange import ExchangeCalendarStore, get_trading_days, is_early_close, is_trading_day
 
 
@@ -42,3 +44,34 @@ def test_holiday_flags_are_persisted(tmp_path: Path) -> None:
     assert thanksgiving["is_holiday"]
     assert pd.isna(thanksgiving["market_open"])
     assert not saturday["is_holiday"]
+
+
+def test_exchange_calendar_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    exchange_module._calendar.cache_clear()
+    calls = {"count": 0}
+
+    class FakeCalendar:
+        def sessions_in_range(self, start: pd.Timestamp, end: pd.Timestamp):
+            return pd.DatetimeIndex([start, end])
+
+        def is_session(self, day: pd.Timestamp) -> bool:
+            return True
+
+        def session_open(self, day: pd.Timestamp) -> pd.Timestamp:
+            return pd.Timestamp(day)
+
+        def session_close(self, day: pd.Timestamp) -> pd.Timestamp:
+            return pd.Timestamp(day) + pd.Timedelta(hours=6, minutes=30)
+
+    def fake_get_calendar(exchange: str) -> FakeCalendar:
+        calls["count"] += 1
+        return FakeCalendar()
+
+    monkeypatch.setattr(exchange_module.xcals, "get_calendar", fake_get_calendar)
+
+    get_trading_days("XNYS", "2025-01-02", "2025-01-03")
+    is_trading_day("XNYS", "2025-01-02")
+    is_early_close("XNYS", "2025-01-02")
+
+    assert calls["count"] == 1
+    exchange_module._calendar.cache_clear()

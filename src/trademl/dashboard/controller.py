@@ -1300,7 +1300,8 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
     if running and runtime.get("started_at"):
         started_at = datetime.fromisoformat(str(runtime["started_at"]))
         runtime["uptime_seconds"] = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
-    queue_counts = _read_queue_counts(settings.db_path)
+    planner_summary = _read_planner_summary(settings.db_path)
+    queue_counts = _queue_counts_from_planner_summary(planner_summary) or _read_queue_counts(settings.db_path)
     qc_frame = _read_qc_frame(settings.qc_path)
     partition_summary = _partition_summary_from_frame(qc_frame)
     raw_dates = _partition_dates_from_qc(partition_summary)
@@ -1313,11 +1314,9 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
     audit = load_audit_state(_audit_report_path(settings))
     coverage_plan = _read_optional_json(_coverage_plan_path(settings))
     vendor_attempt_summary = _read_vendor_attempt_summary(settings.db_path)
-    planner_summary = _read_planner_summary(settings.db_path)
     budget_summary = _read_budget_summary(settings)
     vendor_throughput = _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
     planner_eta = _summarize_planner_eta(settings.db_path, planner_summary=planner_summary, vendor_throughput=vendor_throughput)
-    reference_files = _readable_reference_files(settings.reference_root)
     stage = _read_yaml(settings.stage_path)
     stage_symbols = stage.get("symbols", [])
     stage_years = stage.get("years")
@@ -1488,11 +1487,11 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
     if running and runtime.get("started_at"):
         started_at = datetime.fromisoformat(str(runtime["started_at"]))
         runtime["uptime_seconds"] = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
-    queue_counts = _read_queue_counts(settings.db_path)
+    planner_summary = _read_planner_summary(settings.db_path)
+    queue_counts = _queue_counts_from_planner_summary(planner_summary) or _read_queue_counts(settings.db_path)
     qc_frame = _read_qc_frame(settings.qc_path)
     partition_summary = _partition_summary_from_frame(qc_frame)
     raw_datapoints = _raw_datapoints_from_qc(partition_summary)
-    planner_summary = _read_planner_summary(settings.db_path)
     budget_summary = _read_budget_summary(settings)
     vendor_throughput = _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
     planner_eta = _summarize_planner_eta(settings.db_path, planner_summary=planner_summary, vendor_throughput=vendor_throughput)
@@ -1576,7 +1575,8 @@ def collect_dashboard_game_snapshot(
             started_at = datetime.fromisoformat(str(worker_started_at or runtime["started_at"]))
             uptime_seconds = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
 
-    queue_counts = _read_queue_counts(settings.db_path)
+    planner_summary = _read_planner_summary(settings.db_path)
+    queue_counts = _queue_counts_from_planner_summary(planner_summary) or _read_queue_counts(settings.db_path)
     qc_frame = _read_qc_frame(settings.qc_path)
     partition_summary = _partition_summary_from_frame(qc_frame)
     raw_dates = _partition_dates_from_qc(partition_summary)
@@ -1584,7 +1584,6 @@ def collect_dashboard_game_snapshot(
     reference_files = _readable_reference_files(settings.reference_root)
     macro_series = _macro_series(settings.macro_root)
     price_check_files = _price_check_files(settings.price_checks_root)
-    planner_summary = _read_planner_summary(settings.db_path)
     budget_summary = _read_budget_summary(settings)
     vendor_throughput = _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
     planner_eta = _summarize_planner_eta(
@@ -2786,6 +2785,14 @@ def _probe_available_history_years(
     }
 
 
+def _queue_counts_from_planner_summary(planner_summary: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for family_counts in planner_summary.get("counts", {}).values():
+        for status, count in family_counts.items():
+            counts[str(status)] = counts.get(str(status), 0) + int(count)
+    return counts
+
+
 def _read_queue_counts(db_path: Path) -> dict[str, int]:
     if not db_path.exists():
         return {"PENDING": 0, "LEASED": 0, "FAILED": 0, "DONE": 0, "BOOTSTRAP": 0, "FORWARD": 0, "GAP": 0}
@@ -2793,10 +2800,7 @@ def _read_queue_counts(db_path: Path) -> dict[str, int]:
         planner_summary = DataNodeDB(db_path).planner_summary()
     except sqlite3.OperationalError:
         return {"PENDING": 0, "LEASED": 0, "FAILED": 0, "DONE": 0, "BOOTSTRAP": 0, "FORWARD": 0, "GAP": 0}
-    counts: dict[str, int] = {}
-    for family_counts in planner_summary.get("counts", {}).values():
-        for status, count in family_counts.items():
-            counts[str(status)] = counts.get(str(status), 0) + int(count)
+    counts = _queue_counts_from_planner_summary(planner_summary)
     if counts:
         return counts
     try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date as date_type
+from functools import lru_cache
 from pathlib import Path
 
 import exchange_calendars as xcals
@@ -13,6 +14,12 @@ import pandas as pd
 def _to_timestamp(value: str | date_type | pd.Timestamp) -> pd.Timestamp:
     """Normalize incoming date-like values to a midnight timestamp."""
     return pd.Timestamp(value).normalize()
+
+
+@lru_cache(maxsize=None)
+def _calendar(exchange: str):
+    """Return a cached exchange calendar instance."""
+    return xcals.get_calendar(exchange)
 
 
 @dataclass(slots=True)
@@ -28,7 +35,7 @@ class ExchangeCalendarStore:
         end: str | date_type | pd.Timestamp,
     ) -> pd.DataFrame:
         """Return a dataframe covering all dates in the requested range."""
-        calendar = xcals.get_calendar(exchange)
+        calendar = _calendar(exchange)
         start_ts = _to_timestamp(start)
         end_ts = _to_timestamp(end)
         all_days = pd.date_range(start_ts, end_ts, freq="D")
@@ -77,13 +84,13 @@ def get_trading_days(
     end: str | date_type | pd.Timestamp,
 ) -> list[date_type]:
     """Return the exchange trading sessions in the given range."""
-    calendar = xcals.get_calendar(exchange)
+    calendar = _calendar(exchange)
     return [session.date() for session in calendar.sessions_in_range(_to_timestamp(start), _to_timestamp(end))]
 
 
 def is_trading_day(exchange: str, day: str | date_type | pd.Timestamp) -> bool:
     """Return whether the supplied day is a valid trading session."""
-    calendar = xcals.get_calendar(exchange)
+    calendar = _calendar(exchange)
     return bool(calendar.is_session(_to_timestamp(day)))
 
 
@@ -92,7 +99,7 @@ def is_early_close(exchange: str, day: str | date_type | pd.Timestamp) -> bool:
     normalized_day = _to_timestamp(day)
     if not is_trading_day(exchange, normalized_day):
         return False
-    calendar = xcals.get_calendar(exchange)
+    calendar = _calendar(exchange)
     return (calendar.session_close(normalized_day) - calendar.session_open(normalized_day)) < pd.Timedelta(
         hours=6, minutes=30
     )

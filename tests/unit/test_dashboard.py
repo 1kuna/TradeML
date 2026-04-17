@@ -2310,6 +2310,122 @@ def test_collect_dashboard_game_snapshot_passes_qc_frame_to_training_gates(tmp_p
     assert captured["reference_files"] == ["corp_actions.parquet"]
 
 
+def test_collect_dashboard_status_snapshot_reuses_reference_files(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                },
+                "vendors": {},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 0, "symbols": ["AAPL"], "years": 1}, sort_keys=False),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    qc_frame = pd.DataFrame([{"dataset": "equities_eod", "status": "GREEN", "source": "alpaca", "date": "2026-04-09", "row_count": 1}])
+
+    monkeypatch.setattr(dashboard_controller, "_read_runtime_state", lambda settings: {"pid": None, "started_at": None})
+    monkeypatch.setattr(dashboard_controller, "_is_process_running", lambda pid: False)
+    monkeypatch.setattr(dashboard_controller, "_read_queue_counts", lambda db_path: {})
+    monkeypatch.setattr(dashboard_controller, "_read_qc_frame", lambda qc_path: qc_frame)
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_partition_summary_from_frame",
+        lambda frame: {"counts": {"GREEN": 1}, "coverage_green": 1.0, "latest_date": "2026-04-09", "raw_dates": ["2026-04-09"], "raw_datapoints": 1},
+    )
+    monkeypatch.setattr(dashboard_controller, "_partition_dates", lambda root: ["2026-04-09"])
+    monkeypatch.setattr(dashboard_controller, "_curated_datapoints_estimate", lambda settings, raw_datapoints: raw_datapoints)
+    readable_calls = {"count": 0}
+
+    def fake_readable_reference_files(root: Path) -> list[str]:
+        readable_calls["count"] += 1
+        return ["corp_actions.parquet"]
+
+    monkeypatch.setattr(dashboard_controller, "_readable_reference_files", fake_readable_reference_files)
+    monkeypatch.setattr(dashboard_controller, "_macro_series", lambda root: [])
+    monkeypatch.setattr(dashboard_controller, "_price_check_files", lambda root: [])
+    monkeypatch.setattr(dashboard_controller, "_audit_report_path", lambda settings: tmp_path / "audit.json")
+    monkeypatch.setattr(dashboard_controller, "_coverage_plan_path", lambda settings: tmp_path / "coverage.json")
+    monkeypatch.setattr(dashboard_controller, "load_audit_state", lambda path: {})
+    monkeypatch.setattr(dashboard_controller, "_read_optional_json", lambda path: {})
+    monkeypatch.setattr(dashboard_controller, "_read_vendor_attempt_summary", lambda db_path: {})
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_read_planner_summary",
+        lambda db_path: {
+            "progress": {"canonical_bars": {"expected_units": 1, "completed_units": 1, "remaining_units": 0}},
+            "backlog_progress": {},
+            "counts": {},
+        },
+    )
+    monkeypatch.setattr(dashboard_controller, "_read_budget_summary", lambda settings: {"rows": [], "checked_at": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_vendor_throughput", lambda db_path, budget_summary: {"rows": [], "checked_at": None})
+    monkeypatch.setattr(dashboard_controller, "_summarize_planner_eta", lambda db_path, planner_summary, vendor_throughput: {})
+    monkeypatch.setattr(
+        dashboard_controller,
+        "_build_collection_health",
+        lambda **kwargs: {"dataset_coverage": {}, "collection_status": {"coverage_percent": 100.0}, "data_readiness": {"phase1": True}},
+    )
+    monkeypatch.setattr(dashboard_controller, "resolve_training_target", lambda **kwargs: type("Target", (), {"name": "workstation-remote"})())
+    monkeypatch.setattr(dashboard_controller, "latest_experiment_summary", lambda local_state: {})
+    monkeypatch.setattr(dashboard_controller, "latest_experiment_proposal", lambda local_state: {})
+    monkeypatch.setattr(dashboard_controller, "latest_research_program_summary", lambda local_state: {})
+    monkeypatch.setattr(dashboard_controller, "training_status_snapshot", lambda **kwargs: {"status": "idle"})
+    monkeypatch.setattr(dashboard_controller, "_status_snapshot_needs_phase_training_probe", lambda **kwargs: False)
+    monkeypatch.setattr(dashboard_controller, "_idle_training_status_snapshot", lambda *, target: {"status": "idle"})
+    monkeypatch.setattr(dashboard_controller, "_summarize_train_operational_status", lambda training_status, readiness: {"status": "idle"})
+    monkeypatch.setattr(
+        dashboard_controller,
+        "collect_dashboard_health_snapshot",
+        lambda settings, **kwargs: {
+            "training_targets": [],
+            "default_training_target": None,
+            "experiment_summary": {},
+        },
+    )
+    captured: dict[str, object] = {}
+
+    def fake_evaluate_training_gates(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+        return {"phase1": {"ready": True, "blockers": []}, "freeze_cutoff": {}}
+
+    monkeypatch.setattr(dashboard_controller, "evaluate_training_gates", fake_evaluate_training_gates)
+
+    snapshot = dashboard_controller.collect_dashboard_status_snapshot(settings)
+
+    assert snapshot["reference_files"] == ["corp_actions.parquet"]
+    assert captured["qc_frame"] is qc_frame
+    assert captured["reference_files"] == ["corp_actions.parquet"]
+    assert readable_calls["count"] == 1
+
+
+def test_queue_counts_from_planner_summary_rolls_up_family_totals() -> None:
+    planner_summary = {
+        "counts": {
+            "canonical_bars": {"PENDING": 2, "SUCCESS": 3},
+            "macro": {"FAILED": 1, "PENDING": 4},
+        }
+    }
+
+    counts = dashboard_controller._queue_counts_from_planner_summary(planner_summary)
+
+    assert counts == {"PENDING": 6, "SUCCESS": 3, "FAILED": 1}
+
+
 def test_collect_dashboard_game_snapshot_marks_idle_when_no_runs(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     nas_mount = tmp_path / "nas"
