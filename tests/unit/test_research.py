@@ -298,6 +298,95 @@ def test_resume_if_data_changed_launches_pending_spec(tmp_path: Path, monkeypatc
     assert captured["next_spec"]["search_epoch"] == 1
 
 
+def test_recover_stalled_active_experiment_relaunches_same_family_when_work_remains(tmp_path: Path, monkeypatch) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["current_experiment_id"] = "perpetual-macmini-p1-f032"
+    state["current_experiment_spec_path"] = str(tmp_path / "specs" / "perpetual-macmini-p1-f032.yml")
+    experiment_supervisor = {
+        "status": "STOPPED",
+        "experiment_id": "perpetual-macmini-p1-f032",
+        "spec_path": str(tmp_path / "specs" / "perpetual-macmini-p1-f032.yml"),
+        "last_error": "phase 1 training preflight failed: ssh command timed out for target=workstation-remote",
+        "last_error_kind": "infra",
+    }
+    experiment_summary = {
+        "experiment_id": "perpetual-macmini-p1-f032",
+        "counts": {"COMPLETED": 68, "FAILED": 1},
+        "runs": [
+            {"run_id": "retry-me", "status": "FAILED", "failure_kind": "infra", "retry_count": 1},
+        ],
+    }
+    observed: dict[str, object] = {}
+
+    def fake_supervise_experiment(**kwargs):  # noqa: ANN001
+        observed["spec_path"] = kwargs["spec_path"]
+        observed["detach"] = kwargs["detach"]
+        return {"experiment_id": "perpetual-macmini-p1-f032", "pid": 99991, "status": "RUNNING"}
+
+    monkeypatch.setattr(research, "supervise_experiment", fake_supervise_experiment)
+
+    relaunched = research._recover_stalled_active_experiment(  # noqa: SLF001
+        state=state,
+        experiment_supervisor=experiment_supervisor,
+        experiment_summary=experiment_summary,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    assert relaunched == {"experiment_id": "perpetual-macmini-p1-f032", "pid": 99991, "status": "RUNNING"}
+    assert observed["detach"] is True
+    assert observed["spec_path"] == Path(state["current_experiment_spec_path"])
+
+
+def test_recover_stalled_active_experiment_skips_relaunch_when_family_is_idle(tmp_path: Path, monkeypatch) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["current_experiment_id"] = "perpetual-macmini-p1-f032"
+    state["current_experiment_spec_path"] = str(tmp_path / "specs" / "perpetual-macmini-p1-f032.yml")
+    experiment_supervisor = {
+        "status": "STOPPED",
+        "experiment_id": "perpetual-macmini-p1-f032",
+        "spec_path": str(tmp_path / "specs" / "perpetual-macmini-p1-f032.yml"),
+        "last_error_kind": "infra",
+    }
+    experiment_summary = {
+        "experiment_id": "perpetual-macmini-p1-f032",
+        "counts": {"COMPLETED": 68, "FAILED": 4},
+        "runs": [
+            {"run_id": "a", "status": "FAILED", "failure_kind": "infra", "retry_count": 2},
+            {"run_id": "b", "status": "FAILED", "failure_kind": "infra", "retry_count": 2},
+            {"run_id": "c", "status": "FAILED", "failure_kind": "infra", "retry_count": 2},
+            {"run_id": "d", "status": "FAILED", "failure_kind": "model", "retry_count": 0},
+        ],
+    }
+
+    def unexpected_supervise(**kwargs):  # noqa: ANN001
+        raise AssertionError("stalled family recovery should not relaunch an idle family")
+
+    monkeypatch.setattr(research, "supervise_experiment", unexpected_supervise)
+
+    relaunched = research._recover_stalled_active_experiment(  # noqa: SLF001
+        state=state,
+        experiment_supervisor=experiment_supervisor,
+        experiment_summary=experiment_summary,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    assert relaunched is None
+
+
 def test_ensure_program_state_refreshes_budget_caps_from_latest_spec(tmp_path: Path) -> None:
     program_path = _program_spec(tmp_path)
     spec = research._load_research_program_spec(program_path)  # noqa: SLF001

@@ -678,6 +678,72 @@ def test_supervise_experiment_autochains_next_family_when_policy_allows(tmp_path
     assert spawned[0]["experiment_id"] == "phase1-baselines-g1"
 
 
+def test_supervise_experiment_completes_when_only_exhausted_failed_runs_remain(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "local"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    spec_path = tmp_path / "phase1.yml"
+    spec_path.write_text(
+        yaml.safe_dump(
+            {
+                "experiment_id": "phase1-baselines",
+                "phase": 1,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        experiments,
+        "plan_experiment",
+        lambda **kwargs: {"experiment_id": "phase1-baselines", "max_concurrent": 1},
+    )
+    monkeypatch.setattr(
+        experiments,
+        "_supervision_policy",
+        lambda spec: {"poll_seconds": 1, "auto_backtest_survivors": False, "auto_propose_next_family": False, "max_retry_count": 2},
+    )
+    monkeypatch.setattr(experiments, "_proposal_policy", lambda spec: {"family_size_cap": 6, "allowed_dimensions": [], "max_generations": 1, "auto_launch_next_family": False})
+    monkeypatch.setattr(experiments, "read_experiment_supervisor_state", lambda **kwargs: {})
+    monkeypatch.setattr(experiments, "_write_supervisor_state", lambda **kwargs: None)
+    monkeypatch.setattr(
+        experiments,
+        "experiment_status",
+        lambda **kwargs: {
+            "counts": {"COMPLETED": 68, "FAILED": 4},
+            "runs": [
+                {"run_id": "run-a", "status": "FAILED", "failure_kind": "infra", "retry_count": 2},
+                {"run_id": "run-b", "status": "FAILED", "failure_kind": "infra", "retry_count": 2},
+                {"run_id": "run-c", "status": "FAILED", "failure_kind": "infra", "retry_count": 2},
+                {"run_id": "run-d", "status": "FAILED", "failure_kind": "model", "retry_count": 0},
+            ],
+        },
+    )
+    monkeypatch.setattr(experiments, "evaluate_experiment", lambda **kwargs: {"ok": True})
+
+    def unexpected_launch(**kwargs):  # noqa: ANN001
+        raise AssertionError("terminal failed runs should not be relaunched")
+
+    monkeypatch.setattr(experiments, "launch_experiment", unexpected_launch)
+
+    state = experiments.supervise_experiment(
+        spec_path=spec_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        targets_config_path=repo_root / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=1,
+        detach=False,
+    )
+
+    assert state["status"] == "COMPLETED"
+
+
 def test_experiment_status_skips_remote_polling_for_planned_runs(tmp_path: Path, monkeypatch) -> None:
     local_state = tmp_path / "local"
     experiment_root = local_state / "experiments" / "phase1-baselines"

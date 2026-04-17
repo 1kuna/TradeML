@@ -21,6 +21,7 @@ from trademl.experiments import (
     _atomic_write_json,
     _backtest_gate,
     _predictive_gate,
+    _count_launchable_runs,
     _supervision_policy,
     compare_experiment,
     experiment_status,
@@ -223,6 +224,30 @@ def supervise_research_program(
         experiment_summary = latest_experiment_summary(local_state=local_state)
         if experiment_summary.get("experiment_id") != active_experiment:
             experiment_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=active_experiment)
+        recovered = _recover_stalled_active_experiment(
+            state=state,
+            experiment_supervisor=experiment_supervisor,
+            experiment_summary=experiment_summary,
+            repo_root=repo_root,
+            data_root=data_root,
+            local_state=local_state,
+            env_path=env_path,
+            targets_config_path=targets_config_path,
+            python_executable=python_executable,
+            poll_seconds=resolved_poll,
+        )
+        if recovered is not None:
+            state["status"] = "RUNNING"
+            state["stop_reason"] = None
+            state["wait_reason"] = None
+            state["active_experiment_supervisor"] = recovered
+            state["last_transition"] = {
+                "action": "recover_family",
+                "reason": f"restarting stalled experiment supervisor for {active_experiment}",
+            }
+            _write_program_state(local_state=local_state, program_id=program_id, payload=state)
+            time.sleep(max(1, resolved_poll))
+            continue
         proposal_result = propose_next_experiment_family(
             experiment_id=active_experiment,
             local_state=local_state,
@@ -1314,6 +1339,51 @@ def _resume_if_data_changed(
     )
     state["pending_next_spec"] = None
     return launched
+
+
+def _recover_stalled_active_experiment(
+    *,
+    state: dict[str, Any],
+    experiment_supervisor: dict[str, Any] | None,
+    experiment_summary: dict[str, Any],
+    repo_root: Path,
+    data_root: Path,
+    local_state: Path,
+    env_path: Path,
+    targets_config_path: Path,
+    python_executable: str,
+    poll_seconds: int,
+) -> dict[str, Any] | None:
+    status = str((experiment_supervisor or {}).get("status") or "").upper()
+    if status != "STOPPED":
+        return None
+    if not _experiment_has_remaining_work(experiment_summary):
+        return None
+    spec_path_value = (
+        (experiment_supervisor or {}).get("spec_path")
+        or state.get("current_experiment_spec_path")
+    )
+    if not spec_path_value:
+        return None
+    return supervise_experiment(
+        spec_path=Path(str(spec_path_value)),
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        targets_config_path=targets_config_path,
+        python_executable=python_executable,
+        poll_seconds=poll_seconds,
+        detach=True,
+    )
+
+
+def _experiment_has_remaining_work(summary: dict[str, Any]) -> bool:
+    runs = list(summary.get("runs") or [])
+    supervision = _supervision_policy(summary)
+    if _count_launchable_runs(runs=[run for run in runs if isinstance(run, dict)], supervision=supervision) > 0:
+        return True
+    return any(str((run or {}).get("status") or "").upper() in {"RUNNING", "STARTING"} for run in runs if isinstance(run, dict))
 
 
 def _launch_program_family(

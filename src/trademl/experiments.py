@@ -690,7 +690,7 @@ def supervise_experiment(
             python_executable=python_executable,
         )
         counts = status.get("counts", {})
-        planned = int(counts.get("PLANNED", 0) + counts.get("FAILED", 0))
+        planned = _count_launchable_runs(runs=list(status.get("runs") or []), supervision=supervision)
         active = int(counts.get("RUNNING", 0) + counts.get("STARTING", 0))
         if planned > 0 and active < int(plan.get("max_concurrent", 1)):
             launch_result = launch_experiment(
@@ -1979,6 +1979,11 @@ def _run_ready_for_retry(*, manifest: dict[str, Any], supervision: dict[str, Any
     if str(manifest.get("failure_kind") or "") != "infra":
         return False
     return int(manifest.get("retry_count", 0) or 0) < int(supervision["max_retry_count"])
+
+
+def _count_launchable_runs(*, runs: list[dict[str, Any]], supervision: dict[str, Any]) -> int:
+    """Return how many runs are still eligible for launch or retry."""
+    return sum(1 for run in runs if _run_ready_for_retry(manifest=run, supervision=supervision))
 
 
 def _manifest_requires_runtime_refresh(manifest: dict[str, Any]) -> bool:
