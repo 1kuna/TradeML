@@ -569,3 +569,32 @@ def test_raw_partition_manifest_and_vendor_lane_health_round_trip(tmp_path: Path
     assert lane is not None
     assert lane.state == "COOLDOWN"
     assert lane.recent_remote_429s == 4
+
+
+def test_fetch_recent_raw_partition_dates_returns_newest_dates_first(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    for trading_date, status in [
+        ("2025-01-01", "GREEN"),
+        ("2025-01-02", "INCOMPLETE"),
+        ("2025-01-03", "UNREADABLE"),
+        ("2025-01-04", "QUARANTINED"),
+        ("2025-01-05", "GREEN"),
+    ]:
+        database.upsert_raw_partition_manifest(
+            dataset="equities_eod",
+            trading_date=trading_date,
+            partition_revision=1,
+            symbol_count=1,
+            row_count=1,
+            symbols=["AAPL"],
+            content_hash=f"hash-{trading_date}",
+            status=status,
+        )
+
+    recent = database.fetch_recent_raw_partition_dates(
+        dataset="equities_eod",
+        statuses=("INCOMPLETE", "UNREADABLE", "QUARANTINED"),
+        limit=2,
+    )
+
+    assert recent == ["2025-01-04", "2025-01-03"]

@@ -911,6 +911,30 @@ class DataNodeDB:
             rows = connection.execute(query, params).fetchall()
         return [RawPartitionManifest(**dict(row)) for row in rows]
 
+    def fetch_recent_raw_partition_dates(
+        self,
+        *,
+        dataset: str,
+        statuses: tuple[str, ...],
+        limit: int = 10,
+    ) -> list[str]:
+        """Return the newest raw partition dates matching one dataset/status filter."""
+        placeholders = ",".join("?" for _ in statuses)
+        params: list[object] = [dataset, *statuses, int(limit)]
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT trading_date
+                FROM raw_partition_manifest
+                WHERE dataset = ?
+                  AND status IN ({placeholders})
+                ORDER BY trading_date DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [str(row["trading_date"]) for row in rows]
+
     def mark_raw_partition_manifest_status(
         self,
         *,

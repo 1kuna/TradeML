@@ -2046,10 +2046,15 @@ def collect_dashboard_health_snapshot(
         python_executable=sys.executable,
     )
     default_target = next((target for target in targets.values() if target.default), targets["local"])
-    recent_bad_dates = [
-        manifest.trading_date
-        for manifest in db.fetch_raw_partition_manifests(dataset="equities_eod", statuses=("INCOMPLETE", "UNREADABLE", "QUARANTINED"))
-    ][-10:]
+    recent_bad_dates = list(
+        reversed(
+            db.fetch_recent_raw_partition_dates(
+                dataset="equities_eod",
+                statuses=("INCOMPLETE", "UNREADABLE", "QUARANTINED"),
+                limit=10,
+            )
+        )
+    )
     experiment_summary = experiment_summary or latest_experiment_summary(local_state=settings.local_state)
     experiment_supervisor = experiment_supervisor or (
         read_experiment_supervisor_state(
