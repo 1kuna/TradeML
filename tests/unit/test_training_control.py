@@ -136,6 +136,46 @@ def test_evaluate_training_gates_uses_supplied_qc_frame_without_reloading_parque
     assert readiness["freeze_cutoff"]["window_coverage_ratio"] == 1.0
 
 
+def test_evaluate_training_gates_uses_supplied_reference_files_without_rescanning(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qc_root = tmp_path / "data" / "qc"
+    qc_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"dataset": "equities_eod", "status": "GREEN"}]).to_parquet(qc_root / "partition_status.parquet", index=False)
+    for series in training_control.default_macro_series():
+        partition = tmp_path / "data" / "raw" / "macros_fred" / f"series={series}"
+        partition.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([{"series_id": series, "value": 1.0}]).to_parquet(partition / "data.parquet", index=False)
+
+    monkeypatch.setattr(
+        training_control,
+        "_readable_reference_files",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("reference files should be reused")),
+    )
+
+    readiness = evaluate_training_gates(
+        data_root=tmp_path,
+        stage_symbol_count=500,
+        stage_years=10,
+        reference_files={
+            "corp_actions.parquet",
+            "listing_history.parquet",
+            "delistings.parquet",
+            "sec_filings.parquet",
+            "ticker_changes.parquet",
+            "fred_vintagedates.parquet",
+            "security_master.parquet",
+            "fundamentals_daily.parquet",
+            "earnings_calendar_pit.parquet",
+            "sec_filing_index.parquet",
+            "universe_snapshots",
+        },
+    )
+
+    assert "listing_history" not in readiness["phase1"]["blockers"]
+
+
 def test_recommended_training_cutoff_uses_latest_complete_raw_partition_before_lagged_anchor(tmp_path: Path) -> None:
     raw_root = tmp_path / "data" / "raw" / "equities_bars"
     for trading_date, symbols in {

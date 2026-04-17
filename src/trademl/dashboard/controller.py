@@ -1607,6 +1607,7 @@ def collect_dashboard_game_snapshot(
         stage_years=int(stage_years or 0),
         planner_db_path=settings.db_path,
         qc_frame=qc_frame,
+        reference_files=reference_files,
     )
     collection_health = _build_collection_health(
         planner_summary=planner_summary,

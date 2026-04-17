@@ -230,10 +230,11 @@ def evaluate_training_gates(
     stage_years: int,
     planner_db_path: Path | None = None,
     qc_frame: pd.DataFrame | None = None,
+    reference_files: set[str] | None = None,
 ) -> dict[str, Any]:
     """Evaluate Phase 1 and Phase 2 readiness from current NAS-backed artifacts."""
     reference_root = data_root / "data" / "reference"
-    reference_files = _readable_reference_files(reference_root)
+    resolved_reference_files = reference_files if reference_files is not None else _readable_reference_files(reference_root)
     macro_root = data_root / "data" / "raw" / "macros_fred"
     macro_series = {path.name.partition("=")[2] for path in macro_root.glob("series=*")} if macro_root.exists() else set()
     qc_path = data_root / "data" / "qc" / "partition_status.parquet"
@@ -264,26 +265,26 @@ def evaluate_training_gates(
     bars_ratio = effective_window_ratio
     phase1 = training_readiness(
         raw_green_ratio=bars_ratio,
-        has_corp_actions=("corp_actions.parquet" in reference_files) or {"dividends.parquet", "splits.parquet"}.issubset(reference_files),
-        has_listing_history="listing_history.parquet" in reference_files,
-        has_delistings="delistings.parquet" in reference_files,
-        has_sec_filings="sec_filings.parquet" in reference_files,
-        has_macro_vintages="fred_vintagedates.parquet" in reference_files,
+        has_corp_actions=("corp_actions.parquet" in resolved_reference_files) or {"dividends.parquet", "splits.parquet"}.issubset(resolved_reference_files),
+        has_listing_history="listing_history.parquet" in resolved_reference_files,
+        has_delistings="delistings.parquet" in resolved_reference_files,
+        has_sec_filings="sec_filings.parquet" in resolved_reference_files,
+        has_macro_vintages="fred_vintagedates.parquet" in resolved_reference_files,
         macro_series_count=len(macro_series),
         required_macro_series=len(default_macro_series()),
     )
     phase2_blockers = list(phase1["blockers"])
-    if "ticker_changes.parquet" not in reference_files:
+    if "ticker_changes.parquet" not in resolved_reference_files:
         phase2_blockers.append("ticker_changes")
-    if "security_master.parquet" not in reference_files:
+    if "security_master.parquet" not in resolved_reference_files:
         phase2_blockers.append("security_master")
-    if "fundamentals_daily.parquet" not in reference_files:
+    if "fundamentals_daily.parquet" not in resolved_reference_files:
         phase2_blockers.append("fundamentals_daily")
-    if "earnings_calendar_pit.parquet" not in reference_files:
+    if "earnings_calendar_pit.parquet" not in resolved_reference_files:
         phase2_blockers.append("earnings_calendar_pit")
-    if "sec_filing_index.parquet" not in reference_files:
+    if "sec_filing_index.parquet" not in resolved_reference_files:
         phase2_blockers.append("sec_filing_index")
-    if "universe_snapshots" not in reference_files:
+    if "universe_snapshots" not in resolved_reference_files:
         phase2_blockers.append("universe_snapshots")
     if stage_symbol_count < 500:
         phase2_blockers.append("expanded_universe")

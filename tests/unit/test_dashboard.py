@@ -2275,7 +2275,7 @@ def test_collect_dashboard_game_snapshot_passes_qc_frame_to_training_gates(tmp_p
         "_partition_summary_from_frame",
         lambda frame: {"counts": {"GREEN": 1}, "coverage_green": 1.0, "latest_date": "2026-04-09", "raw_dates": ["2026-04-09"], "raw_datapoints": 1},
     )
-    monkeypatch.setattr(dashboard_controller, "_readable_reference_files", lambda root: [])
+    monkeypatch.setattr(dashboard_controller, "_readable_reference_files", lambda root: ["corp_actions.parquet"])
     monkeypatch.setattr(dashboard_controller, "_macro_series", lambda root: [])
     monkeypatch.setattr(dashboard_controller, "_price_check_files", lambda root: [])
     monkeypatch.setattr(
@@ -2307,6 +2307,7 @@ def test_collect_dashboard_game_snapshot_passes_qc_frame_to_training_gates(tmp_p
     collect_dashboard_game_snapshot(settings)
 
     assert captured["qc_frame"] is qc_frame
+    assert captured["reference_files"] == ["corp_actions.parquet"]
 
 
 def test_collect_dashboard_game_snapshot_marks_idle_when_no_runs(tmp_path: Path, monkeypatch) -> None:
