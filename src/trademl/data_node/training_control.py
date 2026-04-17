@@ -106,8 +106,10 @@ def read_training_runtime(
     status = str(payload.get("status", "")).lower()
     if isinstance(pid, int) and host == _hostname():
         payload["running"] = _is_process_running(pid)
-        if status == "running" and not payload["running"]:
-            payload["status"] = "unknown"
+        if status in {"starting", "running"} and not payload["running"]:
+            payload["status"] = "failed"
+            payload["finished_at"] = payload.get("finished_at") or datetime.now(tz=UTC).isoformat()
+            payload.setdefault("error", "local process is not running")
     else:
         payload["running"] = status in {"starting", "running"}
     return payload
@@ -671,31 +673,48 @@ def launch_training_process(
         ]
         env = os.environ.copy()
         env.update(_read_env_file(env_path))
-        with log_path.open("a", encoding="utf-8") as handle:
-            process = subprocess.Popen(  # noqa: S603
-                command,
-                cwd=repo_root,
-                env=env,
-                stdout=handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+        try:
+            with log_path.open("a", encoding="utf-8") as handle:
+                process = subprocess.Popen(  # noqa: S603
+                    command,
+                    cwd=repo_root,
+                    env=env,
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+        except Exception as exc:
+            runtime_payload["running"] = False
+            runtime_payload["status"] = "failed"
+            runtime_payload["finished_at"] = datetime.now(tz=UTC).isoformat()
+            runtime_payload["error"] = str(exc)
+            _write_runtime_payload(runtime_path, runtime_payload)
+            _write_runtime_payload(shared_runtime_path, runtime_payload)
+            raise
         runtime_payload["pid"] = process.pid
         runtime_payload["command"] = command
         _write_runtime_payload(runtime_path, runtime_payload)
         _write_runtime_payload(shared_runtime_path, runtime_payload)
         return runtime_payload
 
-    remote_pid = _launch_remote_training_process(
-        target=resolved_target,
-        phase=phase,
-        config_path=execution_config_path,
-        report_date=resolved_report_date,
-        model_suite=model_suite or ("ridge_only" if phase == 1 else "full"),
-        shared_runtime_path=shared_runtime_path,
-        runtime_name=runtime_name,
-        output_root=resolved_output_root,
-    )
+    try:
+        remote_pid = _launch_remote_training_process(
+            target=resolved_target,
+            phase=phase,
+            config_path=execution_config_path,
+            report_date=resolved_report_date,
+            model_suite=model_suite or ("ridge_only" if phase == 1 else "full"),
+            shared_runtime_path=shared_runtime_path,
+            runtime_name=runtime_name,
+            output_root=resolved_output_root,
+        )
+    except Exception as exc:
+        runtime_payload["running"] = False
+        runtime_payload["status"] = "failed"
+        runtime_payload["finished_at"] = datetime.now(tz=UTC).isoformat()
+        runtime_payload["error"] = str(exc)
+        _write_runtime_payload(runtime_path, runtime_payload)
+        raise
     runtime_payload["pid"] = remote_pid
     runtime_payload["command"] = ["ssh", resolved_target.host or "", str(remote_log_path)]
     _write_runtime_payload(runtime_path, runtime_payload)

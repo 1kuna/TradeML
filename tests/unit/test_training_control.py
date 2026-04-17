@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 import trademl.data_node.training_control as training_control
 from trademl.data_node.training_control import (
@@ -534,6 +535,31 @@ def test_read_training_runtime_logs_invalid_json(tmp_path: Path, caplog) -> None
     assert any("invalid_training_runtime_json" in record.message for record in caplog.records)
 
 
+def test_read_training_runtime_marks_dead_local_pid_failed(tmp_path: Path, monkeypatch) -> None:
+    runtime_path = tmp_path / "control" / "training_phase_1.json"
+    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_path.write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "host": "test-host",
+                "status": "running",
+                "started_at": "2026-04-17T10:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(training_control, "_hostname", lambda: "test-host")
+    monkeypatch.setattr(training_control, "_is_process_running", lambda pid: False)
+
+    payload = read_training_runtime(path=runtime_path)
+
+    assert payload["running"] is False
+    assert payload["status"] == "failed"
+    assert payload["error"] == "local process is not running"
+    assert payload["finished_at"]
+
+
 def test_resolve_training_target_prefers_configured_remote_default(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     local_state = tmp_path / "control"
@@ -680,6 +706,42 @@ training_targets:
     assert payload["target"] == "workstation-remote"
     assert json.loads(runtime_path.read_text(encoding="utf-8"))["remote_runtime_path"].endswith("training_phase_1.json")
     assert payload["execution_config_path"] == "/srv/trademl/control/configs/training_phase_1.yml"
+
+
+def test_launch_training_process_marks_runtime_failed_when_local_spawn_raises(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    (repo_root / "configs").mkdir(parents=True, exist_ok=True)
+    (repo_root / "configs" / "equities_xs.yml").write_text("data:\n  green_threshold: 0.9\n", encoding="utf-8")
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "local_state"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(training_control, "training_preflight", lambda **kwargs: {"ok": True, "sample_rows": 5})
+
+    def boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(training_control.subprocess, "Popen", boom)
+
+    with pytest.raises(OSError, match="spawn failed"):
+        launch_training_process(
+            repo_root=repo_root,
+            data_root=data_root,
+            local_state=local_state,
+            env_path=env_path,
+            phase=1,
+            model_suite="ridge_only",
+            python_executable="/usr/bin/python3",
+            report_date="2026-04-02",
+        )
+
+    local_runtime = json.loads((local_state / "training_phase_1.json").read_text(encoding="utf-8"))
+    shared_runtime = json.loads((data_root / "control" / "cluster" / "state" / "training_phase_1.json").read_text(encoding="utf-8"))
+    assert local_runtime["status"] == "failed"
+    assert local_runtime["running"] is False
+    assert local_runtime["error"] == "spawn failed"
+    assert shared_runtime["status"] == "failed"
 
 
 def test_launch_training_process_remote_serializes_nested_preflight_paths(tmp_path: Path, monkeypatch) -> None:

@@ -386,6 +386,21 @@ def experiment_status(
                 "ridge_mean_rank_ic": report.get("ridge", {}).get("mean_rank_ic"),
                 "lightgbm_mean_rank_ic": report.get("lightgbm", {}).get("mean_rank_ic"),
             }
+        elif status == "UNKNOWN":
+            status = "FAILED"
+            manifest["last_error"] = runtime.get("error") or manifest.get("last_error") or "training runtime ended unexpectedly"
+            if not manifest.get("failure_kind") or str(manifest.get("failure_kind")) == "model":
+                manifest["failure_kind"] = _classify_failure(
+                    "\n".join(
+                        part
+                        for part in [
+                            str(manifest.get("last_error") or ""),
+                            str(snapshot.get("log_tail") or ""),
+                        ]
+                        if part
+                    )
+                    or "training runtime ended unexpectedly"
+                )
         elif status == "FAILED":
             manifest["last_error"] = runtime.get("error") or manifest.get("last_error")
             failure_detail = "\n".join(
@@ -1943,8 +1958,15 @@ def _spawn_supervisor_process(
         "--poll-seconds",
         str(poll_seconds),
     ]
-    with log_path.open("a", encoding="utf-8") as handle:
-        process = subprocess.Popen(command, cwd=repo_root, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)  # noqa: S603
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            process = subprocess.Popen(command, cwd=repo_root, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)  # noqa: S603
+    except Exception as exc:
+        payload["status"] = "STOPPED"
+        payload["last_error"] = str(exc)
+        payload["completed_at"] = datetime.now(tz=UTC).isoformat()
+        _write_supervisor_state(local_state=local_state, experiment_id=experiment_id, payload=payload)
+        raise
     payload["pid"] = process.pid
     payload["status"] = "RUNNING"
     payload["heartbeat_at"] = datetime.now(tz=UTC).isoformat()
@@ -2006,7 +2028,21 @@ def _append_supervisor_event(manifest: dict[str, Any], *, event: str, payload: d
 
 def _classify_failure(error: str) -> str:
     lowered = error.lower()
-    if any(token in lowered for token in ["ssh", "permission denied", "connection refused", "connection reset", "host", "mount", "timed out", "no route"]):
+    if any(
+        token in lowered
+        for token in [
+            "ssh",
+            "permission denied",
+            "connection refused",
+            "connection reset",
+            "host",
+            "mount",
+            "timed out",
+            "no route",
+            "local process is not running",
+            "remote process is not running",
+        ]
+    ):
         return "infra"
     if any(token in lowered for token in ["modulenotfounderror", "importerror", "no module named"]):
         return "infra"

@@ -878,6 +878,51 @@ def test_experiment_status_writes_shared_summary_to_data_root(tmp_path: Path, mo
     assert dashboard_summary["recent_runs"][0]["assessment"]["decision"] == "NO_GO"
 
 
+def test_experiment_status_reclassifies_unknown_runtime_as_failed_infra(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    experiment_root = local_state / "experiments" / "phase1-baselines"
+    (experiment_root / "runs").mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "experiment_id": "phase1-baselines",
+        "run_id": "run-a",
+        "phase": 1,
+        "target": "local",
+        "runtime_name": "experiment_phase1-baselines__run-a",
+        "status": "RUNNING",
+        "model_suite": "ridge_only",
+        "matrix_values": {"architecture_family": "linear_baseline"},
+        "config_path": str(tmp_path / "run-a.yml"),
+        "output_root": str(tmp_path / "output"),
+        "report_path": str(tmp_path / "report.json"),
+    }
+    (experiment_root / "runs" / "run-a.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (experiment_root / "summary.json").write_text(json.dumps({"experiment_id": "phase1-baselines"}), encoding="utf-8")
+
+    monkeypatch.setattr(
+        experiments,
+        "training_status_snapshot",
+        lambda **kwargs: {
+            "runtime": {"status": "unknown", "running": False, "error": "local process is not running"},
+            "log_tail": "Traceback\\nlocal process is not running",
+        },
+    )
+    monkeypatch.setattr(experiments, "_load_report_payload", lambda **kwargs: None)
+
+    status = experiments.experiment_status(
+        experiment_id="phase1-baselines",
+        local_state=local_state,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    run = status["runs"][0]
+    assert run["status"] == "FAILED"
+    assert run["failure_kind"] == "infra"
+    assert run["last_error"] == "local process is not running"
+
+
 def test_write_supervisor_state_is_atomic(tmp_path: Path, monkeypatch) -> None:
     local_state = tmp_path / "local"
     experiment_id = "phase1-baselines"
@@ -979,6 +1024,34 @@ def test_spawn_supervisor_process_preserves_existing_state(tmp_path: Path, monke
     stored = experiments.read_experiment_supervisor_state(local_state=local_state, experiment_id="phase1-baselines")
     assert payload["pid"] == 7654
     assert stored["queue_counts"] == {"COMPLETED": 12}
+
+
+def test_spawn_supervisor_process_marks_state_stopped_when_popen_raises(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    env_path = tmp_path / ".env"
+    spec_path = tmp_path / "phase1.yml"
+    env_path.write_text("", encoding="utf-8")
+    spec_path.write_text("experiment_id: phase1-baselines\n", encoding="utf-8")
+
+    monkeypatch.setattr(experiments.subprocess, "Popen", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")))
+
+    with pytest.raises(OSError, match="spawn failed"):
+        experiments._spawn_supervisor_process(  # noqa: SLF001
+            experiment_id="phase1-baselines",
+            spec_path=spec_path,
+            repo_root=repo_root,
+            data_root=data_root,
+            local_state=local_state,
+            env_path=env_path,
+            python_executable="/usr/bin/python3",
+            poll_seconds=30,
+        )
+
+    stored = experiments.read_experiment_supervisor_state(local_state=local_state, experiment_id="phase1-baselines")
+    assert stored["status"] == "STOPPED"
+    assert stored["last_error"] == "spawn failed"
 
 
 def test_read_experiment_supervisor_state_marks_dead_pid_stopped(tmp_path: Path, monkeypatch) -> None:

@@ -549,6 +549,36 @@ def test_update_frontier_memory_records_lane_coverage_and_best_scores(tmp_path: 
     assert frontier["best_by_phase"]["1"]["best_primary_score"] == 0.031
 
 
+def test_update_frontier_memory_preserves_family_counter_beyond_history_cap(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["current_phase"] = 1
+    state["budgets"]["families_started"] = 50
+    frontier = {
+        **research._empty_frontier(),  # noqa: SLF001
+        "family_history": [{"experiment_id": f"old-p1-f{i:03d}"} for i in range(1, 51)],
+    }
+    state["frontier"] = frontier
+    state["current_experiment_id"] = "perpetual-macmini-p1-f051"
+    state["current_family_signature"] = "family-sig-051"
+    summary = {
+        "experiment_id": "perpetual-macmini-p1-f051",
+        "best_candidate": "full",
+        "best_primary_score": 0.02,
+        "best_decision": "NO_GO",
+        "shortlist_count": 0,
+        "run_count": 1,
+        "top_gate_failures": [],
+        "runs": [],
+    }
+
+    updated = research._update_frontier_memory(state=state, experiment_summary=summary)  # noqa: SLF001
+
+    assert updated["family_history"][-1]["experiment_id"] == "perpetual-macmini-p1-f051"
+    assert state["budgets"]["families_started"] == 51
+    assert research._next_experiment_id(program_state=state, spec=spec, phase=1) == "perpetual-macmini-p1-f052"  # noqa: SLF001
+
+
 def test_steer_research_program_persists_manual_overrides(tmp_path: Path) -> None:
     local_state = tmp_path / "local"
     program_path = _program_spec(tmp_path)
@@ -714,6 +744,33 @@ def test_spawn_program_supervisor_process_refreshes_budget_caps_from_spec(tmp_pa
     assert payload["budgets"]["max_total_hours"] == 24
     assert payload["poll_seconds"] == 45
     assert payload["stop_requested"] is False
+
+
+def test_spawn_program_supervisor_process_marks_state_stopped_when_popen_raises(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    program_path = _program_spec(tmp_path)
+
+    monkeypatch.setattr(research.subprocess, "Popen", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn failed")))
+
+    with pytest.raises(OSError, match="spawn failed"):
+        research._spawn_program_supervisor_process(  # noqa: SLF001
+            program_id="perpetual-macmini",
+            program_path=program_path,
+            repo_root=repo_root,
+            data_root=data_root,
+            local_state=local_state,
+            env_path=env_path,
+            python_executable="/usr/bin/python3",
+            poll_seconds=30,
+        )
+
+    stored = research.read_research_program_state(local_state=local_state, program_id="perpetual-macmini")
+    assert stored["status"] == "STOPPED"
+    assert stored["last_error"] == "spawn failed"
 
 
 def test_read_research_program_state_marks_dead_pid_stopped(tmp_path: Path, monkeypatch) -> None:

@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -1025,7 +1026,11 @@ def _update_frontier_memory(*, state: dict[str, Any], experiment_summary: dict[s
     )
     frontier["family_history"] = family_history[-50:]
     budgets = state.setdefault("budgets", {})
-    budgets["families_started"] = max(int(budgets.get("families_started", 0) or 0), len(frontier["family_history"]))
+    budgets["families_started"] = max(
+        int(budgets.get("families_started", 0) or 0),
+        len(frontier["family_history"]),
+        _family_sequence(experiment_id) or 0,
+    )
     budgets["runs_completed"] = int(budgets.get("runs_completed", 0) or 0) + int(experiment_summary.get("run_count", 0) or 0)
     phase_family_counts = dict(budgets.get("phase_family_counts") or {})
     phase_family_counts[phase_key] = int(phase_family_counts.get(phase_key, 0) or 0) + 1
@@ -1529,8 +1534,15 @@ def _spawn_program_supervisor_process(
         "--poll-seconds",
         str(poll_seconds),
     ]
-    with log_path.open("a", encoding="utf-8") as handle:
-        process = subprocess.Popen(command, cwd=repo_root, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)  # noqa: S603
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            process = subprocess.Popen(command, cwd=repo_root, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)  # noqa: S603
+    except Exception as exc:
+        payload["status"] = "STOPPED"
+        payload["last_error"] = str(exc)
+        payload["completed_at"] = datetime.now(tz=UTC).isoformat()
+        _write_program_state(local_state=local_state, program_id=program_id, payload=payload)
+        raise
     payload["pid"] = process.pid
     payload["status"] = "RUNNING"
     payload["heartbeat_at"] = datetime.now(tz=UTC).isoformat()
@@ -1548,6 +1560,15 @@ def _read_experiment_summary_direct(*, local_state: Path, experiment_id: str) ->
 def _next_experiment_id(*, program_state: dict[str, Any], spec: dict[str, Any], phase: int) -> str:
     families_started = int((program_state.get("budgets") or {}).get("families_started", 0) or 0) + 1
     return f"{spec['program_id']}-p{phase}-f{families_started:03d}"
+
+
+def _family_sequence(experiment_id: str | None) -> int | None:
+    if not experiment_id:
+        return None
+    match = re.search(r"-f(\d+)$", str(experiment_id))
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _current_ssot_phase(*, state: dict[str, Any], spec: dict[str, Any]) -> int:
