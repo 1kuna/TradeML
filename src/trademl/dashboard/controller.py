@@ -357,10 +357,10 @@ def start_node(
         scope = str(svc.get("scope") or "system")
         service_name = str(svc.get("service_name") or "trademl-node.service")
         subprocess.run(["systemctl", *_systemctl_scope_args(scope), "start", service_name], check=False)
-        snapshot = collect_dashboard_snapshot(settings)
-        snapshot["runtime"]["managed_by"] = "systemd"
-        snapshot["runtime"]["service_scope"] = scope
-        return snapshot["runtime"]
+        runtime = _current_node_runtime(settings)
+        runtime["managed_by"] = "systemd"
+        runtime["service_scope"] = scope
+        return runtime
     runtime = _read_runtime_state(settings)
     pid = runtime.get("pid")
     if isinstance(pid, int) and _is_process_running(pid):
@@ -546,7 +546,7 @@ def advance_collection_stage(
     manifest = coordinator.update_stage(current_stage=target_stage, symbols=symbols, years=stage_years)
     seeded = _seed_stage_backfill(settings.db_path, symbols=symbols, years=stage_years)
 
-    runtime_before = collect_dashboard_snapshot(settings)["runtime"]
+    runtime_before = _current_node_runtime(settings)
     restarted = False
     if runtime_before.get("running"):
         restart_node(settings, passphrase=passphrase)
@@ -652,7 +652,7 @@ def install_service(settings: NodeSettings, *, service_path: str | None = None) 
 
 def update_worker(settings: NodeSettings) -> dict[str, Any]:
     """Update the local worker installation and optionally restart it."""
-    runtime_before = collect_dashboard_snapshot(settings)["runtime"]
+    runtime_before = _current_node_runtime(settings)
     was_running = bool(runtime_before.get("running"))
     if was_running:
         stop_node(settings)
@@ -688,7 +688,7 @@ def update_worker(settings: NodeSettings) -> dict[str, Any]:
 
 def reset_worker(settings: NodeSettings, *, passphrase: str | None = None) -> dict[str, Any]:
     """Wipe local disposable worker state, then rejoin/rebuild from NAS truth."""
-    runtime_before = collect_dashboard_snapshot(settings)["runtime"]
+    runtime_before = _current_node_runtime(settings)
     was_running = bool(runtime_before.get("running"))
     stop_node(settings)
     leave_cluster(settings)
@@ -1291,8 +1291,8 @@ def collect_dashboard_snapshot(settings: NodeSettings) -> dict[str, Any]:
     return snapshot
 
 
-def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
-    """Collect the live dashboard state used by the main status and budget views."""
+def _current_node_runtime(settings: NodeSettings) -> dict[str, Any]:
+    """Return the current node runtime state without paying for a full dashboard snapshot."""
     runtime = _read_runtime_state(settings)
     pid = runtime.get("pid")
     running = isinstance(pid, int) and _is_process_running(pid)
@@ -1300,6 +1300,13 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
     if running and runtime.get("started_at"):
         started_at = datetime.fromisoformat(str(runtime["started_at"]))
         runtime["uptime_seconds"] = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
+    return runtime
+
+
+def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
+    """Collect the live dashboard state used by the main status and budget views."""
+    runtime = _current_node_runtime(settings)
+    running = bool(runtime.get("running"))
     planner_summary = _read_planner_summary(settings.db_path)
     queue_counts = _queue_counts_from_planner_summary(planner_summary) or _read_queue_counts(settings.db_path)
     qc_frame = _read_qc_frame(settings.qc_path)
@@ -1480,13 +1487,8 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
 
 def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
     """Collect the lightweight live snapshot used for continuously updating top-line metrics."""
-    runtime = _read_runtime_state(settings)
-    pid = runtime.get("pid")
-    running = isinstance(pid, int) and _is_process_running(pid)
-    runtime["running"] = running
-    if running and runtime.get("started_at"):
-        started_at = datetime.fromisoformat(str(runtime["started_at"]))
-        runtime["uptime_seconds"] = max(0.0, (datetime.now(tz=UTC) - started_at).total_seconds())
+    runtime = _current_node_runtime(settings)
+    running = bool(runtime.get("running"))
     planner_summary = _read_planner_summary(settings.db_path)
     queue_counts = _queue_counts_from_planner_summary(planner_summary) or _read_queue_counts(settings.db_path)
     qc_frame = _read_qc_frame(settings.qc_path)

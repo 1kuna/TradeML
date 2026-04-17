@@ -957,10 +957,12 @@ def test_start_node_uses_user_systemd_scope_when_available(tmp_path: Path, monke
         lambda: {"supported": True, "scope": "user", "service_name": "trademl-node.service", "UnitFileState": "enabled"},
     )
     monkeypatch.setattr(dashboard_controller.subprocess, "run", _fake_run)
+    monkeypatch.setattr(dashboard_controller, "_read_runtime_state", lambda _settings: {"pid": 1})
+    monkeypatch.setattr(dashboard_controller, "_is_process_running", lambda pid: pid == 1)
     monkeypatch.setattr(
         dashboard_controller,
         "collect_dashboard_snapshot",
-        lambda settings: {"runtime": {"running": True, "pid": 1, "log_path": str(settings.log_path)}},
+        lambda _settings: (_ for _ in ()).throw(AssertionError("full dashboard snapshot should not be used here")),
     )
 
     runtime = start_node(settings)
@@ -1113,6 +1115,12 @@ def test_advance_collection_stage_updates_stage_manifest_and_queue(tmp_path: Pat
 
     settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
     join_cluster(settings, passphrase="pass123")
+    monkeypatch.setattr(dashboard_controller, "_read_runtime_state", lambda _settings: {})
+    monkeypatch.setattr(
+        dashboard_controller,
+        "collect_dashboard_snapshot",
+        lambda _settings: (_ for _ in ()).throw(AssertionError("full dashboard snapshot should not be used here")),
+    )
     monkeypatch.setattr(dashboard_controller, "build_stage1_universe", lambda **kwargs: ["AAA", "BBB", "CCC"])
     monkeypatch.setattr(
         dashboard_controller,
@@ -1666,7 +1674,11 @@ def test_update_worker_refreshes_wrapper_and_reports_paths(tmp_path: Path, monke
     )
     settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
-    monkeypatch.setattr("trademl.dashboard.controller.collect_dashboard_snapshot", lambda _settings: {"runtime": {"running": False}})
+    monkeypatch.setattr("trademl.dashboard.controller._read_runtime_state", lambda _settings: {})
+    monkeypatch.setattr(
+        "trademl.dashboard.controller.collect_dashboard_snapshot",
+        lambda _settings: (_ for _ in ()).throw(AssertionError("full dashboard snapshot should not be used here")),
+    )
     commands: list[list[str]] = []
 
     class _Result:
@@ -1711,7 +1723,11 @@ def test_reset_and_uninstall_worker_manage_local_artifacts(tmp_path: Path, monke
     (workspace / "control").mkdir(parents=True, exist_ok=True)
     settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
-    monkeypatch.setattr("trademl.dashboard.controller.collect_dashboard_snapshot", lambda _settings: {"runtime": {"running": False}})
+    monkeypatch.setattr("trademl.dashboard.controller._read_runtime_state", lambda _settings: {})
+    monkeypatch.setattr(
+        "trademl.dashboard.controller.collect_dashboard_snapshot",
+        lambda _settings: (_ for _ in ()).throw(AssertionError("full dashboard snapshot should not be used here")),
+    )
     monkeypatch.setattr("trademl.dashboard.controller.stop_node", lambda _settings: {"running": False})
     monkeypatch.setattr("trademl.dashboard.controller.leave_cluster", lambda _settings: {"ok": True})
     monkeypatch.setattr(
