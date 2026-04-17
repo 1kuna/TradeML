@@ -1761,12 +1761,12 @@ def _map_training_state(runtime_payload: dict[str, Any]) -> str:
 def _read_training_run_history(settings: NodeSettings, *, limit: int = 12) -> list[dict[str, Any]]:
     """Return the most recent training attempts sorted newest first.
 
-    Prefer local experiment run manifests under ``{local_state}/experiments/*/runs/*.json``
-    because they already contain the assessment/report preview fields the HUD
-    needs and avoid a wide NAS report crawl on every refresh.
-
     Prefer shared experiment summaries under ``{nas}/experiments/*/summary.json``
     because they preserve repeated runs and avoid a wide report crawl on the Pi.
+
+    Fall back to local experiment run manifests under
+    ``{local_state}/experiments/*/runs/*.json`` when shared summaries are not
+    available yet.
 
     Fall back to per-run experiment artifacts under ``{nas}/experiments/*/runs/*/reports/daily/*.json``
     so repeated runs on the same report date are preserved. Fall back to
@@ -1778,13 +1778,13 @@ def _read_training_run_history(settings: NodeSettings, *, limit: int = 12) -> li
     if not local_experiments_root.exists() and not daily_root.exists() and not experiments_root.exists():
         return []
 
-    local_entries = _read_local_training_run_history(local_experiments_root, limit=limit)
-    if local_entries:
-        return local_entries
-
     shared_entries = _read_shared_training_run_history(experiments_root, limit=limit)
     if shared_entries:
         return shared_entries
+
+    local_entries = _read_local_training_run_history(local_experiments_root, limit=limit)
+    if local_entries:
+        return local_entries
 
     candidate_paths: list[Path] = []
     if experiments_root.exists():

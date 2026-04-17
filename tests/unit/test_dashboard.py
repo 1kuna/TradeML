@@ -1856,7 +1856,7 @@ def test_read_training_run_history_prefers_per_run_experiment_reports(tmp_path: 
     assert history[1]["decision"] == "GO"
 
 
-def test_read_training_run_history_prefers_local_experiment_manifests(tmp_path: Path) -> None:
+def test_read_training_run_history_uses_local_experiment_manifests_when_shared_summaries_missing(tmp_path: Path) -> None:
     nas_mount = tmp_path / "nas"
     _write_training_report(nas_mount, "2026-03-09", mean_rank_ic=0.011, decision="NO_GO")
     local_state = tmp_path / "workspace" / "control"
@@ -1912,6 +1912,69 @@ def test_read_training_run_history_prefers_local_experiment_manifests(tmp_path: 
     assert history[0]["experiment_id"] == "phase1-local"
     assert history[0]["mean_rank_ic"] == pytest.approx(0.044)
     assert history[1]["decision"] == "GO"
+
+
+def test_read_training_run_history_prefers_shared_summaries_over_stale_local_manifests(tmp_path: Path) -> None:
+    nas_mount = tmp_path / "nas"
+    experiments_root = nas_mount / "experiments" / "phase1-shared"
+    experiments_root.mkdir(parents=True, exist_ok=True)
+    (experiments_root / "dashboard_summary.json").write_text(
+        json.dumps(
+            {
+                "experiment_id": "phase1-shared",
+                "recent_runs": [
+                    {
+                        "experiment_id": "phase1-shared",
+                        "run_id": "run-fresh",
+                        "report_date": "2026-03-16",
+                        "model_suite": "ridge_only",
+                        "assessment": {"decision": "GO", "reason": "shared"},
+                        "report_preview": {"coverage": 0.99, "ridge_mean_rank_ic": 0.044},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    local_state = tmp_path / "workspace" / "control"
+    runs_root = local_state / "experiments" / "phase1-local" / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    (runs_root / "run-stale.json").write_text(
+        json.dumps(
+            {
+                "experiment_id": "phase1-local",
+                "run_id": "run-stale",
+                "report_date": "2026-03-09",
+                "model_suite": "ridge_only",
+                "assessment": {"decision": "NO_GO", "reason": "local"},
+                "report_preview": {"coverage": 0.91, "ridge": {"mean_rank_ic": 0.012}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (local_state / "experiments" / "phase1-local" / "summary.json").write_text(
+        json.dumps({"experiment_id": "phase1-local"}),
+        encoding="utf-8",
+    )
+
+    settings = NodeSettings(
+        repo_root=tmp_path,
+        workspace_root=tmp_path / "workspace",
+        config_path=tmp_path / "workspace" / "node.yml",
+        env_path=tmp_path / "workspace" / ".env",
+        local_state=local_state,
+        nas_mount=nas_mount,
+        nas_share="//nas/trademl",
+        collection_time_et="16:30",
+        maintenance_hour_local=2,
+        worker_id="worker-1",
+    )
+
+    history = dashboard_controller._read_training_run_history(settings, limit=5)
+
+    assert history[0]["run_id"] == "run-fresh"
+    assert history[0]["experiment_id"] == "phase1-shared"
+    assert history[0]["decision"] == "GO"
 
 
 def test_read_training_run_history_prefers_shared_experiment_summaries(tmp_path: Path) -> None:
