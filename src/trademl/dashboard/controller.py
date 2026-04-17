@@ -1317,6 +1317,7 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
     budget_summary = _read_budget_summary(settings)
     vendor_throughput = _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
     planner_eta = _summarize_planner_eta(settings.db_path, planner_summary=planner_summary, vendor_throughput=vendor_throughput)
+    reference_files = _readable_reference_files(settings.reference_root)
     stage = _read_yaml(settings.stage_path)
     stage_symbols = stage.get("symbols", [])
     stage_years = stage.get("years")
@@ -1340,6 +1341,7 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
         stage_years=int(stage_years or 0),
         planner_db_path=settings.db_path,
         qc_frame=qc_frame,
+        reference_files=reference_files,
     )
     collection_health = _build_collection_health(
         planner_summary=planner_summary,
