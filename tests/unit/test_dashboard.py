@@ -2674,3 +2674,32 @@ def test_dashboard_readable_reference_files_uses_parquet_metadata_only(tmp_path:
 
     assert "listing_history.parquet" in readable
     assert "universe_snapshots" in readable
+
+
+def test_dashboard_readable_reference_files_reuses_cached_metadata_until_files_change(tmp_path: Path, monkeypatch) -> None:
+    reference_root = tmp_path / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    parquet_path = reference_root / "listing_history.parquet"
+    pd.DataFrame([{"symbol": "AAPL"}]).to_parquet(parquet_path, index=False)
+
+    metadata_calls: list[str] = []
+    original_read_metadata = dashboard_controller.pq.read_metadata
+
+    def tracked_read_metadata(path: Path, *args, **kwargs):  # noqa: ANN001
+        metadata_calls.append(Path(path).name)
+        return original_read_metadata(path, *args, **kwargs)
+
+    monkeypatch.setattr(dashboard_controller.pq, "read_metadata", tracked_read_metadata)
+
+    first = dashboard_controller._readable_reference_files(reference_root)
+    second = dashboard_controller._readable_reference_files(reference_root)
+
+    assert first == ["listing_history.parquet"]
+    assert second == ["listing_history.parquet"]
+    assert metadata_calls == ["listing_history.parquet"]
+
+    parquet_path.touch()
+    third = dashboard_controller._readable_reference_files(reference_root)
+
+    assert third == ["listing_history.parquet"]
+    assert metadata_calls == ["listing_history.parquet", "listing_history.parquet"]

@@ -86,6 +86,7 @@ from trademl.fleet.cluster import (
 from trademl.reference.universe import build_stage1_universe, build_time_varying_universe
 
 LOGGER = logging.getLogger(__name__)
+_REFERENCE_FILES_CACHE: dict[str, tuple[tuple[tuple[str, int, int], ...], list[str]]] = {}
 
 
 def _systemctl_scope_args(scope: str | None) -> list[str]:
@@ -2865,8 +2866,17 @@ def _readable_reference_files(root: Path) -> list[str]:
     """Return readable reference parquet filenames for dashboard readiness views."""
     if not root.exists():
         return []
+    parquet_paths = sorted(root.glob("*.parquet"))
+    signature = tuple(
+        (path.name, path.stat().st_mtime_ns, path.stat().st_size)
+        for path in parquet_paths
+    ) + (( "universe_snapshots", int((root / "universe_snapshots").exists()), 0),)
+    cache_key = str(root.resolve())
+    cached = _REFERENCE_FILES_CACHE.get(cache_key)
+    if cached is not None and cached[0] == signature:
+        return list(cached[1])
     readable: list[str] = []
-    for path in sorted(root.glob("*.parquet")):
+    for path in parquet_paths:
         try:
             pq.read_metadata(path)
         except Exception:
@@ -2874,6 +2884,7 @@ def _readable_reference_files(root: Path) -> list[str]:
         readable.append(path.name)
     if (root / "universe_snapshots").exists():
         readable.append("universe_snapshots")
+    _REFERENCE_FILES_CACHE[cache_key] = (signature, list(readable))
     return readable
 
 
