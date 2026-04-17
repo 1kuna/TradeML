@@ -93,6 +93,19 @@ def test_dashboard_server_serves_hud_and_game_snapshot(tmp_path: Path, monkeypat
             "vendor_throughput": {"rows": []},
         },
     )
+    monkeypatch.setattr(
+        dashboard_server,
+        "collect_dashboard_setup_snapshot",
+        lambda resolved, *, cluster_snapshot=None: {
+            "cluster": {
+                "workers": [{"worker_id": "rpi-01", "last_heartbeat": "2026-04-10T16:30:00+00:00"}],
+                "active_workers": [{"worker_id": "rpi-01", "last_heartbeat": "2026-04-10T16:30:00+00:00"}],
+            },
+            "systemd": {"scope": "user"},
+            "nas": {"share": "//nas/trademl"},
+            "provider_contracts": [],
+        },
+    )
     httpd = dashboard_server.create_dashboard_server("127.0.0.1", 0, settings=settings)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -115,6 +128,11 @@ def test_dashboard_server_serves_hud_and_game_snapshot(tmp_path: Path, monkeypat
     assert "The Collector" in html
     assert "The Brain" in html
     assert "<title>TradeML Operator Dashboard</title>" in operator_html
+    assert 'data-section="status"' in operator_html
+    assert 'data-section="budgets"' in operator_html
+    assert 'data-section="setup"' in operator_html
+    assert 'data-section="logs"' in operator_html
+    assert "const sections = ['status', 'budgets', 'setup', 'logs'];" in operator_html
     assert game_payload["node"]["label"] == "rpi-01"
     assert game_payload["training"]["streak_go"] == 3
     assert game_payload["phase1_gate"]["freeze_cutoff"] == "2026-03-09"
@@ -124,8 +142,9 @@ def test_dashboard_server_serves_hud_and_game_snapshot(tmp_path: Path, monkeypat
     assert live_payload["training_readiness"]["phase1"]["ready"] is True
 
 
-def test_dashboard_server_setup_reuses_cached_game_cluster_snapshot(tmp_path: Path, monkeypatch) -> None:
+def test_dashboard_server_setup_reads_fresh_cluster_snapshot(tmp_path: Path, monkeypatch) -> None:
     settings = _test_settings(tmp_path)
+    setup_calls: list[object] = []
     monkeypatch.setattr(
         dashboard_server,
         "collect_dashboard_game_snapshot",
@@ -156,8 +175,11 @@ def test_dashboard_server_setup_reuses_cached_game_cluster_snapshot(tmp_path: Pa
     monkeypatch.setattr(
         dashboard_server,
         "collect_dashboard_setup_snapshot",
-        lambda resolved, *, cluster_snapshot=None: {
-            "cluster": cluster_snapshot,
+        lambda resolved, *, cluster_snapshot=None: setup_calls.append(cluster_snapshot) or {
+            "cluster": {
+                "workers": [{"worker_id": "fresh-worker", "last_heartbeat": "2026-04-10T16:35:00+00:00"}],
+                "active_workers": [{"worker_id": "fresh-worker", "last_heartbeat": "2026-04-10T16:35:00+00:00"}],
+            },
             "systemd": {"scope": "user"},
             "nas": {"share": "//nas/trademl"},
             "provider_contracts": [],
@@ -175,7 +197,8 @@ def test_dashboard_server_setup_reuses_cached_game_cluster_snapshot(tmp_path: Pa
         httpd.server_close()
         thread.join(timeout=5)
 
-    assert setup_payload["cluster"]["active_workers"][0]["worker_id"] == "rpi-01"
+    assert setup_calls == [None]
+    assert setup_payload["cluster"]["active_workers"][0]["worker_id"] == "fresh-worker"
 
 
 def test_dashboard_server_caches_game_snapshot_between_quick_requests(tmp_path: Path, monkeypatch) -> None:

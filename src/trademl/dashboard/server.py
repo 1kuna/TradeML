@@ -509,6 +509,19 @@ OPERATOR_HTML_PAGE = """<!doctype html>
       <div class="card"><div class="label">Best Result</div><div class="value" id="metric-eta">-</div><div class="delta" id="metric-freeze-cutoff">-</div></div>
     </div>
 
+    <div class="toolbar" style="margin-top:18px">
+      <div>
+        <h2 style="margin-bottom:4px">Operator Views</h2>
+        <div class="small muted">Switch between live status, vendor budgets, setup controls, and logs.</div>
+      </div>
+      <div class="form-row">
+        <button type="button" data-section="status" class="active">Status</button>
+        <button type="button" data-section="budgets" class="ghost">Budgets</button>
+        <button type="button" data-section="setup" class="ghost">Setup</button>
+        <button type="button" data-section="logs" class="ghost">Logs</button>
+      </div>
+    </div>
+
     <section class="panel" id="section-status">
       <div class="toolbar">
         <div>
@@ -715,7 +728,7 @@ OPERATOR_HTML_PAGE = """<!doctype html>
   </div>
 
   <script>
-    const sections = ['status'];
+    const sections = ['status', 'budgets', 'setup', 'logs'];
     let activeSection = 'status';
     let currentLiveSnapshot = null;
     let currentStatusSnapshot = null;
@@ -1010,7 +1023,17 @@ OPERATOR_HTML_PAGE = """<!doctype html>
     }
 
     async function refreshActiveSection(force=false) {
-      await refreshStatus();
+      if (activeSection === 'status' || activeSection === 'budgets') {
+        await refreshStatus();
+        return;
+      }
+      if (activeSection === 'setup') {
+        await refreshSetup(force);
+        return;
+      }
+      if (activeSection === 'logs') {
+        await refreshLogs(force);
+      }
     }
 
     async function refreshLiveOnce() {
@@ -1080,6 +1103,12 @@ OPERATOR_HTML_PAGE = """<!doctype html>
             setMessage('setup-message', `${action} failed: ${error.message}`, 'bad');
           }
         }
+      });
+    });
+
+    document.querySelectorAll('[data-section]').forEach((button) => {
+      button.addEventListener('click', () => {
+        setSection(button.dataset.section);
       });
     });
 
@@ -2859,13 +2888,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._write_json(collect_dashboard_health_snapshot(self.server.settings))
             return
         if self.path == "/api/setup":
-            game_payload = self.server.snapshot_manager.get_latest("game") or {}
-            self._write_json(
-                collect_dashboard_setup_snapshot(
-                    self.server.settings,
-                    cluster_snapshot=game_payload.get("cluster"),
-                )
-            )
+            self._write_json(collect_dashboard_setup_snapshot(self.server.settings))
             return
         if self.path == "/api/logs":
             self._write_json(collect_dashboard_logs_snapshot(self.server.settings))
