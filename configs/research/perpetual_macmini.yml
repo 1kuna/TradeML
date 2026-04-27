@@ -49,6 +49,7 @@ frontier_architecture_policy:
   sentinel_baseline_runs: 2
   max_advanced_failures_per_epoch: 12
   require_dependency_preflight: true
+  auto_pivot_on_brake: true
 steering_defaults:
   exploration_breadth: normal
 search_policy:

@@ -1300,6 +1300,33 @@ def _current_node_runtime(settings: NodeSettings) -> dict[str, Any]:
     runtime = _read_runtime_state(settings)
     pid = runtime.get("pid")
     running = isinstance(pid, int) and _is_process_running(pid)
+    if not running and (runtime.get("managed_by") == "systemd" or runtime.get("service_name")):
+        svc = systemd_status()
+        main_pid_raw = svc.get("MainPID")
+        try:
+            main_pid = int(main_pid_raw)
+        except (TypeError, ValueError):
+            main_pid = 0
+        if (
+            bool(svc.get("supported"))
+            and str(svc.get("ActiveState") or "") == "active"
+            and main_pid > 0
+            and _is_process_running(main_pid)
+        ):
+            runtime.update(
+                {
+                    "pid": main_pid,
+                    "running": True,
+                    "managed_by": "systemd",
+                    "service_scope": str(svc.get("scope") or "system"),
+                    "service_name": str(svc.get("service_name") or "trademl-node.service"),
+                    "log_path": str(settings.log_path),
+                }
+            )
+            started = svc.get("ExecMainStartTimestamp")
+            if started:
+                runtime["systemd_started_at"] = str(started)
+            return runtime
     runtime["running"] = running
     if running and runtime.get("started_at"):
         started_at = datetime.fromisoformat(str(runtime["started_at"]))

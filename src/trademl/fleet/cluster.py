@@ -738,6 +738,8 @@ def render_systemd_unit(
             f"ExecStart={python_executable} -m trademl.data_node --config {config_path} --root {workspace_root} --env-file {env_path}",
             "Restart=on-failure",
             "RestartSec=15",
+            f"StandardOutput=append:{workspace_root / 'control' / 'logs' / 'node.log'}",
+            f"StandardError=append:{workspace_root / 'control' / 'logs' / 'node.log'}",
             "",
             "[Install]",
             f"WantedBy={wanted_by}",
@@ -851,7 +853,7 @@ def systemd_status(service_name: str = "trademl-node.service") -> dict[str, Any]
     chosen: dict[str, Any] | None = None
     for scope in ("system", "user"):
         result = subprocess.run(
-            _systemctl_command(scope, "show", service_name, "--no-page", "--property=LoadState,ActiveState,SubState,UnitFileState"),
+            _systemctl_command(scope, "show", service_name, "--no-page", "--property=LoadState,ActiveState,SubState,UnitFileState,MainPID,ExecMainStartTimestamp"),
             check=False,
             capture_output=True,
             text=True,

@@ -102,6 +102,7 @@ DEFAULT_FRONTIER_ARCHITECTURE_POLICY = {
     "sentinel_baseline_runs": 2,
     "max_advanced_failures_per_epoch": 12,
     "require_dependency_preflight": True,
+    "auto_pivot_on_brake": True,
 }
 
 
@@ -1423,6 +1424,28 @@ def _determine_program_transition(
             "frontier_architecture": _frontier_architecture_status(spec=spec, state=state, frontier=frontier, experiment_summary=experiment_summary),
         }
 
+    pivot_spec = _frontier_architecture_brake_pivot_spec(
+        spec=spec,
+        state=state,
+        phase_policy=phase_policy,
+        frontier=frontier,
+        experiment_summary=experiment_summary,
+    )
+    if pivot_spec is not None:
+        return {
+            "action": "launch_family",
+            "reason": f"frontier architecture brake reached; pivoting to search epoch {pivot_spec['search_epoch']}",
+            "next_spec": pivot_spec,
+            "family_signature": _family_signature(pivot_spec),
+            "novelty_score": _novelty_score(frontier=frontier, next_spec=pivot_spec),
+            "frontier_architecture": _frontier_architecture_status(
+                spec=spec,
+                state={**state, "search_epoch": pivot_spec["search_epoch"]},
+                frontier=frontier,
+                experiment_summary=experiment_summary,
+            ),
+        }
+
     stop_reason = _program_stop_reason(spec=spec, state=state, phase_policy=phase_policy, frontier=frontier, experiment_summary=experiment_summary)
     if stop_reason:
         if _stop_reason_waits_for_data(spec=spec, stop_reason=stop_reason):
@@ -1530,14 +1553,16 @@ def _frontier_architecture_status(
     experiment_summary: dict[str, Any],
 ) -> dict[str, Any]:
     policy = _frontier_architecture_policy(spec)
-    advanced_count = int(((frontier.get("lane_stats") or {}).get("architecture_family") or {}).get("advanced_challenger", 0) or 0)
+    advanced_count = _frontier_advanced_count_for_epoch(state=state, frontier=frontier)
     return {
         "policy": policy,
         "enabled": bool(policy.get("enabled", False)),
         "runs_completed": int((state.get("budgets") or {}).get("runs_completed", 0) or 0),
+        "search_epoch": int(state.get("search_epoch", 0) or 0),
         "trigger_min_completed_runs": int(policy.get("trigger_min_completed_runs") or 0),
         "advanced_failures_this_epoch": advanced_count,
         "max_advanced_failures_per_epoch": int(policy.get("max_advanced_failures_per_epoch") or 0),
+        "brake_active": bool(int(policy.get("max_advanced_failures_per_epoch") or 0) > 0 and advanced_count >= int(policy.get("max_advanced_failures_per_epoch") or 0)),
         "shortlist_count": int(experiment_summary.get("shortlist_count", 0) or 0),
     }
 
@@ -1561,7 +1586,7 @@ def _frontier_architecture_spec(
     best_summary = dict(state.get("best_candidate_summary") or {})
     if int(experiment_summary.get("shortlist_count", 0) or best_summary.get("shortlist_count", 0) or 0) > 0:
         return None
-    advanced_count = int(((frontier.get("lane_stats") or {}).get("architecture_family") or {}).get("advanced_challenger", 0) or 0)
+    advanced_count = _frontier_advanced_count_for_epoch(state=state, frontier=frontier)
     max_advanced = int(policy.get("max_advanced_failures_per_epoch") or 0)
     if max_advanced > 0 and advanced_count >= max_advanced:
         return None
@@ -1572,8 +1597,21 @@ def _frontier_architecture_spec(
     ]
     if not allowed_data_families:
         allowed_data_families = ["price_only"]
-    best_feature = _best_frontier_lane(frontier=frontier, lane="feature_family", allowed=["price_liquidity", "price_core", "price_short_horizon"], default="price_liquidity")
-    best_data = _best_frontier_lane(frontier=frontier, lane="data_family", allowed=allowed_data_families, default=allowed_data_families[0])
+    epoch = int(state.get("search_epoch", 0) or 0)
+    best_feature = _frontier_lane_for_epoch(
+        frontier=frontier,
+        lane="feature_family",
+        allowed=["price_liquidity", "price_core", "price_short_horizon"],
+        default="price_liquidity",
+        epoch=epoch,
+    )
+    best_data = _frontier_lane_for_epoch(
+        frontier=frontier,
+        lane="data_family",
+        allowed=allowed_data_families,
+        default=allowed_data_families[0],
+        epoch=epoch,
+    )
     sentinel_count = max(0, int(policy.get("sentinel_baseline_runs") or 0))
     architectures = ["advanced_challenger"]
     if sentinel_count >= 1:
@@ -1594,8 +1632,8 @@ def _frontier_architecture_spec(
             "architecture_family": architectures,
             "feature_family": [best_feature],
             "data_family": [best_data],
-            "data_profile": ["phase1_default"],
-            "validation.initial_train_years": [2],
+            "data_profile": [_frontier_profile_for_epoch(epoch)],
+            "validation.initial_train_years": [_frontier_train_years_for_epoch(epoch)],
         },
         steering=dict(state.get("steering") or {}),
     )
@@ -1613,6 +1651,51 @@ def _frontier_architecture_spec(
     if _family_signature(next_spec) in set(frontier.get("tried_family_signatures") or []):
         return None
     return next_spec
+
+
+def _frontier_advanced_count_for_epoch(*, state: dict[str, Any], frontier: dict[str, Any]) -> int:
+    """Return advanced challenger families completed in the current search epoch."""
+    epoch = int(state.get("search_epoch", 0) or 0)
+    history = [item for item in list(frontier.get("family_history") or []) if isinstance(item, dict)]
+    with_epoch = [item for item in history if item.get("search_epoch") is not None]
+    if with_epoch:
+        return sum(
+            1
+            for item in with_epoch
+            if int(item.get("search_epoch", 0) or 0) == epoch
+            and "advanced_challenger" in set(item.get("architecture_families") or [])
+        )
+    if epoch == 0:
+        return int(((frontier.get("lane_stats") or {}).get("architecture_family") or {}).get("advanced_challenger", 0) or 0)
+    return 0
+
+
+def _frontier_architecture_brake_pivot_spec(
+    *,
+    spec: dict[str, Any],
+    state: dict[str, Any],
+    phase_policy: dict[str, Any],
+    frontier: dict[str, Any],
+    experiment_summary: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Open a new search epoch when the advanced lane brake fires."""
+    policy = _frontier_architecture_policy(spec)
+    if not bool(policy.get("enabled", False)) or not bool(policy.get("auto_pivot_on_brake", True)):
+        return None
+    max_advanced = int(policy.get("max_advanced_failures_per_epoch") or 0)
+    if max_advanced <= 0:
+        return None
+    if _frontier_advanced_count_for_epoch(state=state, frontier=frontier) < max_advanced:
+        return None
+    next_state = deepcopy(state)
+    next_state["search_epoch"] = int(state.get("search_epoch", 0) or 0) + 1
+    return _frontier_architecture_spec(
+        spec=spec,
+        state=next_state,
+        phase_policy=phase_policy,
+        frontier=frontier,
+        experiment_summary=experiment_summary,
+    )
 
 
 def _best_frontier_lane(*, frontier: dict[str, Any], lane: str, allowed: list[str], default: str) -> str:
@@ -1634,6 +1717,48 @@ def _best_frontier_lane(*, frontier: dict[str, Any], lane: str, allowed: list[st
     if ranked:
         return ranked[0][0]
     return default if default in set(allowed) else allowed[0]
+
+
+def _frontier_lane_for_epoch(*, frontier: dict[str, Any], lane: str, allowed: list[str], default: str, epoch: int) -> str:
+    """Cycle through scored lanes across search epochs, best lane first."""
+    ordered = _ranked_frontier_lanes(frontier=frontier, lane=lane, allowed=allowed)
+    if not ordered:
+        ordered = [default if default in set(allowed) else allowed[0]]
+    return ordered[int(epoch or 0) % len(ordered)]
+
+
+def _ranked_frontier_lanes(*, frontier: dict[str, Any], lane: str, allowed: list[str]) -> list[str]:
+    mapping = {
+        "feature_family": "best_by_feature_family",
+        "data_family": "best_by_data_family",
+        "architecture_family": "best_by_architecture_family",
+    }
+    scored = dict(frontier.get(mapping[lane]) or {})
+    ranked = [
+        name
+        for name, _score in sorted(
+            (
+                (name, float((payload or {}).get("best_primary_score") or float("-inf")))
+                for name, payload in scored.items()
+                if name in set(allowed)
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    ]
+    ranked.extend(name for name in allowed if name not in set(ranked))
+    return ranked
+
+
+def _frontier_profile_for_epoch(epoch: int) -> str:
+    """Return the data profile for a frontier search epoch."""
+    return DEFAULT_EXPANSION_PROFILES[int(epoch or 0) % len(DEFAULT_EXPANSION_PROFILES)]
+
+
+def _frontier_train_years_for_epoch(epoch: int) -> int:
+    """Return the initial training window for a frontier search epoch."""
+    values = [2, 3, 4]
+    return values[int(epoch or 0) % len(values)]
 
 
 def _expanded_search_spec(
@@ -1789,6 +1914,31 @@ def _update_frontier_memory(*, state: dict[str, Any], experiment_summary: dict[s
             "experiment_id": experiment_id,
             "family_signature": signature,
             "phase": current_phase,
+            "search_epoch": int(state.get("search_epoch", 0) or 0),
+            "architecture_families": sorted(
+                {
+                    str((run.get("matrix_values") or {}).get("architecture_family"))
+                    for run in runs
+                    if isinstance(run, dict)
+                    and (run.get("matrix_values") or {}).get("architecture_family") is not None
+                }
+            ),
+            "feature_families": sorted(
+                {
+                    str((run.get("matrix_values") or {}).get("feature_family"))
+                    for run in runs
+                    if isinstance(run, dict)
+                    and (run.get("matrix_values") or {}).get("feature_family") is not None
+                }
+            ),
+            "data_families": sorted(
+                {
+                    str((run.get("matrix_values") or {}).get("data_family"))
+                    for run in runs
+                    if isinstance(run, dict)
+                    and (run.get("matrix_values") or {}).get("data_family") is not None
+                }
+            ),
             "best_primary_score": experiment_summary.get("best_primary_score"),
             "shortlist_count": experiment_summary.get("shortlist_count"),
             "top_gate_failures": top_failures,
@@ -2217,11 +2367,16 @@ def _launch_program_family(
         "current_experiment_spec_path": str(spec_path),
         "current_family_signature": _family_signature(next_spec),
         "current_generation": int(next_spec.get("generation", 0) or 0),
+        "search_epoch": int(next_spec.get("search_epoch", program_state.get("search_epoch", 0)) or 0),
         "current_phase": int(next_spec.get("phase", 1) or 1),
         "current_ssot_phase": int(next_spec.get("ssot_phase", next_spec.get("phase", 1)) or 1),
         "current_track": str(next_spec.get("campaign_track") or "baseline"),
         "current_campaign_track": str(next_spec.get("campaign_track") or "baseline"),
         "active_experiment_supervisor": payload,
+        "wait_reason": None,
+        "waiting_since": None,
+        "stop_reason": None,
+        "pending_next_spec": None,
     }
 
 

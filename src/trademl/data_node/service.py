@@ -499,14 +499,20 @@ class DataNodeService:
     ) -> None:
         """Seed planner tasks, optionally heartbeating during long startup refreshes."""
         heartbeat_every = max(1, int(heartbeat_task_interval))
+        if heartbeat_fn is not None:
+            heartbeat_fn()
         if not self._ledger_bootstrap_complete:
             self.bootstrap_canonical_ledger()
+            if heartbeat_fn is not None:
+                heartbeat_fn()
         as_of_date = trading_date or datetime.now(tz=UTC).date().isoformat()
         freeze_cutoff = recommended_training_cutoff(
             data_root=self.paths.root,
             expected_symbol_count=len(self.default_symbols),
             as_of=as_of_date,
         )
+        if heartbeat_fn is not None:
+            heartbeat_fn()
         planned = plan_coverage_tasks(
             data_root=self.paths.root,
             stage_symbols=self.default_symbols,
@@ -517,6 +523,8 @@ class DataNodeService:
             current_date=as_of_date,
             freeze_report_date=freeze_cutoff.get("date"),
         )
+        if heartbeat_fn is not None:
+            heartbeat_fn()
         canonical_task_keys = {
             task.task_key for task in planned if task.task_family == "canonical_bars"
         }
@@ -560,7 +568,11 @@ class DataNodeService:
                 }
             )
         self.db.bulk_upsert_planner_tasks(task_rows)
+        if heartbeat_fn is not None:
+            heartbeat_fn()
         for index, task in enumerate(planned, start=1):
+            if heartbeat_fn is not None and index % heartbeat_every == 0:
+                heartbeat_fn()
             task_family = task.task_family
             if task_family == "auxiliary":
                 task_family = self._planner_family_for_dataset(task.dataset)
@@ -627,9 +639,9 @@ class DataNodeService:
                         },
                     }
                 )
-            if heartbeat_fn is not None and index % heartbeat_every == 0:
-                heartbeat_fn()
         self.db.bulk_update_planner_task_progress(progress_rows)
+        if heartbeat_fn is not None:
+            heartbeat_fn()
         if regressed_task_keys:
             reopened = self.db.reopen_planner_tasks(
                 sorted(set(regressed_task_keys)), reason="canonical coverage regressed"
@@ -642,6 +654,8 @@ class DataNodeService:
             symbol_filter=None,
             verify_only=False,
         )
+        if heartbeat_fn is not None:
+            heartbeat_fn()
         if repair_seeded.get("seeded_tasks", 0):
             LOGGER.warning(
                 "seeded_canonical_repairs count=%s", repair_seeded["seeded_tasks"]
@@ -1390,10 +1404,24 @@ class DataNodeService:
         price_check_symbols: list[str] | None = None,
         now_fn=lambda: datetime.now(tz=UTC),
         sleep_fn=sleep,
+        runtime_heartbeat_fn: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         """Run the clustered scheduled data-node loop until a stop signal is received."""
         self.default_symbols = symbols
         owned_shards: list[ShardSpec] = []
+
+        def heartbeat_worker(mode: str = "cluster", trading_date: str | None = None) -> object:
+            if runtime_heartbeat_fn is not None:
+                payload: dict[str, object] = {
+                    "running": True,
+                    "worker_id": self.worker_id,
+                    "mode": mode,
+                    "heartbeat_at": datetime.now(tz=UTC).isoformat(),
+                }
+                if trading_date is not None:
+                    payload["trading_date"] = trading_date
+                runtime_heartbeat_fn(payload)
+            return coordinator.heartbeat_worker()
 
         def before_iteration(
             *,
@@ -1403,7 +1431,7 @@ class DataNodeService:
             trading_date: str,
         ) -> None:
             nonlocal owned_shards
-            coordinator.heartbeat_worker()
+            heartbeat_worker("cluster", trading_date=trading_date)
             owned_shards = coordinator.sync_shard_leases()
 
         def collect_iteration(
@@ -1450,7 +1478,7 @@ class DataNodeService:
                 pending_backfill=pending_backfill,
             ):
                 changed_dates = self.process_backfill_queue(
-                    heartbeat_fn=coordinator.heartbeat_worker,
+                    heartbeat_fn=lambda: heartbeat_worker("cluster_backfill"),
                     heartbeat_interval_seconds=float(
                         getattr(coordinator, "heartbeat_interval_seconds", 30)
                     ),
@@ -1491,6 +1519,8 @@ class DataNodeService:
             before_iteration_fn=before_iteration,
             backfill_when_pending=True,
             after_backlog_clear_fn=after_backlog_clear,
+            runtime_heartbeat_fn=runtime_heartbeat_fn,
+            runtime_mode="cluster",
         )
 
     def run_forever(
@@ -1508,6 +1538,7 @@ class DataNodeService:
         price_check_symbols: list[str] | None = None,
         now_fn=lambda: datetime.now(tz=UTC),
         sleep_fn=sleep,
+        runtime_heartbeat_fn: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         """Run the scheduled data-node loop until a stop signal is received."""
 
@@ -1573,6 +1604,8 @@ class DataNodeService:
             collect_fn=collect_iteration,
             backfill_fn=backfill_iteration,
             backfill_when_pending=False,
+            runtime_heartbeat_fn=runtime_heartbeat_fn,
+            runtime_mode="local",
         )
 
     def _run_scheduler_loop(
@@ -1589,6 +1622,8 @@ class DataNodeService:
         before_iteration_fn: Callable[..., None] | None = None,
         backfill_when_pending: bool,
         after_backlog_clear_fn: Callable[..., None] | None = None,
+        runtime_heartbeat_fn: Callable[[dict[str, object]], None] | None = None,
+        runtime_mode: str = "local",
     ) -> None:
         """Run the shared scheduled service loop for local and clustered modes."""
         market_tz = ZoneInfo("America/New_York")
@@ -1607,6 +1642,16 @@ class DataNodeService:
             current_et = current.astimezone(market_tz)
             current_local = current.astimezone()
             trading_date = current_et.date().isoformat()
+            if runtime_heartbeat_fn is not None:
+                runtime_heartbeat_fn(
+                    {
+                        "running": True,
+                        "worker_id": self.worker_id,
+                        "mode": runtime_mode,
+                        "heartbeat_at": current.isoformat(),
+                        "trading_date": trading_date,
+                    }
+                )
             try:
                 if before_iteration_fn is not None:
                     before_iteration_fn(

@@ -1289,6 +1289,137 @@ def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(
     assert calls == ["process_backfill_queue"]
 
 
+def test_run_cluster_forever_updates_runtime_heartbeat(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    coordinator = _ClusterCoordinatorStub()
+    heartbeats: list[dict[str, object]] = []
+
+    def runtime_heartbeat(payload: dict[str, object]) -> None:
+        heartbeats.append(payload)
+        service.stop()
+
+    service.run_cluster_forever(
+        coordinator=coordinator,  # type: ignore[arg-type]
+        symbols=["AAPL"],
+        exchange="XNYS",
+        collection_time_et="16:30",
+        maintenance_hour_local=23,
+        poll_seconds=0.0,
+        now_fn=lambda: datetime.fromisoformat("2026-03-31T20:35:00+00:00"),
+        sleep_fn=lambda _seconds: None,
+        runtime_heartbeat_fn=runtime_heartbeat,
+    )
+
+    assert heartbeats
+    assert heartbeats[-1]["running"] is True
+    assert heartbeats[-1]["worker_id"] == "local-worker"
+    assert heartbeats[-1]["mode"] == "cluster"
+    assert heartbeats[-1]["trading_date"] == "2026-03-31"
+
+
+def test_run_cluster_forever_backfill_renews_runtime_heartbeat(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    db.enqueue_task("equities_eod", "AAPL", "2026-03-31", "2026-03-31", "GAP", 1)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    coordinator = _ClusterCoordinatorStub()
+    heartbeats: list[dict[str, object]] = []
+
+    def process_backfill_queue(**kwargs) -> list[str]:
+        kwargs["heartbeat_fn"]()
+        service.stop()
+        return []
+
+    service.process_backfill_queue = process_backfill_queue  # type: ignore[method-assign]
+    service.sync_partition_status = lambda: tmp_path / "data" / "qc" / "partition_status.parquet"  # type: ignore[method-assign]
+
+    service.run_cluster_forever(
+        coordinator=coordinator,  # type: ignore[arg-type]
+        symbols=["AAPL"],
+        exchange="XNYS",
+        collection_time_et="16:30",
+        maintenance_hour_local=23,
+        poll_seconds=0.0,
+        now_fn=lambda: datetime.fromisoformat("2026-03-31T20:35:00+00:00"),
+        sleep_fn=lambda _seconds: None,
+        runtime_heartbeat_fn=lambda payload: heartbeats.append(payload),
+    )
+
+    assert "cluster_backfill" in {str(item["mode"]) for item in heartbeats}
+
+
+def test_seed_planner_tasks_heartbeats_during_startup_refresh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+    service._ledger_bootstrap_complete = True
+    monkeypatch.setattr(service_module, "recommended_training_cutoff", lambda **kwargs: {"date": "2026-03-31"})
+    monkeypatch.setattr(
+        service_module,
+        "plan_coverage_tasks",
+        lambda **kwargs: [
+            PlannedTask(
+                task_key="aux::news::AAPL::2026-03-31",
+                task_family="auxiliary",
+                planner_group="news",
+                dataset="news",
+                tier="research",
+                priority=255,
+                start_date="2026-03-31",
+                end_date="2026-03-31",
+                symbols=("AAPL",),
+                output_name=None,
+                preferred_vendors=("tiingo",),
+                payload={"scope_kind": "symbol"},
+            )
+        ],
+    )
+    service._verify_and_seed_canonical_repairs = lambda **kwargs: {"seeded_tasks": 0}  # type: ignore[method-assign]
+    service._release_budget_blocked_canonical_tasks = lambda: 0  # type: ignore[method-assign]
+    heartbeats: list[str] = []
+
+    service._seed_planner_tasks_with_heartbeat(
+        trading_date="2026-03-31",
+        heartbeat_fn=lambda: heartbeats.append("beat"),
+        heartbeat_task_interval=1,
+    )
+
+    assert len(heartbeats) >= 5
+
+
 def test_ensure_planner_backlog_seeded_when_planner_is_empty(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

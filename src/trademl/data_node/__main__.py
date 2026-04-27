@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
+import json
 import os
 from pathlib import Path
+import sys
+from typing import Callable
 
 import yaml
 
@@ -101,6 +104,16 @@ def main() -> int:
             "worker_id", os.uname().nodename if hasattr(os, "uname") else "worker"
         ),
     )
+    started_at = datetime.now(tz=UTC).isoformat()
+    runtime_heartbeat = _runtime_heartbeat_writer(
+        local_state=local_state,
+        workspace_root=workspace_root,
+        config_path=Path(args.config).expanduser(),
+        env_path=env_path or (workspace_root / ".env"),
+        worker_id=str(worker_id),
+        started_at=started_at,
+    )
+    runtime_heartbeat({"running": True, "mode": "startup"})
     db = DataNodeDB(local_state / "node.sqlite")
     data_root = Path(
         args.data_root or os.getenv("NAS_MOUNT", config["node"]["nas_mount"])
@@ -153,6 +166,7 @@ def main() -> int:
                 trading_date=args.date, sample_symbols=symbols[:5]
             )
         service.sync_partition_status()
+        runtime_heartbeat({"running": False, "mode": "once", "stopped_at": datetime.now(tz=UTC).isoformat()})
         return 0
 
     coordinator = ClusterCoordinator(
@@ -172,6 +186,10 @@ def main() -> int:
         universe_builder=stage0_universe_builder,
     )
     manifest = coordinator.ensure_cluster_ready(passphrase=args.passphrase)
+    def cluster_heartbeat() -> object:
+        runtime_heartbeat({"running": True, "mode": "cluster_startup"})
+        return coordinator.heartbeat_worker()
+
     local_db_path = local_state / "node.sqlite"
     if _should_rebuild_local_state(local_db_path=local_db_path):
         coordinator.rebuild_local_state(local_db_path=local_db_path)
@@ -182,29 +200,33 @@ def main() -> int:
     service.default_symbols = list(active_symbols)
     service._ensure_planner_backlog_seeded_with_heartbeat(
         trading_date=(args.date or datetime.now(tz=UTC).date().isoformat()),
-        heartbeat_fn=coordinator.heartbeat_worker,
+        heartbeat_fn=cluster_heartbeat,
     )
-    service.run_cluster_forever(
-        coordinator=coordinator,
-        symbols=active_symbols,
-        exchange=manifest["datasets"]["equities_eod"].get("exchange", "XNYS"),
-        collection_time_et=os.getenv(
-            "COLLECTION_TIME_ET", manifest["schedule"]["collection_time_et"]
-        ),
-        maintenance_hour_local=int(
-            os.getenv(
-                "MAINTENANCE_HOUR_LOCAL", manifest["schedule"]["maintenance_hour_local"]
-            )
-        ),
-        poll_seconds=args.poll_seconds,
-        macro_series_ids=default_macro_series() if "fred" in connectors else [],
-        reference_jobs=reference_jobs,
-        price_check_symbols=(
-            active_symbols[:5]
-            if {"massive", "twelve_data", "tiingo"}.intersection(connectors)
-            else []
-        ),
-    )
+    try:
+        service.run_cluster_forever(
+            coordinator=coordinator,
+            symbols=active_symbols,
+            exchange=manifest["datasets"]["equities_eod"].get("exchange", "XNYS"),
+            collection_time_et=os.getenv(
+                "COLLECTION_TIME_ET", manifest["schedule"]["collection_time_et"]
+            ),
+            maintenance_hour_local=int(
+                os.getenv(
+                    "MAINTENANCE_HOUR_LOCAL", manifest["schedule"]["maintenance_hour_local"]
+                )
+            ),
+            poll_seconds=args.poll_seconds,
+            macro_series_ids=default_macro_series() if "fred" in connectors else [],
+            reference_jobs=reference_jobs,
+            price_check_symbols=(
+                active_symbols[:5]
+                if {"massive", "twelve_data", "tiingo"}.intersection(connectors)
+                else []
+            ),
+            runtime_heartbeat_fn=runtime_heartbeat,
+        )
+    finally:
+        runtime_heartbeat({"running": False, "stopped_at": datetime.now(tz=UTC).isoformat()})
     return 0
 
 
@@ -255,6 +277,44 @@ def _apply_collection_runtime_env(config: dict[str, object]) -> None:
         os.environ.setdefault(
             "TRADEML_STORAGE_PAUSE_LOW_PRIORITY_PERCENT", str(pause_threshold)
         )
+
+
+def _runtime_heartbeat_writer(
+    *,
+    local_state: Path,
+    workspace_root: Path,
+    config_path: Path,
+    env_path: Path,
+    worker_id: str,
+    started_at: str,
+) -> Callable[[dict[str, object]], None]:
+    """Build an atomic node runtime heartbeat writer."""
+    runtime_path = local_state / "node_runtime.json"
+    base: dict[str, object] = {
+        "pid": os.getpid(),
+        "started_at": started_at,
+        "worker_id": worker_id,
+        "workspace_root": str(workspace_root),
+        "config_path": str(config_path),
+        "env_path": str(env_path),
+        "log_path": str(local_state / "logs" / "node.log"),
+        "command": list(sys.argv),
+        "managed_by": "process",
+    }
+
+    def write(update: dict[str, object]) -> None:
+        payload = {**base, **update, "heartbeat_at": datetime.now(tz=UTC).isoformat()}
+        _write_runtime_json(runtime_path, payload)
+
+    return write
+
+
+def _write_runtime_json(path: Path, payload: dict[str, object]) -> None:
+    """Atomically write node runtime JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
 
 
 if __name__ == "__main__":

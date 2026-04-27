@@ -29,6 +29,7 @@ from trademl.dashboard.controller import (
     update_worker,
 )
 from trademl.data_node.db import DataNodeDB
+from trademl.fleet.cluster import render_systemd_unit
 
 
 def test_persist_node_settings_updates_config_env_stage_and_fstab(tmp_path: Path) -> None:
@@ -970,6 +971,67 @@ def test_start_node_uses_user_systemd_scope_when_available(tmp_path: Path, monke
     assert ["systemctl", "--user", "start", "trademl-node.service"] in commands
     assert runtime["managed_by"] == "systemd"
     assert runtime["service_scope"] == "user"
+
+
+def test_render_systemd_unit_writes_node_log(tmp_path: Path) -> None:
+    unit = render_systemd_unit(
+        python_executable="/venv/bin/python",
+        config_path=tmp_path / "node.yml",
+        workspace_root=tmp_path / "node",
+        env_path=tmp_path / ".env",
+        user_mode=True,
+    )
+
+    assert f"StandardOutput=append:{tmp_path / 'node' / 'control' / 'logs' / 'node.log'}" in unit
+    assert f"StandardError=append:{tmp_path / 'node' / 'control' / 'logs' / 'node.log'}" in unit
+
+
+def test_current_node_runtime_uses_systemd_main_pid_when_runtime_file_is_stale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = workspace / "node.yml"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    settings.runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.runtime_path.write_text(
+        '{"pid": 999, "running": false, "managed_by": "systemd"}',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        dashboard_controller,
+        "systemd_status",
+        lambda: {
+            "supported": True,
+            "scope": "user",
+            "service_name": "trademl-node.service",
+            "ActiveState": "active",
+            "MainPID": "12345",
+        },
+    )
+    monkeypatch.setattr(dashboard_controller, "_is_process_running", lambda pid: pid == 12345)
+
+    runtime = dashboard_controller._current_node_runtime(settings)
+
+    assert runtime["running"] is True
+    assert runtime["pid"] == 12345
+    assert runtime["managed_by"] == "systemd"
+    assert runtime["service_scope"] == "user"
+    assert runtime["log_path"] == str(settings.log_path)
 
 
 def test_seed_stage_backfill_logs_enqueue_failures(tmp_path: Path, monkeypatch, caplog) -> None:

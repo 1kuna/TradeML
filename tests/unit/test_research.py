@@ -392,6 +392,7 @@ def test_frontier_architecture_policy_respects_advanced_failure_brake(tmp_path: 
         "allow_phase1_advanced": True,
         "trigger_min_completed_runs": 100,
         "max_advanced_failures_per_epoch": 12,
+        "auto_pivot_on_brake": False,
     }
     spec["budget_policy"]["max_total_runs"] = 5000
     state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
@@ -410,6 +411,76 @@ def test_frontier_architecture_policy_respects_advanced_failure_brake(tmp_path: 
 
     assert decision["action"] == "launch_family"
     assert "advanced_challenger" not in decision["next_spec"]["matrix"]["architecture_family"]
+
+
+def test_frontier_architecture_brake_pivots_to_new_epoch_instead_of_waiting(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec["frontier_architecture_policy"] = {
+        "enabled": True,
+        "allow_phase1_advanced": True,
+        "trigger_min_completed_runs": 100,
+        "advanced_first": True,
+        "sentinel_baseline_runs": 2,
+        "max_advanced_failures_per_epoch": 12,
+    }
+    spec["budget_policy"]["max_total_runs"] = 5000
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 1222
+    state["budgets"]["non_improving_families"] = 12
+    frontier = research._empty_frontier()  # noqa: SLF001
+    frontier["lane_stats"]["architecture_family"]["advanced_challenger"] = 12
+    frontier["best_by_feature_family"] = {
+        "price_liquidity": {"best_primary_score": 0.001},
+        "price_core": {"best_primary_score": -0.001},
+    }
+    frontier["best_by_data_family"] = {
+        "price_plus_liquidity": {"best_primary_score": 0.002},
+        "price_only": {"best_primary_score": -0.002},
+    }
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=frontier,
+        experiment_summary={"experiment_id": "perpetual-macmini-p1-f063", "shortlist_count": 0, "top_gate_failures": []},
+        proposal={},
+    )
+
+    assert decision["action"] == "launch_family"
+    assert "pivoting to search epoch 1" in decision["reason"]
+    assert decision["next_spec"]["search_epoch"] == 1
+    assert decision["next_spec"]["frontier_iteration"] == 1
+    assert decision["next_spec"]["matrix"]["architecture_family"][0] == "advanced_challenger"
+    assert decision["next_spec"]["matrix"]["data_profile"] == ["phase1_short_window"]
+
+
+def test_frontier_architecture_failure_count_is_epoch_local(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec["frontier_architecture_policy"] = {
+        "enabled": True,
+        "allow_phase1_advanced": True,
+        "trigger_min_completed_runs": 100,
+        "max_advanced_failures_per_epoch": 12,
+    }
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 1222
+    state["search_epoch"] = 1
+    frontier = research._empty_frontier()  # noqa: SLF001
+    frontier["family_history"] = [
+        {"search_epoch": 0, "architecture_families": ["advanced_challenger"]}
+        for _ in range(12)
+    ]
+
+    next_spec = research._frontier_architecture_spec(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        phase_policy=research._phase_policy(spec=spec, phase=1),  # noqa: SLF001
+        frontier=frontier,
+        experiment_summary={"shortlist_count": 0},
+    )
+
+    assert next_spec is not None
+    assert next_spec["frontier_iteration"] == 1
 
 
 def test_program_family_preflight_blocks_missing_advanced_dependencies(tmp_path: Path, monkeypatch) -> None:
@@ -776,6 +847,8 @@ def test_update_frontier_memory_records_lane_coverage_and_best_scores(tmp_path: 
     assert frontier["best_by_architecture_family"]["tree_challenger"]["best_primary_score"] == 0.031
     assert frontier["best_by_data_family"]["price_plus_liquidity"]["best_primary_score"] == 0.014
     assert frontier["best_by_phase"]["1"]["best_primary_score"] == 0.031
+    assert frontier["family_history"][-1]["search_epoch"] == 0
+    assert frontier["family_history"][-1]["architecture_families"] == ["linear_baseline", "tree_challenger"]
 
 
 def test_update_frontier_memory_preserves_family_counter_beyond_history_cap(tmp_path: Path) -> None:
@@ -1084,6 +1157,51 @@ def test_launch_program_family_blocks_when_research_preflight_fails(tmp_path: Pa
     assert payload["wait_reason"].startswith("research preflight failed")
     assert payload["pending_next_spec"] == next_spec
     assert not (local_state / "research_programs" / "perpetual-macmini" / "specs").exists()
+
+
+def test_launch_program_family_clears_stale_wait_markers(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    next_spec = {
+        "experiment_id": "perpetual-macmini-p1-f064",
+        "phase": 1,
+        "ssot_phase": 1,
+        "generation": 64,
+        "search_epoch": 4,
+        "campaign_track": "baseline",
+        "matrix": {"architecture_family": ["advanced_challenger"]},
+    }
+
+    monkeypatch.setattr(research, "_program_family_preflight", lambda **kwargs: {"ok": True})
+    monkeypatch.setattr(
+        research,
+        "supervise_experiment",
+        lambda **kwargs: {"experiment_id": "perpetual-macmini-p1-f064", "status": "RUNNING", "pid": 1234},
+    )
+
+    payload = research._launch_program_family(  # noqa: SLF001
+        program_id="perpetual-macmini",
+        program_state={
+            "search_epoch": 3,
+            "wait_reason": "too many consecutive non-improving families",
+            "waiting_since": "2026-04-27T21:44:19+00:00",
+            "stop_reason": "old",
+            "pending_next_spec": {"experiment_id": "old"},
+        },
+        next_spec=next_spec,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=local_state,
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    assert payload["search_epoch"] == 4
+    assert payload["wait_reason"] is None
+    assert payload["waiting_since"] is None
+    assert payload["stop_reason"] is None
+    assert payload["pending_next_spec"] is None
 
 
 def test_sweep_stale_experiment_runs_reconciles_dead_remote_runtime(tmp_path: Path, monkeypatch) -> None:
