@@ -9,6 +9,8 @@ import numpy as np
 import optuna
 import pandas as pd
 
+from trademl.models.utils import time_decay_weights
+
 
 @dataclass
 class LightGBMModel:
@@ -42,11 +44,7 @@ class LightGBMModel:
         return self.model.predict(X)
 
     def _time_decay_weights(self, n_rows: int) -> np.ndarray:
-        if n_rows <= 1:
-            return np.ones(n_rows)
-        idx = np.arange(n_rows)
-        half_life = max(1, int(252 * 1.5))
-        return 0.5 ** ((n_rows - 1 - idx) / half_life)
+        return time_decay_weights(n_rows)
 
 
 def tune_lightgbm_via_walk_forward(
