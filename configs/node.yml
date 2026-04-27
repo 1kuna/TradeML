@@ -29,10 +29,23 @@ training_targets:
     repo_root: /Users/openclaw/TradeML
     data_root: /Users/openclaw/atlas_mounts/nas
     python_executable: /Users/openclaw/TradeML/.venv/bin/python
+collection:
+  saturation:
+    enabled: true
+    target_utilization: 0.98
+  universe_policy: tiered_expansion
+  retention_policy: watermarked_indefinite
+  storage_watermark:
+    warn_percent: 85
+    pause_low_priority_percent: 92
 vendors:
   alpaca:
-    rpm: 190
-    daily_cap: 273600
+    rpm: 200
+    daily_cap: 288000
+    reset_timezone: UTC
+    minute_lane_enabled: true
+    research_lane_priority: 205
+    daily_cap_source: rpm_x_1440_no_documented_daily_cap
     datasets:
     - equities_eod
     - equities_minute
@@ -40,6 +53,10 @@ vendors:
   tiingo:
     rpm: 158
     daily_cap: 95000
+    reset_timezone: UTC
+    minute_lane_enabled: false
+    research_lane_priority: 211
+    daily_cap_source: existing_config_live_calibration_required
     datasets:
     - equities_eod
     - corp_actions_dividends
@@ -49,10 +66,15 @@ vendors:
     - news
     role: deep_history_bars
   twelve_data:
-    rpm: 7
-    daily_cap: 760
+    rpm: 8
+    daily_cap: 800
+    reset_timezone: UTC
+    minute_lane_enabled: true
+    research_lane_priority: 207
+    daily_cap_source: documented_basic_credits
     datasets:
     - equities_eod
+    - equities_minute
     - dividends
     - splits
     - earnings_calendar
@@ -60,10 +82,15 @@ vendors:
     - stocks
     role: cross_validation
   massive:
-    rpm: 4
-    daily_cap: 6840
+    rpm: 5
+    daily_cap: 7200
+    reset_timezone: UTC
+    minute_lane_enabled: true
+    research_lane_priority: 209
+    daily_cap_source: documented_basic_calls_per_minute
     datasets:
     - equities_eod
+    - equities_minute
     - reference_tickers
     - reference_splits
     - reference_dividends
@@ -71,6 +98,10 @@ vendors:
   finnhub:
     rpm: 57
     daily_cap: 82080
+    reset_timezone: UTC
+    minute_lane_enabled: false
+    research_lane_priority: 215
+    daily_cap_source: existing_config_live_calibration_required
     datasets:
     - equities_eod
     - earnings_calendar
@@ -79,7 +110,11 @@ vendors:
     role: backup_bars
   alpha_vantage:
     rpm: 1
-    daily_cap: 23
+    daily_cap: 25
+    reset_timezone: UTC
+    minute_lane_enabled: false
+    research_lane_priority: 280
+    daily_cap_source: documented_free_requests_per_day
     datasets:
     - corp_actions
     - listings
@@ -87,12 +122,20 @@ vendors:
   fred:
     rpm: 114
     daily_cap: 164160
+    reset_timezone: UTC
+    minute_lane_enabled: false
+    research_lane_priority: 225
+    daily_cap_source: existing_config_no_daily_cap
     datasets:
     - macros_treasury
     role: macro
   fmp:
     rpm: 1
-    daily_cap: 237
+    daily_cap: 250
+    reset_timezone: UTC
+    minute_lane_enabled: false
+    research_lane_priority: 270
+    daily_cap_source: documented_basic_calls_per_day
     datasets:
     - delistings
     - symbol_changes
@@ -100,8 +143,12 @@ vendors:
     - fundamentals
     role: reference
   sec_edgar:
-    rpm: 570
-    daily_cap: 820800
+    rpm: 600
+    daily_cap: 864000
+    reset_timezone: UTC
+    minute_lane_enabled: false
+    research_lane_priority: 230
+    daily_cap_source: sec_fair_access_10_requests_per_second
     datasets:
     - filing_index
     role: authoritative_events

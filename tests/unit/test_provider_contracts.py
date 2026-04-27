@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from trademl.data_node.provider_contracts import dataset_contract, default_vendor_limits, provider_contract
+from trademl.data_node.provider_contracts import (
+    dataset_contract,
+    default_vendor_limits,
+    provider_contract,
+)
 
 
 def test_provider_contract_exposes_canonical_contracts() -> None:
@@ -10,8 +14,11 @@ def test_provider_contract_exposes_canonical_contracts() -> None:
     massive_reference = dataset_contract("massive", "reference_tickers")
 
     assert alpaca is not None
-    assert alpaca.rpm == 190
-    assert dataset_contract("alpaca", "equities_eod").retry_after_header == "X-RateLimit-Reset"
+    assert alpaca.rpm == 200
+    assert (
+        dataset_contract("alpaca", "equities_eod").retry_after_header
+        == "X-RateLimit-Reset"
+    )
     assert tiingo_equities is not None
     assert tiingo_equities.max_batch_symbols == 1
     assert tiingo_equities.critical_path_allowed is True
@@ -25,6 +32,8 @@ def test_provider_contract_exposes_canonical_contracts() -> None:
     assert dataset_contract("alpaca", "equities_minute").pagination_mode == "page_token"
     assert dataset_contract("alpaca", "equities_minute").pagination_limit == 10000
     assert dataset_contract("alpaca", "equities_minute").critical_path_allowed is False
+    assert dataset_contract("massive", "equities_minute").pagination_mode == "next_url"
+    assert dataset_contract("massive", "equities_minute").critical_path_allowed is False
     assert dataset_contract("tiingo", "news").max_batch_symbols == 50
     assert dataset_contract("finnhub", "company_news").max_batch_symbols == 1
 
@@ -32,5 +41,7 @@ def test_provider_contract_exposes_canonical_contracts() -> None:
 def test_default_vendor_limits_are_derived_from_provider_contracts() -> None:
     limits = default_vendor_limits()
 
-    assert limits["alpaca"] == {"rpm": 190, "daily_cap": 273600}
-    assert limits["twelve_data"] == {"rpm": 7, "daily_cap": 760}
+    assert limits["alpaca"] == {"rpm": 200, "daily_cap": 288000}
+    assert limits["twelve_data"] == {"rpm": 8, "daily_cap": 800}
+    assert limits["massive"] == {"rpm": 5, "daily_cap": 7200}
+    assert limits["sec_edgar"] == {"rpm": 600, "daily_cap": 864000}

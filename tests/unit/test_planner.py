@@ -17,7 +17,9 @@ from trademl.data_node.planner import (
 )
 
 
-def test_choose_vendor_for_canonical_task_uses_priority_order_and_skips_failed_attempts() -> None:
+def test_choose_vendor_for_canonical_task_uses_priority_order_and_skips_failed_attempts() -> (
+    None
+):
     task = BackfillTask(
         id=1,
         dataset="equities_eod",
@@ -62,7 +64,9 @@ def test_choose_vendor_for_canonical_task_uses_priority_order_and_skips_failed_a
     assert chosen == "alpaca"
 
 
-def test_choose_vendor_for_canonical_task_skips_single_symbol_vendors_for_datewide_tasks() -> None:
+def test_choose_vendor_for_canonical_task_skips_single_symbol_vendors_for_datewide_tasks() -> (
+    None
+):
     task = BackfillTask(
         id=1,
         dataset="equities_eod",
@@ -81,7 +85,12 @@ def test_choose_vendor_for_canonical_task_skips_single_symbol_vendors_for_datewi
 
     chosen = choose_vendor_for_canonical_task(
         task=task,
-        connectors={"alpaca": object(), "tiingo": object(), "twelve_data": object(), "finnhub": object()},
+        connectors={
+            "alpaca": object(),
+            "tiingo": object(),
+            "twelve_data": object(),
+            "finnhub": object(),
+        },
         audit_state=None,
         attempts=[],
     )
@@ -89,7 +98,9 @@ def test_choose_vendor_for_canonical_task_skips_single_symbol_vendors_for_datewi
     assert chosen == "alpaca"
 
 
-def test_choose_vendor_for_canonical_task_retries_vendor_after_backoff_expires() -> None:
+def test_choose_vendor_for_canonical_task_retries_vendor_after_backoff_expires() -> (
+    None
+):
     task = BackfillTask(
         id=1,
         dataset="equities_eod",
@@ -171,10 +182,14 @@ def test_choose_vendor_for_canonical_task_skips_budget_blocked_vendor() -> None:
     assert chosen == "alpaca"
 
 
-def test_plan_auxiliary_tasks_includes_macro_and_reference_chunks(tmp_path: Path) -> None:
+def test_plan_auxiliary_tasks_includes_macro_and_reference_chunks(
+    tmp_path: Path,
+) -> None:
     reference_root = tmp_path / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{"ticker": "AAPL", "cik_str": "320193"}]).to_parquet(reference_root / "sec_company_tickers.parquet", index=False)
+    pd.DataFrame([{"ticker": "AAPL", "cik_str": "320193"}]).to_parquet(
+        reference_root / "sec_company_tickers.parquet", index=False
+    )
 
     tasks = plan_auxiliary_tasks(
         data_root=tmp_path,
@@ -193,10 +208,14 @@ def test_plan_auxiliary_tasks_includes_macro_and_reference_chunks(tmp_path: Path
     assert len(macro_tasks) == len(default_macro_series())
 
 
-def test_plan_auxiliary_tasks_includes_research_archive_lanes_with_short_windows(tmp_path: Path) -> None:
+def test_plan_auxiliary_tasks_includes_research_archive_lanes_with_historical_windows(
+    tmp_path: Path,
+) -> None:
     reference_root = tmp_path / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{"ticker": "AAPL", "cik_str": "320193"}]).to_parquet(reference_root / "sec_company_tickers.parquet", index=False)
+    pd.DataFrame([{"ticker": "AAPL", "cik_str": "320193"}]).to_parquet(
+        reference_root / "sec_company_tickers.parquet", index=False
+    )
 
     tasks = plan_auxiliary_tasks(
         data_root=tmp_path,
@@ -215,9 +234,34 @@ def test_plan_auxiliary_tasks_includes_research_archive_lanes_with_short_windows
     assert minute_tasks
     assert tiingo_news_tasks
     assert finnhub_news_tasks
-    assert all(task.planner_group == "supplemental_research_backlog" for task in minute_tasks + tiingo_news_tasks + finnhub_news_tasks)
-    assert all(task.start_date == "2026-04-05" and task.end_date == "2026-04-10" for task in minute_tasks)
-    assert all(task.start_date == "2026-04-03" and task.end_date == "2026-04-10" for task in tiingo_news_tasks + finnhub_news_tasks)
+    assert all(
+        task.planner_group == "supplemental_research_backlog"
+        for task in minute_tasks + tiingo_news_tasks + finnhub_news_tasks
+    )
+    assert any(
+        task.start_date == "2025-04-10" and task.end_date == "2025-04-14"
+        for task in minute_tasks
+    )
+    assert any(
+        task.start_date == "2026-04-10" and task.end_date == "2026-04-10"
+        for task in minute_tasks
+    )
+    assert any(
+        task.start_date == "2025-04-10" and task.end_date == "2025-04-16"
+        for task in tiingo_news_tasks + finnhub_news_tasks
+    )
+    assert any(
+        task.start_date == "2026-04-09" and task.end_date == "2026-04-10"
+        for task in tiingo_news_tasks + finnhub_news_tasks
+    )
+    assert all(
+        task.payload["capture_family"] == "research_archive"
+        for task in minute_tasks + tiingo_news_tasks + finnhub_news_tasks
+    )
+    assert all(
+        task.payload["retention_class"] == "raw_archive"
+        for task in minute_tasks + tiingo_news_tasks + finnhub_news_tasks
+    )
 
 
 def test_plan_canonical_bar_tasks_uses_symbol_range_windows() -> None:
@@ -241,11 +285,18 @@ def test_plan_canonical_bar_tasks_uses_symbol_range_windows() -> None:
     assert any(task.symbols == ("NVDA",) for task in tasks)
 
 
-def test_plan_canonical_bar_tasks_expands_and_prioritizes_frozen_training_window() -> None:
+def test_plan_canonical_bar_tasks_expands_and_prioritizes_frozen_training_window() -> (
+    None
+):
     tasks = plan_canonical_bar_tasks(
         stage_symbols=["AAPL"],
         stage_years=1,
-        connectors={"alpaca": object(), "tiingo": object(), "twelve_data": object(), "massive": object()},
+        connectors={
+            "alpaca": object(),
+            "tiingo": object(),
+            "twelve_data": object(),
+            "massive": object(),
+        },
         current_date="2026-04-07",
         freeze_report_date="2026-03-06",
         symbol_batch_size=1,
@@ -264,7 +315,9 @@ def test_plan_canonical_bar_tasks_expands_and_prioritizes_frozen_training_window
     assert all(task.priority == 10 for task in tail)
 
 
-def test_plan_canonical_bar_tasks_respects_listing_history_windows(tmp_path: Path) -> None:
+def test_plan_canonical_bar_tasks_respects_listing_history_windows(
+    tmp_path: Path,
+) -> None:
     reference_root = tmp_path / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
@@ -289,19 +342,31 @@ def test_plan_canonical_bar_tasks_respects_listing_history_windows(tmp_path: Pat
     sn_tasks = [task for task in tasks if task.symbols == ("SN",)]
     assert sn_tasks
     assert min(task.start_date for task in sn_tasks) >= "2023-07-31"
-    assert all(task.preferred_vendors == ("alpaca", "tiingo") for task in sn_tasks if task.payload["freeze_priority"] is True)
+    assert all(
+        task.preferred_vendors == ("alpaca", "tiingo")
+        for task in sn_tasks
+        if task.payload["freeze_priority"] is True
+    )
 
 
 def test_plan_coverage_tasks_orders_canonical_before_auxiliary(tmp_path: Path) -> None:
     reference_root = tmp_path / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{"ticker": "AAPL", "cik_str": "320193"}]).to_parquet(reference_root / "sec_company_tickers.parquet", index=False)
+    pd.DataFrame([{"ticker": "AAPL", "cik_str": "320193"}]).to_parquet(
+        reference_root / "sec_company_tickers.parquet", index=False
+    )
 
     tasks = plan_coverage_tasks(
         data_root=tmp_path,
         stage_symbols=["AAPL", "MSFT"],
         stage_years=1,
-        connectors={"alpaca": object(), "tiingo": object(), "alpha_vantage": object(), "fred": object(), "sec_edgar": object()},
+        connectors={
+            "alpaca": object(),
+            "tiingo": object(),
+            "alpha_vantage": object(),
+            "fred": object(),
+            "sec_edgar": object(),
+        },
         current_date="2026-04-02",
         symbol_batch_size=2,
         trading_day_chunk_size=10,

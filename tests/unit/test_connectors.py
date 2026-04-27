@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 
-import pandas as pd
 import pytest
 import requests
 
 import trademl.connectors.base as base_module
 from trademl.connectors.alpaca import AlpacaConnector
 from trademl.connectors.alpha_vantage import AlphaVantageConnector
-from trademl.connectors.base import BaseConnector, PermanentConnectorError, RetryConfig, TemporaryConnectorError
+from trademl.connectors.base import (
+    BaseConnector,
+    PermanentConnectorError,
+    RetryConfig,
+    TemporaryConnectorError,
+)
 from trademl.connectors.finnhub import FinnhubConnector
 from trademl.connectors.fmp import FMPConnector
 from trademl.connectors.fred import FredConnector
@@ -21,7 +25,13 @@ from trademl.data_node.budgets import BudgetManager
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload: object, text: str | None = None, headers: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: object,
+        text: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self.payload = payload
         self._text = text
@@ -46,7 +56,14 @@ class FakeSession:
         self.responses = responses
         self.calls: list[tuple[str, str, dict | None, dict | None]] = []
 
-    def request(self, method: str, url: str, params: dict | None, headers: dict | None, timeout: int) -> FakeResponse:
+    def request(
+        self,
+        method: str,
+        url: str,
+        params: dict | None,
+        headers: dict | None,
+        timeout: int,
+    ) -> FakeResponse:
         self.calls.append((method, url, params, headers))
         if not self.responses:
             raise AssertionError("no fake responses left")
@@ -58,7 +75,14 @@ class ErrorSession:
         self.error = error
         self.calls: list[tuple[str, str, dict | None, dict | None]] = []
 
-    def request(self, method: str, url: str, params: dict | None, headers: dict | None, timeout: int) -> FakeResponse:
+    def request(
+        self,
+        method: str,
+        url: str,
+        params: dict | None,
+        headers: dict | None,
+        timeout: int,
+    ) -> FakeResponse:
         self.calls.append((method, url, params, headers))
         raise self.error
 
@@ -86,7 +110,18 @@ def test_alpaca_connector_normalizes_bars() -> None:
                 200,
                 {
                     "bars": {
-                        "AAPL": [{"t": "2026-01-02T00:00:00Z", "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "vw": 1.4, "v": 10, "n": 2}]
+                        "AAPL": [
+                            {
+                                "t": "2026-01-02T00:00:00Z",
+                                "o": 1.0,
+                                "h": 2.0,
+                                "l": 0.5,
+                                "c": 1.5,
+                                "vw": 1.4,
+                                "v": 10,
+                                "n": 2,
+                            }
+                        ]
                     },
                     "next_page_token": None,
                 },
@@ -115,7 +150,16 @@ def test_alpaca_connector_normalizes_minute_bars() -> None:
                 {
                     "bars": {
                         "AAPL": [
-                            {"t": "2026-04-09T14:31:00Z", "o": 100.0, "h": 101.0, "l": 99.5, "c": 100.5, "vw": 100.2, "v": 50, "n": 3}
+                            {
+                                "t": "2026-04-09T14:31:00Z",
+                                "o": 100.0,
+                                "h": 101.0,
+                                "l": 99.5,
+                                "c": 100.5,
+                                "vw": 100.2,
+                                "v": 50,
+                                "n": 3,
+                            }
                         ]
                     },
                     "next_page_token": None,
@@ -140,6 +184,7 @@ def test_alpaca_connector_normalizes_minute_bars() -> None:
     assert session.calls[0][2]["timeframe"] == "1Min"
     assert session.calls[0][2]["start"] == "2026-04-09T00:00:00Z"
     assert session.calls[0][2]["end"] == "2026-04-09T23:59:59Z"
+    assert session.calls[0][2]["limit"] == 10000
 
 
 def test_twelve_data_batch_fetch_records_weighted_request_telemetry() -> None:
@@ -148,8 +193,32 @@ def test_twelve_data_batch_fetch_records_weighted_request_telemetry() -> None:
             FakeResponse(
                 200,
                 {
-                    "AAPL": {"meta": {"symbol": "AAPL"}, "values": [{"datetime": "2026-01-02", "open": "1", "high": "2", "low": "0.5", "close": "1.5", "volume": "10"}]},
-                    "MSFT": {"meta": {"symbol": "MSFT"}, "values": [{"datetime": "2026-01-02", "open": "3", "high": "4", "low": "2.5", "close": "3.5", "volume": "11"}]},
+                    "AAPL": {
+                        "meta": {"symbol": "AAPL"},
+                        "values": [
+                            {
+                                "datetime": "2026-01-02",
+                                "open": "1",
+                                "high": "2",
+                                "low": "0.5",
+                                "close": "1.5",
+                                "volume": "10",
+                            }
+                        ],
+                    },
+                    "MSFT": {
+                        "meta": {"symbol": "MSFT"},
+                        "values": [
+                            {
+                                "datetime": "2026-01-02",
+                                "open": "3",
+                                "high": "4",
+                                "low": "2.5",
+                                "close": "3.5",
+                                "volume": "11",
+                            }
+                        ],
+                    },
                 },
             )
         ]
@@ -162,7 +231,9 @@ def test_twelve_data_batch_fetch_records_weighted_request_telemetry() -> None:
         session=session,
     )
 
-    frame = connector.fetch("equities_eod", ["AAPL", "MSFT"], "2026-01-02", "2026-01-02")
+    frame = connector.fetch(
+        "equities_eod", ["AAPL", "MSFT"], "2026-01-02", "2026-01-02"
+    )
 
     snapshot = budget_manager.snapshot()
     telemetry = snapshot["vendors"]["twelve_data"]["telemetry"]
@@ -170,6 +241,46 @@ def test_twelve_data_batch_fetch_records_weighted_request_telemetry() -> None:
     assert telemetry["totals"]["outbound_requests"] == 1
     assert telemetry["totals"]["logical_units"] == 2
     assert telemetry["totals"]["request_cost_units"] == 2
+
+
+def test_twelve_data_connector_normalizes_minute_bars_with_weighted_credits() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "meta": {"symbol": "AAPL"},
+                    "values": [
+                        {
+                            "datetime": "2026-04-09 09:31:00",
+                            "open": "100",
+                            "high": "101",
+                            "low": "99",
+                            "close": "100.5",
+                            "volume": "2500",
+                        }
+                    ],
+                },
+            )
+        ]
+    )
+    budget_manager = _budget_manager()
+    connector = TwelveDataConnector(
+        base_url="https://api.twelvedata.com",
+        api_key="key",
+        budget_manager=budget_manager,
+        session=session,
+    )
+
+    frame = connector.fetch("equities_minute", ["AAPL"], "2026-04-09", "2026-04-09")
+
+    assert frame.iloc[0]["symbol"] == "AAPL"
+    assert str(frame.iloc[0]["date"]) == "2026-04-09"
+    assert frame.iloc[0]["vendor_ts"].isoformat() == "2026-04-09T09:31:00+00:00"
+    assert session.calls[0][2]["interval"] == "1min"
+    assert session.calls[0][2]["outputsize"] == 5000
+    telemetry = budget_manager.snapshot()["vendors"]["twelve_data"]["telemetry"]
+    assert telemetry["totals"]["request_cost_units"] == 1
 
 
 def test_alpaca_connector_normalizes_assets() -> None:
@@ -207,8 +318,33 @@ def test_alpaca_connector_normalizes_assets() -> None:
 
 
 def test_massive_connector_normalizes_bars() -> None:
-    session = FakeSession([FakeResponse(200, {"results": [{"t": 1704153600000, "o": 10, "h": 11, "l": 9, "c": 10.5, "vw": 10.2, "v": 20, "n": 4}]})])
-    connector = MassiveConnector(base_url="https://api.polygon.io", api_key="key", budget_manager=_budget_manager(), session=session)
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "results": [
+                        {
+                            "t": 1704153600000,
+                            "o": 10,
+                            "h": 11,
+                            "l": 9,
+                            "c": 10.5,
+                            "vw": 10.2,
+                            "v": 20,
+                            "n": 4,
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    connector = MassiveConnector(
+        base_url="https://api.polygon.io",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
 
     frame = connector.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-02")
 
@@ -222,24 +358,91 @@ def test_massive_connector_paginates_bars_via_next_url() -> None:
             FakeResponse(
                 200,
                 {
-                    "results": [{"t": 1704153600000, "o": 10, "h": 11, "l": 9, "c": 10.5, "vw": 10.2, "v": 20, "n": 4}],
+                    "results": [
+                        {
+                            "t": 1704153600000,
+                            "o": 10,
+                            "h": 11,
+                            "l": 9,
+                            "c": 10.5,
+                            "vw": 10.2,
+                            "v": 20,
+                            "n": 4,
+                        }
+                    ],
                     "next_url": "https://api.massive.com/v2/aggs/ticker/MSFT/range/1/day/2024-01-02/2024-01-03?cursor=abc",
                 },
             ),
             FakeResponse(
                 200,
                 {
-                    "results": [{"t": 1704240000000, "o": 11, "h": 12, "l": 10, "c": 11.5, "vw": 11.2, "v": 21, "n": 5}],
+                    "results": [
+                        {
+                            "t": 1704240000000,
+                            "o": 11,
+                            "h": 12,
+                            "l": 10,
+                            "c": 11.5,
+                            "vw": 11.2,
+                            "v": 21,
+                            "n": 5,
+                        }
+                    ],
                 },
             ),
         ]
     )
-    connector = MassiveConnector(base_url="https://api.polygon.io", api_key="key", budget_manager=_budget_manager(), session=session)
+    connector = MassiveConnector(
+        base_url="https://api.polygon.io",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
 
     frame = connector.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-03")
 
     assert frame["date"].astype(str).tolist() == ["2024-01-02", "2024-01-03"]
-    assert session.calls[1][1] == "https://api.massive.com/v2/aggs/ticker/MSFT/range/1/day/2024-01-02/2024-01-03?cursor=abc"
+    assert (
+        session.calls[1][1]
+        == "https://api.massive.com/v2/aggs/ticker/MSFT/range/1/day/2024-01-02/2024-01-03?cursor=abc"
+    )
+
+
+def test_massive_connector_normalizes_minute_aggregates() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "results": [
+                        {
+                            "t": 1775745060000,
+                            "o": 100,
+                            "h": 101,
+                            "l": 99,
+                            "c": 100.5,
+                            "vw": 100.2,
+                            "v": 20,
+                            "n": 4,
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    connector = MassiveConnector(
+        base_url="https://api.polygon.io",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    frame = connector.fetch("equities_minute", ["AAPL"], "2026-04-09", "2026-04-09")
+
+    assert frame.iloc[0]["symbol"] == "AAPL"
+    assert frame.iloc[0]["source_name"] == "massive"
+    assert "/range/1/minute/" in session.calls[0][1]
+    assert session.calls[0][2]["limit"] == 50000
 
 
 def test_massive_connector_paginates_reference_tickers_via_next_url() -> None:
@@ -255,22 +458,47 @@ def test_massive_connector_paginates_reference_tickers_via_next_url() -> None:
             FakeResponse(200, {"results": [{"ticker": "MSFT"}]}),
         ]
     )
-    connector = MassiveConnector(base_url="https://api.polygon.io", api_key="key", budget_manager=_budget_manager(), session=session)
+    connector = MassiveConnector(
+        base_url="https://api.polygon.io",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
 
     frame = connector.fetch("reference_tickers", [], "2024-01-02", "2024-01-03")
 
     assert frame["ticker"].tolist() == ["AAPL", "MSFT"]
-    assert session.calls[1][1] == "https://api.massive.com/v3/reference/tickers?cursor=abc"
+    assert (
+        session.calls[1][1] == "https://api.massive.com/v3/reference/tickers?cursor=abc"
+    )
 
 
 def test_finnhub_connector_normalizes_equities_and_earnings() -> None:
     session = FakeSession(
         [
-            FakeResponse(200, {"s": "ok", "t": [1704153600], "o": [10], "h": [12], "l": [9], "c": [11], "v": [100]}),
-            FakeResponse(200, {"earningsCalendar": [{"symbol": "AAPL", "date": "2026-01-29"}]}),
+            FakeResponse(
+                200,
+                {
+                    "s": "ok",
+                    "t": [1704153600],
+                    "o": [10],
+                    "h": [12],
+                    "l": [9],
+                    "c": [11],
+                    "v": [100],
+                },
+            ),
+            FakeResponse(
+                200, {"earningsCalendar": [{"symbol": "AAPL", "date": "2026-01-29"}]}
+            ),
         ]
     )
-    connector = FinnhubConnector(base_url="https://finnhub.io", api_key="key", budget_manager=_budget_manager(), session=session)
+    connector = FinnhubConnector(
+        base_url="https://finnhub.io",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
 
     bars = connector.fetch("equities_eod", ["AAPL"], "2024-01-02", "2024-01-02")
     earnings = connector.fetch("earnings_calendar", [], "2026-01-01", "2026-01-31")
@@ -301,7 +529,12 @@ def test_tiingo_connector_normalizes_company_news() -> None:
             )
         ]
     )
-    connector = TiingoConnector(base_url="https://api.tiingo.com", api_key="key", budget_manager=_budget_manager(), session=session)
+    connector = TiingoConnector(
+        base_url="https://api.tiingo.com",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
 
     frame = connector.fetch("news", ["AAPL", "MSFT"], "2026-04-09", "2026-04-09")
 
@@ -310,6 +543,8 @@ def test_tiingo_connector_normalizes_company_news() -> None:
     assert frame.iloc[0]["tags"] == ("HARDWARE", "TECHNOLOGY")
     assert frame.iloc[0]["headline"] == "Apple launches something"
     assert session.calls[0][2]["tickers"] == "AAPL,MSFT"
+    assert session.calls[0][2]["startDate"] == "2026-04-09"
+    assert session.calls[0][2]["endDate"] == "2026-04-09"
 
 
 def test_finnhub_connector_normalizes_company_news() -> None:
@@ -333,7 +568,12 @@ def test_finnhub_connector_normalizes_company_news() -> None:
             )
         ]
     )
-    connector = FinnhubConnector(base_url="https://finnhub.io", api_key="key", budget_manager=_budget_manager(), session=session)
+    connector = FinnhubConnector(
+        base_url="https://finnhub.io",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
 
     frame = connector.fetch("company_news", ["AAPL"], "2026-04-08", "2026-04-09")
 
@@ -347,18 +587,53 @@ def test_finnhub_connector_normalizes_company_news() -> None:
 def test_alpha_vantage_and_fred_connectors() -> None:
     av_session = FakeSession(
         [
-            FakeResponse(200, payload=[], text="symbol,name,exchange,assetType,ipoDate,delistingDate,status\nAAPL,Apple,NASDAQ,Stock,1980-12-12,,Active\n"),
-            FakeResponse(200, payload=[], text="symbol,name,exchange,assetType,ipoDate,delistingDate,status\nOLD,Old Co,NASDAQ,Stock,1980-12-12,2024-01-15,Delisted\n"),
-            FakeResponse(200, {"data": [{"ex_dividend_date": "2024-01-05", "amount": "0.24"}]}),
-            FakeResponse(200, {"data": [{"effective_date": "2024-01-10", "split_factor": "0.5"}]}),
+            FakeResponse(
+                200,
+                payload=[],
+                text="symbol,name,exchange,assetType,ipoDate,delistingDate,status\nAAPL,Apple,NASDAQ,Stock,1980-12-12,,Active\n",
+            ),
+            FakeResponse(
+                200,
+                payload=[],
+                text="symbol,name,exchange,assetType,ipoDate,delistingDate,status\nOLD,Old Co,NASDAQ,Stock,1980-12-12,2024-01-15,Delisted\n",
+            ),
+            FakeResponse(
+                200, {"data": [{"ex_dividend_date": "2024-01-05", "amount": "0.24"}]}
+            ),
+            FakeResponse(
+                200, {"data": [{"effective_date": "2024-01-10", "split_factor": "0.5"}]}
+            ),
         ]
     )
     fred_session = FakeSession(
-        [FakeResponse(200, {"observations": [{"date": "2024-01-02", "value": "4.2", "realtime_start": "2024-01-02"}]})]
+        [
+            FakeResponse(
+                200,
+                {
+                    "observations": [
+                        {
+                            "date": "2024-01-02",
+                            "value": "4.2",
+                            "realtime_start": "2024-01-02",
+                        }
+                    ]
+                },
+            )
+        ]
     )
 
-    av = AlphaVantageConnector(base_url="https://www.alphavantage.co", api_key="key", budget_manager=_budget_manager(), session=av_session)
-    fred = FredConnector(base_url="https://api.stlouisfed.org", api_key="key", budget_manager=_budget_manager(), session=fred_session)
+    av = AlphaVantageConnector(
+        base_url="https://www.alphavantage.co",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=av_session,
+    )
+    fred = FredConnector(
+        base_url="https://api.stlouisfed.org",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=fred_session,
+    )
 
     listings = av.fetch("listings", [], "2024-01-01", "2024-01-31")
     corp_actions = av.fetch("corp_actions", ["AAPL"], "2024-01-01", "2024-01-31")
@@ -369,19 +644,24 @@ def test_alpha_vantage_and_fred_connectors() -> None:
     assert "amount" in corp_actions.columns
     assert observations.iloc[0]["series_id"] == "DGS10"
     assert observations.iloc[0]["value"] == pytest.approx(4.2)
-    assert fred_session.calls[0][2]["limit"] == 10000
+    assert fred_session.calls[0][2]["limit"] == 100000
 
 
 def test_fred_vintagedates_uses_supported_limit() -> None:
     fred_session = FakeSession(
         [FakeResponse(200, {"vintage_dates": ["2024-01-02", "2024-01-03"]})]
     )
-    fred = FredConnector(base_url="https://api.stlouisfed.org", api_key="key", budget_manager=_budget_manager(), session=fred_session)
+    fred = FredConnector(
+        base_url="https://api.stlouisfed.org",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=fred_session,
+    )
 
     vintages = fred.fetch("vintagedates", ["DGS10"], "2024-01-01", "2024-01-31")
 
     assert vintages["series_id"].tolist() == ["DGS10", "DGS10"]
-    assert fred_session.calls[0][2]["limit"] == 10000
+    assert fred_session.calls[0][2]["limit"] == 100000
 
 
 def test_alpha_vantage_corp_actions_normalize_splits_and_dividends() -> None:
@@ -391,7 +671,11 @@ def test_alpha_vantage_corp_actions_normalize_splits_and_dividends() -> None:
                 200,
                 {
                     "data": [
-                        {"symbol": "AAPL", "ex_dividend_date": "2024-01-15", "amount": "0.24"},
+                        {
+                            "symbol": "AAPL",
+                            "ex_dividend_date": "2024-01-15",
+                            "amount": "0.24",
+                        },
                     ]
                 },
             ),
@@ -399,19 +683,34 @@ def test_alpha_vantage_corp_actions_normalize_splits_and_dividends() -> None:
                 200,
                 {
                     "data": [
-                        {"symbol": "AAPL", "effective_date": "2024-02-01", "split_factor": "0.5"},
+                        {
+                            "symbol": "AAPL",
+                            "effective_date": "2024-02-01",
+                            "split_factor": "0.5",
+                        },
                     ]
                 },
             ),
         ]
     )
-    av = AlphaVantageConnector(base_url="https://www.alphavantage.co", api_key="key", budget_manager=_budget_manager(), session=av_session)
+    av = AlphaVantageConnector(
+        base_url="https://www.alphavantage.co",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=av_session,
+    )
 
     actions = av.fetch("corp_actions", ["AAPL"], "2024-01-01", "2024-03-01")
 
     assert set(actions["event_type"]) == {"dividend", "split"}
     assert set(actions["symbol"]) == {"AAPL"}
-    assert set(actions.columns) >= {"symbol", "event_type", "ex_date", "ratio", "source"}
+    assert set(actions.columns) >= {
+        "symbol",
+        "event_type",
+        "ex_date",
+        "ratio",
+        "source",
+    }
 
 
 def test_alpha_vantage_corp_actions_accept_named_top_level_arrays() -> None:
@@ -437,7 +736,12 @@ def test_alpha_vantage_corp_actions_accept_named_top_level_arrays() -> None:
             ),
         ]
     )
-    av = AlphaVantageConnector(base_url="https://www.alphavantage.co", api_key="key", budget_manager=_budget_manager(), session=av_session)
+    av = AlphaVantageConnector(
+        base_url="https://www.alphavantage.co",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=av_session,
+    )
 
     actions = av.fetch("corp_actions", ["AAPL"], "2024-01-01", "2024-03-01")
 
@@ -450,7 +754,9 @@ def test_fmp_and_sec_edgar_connectors() -> None:
     fmp_session = FakeSession(
         [
             FakeResponse(200, [{"symbol": "XYZ", "delistedDate": "2024-01-05"}]),
-            FakeResponse(200, [{"oldSymbol": "FB", "newSymbol": "META", "date": "2022-06-09"}]),
+            FakeResponse(
+                200, [{"oldSymbol": "FB", "newSymbol": "META", "date": "2022-06-09"}]
+            ),
         ]
     )
     sec_session = FakeSession(
@@ -470,7 +776,12 @@ def test_fmp_and_sec_edgar_connectors() -> None:
         ]
     )
 
-    fmp = FMPConnector(base_url="https://financialmodelingprep.com", api_key="key", budget_manager=_budget_manager(), session=fmp_session)
+    fmp = FMPConnector(
+        base_url="https://financialmodelingprep.com",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=fmp_session,
+    )
     sec = SecEdgarConnector(
         base_url="https://data.sec.gov",
         user_agent="TradeML/0.1 test@example.com",
@@ -492,11 +803,22 @@ def test_fmp_and_sec_edgar_connectors() -> None:
 def test_fmp_delistings_follow_documented_page_limit_pagination() -> None:
     fmp_session = FakeSession(
         [
-            FakeResponse(200, [{"symbol": f"SYM{i}", "delistedDate": "2024-01-05"} for i in range(100)]),
+            FakeResponse(
+                200,
+                [
+                    {"symbol": f"SYM{i}", "delistedDate": "2024-01-05"}
+                    for i in range(100)
+                ],
+            ),
             FakeResponse(200, [{"symbol": "TAIL", "delistedDate": "2024-01-06"}]),
         ]
     )
-    fmp = FMPConnector(base_url="https://financialmodelingprep.com", api_key="key", budget_manager=_budget_manager(), session=fmp_session)
+    fmp = FMPConnector(
+        base_url="https://financialmodelingprep.com",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=fmp_session,
+    )
 
     delistings = fmp.fetch("delistings", [], "2024-01-01", "2024-01-31")
 
@@ -549,7 +871,10 @@ def test_sec_edgar_connector_fetches_archived_submission_segments() -> None:
     filings = sec.fetch("filing_index", ["320193"], "2024-01-01", "2024-01-31")
 
     assert filings["form"].tolist() == ["8-K", "10-Q"]
-    assert sec_session.calls[1][1] == "https://data.sec.gov/submissions/CIK0000320193-submissions-001.json"
+    assert (
+        sec_session.calls[1][1]
+        == "https://data.sec.gov/submissions/CIK0000320193-submissions-001.json"
+    )
 
 
 def test_sec_edgar_company_tickers_uses_sec_host_without_forced_data_host() -> None:
@@ -629,7 +954,14 @@ def test_tiingo_connector_normalizes_prices_actions_and_fundamentals() -> None:
             ),
             FakeResponse(
                 200,
-                [{"ticker": "AAPL", "date": "2023-12-31", "statementType": "annual", "revenue": 1000}],
+                [
+                    {
+                        "ticker": "AAPL",
+                        "date": "2023-12-31",
+                        "statementType": "annual",
+                        "revenue": 1000,
+                    }
+                ],
             ),
         ]
     )
@@ -641,8 +973,12 @@ def test_tiingo_connector_normalizes_prices_actions_and_fundamentals() -> None:
     )
 
     bars = connector.fetch("equities_eod", ["AAPL"], "2024-01-02", "2024-01-02")
-    dividends = connector.fetch("corp_actions_dividends", ["AAPL"], "2024-01-01", "2024-01-31")
-    splits = connector.fetch("corp_actions_splits", ["AAPL"], "2024-02-01", "2024-02-01")
+    dividends = connector.fetch(
+        "corp_actions_dividends", ["AAPL"], "2024-01-01", "2024-01-31"
+    )
+    splits = connector.fetch(
+        "corp_actions_splits", ["AAPL"], "2024-02-01", "2024-02-01"
+    )
     fundamentals = connector.fetch("fundamentals", ["AAPL"], "2024-01-01", "2024-01-31")
 
     assert bars.iloc[0]["symbol"] == "AAPL"
@@ -665,45 +1001,97 @@ def test_twelve_data_connector_normalizes_prices_actions_and_statements() -> Non
                 {
                     "AAPL": {
                         "meta": {"symbol": "AAPL", "interval": "1day"},
-                        "values": [{"datetime": "2024-01-02", "open": "10", "high": "11", "low": "9", "close": "10.5", "volume": "100"}],
+                        "values": [
+                            {
+                                "datetime": "2024-01-02",
+                                "open": "10",
+                                "high": "11",
+                                "low": "9",
+                                "close": "10.5",
+                                "volume": "100",
+                            }
+                        ],
                     },
                     "MSFT": {
                         "meta": {"symbol": "MSFT", "interval": "1day"},
-                        "values": [{"datetime": "2024-01-02", "open": "20", "high": "21", "low": "19", "close": "20.5", "volume": "200"}],
+                        "values": [
+                            {
+                                "datetime": "2024-01-02",
+                                "open": "20",
+                                "high": "21",
+                                "low": "19",
+                                "close": "20.5",
+                                "volume": "200",
+                            }
+                        ],
                     },
                 },
             ),
             FakeResponse(
                 200,
-                {"meta": {"symbol": "AAPL"}, "dividends": [{"ex_date": "2024-01-05", "amount": "0.24", "payment_date": "2024-01-15"}]},
-            ),
-            FakeResponse(
-                200,
-                {"meta": {"symbol": "AAPL"}, "splits": [{"date": "2024-02-01", "ratio": "2:1"}]},
-            ),
-            FakeResponse(
-                200,
-                {"earnings": [{"symbol": "AAPL", "date": "2024-01-25", "eps_estimate": "2.10"}]},
-            ),
-            FakeResponse(
-                200,
                 {
                     "meta": {"symbol": "AAPL"},
-                    "income_statement": [{"fiscal_date": "2023-12-31", "period": "annual", "revenue": "1000"}],
+                    "dividends": [
+                        {
+                            "ex_date": "2024-01-05",
+                            "amount": "0.24",
+                            "payment_date": "2024-01-15",
+                        }
+                    ],
                 },
             ),
             FakeResponse(
                 200,
                 {
                     "meta": {"symbol": "AAPL"},
-                    "balance_sheet": [{"fiscal_date": "2023-12-31", "period": "annual", "total_assets": "2000"}],
+                    "splits": [{"date": "2024-02-01", "ratio": "2:1"}],
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "earnings": [
+                        {"symbol": "AAPL", "date": "2024-01-25", "eps_estimate": "2.10"}
+                    ]
                 },
             ),
             FakeResponse(
                 200,
                 {
                     "meta": {"symbol": "AAPL"},
-                    "cash_flow": [{"fiscal_date": "2023-12-31", "period": "annual", "operating_cash_flow": "500"}],
+                    "income_statement": [
+                        {
+                            "fiscal_date": "2023-12-31",
+                            "period": "annual",
+                            "revenue": "1000",
+                        }
+                    ],
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "meta": {"symbol": "AAPL"},
+                    "balance_sheet": [
+                        {
+                            "fiscal_date": "2023-12-31",
+                            "period": "annual",
+                            "total_assets": "2000",
+                        }
+                    ],
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "meta": {"symbol": "AAPL"},
+                    "cash_flow": [
+                        {
+                            "fiscal_date": "2023-12-31",
+                            "period": "annual",
+                            "operating_cash_flow": "500",
+                        }
+                    ],
                 },
             ),
         ]
@@ -719,7 +1107,9 @@ def test_twelve_data_connector_normalizes_prices_actions_and_statements() -> Non
     dividends = connector.fetch("dividends", ["AAPL"], "2024-01-01", "2024-01-31")
     splits = connector.fetch("splits", ["AAPL"], "2024-02-01", "2024-02-01")
     earnings = connector.fetch("earnings_calendar", [], "2024-01-01", "2024-01-31")
-    statements = connector.fetch("financial_statements", ["AAPL"], "2024-01-01", "2024-01-31")
+    statements = connector.fetch(
+        "financial_statements", ["AAPL"], "2024-01-01", "2024-01-31"
+    )
 
     assert sorted(bars["symbol"].tolist()) == ["AAPL", "MSFT"]
     assert bars.loc[bars["symbol"] == "AAPL", "close"].iloc[0] == pytest.approx(10.5)
@@ -728,7 +1118,11 @@ def test_twelve_data_connector_normalizes_prices_actions_and_statements() -> Non
     assert dividends.iloc[0]["amount"] == pytest.approx(0.24)
     assert splits.iloc[0]["ratio"] == pytest.approx(0.5)
     assert earnings.iloc[0]["symbol"] == "AAPL"
-    assert set(statements["statement_type"]) == {"income_statement", "balance_sheet", "cash_flow"}
+    assert set(statements["statement_type"]) == {
+        "income_statement",
+        "balance_sheet",
+        "cash_flow",
+    }
     assert session.calls[0][2]["apikey"] == "key"
     snapshot = budget_manager.snapshot()
     assert snapshot["vendors"]["twelve_data"]["daily_spend"]["FORWARD"] == 2
@@ -743,11 +1137,29 @@ def test_twelve_data_connector_parses_exchange_suffixed_batch_keys() -> None:
                 {
                     "COST:NYSE": {
                         "meta": {"symbol": "COST", "interval": "1day"},
-                        "values": [{"datetime": "2024-01-02", "open": "10", "high": "11", "low": "9", "close": "10.5", "volume": "100"}],
+                        "values": [
+                            {
+                                "datetime": "2024-01-02",
+                                "open": "10",
+                                "high": "11",
+                                "low": "9",
+                                "close": "10.5",
+                                "volume": "100",
+                            }
+                        ],
                     },
                     "DVN:NYSE": {
                         "meta": {"symbol": "DVN", "interval": "1day"},
-                        "values": [{"datetime": "2024-01-02", "open": "20", "high": "21", "low": "19", "close": "20.5", "volume": "200"}],
+                        "values": [
+                            {
+                                "datetime": "2024-01-02",
+                                "open": "20",
+                                "high": "21",
+                                "low": "19",
+                                "close": "20.5",
+                                "volume": "200",
+                            }
+                        ],
                     },
                 },
             )
@@ -769,7 +1181,23 @@ def test_retry_and_permanent_error_behavior() -> None:
     retry_session = FakeSession(
         [
             FakeResponse(429, {"error": "too many requests"}),
-            FakeResponse(200, {"results": [{"t": 1704153600000, "o": 10, "h": 11, "l": 9, "c": 10.5, "vw": 10.2, "v": 20, "n": 4}]}),
+            FakeResponse(
+                200,
+                {
+                    "results": [
+                        {
+                            "t": 1704153600000,
+                            "o": 10,
+                            "h": 11,
+                            "l": 9,
+                            "c": 10.5,
+                            "vw": 10.2,
+                            "v": 20,
+                            "n": 4,
+                        }
+                    ]
+                },
+            ),
         ]
     )
     connector = MassiveConnector(
@@ -777,15 +1205,24 @@ def test_retry_and_permanent_error_behavior() -> None:
         api_key="key",
         budget_manager=_budget_manager(),
         session=retry_session,
-        retry_config=RetryConfig(max_attempts=2, base_delay_seconds=0.0, max_delay_seconds=0.0),
+        retry_config=RetryConfig(
+            max_attempts=2, base_delay_seconds=0.0, max_delay_seconds=0.0
+        ),
         sleep_fn=lambda _: None,
     )
 
     frame = connector.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-02")
     assert not frame.empty
 
-    permanent_session = FakeSession([FakeResponse(403, {"error": "denied"}, text="NOT_ENTITLED")])
-    permanent = MassiveConnector(base_url="https://api.polygon.io", api_key="key", budget_manager=_budget_manager(), session=permanent_session)
+    permanent_session = FakeSession(
+        [FakeResponse(403, {"error": "denied"}, text="NOT_ENTITLED")]
+    )
+    permanent = MassiveConnector(
+        base_url="https://api.polygon.io",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=permanent_session,
+    )
 
     with pytest.raises(PermanentConnectorError):
         permanent.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-02")
@@ -795,12 +1232,27 @@ def test_http_connector_uses_documented_reset_header_for_retry_delay() -> None:
     sleep_calls: list[float] = []
     session = FakeSession(
         [
-            FakeResponse(429, {"error": "too many requests"}, headers={"X-RateLimit-Reset": "103"}),
+            FakeResponse(
+                429,
+                {"error": "too many requests"},
+                headers={"X-RateLimit-Reset": "103"},
+            ),
             FakeResponse(
                 200,
                 {
                     "bars": {
-                        "AAPL": [{"t": "2026-01-02T00:00:00Z", "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "vw": 1.4, "v": 10, "n": 2}]
+                        "AAPL": [
+                            {
+                                "t": "2026-01-02T00:00:00Z",
+                                "o": 1.0,
+                                "h": 2.0,
+                                "l": 0.5,
+                                "c": 1.5,
+                                "vw": 1.4,
+                                "v": 10,
+                                "n": 2,
+                            }
+                        ]
                     },
                     "next_page_token": None,
                 },
@@ -815,7 +1267,9 @@ def test_http_connector_uses_documented_reset_header_for_retry_delay() -> None:
         api_key="key",
         budget_manager=_budget_manager(),
         session=session,
-        retry_config=RetryConfig(max_attempts=2, base_delay_seconds=0.0, max_delay_seconds=0.0),
+        retry_config=RetryConfig(
+            max_attempts=2, base_delay_seconds=0.0, max_delay_seconds=0.0
+        ),
         sleep_fn=lambda seconds: sleep_calls.append(seconds),
     )
     try:
@@ -835,7 +1289,9 @@ def test_http_connector_wraps_request_exception_as_temporary_error() -> None:
         api_key="key",
         budget_manager=_budget_manager(),
         session=ErrorSession(requests.ReadTimeout("timed out")),
-        retry_config=RetryConfig(max_attempts=1, base_delay_seconds=0.0, max_delay_seconds=0.0),
+        retry_config=RetryConfig(
+            max_attempts=1, base_delay_seconds=0.0, max_delay_seconds=0.0
+        ),
         sleep_fn=lambda _: None,
     )
 
@@ -849,9 +1305,13 @@ def test_http_connector_normalizes_exhausted_429_as_budget_error() -> None:
         api_key="key",
         budget_manager=_budget_manager(),
         session=FakeSession([FakeResponse(429, {"error": "too many requests"})]),
-        retry_config=RetryConfig(max_attempts=1, base_delay_seconds=0.0, max_delay_seconds=0.0),
+        retry_config=RetryConfig(
+            max_attempts=1, base_delay_seconds=0.0, max_delay_seconds=0.0
+        ),
         sleep_fn=lambda _: None,
     )
 
-    with pytest.raises(TemporaryConnectorError, match="budget exhausted for vendor=massive"):
+    with pytest.raises(
+        TemporaryConnectorError, match="budget exhausted for vendor=massive"
+    ):
         connector.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-02")

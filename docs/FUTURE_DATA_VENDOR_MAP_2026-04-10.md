@@ -29,6 +29,13 @@ Rules for this archive lane:
     - `next_api_query` pagination
   - Best use:
     - overflow or targeted supplemental archive after Alpaca lane is proven
+- Low-rate independent QC/fill: `massive`
+  - Docs-backed strengths:
+    - minute aggregates
+    - cursor pagination
+    - independent vendor lineage
+  - Best use:
+    - sparse validation samples and gap fill when the 5 calls/minute budget would otherwise idle
 - Future/optional: `tiingo` IEX intraday
   - Best use:
     - targeted validation or alternate sample source
@@ -121,9 +128,17 @@ Promotion order:
 
 - active archive lanes added:
   - `alpaca.equities_minute.research`
+  - `twelve_data.equities_minute.research`
+  - `massive.equities_minute.research`
   - `tiingo.news.research`
   - `finnhub.company_news.research`
-- planner windows intentionally short:
-  - minute bars: last 5 days
-  - news: last 7 days
+- audit-gated archive lanes:
+  - `tiingo.equities_minute.research`
+- planner windows are historical rolling backlogs:
+  - minute bars: 5-day chunks across the configured research history
+  - news: 7-day chunks across the configured research history
+- runtime behavior:
+  - auxiliary minute/news/reference lanes run even while unrelated canonical vendors still have backlog
+  - vendor-specific pressure holds back only lanes that would compete with that vendor's canonical work
+  - storage watermarks pause low-priority raw archive fillers without blocking canonical EOD or repair work
 - these lanes are `research_only`, not critical-path Phase 1 lanes

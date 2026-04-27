@@ -59,13 +59,13 @@ class ProviderContract:
 _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
     "alpaca": ProviderContract(
         vendor="alpaca",
-        rpm=190,
-        daily_cap=273600,
+        rpm=200,
+        daily_cap=288000,
         docs_urls=(
             "https://docs.alpaca.markets/reference/stockbars",
             "https://docs.alpaca.markets/reference/getassets-1",
         ),
-        notes="Use multi-symbol stock bars with pagination; prioritize Alpaca on canonical frozen windows.",
+        notes="Use multi-symbol stock bars with pagination; free/basic historical data is IEX-backed at 200 calls/min with no documented daily cap.",
         datasets=(
             DatasetContract(
                 dataset="equities_eod",
@@ -76,7 +76,11 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 max_history_years=10,
                 retry_after_header="X-RateLimit-Reset",
                 critical_path_allowed=True,
-                entitlement_failure_markers=("NOT_ENTITLED", "subscription", "not permitted"),
+                entitlement_failure_markers=(
+                    "NOT_ENTITLED",
+                    "subscription",
+                    "not permitted",
+                ),
                 docs_urls=("https://docs.alpaca.markets/reference/stockbars",),
                 notes="REST bars support multi-symbol requests, limit up to 10000, next_page_token pagination, and X-RateLimit-* headers.",
             ),
@@ -102,7 +106,9 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 dataset="corp_actions",
                 endpoint_key="corp_actions",
                 max_batch_symbols=1,
-                docs_urls=("https://docs.alpaca.markets/reference/corporateactionsannouncements-1",),
+                docs_urls=(
+                    "https://docs.alpaca.markets/reference/corporateactionsannouncements-1",
+                ),
             ),
         ),
     ),
@@ -131,14 +137,18 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 endpoint_key="corp_actions_dividends",
                 max_batch_symbols=500,
                 pagination_mode="none",
-                docs_urls=("https://www.tiingo.com/documentation/corporate-actions/dividends",),
+                docs_urls=(
+                    "https://www.tiingo.com/documentation/corporate-actions/dividends",
+                ),
             ),
             DatasetContract(
                 dataset="corp_actions_splits",
                 endpoint_key="corp_actions_splits",
                 max_batch_symbols=500,
                 pagination_mode="none",
-                docs_urls=("https://www.tiingo.com/documentation/corporate-actions/splits",),
+                docs_urls=(
+                    "https://www.tiingo.com/documentation/corporate-actions/splits",
+                ),
             ),
             DatasetContract(
                 dataset="supported_tickers",
@@ -158,14 +168,14 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
     ),
     "twelve_data": ProviderContract(
         vendor="twelve_data",
-        rpm=7,
-        daily_cap=760,
+        rpm=8,
+        daily_cap=800,
         docs_urls=(
             "https://support.twelvedata.com/en/articles/5203360-batch-api-requests",
             "https://support.twelvedata.com/en/articles/5609168-introduction-to-twelve-data",
             "https://support.twelvedata.com/en/articles/9935903-us-equities-market-data",
         ),
-        notes="Free/basic plans are credit-sensitive; batch requests are weighted by symbol count in our runtime.",
+        notes="Basic/free entitlement is 8 API credits/min and 800/day; batch requests are weighted by symbol count in our runtime.",
         datasets=(
             DatasetContract(
                 dataset="equities_eod",
@@ -175,7 +185,13 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 pagination_mode="none",
                 max_history_years=10,
                 critical_path_allowed=False,
-                entitlement_failure_markers=("code", "message", "not available", "not found", "plan"),
+                entitlement_failure_markers=(
+                    "code",
+                    "message",
+                    "not available",
+                    "not found",
+                    "plan",
+                ),
                 docs_urls=(
                     "https://support.twelvedata.com/en/articles/5203360-batch-api-requests",
                     "https://support.twelvedata.com/en/articles/9935903-us-equities-market-data",
@@ -213,13 +229,13 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
     ),
     "massive": ProviderContract(
         vendor="massive",
-        rpm=4,
-        daily_cap=6840,
+        rpm=5,
+        daily_cap=7200,
         docs_urls=(
             "https://polygon.io/docs/rest/stocks/aggregates/custom-bars",
             "https://polygon.io/docs/rest/stocks/tickers/all-tickers",
         ),
-        notes="Aggregates are ticker-scoped; basic plans should stay off the critical frozen-window path.",
+        notes="Basic/free entitlement is 5 calls/min; aggregates are ticker-scoped and should stay off the critical frozen-window path.",
         datasets=(
             DatasetContract(
                 dataset="equities_eod",
@@ -229,21 +245,51 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 pagination_limit=50000,
                 max_history_years=10,
                 critical_path_allowed=False,
-                entitlement_failure_markers=("not authorized", "upgrade", "subscription", "plan"),
-                docs_urls=("https://polygon.io/docs/rest/stocks/aggregates/custom-bars",),
+                entitlement_failure_markers=(
+                    "not authorized",
+                    "upgrade",
+                    "subscription",
+                    "plan",
+                ),
+                docs_urls=(
+                    "https://polygon.io/docs/rest/stocks/aggregates/custom-bars",
+                ),
                 notes="Custom bars use limit with next_url cursor pagination; max limit 50000 and default 5000.",
+            ),
+            DatasetContract(
+                dataset="equities_minute",
+                endpoint_key="equities_minute",
+                max_batch_symbols=1,
+                pagination_mode="next_url",
+                pagination_limit=50000,
+                max_history_years=2,
+                critical_path_allowed=False,
+                entitlement_failure_markers=(
+                    "not authorized",
+                    "upgrade",
+                    "subscription",
+                    "plan",
+                ),
+                docs_urls=(
+                    "https://polygon.io/docs/rest/stocks/aggregates/custom-bars",
+                ),
+                notes="Minute aggregates are a low-rate independent QC/fill lane under the 5 calls/min basic limit.",
             ),
             DatasetContract(
                 dataset="reference_splits",
                 endpoint_key="reference_splits",
                 max_batch_symbols=1,
-                docs_urls=("https://polygon.io/docs/rest/stocks/corporate-actions/splits",),
+                docs_urls=(
+                    "https://polygon.io/docs/rest/stocks/corporate-actions/splits",
+                ),
             ),
             DatasetContract(
                 dataset="reference_dividends",
                 endpoint_key="reference_dividends",
                 max_batch_symbols=1,
-                docs_urls=("https://polygon.io/docs/rest/stocks/corporate-actions/dividends",),
+                docs_urls=(
+                    "https://polygon.io/docs/rest/stocks/corporate-actions/dividends",
+                ),
             ),
             DatasetContract(
                 dataset="reference_tickers",
@@ -271,7 +317,9 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 endpoint_key="macros_treasury",
                 max_batch_symbols=1,
                 pagination_mode="none",
-                docs_urls=("https://fred.stlouisfed.org/docs/api/fred/series_observations.html",),
+                docs_urls=(
+                    "https://fred.stlouisfed.org/docs/api/fred/series_observations.html",
+                ),
                 notes="Observations support explicit limit and offset; use limit 100000 and ascending sort for deterministic pulls.",
             ),
             DatasetContract(
@@ -279,44 +327,54 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 endpoint_key="vintagedates",
                 max_batch_symbols=1,
                 pagination_mode="none",
-                docs_urls=("https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html",),
+                docs_urls=(
+                    "https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html",
+                ),
                 notes="Vintage dates are series-scoped and support explicit limits; use large single pulls for current macro lanes.",
             ),
         ),
     ),
     "sec_edgar": ProviderContract(
         vendor="sec_edgar",
-        rpm=570,
-        daily_cap=820800,
-        docs_urls=("https://www.sec.gov/search-filings/edgar-application-programming-interfaces",),
-        notes="Respect SEC fair-access guidance, always send a valid user-agent, and fetch archived submission segments when present.",
+        rpm=600,
+        daily_cap=864000,
+        docs_urls=(
+            "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+        ),
+        notes="Respect SEC fair-access guidance at max 10 requests/sec, always send a valid user-agent, and fetch archived submission segments when present.",
         datasets=(
             DatasetContract(
                 dataset="filing_index",
                 endpoint_key="filing_index",
                 max_batch_symbols=1,
-                docs_urls=("https://www.sec.gov/search-filings/edgar-application-programming-interfaces",),
+                docs_urls=(
+                    "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+                ),
             ),
             DatasetContract(
                 dataset="companyfacts",
                 endpoint_key="companyfacts",
                 max_batch_symbols=1,
-                docs_urls=("https://www.sec.gov/search-filings/edgar-application-programming-interfaces",),
+                docs_urls=(
+                    "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+                ),
             ),
             DatasetContract(
                 dataset="submissions",
                 endpoint_key="submissions",
                 max_batch_symbols=1,
-                docs_urls=("https://www.sec.gov/search-filings/edgar-application-programming-interfaces",),
+                docs_urls=(
+                    "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+                ),
             ),
         ),
     ),
     "fmp": ProviderContract(
         vendor="fmp",
         rpm=1,
-        daily_cap=237,
+        daily_cap=250,
         docs_urls=("https://site.financialmodelingprep.com/developer/docs",),
-        notes="Treat FMP as low-throughput reference-only in this runtime.",
+        notes="Treat FMP basic/free as 250 calls/day and reference-only in this runtime.",
         datasets=(
             DatasetContract(
                 dataset="delistings",
@@ -324,10 +382,19 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 max_batch_symbols=1,
                 pagination_mode="page",
                 pagination_limit=100,
-                docs_urls=("https://site.financialmodelingprep.com/developer/docs/stable-delisted-companies-api",),
+                docs_urls=(
+                    "https://site.financialmodelingprep.com/developer/docs/stable-delisted-companies-api",
+                ),
                 notes="Stable delisted-companies uses page/limit pagination with documented limit 100.",
             ),
-            DatasetContract(dataset="symbol_changes", endpoint_key="symbol_changes", max_batch_symbols=1, docs_urls=("https://site.financialmodelingprep.com/developer/docs/stable-symbol-change-api",)),
+            DatasetContract(
+                dataset="symbol_changes",
+                endpoint_key="symbol_changes",
+                max_batch_symbols=1,
+                docs_urls=(
+                    "https://site.financialmodelingprep.com/developer/docs/stable-symbol-change-api",
+                ),
+            ),
         ),
     ),
     "finnhub": ProviderContract(
@@ -337,7 +404,13 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
         docs_urls=("https://finnhub.io/docs/api",),
         notes="Use as supplemental reference/research lane, not canonical bar closer; candle endpoint documents s=no_data as a valid empty response.",
         datasets=(
-            DatasetContract(dataset="equities_eod", endpoint_key="equities_eod", max_batch_symbols=1, critical_path_allowed=False, docs_urls=("https://finnhub.io/docs/api/stock-candles",)),
+            DatasetContract(
+                dataset="equities_eod",
+                endpoint_key="equities_eod",
+                max_batch_symbols=1,
+                critical_path_allowed=False,
+                docs_urls=("https://finnhub.io/docs/api/stock-candles",),
+            ),
             DatasetContract(
                 dataset="company_news",
                 endpoint_key="company_news",
@@ -345,16 +418,26 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 docs_urls=("https://finnhub.io/docs/api/company-news",),
                 notes="Company news is symbol-scoped and date-bounded, making it a useful supplemental historical news archive lane.",
             ),
-            DatasetContract(dataset="earnings_calendar", endpoint_key="earnings_calendar", max_batch_symbols=1, docs_urls=("https://finnhub.io/docs/api/company-earnings-calendar",)),
-            DatasetContract(dataset="profile", endpoint_key="profile", max_batch_symbols=1, docs_urls=("https://finnhub.io/docs/api/company-profile2",)),
+            DatasetContract(
+                dataset="earnings_calendar",
+                endpoint_key="earnings_calendar",
+                max_batch_symbols=1,
+                docs_urls=("https://finnhub.io/docs/api/company-earnings-calendar",),
+            ),
+            DatasetContract(
+                dataset="profile",
+                endpoint_key="profile",
+                max_batch_symbols=1,
+                docs_urls=("https://finnhub.io/docs/api/company-profile2",),
+            ),
         ),
     ),
     "alpha_vantage": ProviderContract(
         vendor="alpha_vantage",
         rpm=1,
-        daily_cap=23,
+        daily_cap=25,
         docs_urls=("https://www.alphavantage.co/documentation/",),
-        notes="Free tier remains very low-throughput; reference-only in this runtime.",
+        notes="Free tier remains very low-throughput at 25 requests/day; reference-only in this runtime.",
         datasets=(
             DatasetContract(
                 dataset="listings",

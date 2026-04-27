@@ -22,10 +22,18 @@ class AlpacaConnector(HTTPConnector):
 
     vendor_name = "alpaca"
 
-    def __init__(self, *, secret_key: str | None = None, trading_base_url: str | None = None, **kwargs: object) -> None:
+    def __init__(
+        self,
+        *,
+        secret_key: str | None = None,
+        trading_base_url: str | None = None,
+        **kwargs: object,
+    ) -> None:
         super().__init__(**kwargs)
         self.secret_key = secret_key
-        self.trading_base_url = (trading_base_url or kwargs.get("base_url") or "").rstrip("/")
+        self.trading_base_url = (
+            trading_base_url or kwargs.get("base_url") or ""
+        ).rstrip("/")
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -59,7 +67,16 @@ class AlpacaConnector(HTTPConnector):
             )
             frame = pd.DataFrame(payload)
             if frame.empty:
-                return pd.DataFrame(columns=["symbol", "name", "exchange", "status", "tradable", "asset_class"])
+                return pd.DataFrame(
+                    columns=[
+                        "symbol",
+                        "name",
+                        "exchange",
+                        "status",
+                        "tradable",
+                        "asset_class",
+                    ]
+                )
             normalized = pd.DataFrame(
                 {
                     "symbol": frame.get("symbol", pd.Series(dtype="string")),
@@ -67,7 +84,9 @@ class AlpacaConnector(HTTPConnector):
                     "exchange": frame.get("exchange", pd.Series(dtype="string")),
                     "status": frame.get("status", pd.Series(dtype="string")),
                     "tradable": frame.get("tradable", pd.Series(dtype="bool")),
-                    "asset_class": frame.get("class", frame.get("asset_class", pd.Series(dtype="string"))),
+                    "asset_class": frame.get(
+                        "class", frame.get("asset_class", pd.Series(dtype="string"))
+                    ),
                 }
             )
             return normalized.sort_values("symbol").reset_index(drop=True)
@@ -83,24 +102,82 @@ class AlpacaConnector(HTTPConnector):
                     task_kind="OTHER",
                     logical_units=1,
                 )
-                rows = payload.get("announcements", payload.get("results", payload if isinstance(payload, list) else [])) if isinstance(payload, dict) else payload
+                rows = (
+                    payload.get(
+                        "announcements",
+                        payload.get(
+                            "results", payload if isinstance(payload, list) else []
+                        ),
+                    )
+                    if isinstance(payload, dict)
+                    else payload
+                )
                 frame = pd.DataFrame(rows)
                 if frame.empty:
                     continue
                 frame["symbol"] = symbol
-                frame["event_type"] = frame.get("ca_type", frame.get("event_type", pd.Series(dtype="string"))).astype("string").str.lower()
-                frame["ex_date"] = pd.to_datetime(frame.get("ex_date", frame.get("execution_date", frame.get("date"))), errors="coerce").dt.date
-                frame["record_date"] = pd.to_datetime(frame.get("record_date"), errors="coerce").dt.date
-                frame["pay_date"] = pd.to_datetime(frame.get("payable_date", frame.get("pay_date")), errors="coerce").dt.date
+                frame["event_type"] = (
+                    frame.get(
+                        "ca_type", frame.get("event_type", pd.Series(dtype="string"))
+                    )
+                    .astype("string")
+                    .str.lower()
+                )
+                frame["ex_date"] = pd.to_datetime(
+                    frame.get(
+                        "ex_date", frame.get("execution_date", frame.get("date"))
+                    ),
+                    errors="coerce",
+                ).dt.date
+                frame["record_date"] = pd.to_datetime(
+                    frame.get("record_date"), errors="coerce"
+                ).dt.date
+                frame["pay_date"] = pd.to_datetime(
+                    frame.get("payable_date", frame.get("pay_date")), errors="coerce"
+                ).dt.date
                 frame["ratio"] = pd.to_numeric(frame.get("ratio"), errors="coerce")
-                frame["amount"] = pd.to_numeric(frame.get("cash", frame.get("amount")), errors="coerce")
+                frame["amount"] = pd.to_numeric(
+                    frame.get("cash", frame.get("amount")), errors="coerce"
+                )
                 frame["source"] = self.vendor_name
                 frame["source_count"] = 1
                 frame["ingested_at"] = pd.Timestamp.now(tz=UTC)
-                frames.append(frame[["symbol", "event_type", "ex_date", "record_date", "pay_date", "ratio", "amount", "source", "source_count", "ingested_at"]])
+                frames.append(
+                    frame[
+                        [
+                            "symbol",
+                            "event_type",
+                            "ex_date",
+                            "record_date",
+                            "pay_date",
+                            "ratio",
+                            "amount",
+                            "source",
+                            "source_count",
+                            "ingested_at",
+                        ]
+                    ]
+                )
             if not frames:
-                return pd.DataFrame(columns=["symbol", "event_type", "ex_date", "record_date", "pay_date", "ratio", "amount", "source", "source_count", "ingested_at"])
-            return pd.concat(frames, ignore_index=True).dropna(subset=["symbol", "ex_date"]).reset_index(drop=True)
+                return pd.DataFrame(
+                    columns=[
+                        "symbol",
+                        "event_type",
+                        "ex_date",
+                        "record_date",
+                        "pay_date",
+                        "ratio",
+                        "amount",
+                        "source",
+                        "source_count",
+                        "ingested_at",
+                    ]
+                )
+            return (
+                pd.concat(frames, ignore_index=True)
+                .dropna(subset=["symbol", "ex_date"])
+                .reset_index(drop=True)
+            )
         if dataset != "equities_eod":
             raise ValueError(f"unsupported dataset for alpaca: {dataset}")
 
@@ -139,6 +216,7 @@ class AlpacaConnector(HTTPConnector):
                         "timeframe": timeframe,
                         "start": start,
                         "end": end,
+                        "limit": 10000,
                         "adjustment": "raw",
                         "feed": "iex",
                         "sort": "asc",
@@ -158,7 +236,9 @@ class AlpacaConnector(HTTPConnector):
                 if not page_token:
                     break
         if not frames:
-            self.budget_manager.record_empty_success(self.vendor_name, endpoint=endpoint_key)
+            self.budget_manager.record_empty_success(
+                self.vendor_name, endpoint=endpoint_key
+            )
             return pd.DataFrame(columns=self._columns())
         bars_frame = pd.concat(frames, ignore_index=True)
         bars_frame["date"] = pd.to_datetime(bars_frame["t"]).dt.date
@@ -167,9 +247,21 @@ class AlpacaConnector(HTTPConnector):
         bars_frame["source_uri"] = "/v2/stocks/bars"
         bars_frame["vendor_ts"] = pd.to_datetime(bars_frame["t"], utc=True)
         renamed = bars_frame.rename(
-            columns={"o": "open", "h": "high", "l": "low", "c": "close", "vw": "vwap", "v": "volume", "n": "trade_count"}
+            columns={
+                "o": "open",
+                "h": "high",
+                "l": "low",
+                "c": "close",
+                "vw": "vwap",
+                "v": "volume",
+                "n": "trade_count",
+            }
         )
-        return renamed[self._columns()].sort_values(["vendor_ts", "symbol"]).reset_index(drop=True)
+        return (
+            renamed[self._columns()]
+            .sort_values(["vendor_ts", "symbol"])
+            .reset_index(drop=True)
+        )
 
     @staticmethod
     def _columns() -> list[str]:

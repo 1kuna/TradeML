@@ -14,7 +14,15 @@ DOC_STATUSES = {"doc_verified", "doc_unverified"}
 LIVE_STATUSES = {"live_verified", "live_failed", "entitlement_blocked"}
 ENABLE_STATUSES = {"core", "supplemental", "research_only", "disabled"}
 QC_ROLES = {"disabled", "primary", "independent", "supplemental"}
-SATURATION_POLICIES = {"canonical_first", "canonical_only", "reference_only", "events_only", "macro_only", "balanced", "research_only"}
+SATURATION_POLICIES = {
+    "canonical_first",
+    "canonical_only",
+    "reference_only",
+    "events_only",
+    "macro_only",
+    "balanced",
+    "research_only",
+}
 
 
 @dataclass(slots=True, frozen=True)
@@ -83,7 +91,9 @@ def capability_registry() -> list[VendorCapability]:
 
 def capability_map() -> dict[str, VendorCapability]:
     """Return the registry indexed by capability identifier."""
-    return {capability.capability_id: capability for capability in capability_registry()}
+    return {
+        capability.capability_id: capability for capability in capability_registry()
+    }
 
 
 def effective_capabilities(
@@ -104,7 +114,11 @@ def effective_capabilities(
         if status == "research_only":
             if not include_research:
                 continue
-            record = (audit_state or {}).get("capabilities", {}).get(capability.capability_id, {})
+            record = (
+                (audit_state or {})
+                .get("capabilities", {})
+                .get(capability.capability_id, {})
+            )
             live_status = str(record.get("live_status", capability.live_status))
             if live_status != "live_verified":
                 continue
@@ -112,13 +126,21 @@ def effective_capabilities(
     return effective
 
 
-def effective_enable_status(capability: VendorCapability, *, audit_state: dict[str, Any] | None = None) -> str:
+def effective_enable_status(
+    capability: VendorCapability, *, audit_state: dict[str, Any] | None = None
+) -> str:
     """Return the enabled state after applying any persisted audit result."""
-    record = (audit_state or {}).get("capabilities", {}).get(capability.capability_id, {})
+    record = (
+        (audit_state or {}).get("capabilities", {}).get(capability.capability_id, {})
+    )
     doc_status = str(record.get("doc_status", capability.doc_status))
     live_status = str(record.get("live_status", capability.live_status))
     enable_status = str(record.get("enable_status", capability.enable_status))
-    if doc_status not in DOC_STATUSES or live_status not in LIVE_STATUSES or enable_status not in ENABLE_STATUSES:
+    if (
+        doc_status not in DOC_STATUSES
+        or live_status not in LIVE_STATUSES
+        or enable_status not in ENABLE_STATUSES
+    ):
         return "disabled"
     if doc_status != "doc_verified":
         return "disabled"
@@ -136,7 +158,9 @@ def backfill_capabilities(
     """Return enabled backfill lanes for a dataset ordered by priority."""
     return [
         capability
-        for capability in effective_capabilities(connectors=connectors, audit_state=audit_state)
+        for capability in effective_capabilities(
+            connectors=connectors, audit_state=audit_state
+        )
         if capability.task_kind == "BACKFILL" and capability.dataset == dataset
     ]
 
@@ -150,7 +174,9 @@ def forward_capabilities(
     """Return enabled forward lanes for a dataset ordered by priority."""
     return [
         capability
-        for capability in effective_capabilities(connectors=connectors, audit_state=audit_state)
+        for capability in effective_capabilities(
+            connectors=connectors, audit_state=audit_state
+        )
         if capability.task_kind == "FORWARD" and capability.dataset == dataset
     ]
 
@@ -220,13 +246,21 @@ def canonical_qc_capabilities(
     """Return the enabled vendor lanes suitable for cross-vendor bar QC."""
     candidates = [
         capability
-        for capability in effective_capabilities(connectors=connectors, audit_state=audit_state)
-        if capability.dataset == "equities_eod" and capability.task_kind in {"FORWARD", "BACKFILL"} and capability.qc_role != "disabled"
+        for capability in effective_capabilities(
+            connectors=connectors, audit_state=audit_state
+        )
+        if capability.dataset == "equities_eod"
+        and capability.task_kind in {"FORWARD", "BACKFILL"}
+        and capability.qc_role != "disabled"
     ]
     role_order = {"independent": 0, "supplemental": 1, "primary": 2}
     ordered = sorted(
         candidates,
-        key=lambda capability: (role_order.get(capability.qc_role, 99), capability.priority, capability.vendor),
+        key=lambda capability: (
+            role_order.get(capability.qc_role, 99),
+            capability.priority,
+            capability.vendor,
+        ),
     )
     deduped: list[VendorCapability] = []
     seen_vendors: set[str] = set()
@@ -259,28 +293,37 @@ def provider_role_matrix(
             capability
             for capability in capability_registry()
             if capability.vendor == vendor
-            and (include_disabled or effective_enable_status(capability, audit_state=audit_state) != "disabled")
+            and (
+                include_disabled
+                or effective_enable_status(capability, audit_state=audit_state)
+                != "disabled"
+            )
         ]
         enabled_lanes = [
             capability.capability_id
             for capability in enabled_capabilities
-            if effective_enable_status(capability, audit_state=audit_state) != "disabled"
+            if effective_enable_status(capability, audit_state=audit_state)
+            != "disabled"
         ]
         enabled_datasets = sorted(
             {
                 capability.dataset
                 for capability in enabled_capabilities
-                if effective_enable_status(capability, audit_state=audit_state) != "disabled"
+                if effective_enable_status(capability, audit_state=audit_state)
+                != "disabled"
             }
         )
         enabled_task_kinds = sorted(
             {
                 capability.task_kind
                 for capability in enabled_capabilities
-                if effective_enable_status(capability, audit_state=audit_state) != "disabled"
+                if effective_enable_status(capability, audit_state=audit_state)
+                != "disabled"
             }
         )
-        doc_urls = sorted({url for capability in enabled_capabilities for url in capability.doc_urls})
+        doc_urls = sorted(
+            {url for capability in enabled_capabilities for url in capability.doc_urls}
+        )
         row = profile.to_dict()
         row.update(
             {
@@ -349,7 +392,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         lane_width=1,
         planner_group="canonical_bars_backlog",
         qc_role="supplemental",
-        doc_urls=("https://www.tiingo.com/kb/article/where-to-find-your-tiingo-api-token/",),
+        doc_urls=(
+            "https://www.tiingo.com/kb/article/where-to-find-your-tiingo-api-token/",
+        ),
     ),
     VendorCapability(
         capability_id="twelve_data.equities_eod.forward",
@@ -436,7 +481,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         lane_width=1,
         planner_group="canonical_bars_backlog",
         qc_role="supplemental",
-        doc_urls=("https://www.tiingo.com/kb/article/where-to-find-your-tiingo-api-token/",),
+        doc_urls=(
+            "https://www.tiingo.com/kb/article/where-to-find-your-tiingo-api-token/",
+        ),
     ),
     VendorCapability(
         capability_id="alpaca.equities_eod.backfill",
@@ -540,7 +587,16 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         doc_status="doc_verified",
         live_status="live_verified",
         expected_history_years=1,
-        required_fields=("date", "symbol", "open", "high", "low", "close", "volume", "vendor_ts"),
+        required_fields=(
+            "date",
+            "symbol",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "vendor_ts",
+        ),
         priority=205,
         lane_width=1,
         output_name="equities_minute",
@@ -548,6 +604,102 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         preferred_batch_size=100,
         max_symbols_per_run=100,
         doc_urls=("https://docs.alpaca.markets/reference/stockbars",),
+    ),
+    VendorCapability(
+        capability_id="twelve_data.equities_minute.research",
+        vendor="twelve_data",
+        dataset="equities_minute",
+        endpoint="/time_series",
+        auth_mode="apikey_query",
+        batching_mode="single_symbol",
+        pagination_mode="next_api_query",
+        task_kind="RESEARCH_ONLY",
+        tier="B",
+        enable_status="research_only",
+        doc_status="doc_verified",
+        live_status="live_verified",
+        expected_history_years=1,
+        required_fields=(
+            "date",
+            "symbol",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "vendor_ts",
+        ),
+        priority=207,
+        lane_width=1,
+        output_name="equities_minute",
+        planner_group="supplemental_research_backlog",
+        preferred_batch_size=1,
+        max_symbols_per_run=1,
+        doc_urls=("https://twelvedata.com/docs",),
+    ),
+    VendorCapability(
+        capability_id="massive.equities_minute.research",
+        vendor="massive",
+        dataset="equities_minute",
+        endpoint="/v2/aggs/ticker/{symbol}/range/1/minute/{from}/{to}",
+        auth_mode="apikey_query",
+        batching_mode="single_symbol",
+        pagination_mode="next_url",
+        task_kind="RESEARCH_ONLY",
+        tier="B",
+        enable_status="research_only",
+        doc_status="doc_verified",
+        live_status="live_verified",
+        expected_history_years=2,
+        required_fields=(
+            "date",
+            "symbol",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "vendor_ts",
+        ),
+        priority=209,
+        lane_width=1,
+        output_name="equities_minute",
+        planner_group="supplemental_research_backlog",
+        preferred_batch_size=1,
+        max_symbols_per_run=1,
+        doc_urls=("https://massive.com/docs/rest/stocks/aggregates/custom-bars",),
+    ),
+    VendorCapability(
+        capability_id="tiingo.equities_minute.research",
+        vendor="tiingo",
+        dataset="equities_minute",
+        endpoint="/iex/{ticker}/prices",
+        auth_mode="token_header",
+        batching_mode="single_symbol",
+        pagination_mode="none",
+        task_kind="RESEARCH_ONLY",
+        tier="C",
+        enable_status="disabled",
+        doc_status="doc_verified",
+        live_status="entitlement_blocked",
+        expected_history_years=1,
+        required_fields=(
+            "date",
+            "symbol",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "vendor_ts",
+        ),
+        priority=211,
+        lane_width=1,
+        output_name="equities_minute",
+        planner_group="supplemental_research_backlog",
+        preferred_batch_size=1,
+        max_symbols_per_run=1,
+        doc_urls=("https://www.tiingo.com/documentation/iex",),
     ),
     VendorCapability(
         capability_id="alpaca.assets.reference",
@@ -635,7 +787,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         output_name="universe",
         planner_group="reference_events_backlog",
         explode_symbols=False,
-        doc_urls=("https://massive.com/docs/rest/stocks/reference/tickers/all-tickers",),
+        doc_urls=(
+            "https://massive.com/docs/rest/stocks/reference/tickers/all-tickers",
+        ),
     ),
     VendorCapability(
         capability_id="twelve_data.stocks.reference",
@@ -657,7 +811,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         output_name="twelve_data_stocks",
         planner_group="reference_events_backlog",
         explode_symbols=False,
-        doc_urls=("https://support.twelvedata.com/en/articles/5620513-how-to-find-all-available-symbols-at-twelve-data",),
+        doc_urls=(
+            "https://support.twelvedata.com/en/articles/5620513-how-to-find-all-available-symbols-at-twelve-data",
+        ),
     ),
     VendorCapability(
         capability_id="fmp.delistings.reference",
@@ -679,7 +835,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         output_name="delistings",
         planner_group="reference_events_backlog",
         explode_symbols=False,
-        doc_urls=("https://site.financialmodelingprep.com/developer/docs/stable/delisted-companies",),
+        doc_urls=(
+            "https://site.financialmodelingprep.com/developer/docs/stable/delisted-companies",
+        ),
     ),
     VendorCapability(
         capability_id="fmp.symbol_changes.reference",
@@ -701,7 +859,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         output_name="symbol_changes",
         planner_group="reference_events_backlog",
         explode_symbols=False,
-        doc_urls=("https://site.financialmodelingprep.com/developer/docs/stable/symbol-changes",),
+        doc_urls=(
+            "https://site.financialmodelingprep.com/developer/docs/stable/symbol-changes",
+        ),
     ),
     VendorCapability(
         capability_id="alpaca.corp_actions.reference",
@@ -816,7 +976,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         planner_group="reference_events_backlog",
         max_symbols_per_run=50,
         rotation_key="twelve_data:dividends",
-        doc_urls=("https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",),
+        doc_urls=(
+            "https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",
+        ),
     ),
     VendorCapability(
         capability_id="twelve_data.splits.reference",
@@ -839,7 +1001,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         planner_group="reference_events_backlog",
         max_symbols_per_run=50,
         rotation_key="twelve_data:splits",
-        doc_urls=("https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",),
+        doc_urls=(
+            "https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",
+        ),
     ),
     VendorCapability(
         capability_id="sec_edgar.company_tickers.reference",
@@ -861,7 +1025,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         output_name="sec_company_tickers",
         planner_group="reference_events_backlog",
         explode_symbols=False,
-        doc_urls=("https://www.sec.gov/search-filings/edgar-application-programming-interfaces",),
+        doc_urls=(
+            "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+        ),
     ),
     VendorCapability(
         capability_id="sec_edgar.filing_index.event",
@@ -884,7 +1050,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         planner_group="reference_events_backlog",
         max_symbols_per_run=50,
         rotation_key="sec_edgar:filing_index",
-        doc_urls=("https://www.sec.gov/search-filings/edgar-application-programming-interfaces",),
+        doc_urls=(
+            "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+        ),
     ),
     VendorCapability(
         capability_id="fred.macros_treasury.macro",
@@ -906,7 +1074,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         output_name="macros_fred",
         planner_group="reference_events_backlog",
         explode_symbols=False,
-        doc_urls=("https://fred.stlouisfed.org/docs/api/fred/series_observations.html",),
+        doc_urls=(
+            "https://fred.stlouisfed.org/docs/api/fred/series_observations.html",
+        ),
     ),
     VendorCapability(
         capability_id="fred.vintagedates.macro",
@@ -928,7 +1098,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         output_name="fred_vintagedates",
         planner_group="reference_events_backlog",
         explode_symbols=False,
-        doc_urls=("https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html",),
+        doc_urls=(
+            "https://fred.stlouisfed.org/docs/api/fred/series_vintagedates.html",
+        ),
     ),
     VendorCapability(
         capability_id="finnhub.earnings_calendar.event",
@@ -972,7 +1144,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         output_name="earnings_calendar_fmp",
         planner_group="reference_events_backlog",
         explode_symbols=False,
-        doc_urls=("https://site.financialmodelingprep.com/developer/docs/stable/earnings-calendar",),
+        doc_urls=(
+            "https://site.financialmodelingprep.com/developer/docs/stable/earnings-calendar",
+        ),
     ),
     VendorCapability(
         capability_id="twelve_data.earnings_calendar.event",
@@ -994,7 +1168,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         output_name="earnings_calendar_twelve_data",
         planner_group="reference_events_backlog",
         explode_symbols=False,
-        doc_urls=("https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",),
+        doc_urls=(
+            "https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",
+        ),
     ),
     VendorCapability(
         capability_id="finnhub.company_profile.reference",
@@ -1063,7 +1239,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         planner_group="reference_events_backlog",
         max_symbols_per_run=20,
         rotation_key="twelve_data:financial_statements",
-        doc_urls=("https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",),
+        doc_urls=(
+            "https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",
+        ),
     ),
     VendorCapability(
         capability_id="finnhub.company_news.research",
@@ -1109,7 +1287,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         planner_group="reference_events_backlog",
         max_symbols_per_run=50,
         rotation_key="sec_edgar:companyfacts",
-        doc_urls=("https://www.sec.gov/search-filings/edgar-application-programming-interfaces",),
+        doc_urls=(
+            "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+        ),
     ),
     VendorCapability(
         capability_id="twelve_data.price_target.research",
@@ -1132,7 +1312,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         planner_group="supplemental_research_backlog",
         max_symbols_per_run=20,
         rotation_key="twelve_data:price_target",
-        doc_urls=("https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",),
+        doc_urls=(
+            "https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",
+        ),
     ),
     VendorCapability(
         capability_id="twelve_data.insider_transactions.research",
@@ -1155,7 +1337,9 @@ _CAPABILITIES: tuple[VendorCapability, ...] = (
         planner_group="supplemental_research_backlog",
         max_symbols_per_run=20,
         rotation_key="twelve_data:insider_transactions",
-        doc_urls=("https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",),
+        doc_urls=(
+            "https://support.twelvedata.com/en/articles/5620512-how-to-create-a-request",
+        ),
     ),
 )
 
@@ -1164,7 +1348,11 @@ _VENDOR_PROFILES: dict[str, VendorProfile] = {
     "alpaca": VendorProfile(
         vendor="alpaca",
         primary_use="same-day and recent-history canonical bars",
-        best_for=("multi-symbol daily bars", "asset universe snapshots", "recent corporate actions"),
+        best_for=(
+            "multi-symbol daily bars",
+            "asset universe snapshots",
+            "recent corporate actions",
+        ),
         avoid_for=("deep-history saturation beyond current entitlement window",),
         saturation_policy="canonical_first",
         qc_policy="primary source only; do not use as the backup comparator",
@@ -1175,17 +1363,34 @@ _VENDOR_PROFILES: dict[str, VendorProfile] = {
         vendor="tiingo",
         primary_use="deep-history daily bars",
         best_for=("long-tail EOD history",),
-        avoid_for=("broad reference fanout", "price QC when minute/day budget is tight"),
+        avoid_for=(
+            "broad reference fanout",
+            "price QC when minute/day budget is tight",
+        ),
         saturation_policy="canonical_only",
         qc_policy="optional tertiary bar QC only",
-        documented_extra_lanes=("fundamentals", "supported tickers", "ticker-tagged news", "IEX intraday"),
+        documented_extra_lanes=(
+            "fundamentals",
+            "supported tickers",
+            "ticker-tagged news",
+            "IEX intraday",
+        ),
         notes="Treat Tiingo as the history specialist and primary tagged-news archive lane while keeping it focused on PIT-safe daily research.",
     ),
     "twelve_data": VendorProfile(
         vendor="twelve_data",
         primary_use="broad fundamentals, reference, and event support",
-        best_for=("corp actions", "earnings", "financial statements", "reference coverage"),
-        avoid_for=("canonical bars", "bar QC", "unbounded low-value research sweeps on free credits"),
+        best_for=(
+            "corp actions",
+            "earnings",
+            "financial statements",
+            "reference coverage",
+        ),
+        avoid_for=(
+            "canonical bars",
+            "bar QC",
+            "unbounded low-value research sweeps on free credits",
+        ),
         saturation_policy="reference_only",
         qc_policy="disabled for bars",
         documented_extra_lanes=("price targets", "insider transactions"),
@@ -1194,7 +1399,12 @@ _VENDOR_PROFILES: dict[str, VendorProfile] = {
     "massive": VendorProfile(
         vendor="massive",
         primary_use="independent bar QC and reference validation",
-        best_for=("independent OHLCV cross-checks", "ticker reference", "splits", "dividends"),
+        best_for=(
+            "independent OHLCV cross-checks",
+            "ticker reference",
+            "splits",
+            "dividends",
+        ),
         avoid_for=("primary large-scale backfill under the free minute cap",),
         saturation_policy="canonical_first",
         qc_policy="preferred independent QC vendor",
@@ -1208,7 +1418,12 @@ _VENDOR_PROFILES: dict[str, VendorProfile] = {
         avoid_for=("canonical bars", "bar QC"),
         saturation_policy="reference_only",
         qc_policy="disabled for bars until candle entitlement is re-verified",
-        documented_extra_lanes=("peers", "recommendation trends", "company news", "financials-reported"),
+        documented_extra_lanes=(
+            "peers",
+            "recommendation trends",
+            "company news",
+            "financials-reported",
+        ),
         notes="Finnhub is useful for event/reference context, not current canonical OHLCV.",
     ),
     "alpha_vantage": VendorProfile(
@@ -1248,7 +1463,10 @@ _VENDOR_PROFILES: dict[str, VendorProfile] = {
         avoid_for=("bar/reference work outside SEC filings",),
         saturation_policy="events_only",
         qc_policy="not applicable",
-        documented_extra_lanes=("bulk submissions archives", "bulk companyfacts archives"),
+        documented_extra_lanes=(
+            "bulk submissions archives",
+            "bulk companyfacts archives",
+        ),
         notes="SEC is the authoritative PIT event lane and should keep moving independently of bar collection.",
     ),
 }

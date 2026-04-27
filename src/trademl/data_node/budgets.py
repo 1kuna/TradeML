@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -41,15 +41,26 @@ class BudgetManager:
     ) -> None:
         self.reserve_fraction = reserve_fraction
         self.vendor_limits = {
-            vendor: VendorBudget(rpm=values["rpm"], daily_cap=values["daily_cap"]) for vendor, values in config.items()
+            vendor: VendorBudget(rpm=values["rpm"], daily_cap=values["daily_cap"])
+            for vendor, values in config.items()
         }
         self._lock = threading.RLock()
         self.request_windows: dict[str, deque[datetime]] = defaultdict(deque)
-        self.daily_spend: dict[str, dict[str, int]] = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
-        self.daily_requests: dict[str, dict[str, int]] = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
-        self.telemetry_totals: dict[str, dict[str, int]] = defaultdict(self._empty_telemetry_totals)
-        self.endpoint_telemetry: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
-        self.telemetry_windows: dict[str, dict[str, deque[datetime]]] = defaultdict(self._empty_telemetry_windows)
+        self.daily_spend: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"FORWARD": 0, "OTHER": 0}
+        )
+        self.daily_requests: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"FORWARD": 0, "OTHER": 0}
+        )
+        self.telemetry_totals: dict[str, dict[str, int]] = defaultdict(
+            self._empty_telemetry_totals
+        )
+        self.endpoint_telemetry: dict[str, dict[str, dict[str, int]]] = defaultdict(
+            dict
+        )
+        self.telemetry_windows: dict[str, dict[str, deque[datetime]]] = defaultdict(
+            self._empty_telemetry_windows
+        )
         self.day_anchor = datetime.now(tz=UTC).date()
         self.snapshot_path = Path(snapshot_path).expanduser() if snapshot_path else None
         self._restore_snapshot()
@@ -107,8 +118,12 @@ class BudgetManager:
                 self.daily_spend[vendor]["OTHER"] = int(spend.get("OTHER", 0) or 0)
             requests = snapshot.get("daily_requests", {})
             if isinstance(requests, dict):
-                self.daily_requests[vendor]["FORWARD"] = int(requests.get("FORWARD", 0) or 0)
-                self.daily_requests[vendor]["OTHER"] = int(requests.get("OTHER", 0) or 0)
+                self.daily_requests[vendor]["FORWARD"] = int(
+                    requests.get("FORWARD", 0) or 0
+                )
+                self.daily_requests[vendor]["OTHER"] = int(
+                    requests.get("OTHER", 0) or 0
+                )
             window = self.request_windows[vendor]
             for raw_stamp in snapshot.get("window_timestamps", []) or []:
                 try:
@@ -166,6 +181,18 @@ class BudgetManager:
             while window and (now - window[0]).total_seconds() >= 60:
                 window.popleft()
 
+    def _effective_reserved_units(self, limits: VendorBudget, now: datetime) -> int:
+        """Return the non-forward reserve after near-reset burn-down."""
+        reserved_units = max(1, int(limits.daily_cap * self.reserve_fraction))
+        next_reset = datetime.combine(
+            now.date() + timedelta(days=1), datetime.min.time(), tzinfo=UTC
+        )
+        seconds_to_reset = max(0.0, (next_reset - now).total_seconds())
+        burn_window_seconds = 3600.0
+        if seconds_to_reset >= burn_window_seconds:
+            return reserved_units
+        return max(0, int(reserved_units * (seconds_to_reset / burn_window_seconds)))
+
     def can_spend(
         self,
         vendor: str,
@@ -186,7 +213,7 @@ class BudgetManager:
                 return False
 
             total_spend = spend["FORWARD"] + spend["OTHER"]
-            reserved_units = max(1, int(limits.daily_cap * self.reserve_fraction))
+            reserved_units = self._effective_reserved_units(limits, current)
             non_forward_ceiling = max(0, limits.daily_cap - reserved_units)
 
             if task_kind == "FORWARD":
@@ -229,7 +256,12 @@ class BudgetManager:
         with self._lock:
             current = self._normalize(now)
             self._trim_telemetry_windows(vendor, current)
-            self._record_telemetry_event(vendor=vendor, endpoint=endpoint, metric="local_budget_blocks", now=current)
+            self._record_telemetry_event(
+                vendor=vendor,
+                endpoint=endpoint,
+                metric="local_budget_blocks",
+                now=current,
+            )
             self._persist_snapshot(now=current)
 
     def record_remote_rate_limit(
@@ -243,7 +275,12 @@ class BudgetManager:
         with self._lock:
             current = self._normalize(now)
             self._trim_telemetry_windows(vendor, current)
-            self._record_telemetry_event(vendor=vendor, endpoint=endpoint, metric="remote_rate_limits", now=current)
+            self._record_telemetry_event(
+                vendor=vendor,
+                endpoint=endpoint,
+                metric="remote_rate_limits",
+                now=current,
+            )
             self._persist_snapshot(now=current)
 
     def record_permanent_failure(
@@ -257,7 +294,12 @@ class BudgetManager:
         with self._lock:
             current = self._normalize(now)
             self._trim_telemetry_windows(vendor, current)
-            self._record_telemetry_event(vendor=vendor, endpoint=endpoint, metric="permanent_failures", now=current)
+            self._record_telemetry_event(
+                vendor=vendor,
+                endpoint=endpoint,
+                metric="permanent_failures",
+                now=current,
+            )
             self._persist_snapshot(now=current)
 
     def record_empty_success(
@@ -271,7 +313,9 @@ class BudgetManager:
         with self._lock:
             current = self._normalize(now)
             self._trim_telemetry_windows(vendor, current)
-            self._record_telemetry_event(vendor=vendor, endpoint=endpoint, metric="empty_successes", now=current)
+            self._record_telemetry_event(
+                vendor=vendor, endpoint=endpoint, metric="empty_successes", now=current
+            )
             self._persist_snapshot(now=current)
 
     def record_spend(
@@ -314,7 +358,9 @@ class BudgetManager:
             self.daily_requests = defaultdict(lambda: {"FORWARD": 0, "OTHER": 0})
             self._persist_snapshot(now=current)
 
-    def is_temporarily_throttled(self, vendor: str, *, minimum_events: int = 3, now: datetime | None = None) -> bool:
+    def is_temporarily_throttled(
+        self, vendor: str, *, minimum_events: int = 3, now: datetime | None = None
+    ) -> bool:
         """Return whether recent telemetry shows a vendor is fully rate-limited right now."""
         with self._lock:
             current = self._normalize(now)
@@ -338,8 +384,12 @@ class BudgetManager:
                 request_counts = self.daily_requests[vendor]
                 total_spend = spend["FORWARD"] + spend["OTHER"]
                 total_requests = request_counts["FORWARD"] + request_counts["OTHER"]
-                reserved_units = max(1, int(limits.daily_cap * self.reserve_fraction))
+                reserved_units = self._effective_reserved_units(limits, current)
                 non_forward_ceiling = max(0, limits.daily_cap - reserved_units)
+                remaining_daily_units = max(0, limits.daily_cap - total_spend)
+                remaining_window_requests = max(
+                    0, limits.rpm - len(self.request_windows[vendor])
+                )
                 telemetry_totals = dict(self.telemetry_totals[vendor])
                 telemetry_windows = self.telemetry_windows[vendor]
                 vendors[vendor] = {
@@ -348,8 +398,28 @@ class BudgetManager:
                     "reserve_fraction": self.reserve_fraction,
                     "reserved_units": reserved_units,
                     "non_forward_ceiling": non_forward_ceiling,
+                    "remaining_daily_units": remaining_daily_units,
+                    "remaining_non_forward_units": max(
+                        0, non_forward_ceiling - spend["OTHER"]
+                    ),
+                    "remaining_window_requests": remaining_window_requests,
+                    "idle_window_requests": remaining_window_requests,
+                    "utilization": {
+                        "daily": (
+                            round(total_spend / limits.daily_cap, 6)
+                            if limits.daily_cap
+                            else 0.0
+                        ),
+                        "window": (
+                            round(len(self.request_windows[vendor]) / limits.rpm, 6)
+                            if limits.rpm
+                            else 0.0
+                        ),
+                    },
                     "window_used": len(self.request_windows[vendor]),
-                    "window_timestamps": [stamp.isoformat() for stamp in self.request_windows[vendor]],
+                    "window_timestamps": [
+                        stamp.isoformat() for stamp in self.request_windows[vendor]
+                    ],
                     "daily_spend": {
                         "FORWARD": int(spend["FORWARD"]),
                         "OTHER": int(spend["OTHER"]),
@@ -367,12 +437,16 @@ class BudgetManager:
                             for metric in WINDOW_METRICS
                         },
                         "window_timestamps": {
-                            metric: [stamp.isoformat() for stamp in telemetry_windows[metric]]
+                            metric: [
+                                stamp.isoformat() for stamp in telemetry_windows[metric]
+                            ]
                             for metric in WINDOW_METRICS
                         },
                         "per_endpoint": {
                             endpoint: dict(endpoint_totals)
-                            for endpoint, endpoint_totals in sorted(self.endpoint_telemetry[vendor].items())
+                            for endpoint, endpoint_totals in sorted(
+                                self.endpoint_telemetry[vendor].items()
+                            )
                         },
                     },
                 }

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from trademl.data_node.__main__ import _build_reference_jobs, _resolve_vendor_budgets, _should_rebuild_local_state
+from trademl.data_node.__main__ import (
+    _apply_collection_runtime_env,
+    _build_reference_jobs,
+    _resolve_vendor_budgets,
+    _should_rebuild_local_state,
+)
 
 
 def test_resolve_vendor_budgets_keeps_defaults_for_new_connectors() -> None:
@@ -16,7 +22,23 @@ def test_resolve_vendor_budgets_keeps_defaults_for_new_connectors() -> None:
 
     assert budgets["alpaca"] == {"rpm": 200, "daily_cap": 20000}
     assert budgets["tiingo"] == {"rpm": 158, "daily_cap": 95000}
-    assert budgets["twelve_data"] == {"rpm": 7, "daily_cap": 760}
+    assert budgets["twelve_data"] == {"rpm": 8, "daily_cap": 800}
+
+
+def test_apply_collection_runtime_env_sets_storage_pause_threshold(monkeypatch) -> None:
+    monkeypatch.delenv("TRADEML_STORAGE_PAUSE_LOW_PRIORITY_PERCENT", raising=False)
+
+    _apply_collection_runtime_env(
+        {
+            "collection": {
+                "storage_watermark": {
+                    "pause_low_priority_percent": 92,
+                }
+            }
+        }
+    )
+
+    assert os.environ["TRADEML_STORAGE_PAUSE_LOW_PRIORITY_PERCENT"] == "92"
 
 
 def test_build_reference_jobs_uses_verified_defaults_and_caps_symbol_fanout() -> None:
@@ -36,20 +58,32 @@ def test_build_reference_jobs_uses_verified_defaults_and_caps_symbol_fanout() ->
 
     assert all(job["dataset"] != "symbol_changes" for job in jobs)
 
-    tiingo_supported = next(job for job in jobs if job["source"] == "tiingo" and job["dataset"] == "supported_tickers")
+    tiingo_supported = next(
+        job
+        for job in jobs
+        if job["source"] == "tiingo" and job["dataset"] == "supported_tickers"
+    )
     assert tiingo_supported["output_name"] == "tiingo_supported_tickers"
     assert tiingo_supported["symbols"] == []
 
-    finnhub_profiles = next(job for job in jobs if job["source"] == "finnhub" and job["dataset"] == "company_profile")
+    finnhub_profiles = next(
+        job
+        for job in jobs
+        if job["source"] == "finnhub" and job["dataset"] == "company_profile"
+    )
     assert finnhub_profiles["max_symbols_per_run"] == 50
 
     twelve_financials = next(
-        job for job in jobs if job["source"] == "twelve_data" and job["dataset"] == "financial_statements"
+        job
+        for job in jobs
+        if job["source"] == "twelve_data" and job["dataset"] == "financial_statements"
     )
     assert twelve_financials["max_symbols_per_run"] == 20
 
 
-def test_should_rebuild_local_state_only_when_missing_or_forced(tmp_path: Path, monkeypatch) -> None:
+def test_should_rebuild_local_state_only_when_missing_or_forced(
+    tmp_path: Path, monkeypatch
+) -> None:
     db_path = tmp_path / "node.sqlite"
 
     assert _should_rebuild_local_state(local_db_path=db_path) is True

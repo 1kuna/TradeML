@@ -26,24 +26,37 @@ class FredConnector(HTTPConnector):
     ) -> pd.DataFrame:
         """Fetch normalized FRED datasets."""
         if dataset == "macros_treasury":
-            return self._fetch_observations(symbols=symbols, start_date=start_date, end_date=end_date)
+            return self._fetch_observations(
+                symbols=symbols, start_date=start_date, end_date=end_date
+            )
         if dataset == "vintagedates":
             frames = []
             for series_id in symbols:
                 payload = self.request_json(
                     endpoint="/fred/series/vintagedates",
                     endpoint_key="vintagedates",
-                    params={"series_id": series_id, "limit": 10000},
+                    params={"series_id": series_id, "limit": 100000},
                     task_kind="OTHER",
                     logical_units=1,
                 )
-                frames.append(pd.DataFrame({"series_id": series_id, "vintage_date": payload.get("vintage_dates", [])}))
+                frames.append(
+                    pd.DataFrame(
+                        {
+                            "series_id": series_id,
+                            "vintage_date": payload.get("vintage_dates", []),
+                        }
+                    )
+                )
             if not frames:
-                self.budget_manager.record_empty_success(self.vendor_name, endpoint="vintagedates")
+                self.budget_manager.record_empty_success(
+                    self.vendor_name, endpoint="vintagedates"
+                )
                 return pd.DataFrame()
             result = pd.concat(frames, ignore_index=True)
             if result.empty:
-                self.budget_manager.record_empty_success(self.vendor_name, endpoint="vintagedates")
+                self.budget_manager.record_empty_success(
+                    self.vendor_name, endpoint="vintagedates"
+                )
             return result
         raise ValueError(f"unsupported dataset for fred: {dataset}")
 
@@ -63,7 +76,7 @@ class FredConnector(HTTPConnector):
                     "series_id": series_id,
                     "observation_start": pd.Timestamp(start_date).strftime("%Y-%m-%d"),
                     "observation_end": pd.Timestamp(end_date).strftime("%Y-%m-%d"),
-                    "limit": 10000,
+                    "limit": 100000,
                     "sort_order": "asc",
                 },
                 task_kind="OTHER",
@@ -75,11 +88,25 @@ class FredConnector(HTTPConnector):
             frame["series_id"] = series_id
             frames.append(frame)
         if not frames:
-            self.budget_manager.record_empty_success(self.vendor_name, endpoint="macros_treasury")
-            return pd.DataFrame(columns=["series_id", "observation_date", "value", "vintage_date", "ingested_at"])
+            self.budget_manager.record_empty_success(
+                self.vendor_name, endpoint="macros_treasury"
+            )
+            return pd.DataFrame(
+                columns=[
+                    "series_id",
+                    "observation_date",
+                    "value",
+                    "vintage_date",
+                    "ingested_at",
+                ]
+            )
         observations = pd.concat(frames, ignore_index=True)
         observations["observation_date"] = pd.to_datetime(observations["date"]).dt.date
         observations["value"] = pd.to_numeric(observations["value"], errors="coerce")
-        observations["vintage_date"] = pd.to_datetime(observations.get("realtime_start"), errors="coerce").dt.date
+        observations["vintage_date"] = pd.to_datetime(
+            observations.get("realtime_start"), errors="coerce"
+        ).dt.date
         observations["ingested_at"] = pd.Timestamp.now(tz="UTC")
-        return observations[["series_id", "observation_date", "value", "vintage_date", "ingested_at"]]
+        return observations[
+            ["series_id", "observation_date", "value", "vintage_date", "ingested_at"]
+        ]

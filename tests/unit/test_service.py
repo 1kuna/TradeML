@@ -8,6 +8,7 @@ import time
 
 import numpy as np
 import pandas as pd
+import pytest
 import sqlite3
 
 import trademl.data_node.auxiliary_runtime as auxiliary_runtime_module
@@ -27,14 +28,18 @@ from trademl.data_node.service import DataNodePaths, DataNodeService
 class _NoopConnector:
     vendor_name = "alpaca"
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         return pd.DataFrame()
 
 
 class _BudgetFailConnector:
     vendor_name = "massive"
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         raise TemporaryConnectorError("budget exhausted for vendor=massive")
 
 
@@ -42,7 +47,9 @@ class _ForwardFailConnector:
     def __init__(self, vendor_name: str) -> None:
         self.vendor_name = vendor_name
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         raise TemporaryConnectorError(f"{self.vendor_name} unavailable")
 
 
@@ -50,7 +57,9 @@ class _ForwardSuccessConnector:
     def __init__(self, vendor_name: str) -> None:
         self.vendor_name = vendor_name
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         return pd.DataFrame(
             [
                 {
@@ -72,7 +81,9 @@ class _PriceCheckConnector:
         self.vendor_name = vendor_name
         self.calls: list[str] = []
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         self.calls.append(self.vendor_name)
         return pd.DataFrame([{"symbol": symbol, "close": 10.0} for symbol in symbols])
 
@@ -80,10 +91,19 @@ class _PriceCheckConnector:
 class _FredConnector:
     vendor_name = "fred"
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         if dataset == "macros_treasury":
             return pd.DataFrame(
-                [{"series_id": symbols[0], "observation_date": end_date, "value": 4.0, "vintage_date": end_date}]
+                [
+                    {
+                        "series_id": symbols[0],
+                        "observation_date": end_date,
+                        "value": 4.0,
+                        "vintage_date": end_date,
+                    }
+                ]
             )
         if dataset == "vintagedates":
             return pd.DataFrame([{"series_id": symbols[0], "vintage_date": end_date}])
@@ -93,7 +113,9 @@ class _FredConnector:
 class _PartialReferenceConnector:
     vendor_name = "alpha_vantage"
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         symbol = symbols[0]
         if symbol == "MSFT":
             raise TemporaryConnectorError("budget exhausted for vendor=alpha_vantage")
@@ -114,7 +136,9 @@ class _PartialReferenceConnector:
 class _ListingConnector:
     vendor_name = "alpha_vantage"
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         if dataset == "listings":
             return pd.DataFrame(
                 [
@@ -135,11 +159,24 @@ class _ListingConnector:
 class _DelistingConnector:
     vendor_name = "fmp"
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         if dataset == "delistings":
-            return pd.DataFrame([{"symbol": "OLD", "companyName": "Old Co", "delistedDate": "2024-01-05", "reason": "acquired"}])
+            return pd.DataFrame(
+                [
+                    {
+                        "symbol": "OLD",
+                        "companyName": "Old Co",
+                        "delistedDate": "2024-01-05",
+                        "reason": "acquired",
+                    }
+                ]
+            )
         if dataset == "symbol_changes":
-            return pd.DataFrame([{"oldSymbol": "FB", "newSymbol": "META", "date": "2022-06-09"}])
+            return pd.DataFrame(
+                [{"oldSymbol": "FB", "newSymbol": "META", "date": "2022-06-09"}]
+            )
         raise ValueError(dataset)
 
 
@@ -147,7 +184,9 @@ class _NewsConnector:
     def __init__(self, vendor_name: str) -> None:
         self.vendor_name = vendor_name
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         ingested_at = pd.Timestamp("2026-04-10T13:36:00Z")
         return pd.DataFrame(
             [
@@ -196,7 +235,9 @@ class _BackfillConnector:
         self.vendor_name = vendor_name
         self.calls: list[tuple[str, list[str], str, str]] = []
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         self.calls.append((dataset, symbols, start_date, end_date))
         return pd.DataFrame(
             [
@@ -230,7 +271,9 @@ class _MultiSymbolBackfillConnector:
         self.vendor_name = vendor_name
         self.calls: list[tuple[str, list[str], str, str]] = []
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         self.calls.append((dataset, list(symbols), start_date, end_date))
         return pd.DataFrame(
             [
@@ -255,13 +298,21 @@ class _MultiSymbolBackfillConnector:
 
 
 class _SelectiveBackfillConnector:
-    def __init__(self, vendor_name: str, available_symbols: list[str], *, empty_for_unknown: bool = True) -> None:
+    def __init__(
+        self,
+        vendor_name: str,
+        available_symbols: list[str],
+        *,
+        empty_for_unknown: bool = True,
+    ) -> None:
         self.vendor_name = vendor_name
         self.available_symbols = {symbol.upper() for symbol in available_symbols}
         self.empty_for_unknown = empty_for_unknown
         self.calls: list[tuple[str, list[str], str, str]] = []
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         self.calls.append((dataset, list(symbols), start_date, end_date))
         rows: list[dict[str, object]] = []
         for symbol in symbols:
@@ -285,7 +336,11 @@ class _SelectiveBackfillConnector:
                 }
             )
         if not rows and self.empty_for_unknown:
-            return pd.DataFrame(columns=_BackfillConnector(self.vendor_name).fetch(dataset, ["AAPL"], start_date, end_date).columns)
+            return pd.DataFrame(
+                columns=_BackfillConnector(self.vendor_name)
+                .fetch(dataset, ["AAPL"], start_date, end_date)
+                .columns
+            )
         return pd.DataFrame(rows)
 
 
@@ -294,7 +349,9 @@ class _PermanentFailBackfillConnector:
         self.vendor_name = vendor_name
         self.message = message
 
-    def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
         raise PermanentConnectorError(self.message)
 
 
@@ -318,9 +375,15 @@ class _ClusterCoordinatorStub:
         self._lease_calls.append(f"renew:{lease_id}")
         return True
 
-    def mark_singleton_success(self, task_name: str, bucket_key: str, metadata: dict | None = None) -> None:
+    def mark_singleton_success(
+        self, task_name: str, bucket_key: str, metadata: dict | None = None
+    ) -> None:
         self._lease_calls.append(f"success:{task_name}:{bucket_key}:{metadata or {}}")
-        self.last_success[task_name] = {"bucket": bucket_key, "updated_at": "2026-03-31T18:00:00+00:00", "metadata": metadata or {}}
+        self.last_success[task_name] = {
+            "bucket": bucket_key,
+            "updated_at": "2026-03-31T18:00:00+00:00",
+            "metadata": metadata or {},
+        }
 
     def read_last_success(self) -> dict[str, dict]:
         return self.last_success
@@ -331,7 +394,12 @@ def test_run_forever_executes_collection_cycle_and_stops(tmp_path: Path) -> None
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector(), "fred": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -368,7 +436,16 @@ def test_run_forever_executes_collection_cycle_and_stops(tmp_path: Path) -> None
         sleep_fn=lambda _seconds: None,
         poll_seconds=0.0,
         macro_series_ids=["DGS10"],
-        reference_jobs=[{"source": "alpaca", "dataset": "equities_eod", "symbols": ["AAPL"], "start_date": "2026-03-31", "end_date": "2026-03-31", "output_name": "noop"}],
+        reference_jobs=[
+            {
+                "source": "alpaca",
+                "dataset": "equities_eod",
+                "symbols": ["AAPL"],
+                "start_date": "2026-03-31",
+                "end_date": "2026-03-31",
+                "output_name": "noop",
+            }
+        ],
         price_check_symbols=["AAPL"],
     )
 
@@ -379,7 +456,9 @@ def test_run_forever_executes_collection_cycle_and_stops(tmp_path: Path) -> None
     assert "run_cross_vendor_price_checks" in executed
 
 
-def test_run_forever_does_not_drain_backlog_outside_maintenance_window(tmp_path: Path) -> None:
+def test_run_forever_does_not_drain_backlog_outside_maintenance_window(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.bulk_upsert_planner_tasks(
         [
@@ -395,14 +474,22 @@ def test_run_forever_does_not_drain_backlog_outside_maintenance_window(tmp_path:
                 "symbols": ["AAPL"],
                 "eligible_vendors": ["alpaca"],
                 "output_name": "equities_bars",
-                "payload": {"scope_kind": "symbol_range", "trading_days": ["2026-03-31"]},
+                "payload": {
+                    "scope_kind": "symbol_range",
+                    "trading_days": ["2026-03-31"],
+                },
             }
         ]
     )
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -439,8 +526,16 @@ def test_collect_forward_falls_back_to_secondary_vendor(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
-        connectors={"alpaca": _ForwardFailConnector("alpaca"), "tiingo": _ForwardSuccessConnector("tiingo")},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        connectors={
+            "alpaca": _ForwardFailConnector("alpaca"),
+            "tiingo": _ForwardSuccessConnector("tiingo"),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -448,16 +543,25 @@ def test_collect_forward_falls_back_to_secondary_vendor(tmp_path: Path) -> None:
     changed = service.collect_forward(trading_date="2026-03-31", symbols=["AAPL"])
 
     assert changed == ["2026-03-31"]
-    stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31" / "data.parquet")
+    stored = pd.read_parquet(
+        tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31" / "data.parquet"
+    )
     assert stored["symbol"].tolist() == ["AAPL"]
 
 
-def test_seed_planner_tasks_passes_freeze_cutoff_to_planner(tmp_path: Path, monkeypatch) -> None:
+def test_seed_planner_tasks_passes_freeze_cutoff_to_planner(
+    tmp_path: Path, monkeypatch
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -483,12 +587,19 @@ def test_seed_planner_tasks_passes_freeze_cutoff_to_planner(tmp_path: Path, monk
     assert captured["current_date"] == "2026-04-07"
 
 
-def test_seed_planner_tasks_reopens_regressed_canonical_tasks(tmp_path: Path, monkeypatch) -> None:
+def test_seed_planner_tasks_reopens_regressed_canonical_tasks(
+    tmp_path: Path, monkeypatch
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector(), "tiingo": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -536,10 +647,16 @@ def test_seed_planner_tasks_reopens_regressed_canonical_tasks(tmp_path: Path, mo
         planner_group=task.planner_group,
         vendor="alpaca",
         lease_owner=service.worker_id,
-        payload={"symbols": ["AAPL"], "start_date": task.start_date, "end_date": task.end_date},
+        payload={
+            "symbols": ["AAPL"],
+            "start_date": task.start_date,
+            "end_date": task.end_date,
+        },
     )
     assert leased is not None
-    db.mark_vendor_attempt_success(task_key=task.task_key, vendor="alpaca", rows_returned=1)
+    db.mark_vendor_attempt_success(
+        task_key=task.task_key, vendor="alpaca", rows_returned=1
+    )
 
     monkeypatch.setattr(
         service_module,
@@ -548,7 +665,9 @@ def test_seed_planner_tasks_reopens_regressed_canonical_tasks(tmp_path: Path, mo
     )
     monkeypatch.setattr(service_module, "plan_coverage_tasks", lambda **kwargs: [task])
     with sqlite3.connect(db.path) as connection:
-        connection.execute("DELETE FROM planner_task_progress WHERE task_key = ?", (task.task_key,))
+        connection.execute(
+            "DELETE FROM planner_task_progress WHERE task_key = ?", (task.task_key,)
+        )
 
     service._seed_planner_tasks(trading_date="2025-01-04")
 
@@ -565,12 +684,19 @@ def test_seed_planner_tasks_reopens_regressed_canonical_tasks(tmp_path: Path, mo
     assert attempts == []
 
 
-def test_seed_planner_tasks_skips_recomputing_settled_canonical_progress(tmp_path: Path, monkeypatch) -> None:
+def test_seed_planner_tasks_skips_recomputing_settled_canonical_progress(
+    tmp_path: Path, monkeypatch
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector(), "tiingo": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -622,7 +748,9 @@ def test_seed_planner_tasks_skips_recomputing_settled_canonical_progress(tmp_pat
     monkeypatch.setattr(
         service._canonical_runtime,
         "_canonical_progress_for_scope",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not recompute settled canonical task")),
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("should not recompute settled canonical task")
+        ),
     )
 
     service._seed_planner_tasks(trading_date="2025-01-04")
@@ -637,23 +765,37 @@ def test_seed_planner_tasks_skips_recomputing_settled_canonical_progress(tmp_pat
     assert progress.remaining_units == 0
 
 
-def test_backfill_budget_exhaustion_defers_task_instead_of_marking_failed(tmp_path: Path) -> None:
+def test_backfill_budget_exhaustion_defers_task_instead_of_marking_failed(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    task_id = db.enqueue_task("equities_eod", "AAPL", "2025-01-01", "2025-01-02", "GAP", 1)
+    task_id = db.enqueue_task(
+        "equities_eod", "AAPL", "2025-01-01", "2025-01-02", "GAP", 1
+    )
     leased = db.lease_task_by_id(task_id)
     assert leased is not None
     service = DataNodeService(
         db=db,
         connectors={"finnhub": _BudgetFailConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="finnhub",
     )
 
-    changed = service._canonical_runtime._process_backfill_task_for_vendor(leased, "finnhub")
+    changed = service._canonical_runtime._process_backfill_task_for_vendor(
+        leased, "finnhub"
+    )
     with sqlite3.connect(tmp_path / "control" / "node.sqlite") as connection:
-        row = connection.execute("SELECT status, last_error, next_not_before FROM backfill_queue WHERE id = ?", (task_id,)).fetchone()
+        row = connection.execute(
+            "SELECT status, last_error, next_not_before FROM backfill_queue WHERE id = ?",
+            (task_id,),
+        ).fetchone()
 
     assert changed == []
     assert row is not None
@@ -662,13 +804,23 @@ def test_backfill_budget_exhaustion_defers_task_instead_of_marking_failed(tmp_pa
     assert row[2] is not None
 
 
-def test_lease_next_task_for_vendor_skips_single_symbol_vendors_for_datewide_backfill(tmp_path: Path) -> None:
+def test_lease_next_task_for_vendor_skips_single_symbol_vendors_for_datewide_backfill(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-02", "GAP", 1)
     service = DataNodeService(
         db=db,
-        connectors={"alpaca": _BackfillConnector("alpaca"), "tiingo": _BackfillConnector("tiingo")},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        connectors={
+            "alpaca": _BackfillConnector("alpaca"),
+            "tiingo": _BackfillConnector("tiingo"),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -682,15 +834,27 @@ def test_lease_next_task_for_vendor_skips_single_symbol_vendors_for_datewide_bac
     assert alpaca_task.symbol is None
 
 
-def test_lease_next_task_for_vendor_scans_past_front_slice_when_vendor_matches_later_task(tmp_path: Path) -> None:
+def test_lease_next_task_for_vendor_scans_past_front_slice_when_vendor_matches_later_task(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     for index in range(64):
-        db.enqueue_task("equities_eod", f"SYM{index:03d}", "2025-01-01", "2025-01-02", "GAP", 1)
+        db.enqueue_task(
+            "equities_eod", f"SYM{index:03d}", "2025-01-01", "2025-01-02", "GAP", 1
+        )
     db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-02", "GAP", 1)
     service = DataNodeService(
         db=db,
-        connectors={"alpaca": _BackfillConnector("alpaca"), "tiingo": _BackfillConnector("tiingo")},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        connectors={
+            "alpaca": _BackfillConnector("alpaca"),
+            "tiingo": _BackfillConnector("tiingo"),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -702,9 +866,13 @@ def test_lease_next_task_for_vendor_scans_past_front_slice_when_vendor_matches_l
     assert leased.symbol is None
 
 
-def test_datewide_backfill_merges_parallel_vendor_results_and_marks_task_done(tmp_path: Path) -> None:
+def test_datewide_backfill_merges_parallel_vendor_results_and_marks_task_done(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    task_id = db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-01", "GAP", 1)
+    task_id = db.enqueue_task(
+        "equities_eod", None, "2025-01-01", "2025-01-01", "GAP", 1
+    )
     leased = db.lease_task_by_id(task_id)
     assert leased is not None
     alpaca = _SelectiveBackfillConnector("alpaca", ["AAPL", "MSFT"])
@@ -712,20 +880,31 @@ def test_datewide_backfill_merges_parallel_vendor_results_and_marks_task_done(tm
     service = DataNodeService(
         db=db,
         connectors={"alpaca": alpaca, "tiingo": tiingo},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
     )
     service.default_symbols = ["AAPL", "MSFT", "NVDA"]
 
-    changed = service._canonical_runtime._process_backfill_task_for_vendor(leased, "alpaca")
+    changed = service._canonical_runtime._process_backfill_task_for_vendor(
+        leased, "alpaca"
+    )
 
     assert changed == ["2025-01-01"]
-    stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-01" / "data.parquet")
+    stored = pd.read_parquet(
+        tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-01" / "data.parquet"
+    )
     assert sorted(stored["symbol"].tolist()) == ["AAPL", "MSFT", "NVDA"]
     with sqlite3.connect(tmp_path / "control" / "node.sqlite") as connection:
-        status_row = connection.execute("SELECT status FROM backfill_queue WHERE id = ?", (task_id,)).fetchone()
+        status_row = connection.execute(
+            "SELECT status FROM backfill_queue WHERE id = ?", (task_id,)
+        ).fetchone()
     assert status_row == ("DONE",)
     assert alpaca.calls
     assert tiingo.calls
@@ -733,63 +912,96 @@ def test_datewide_backfill_merges_parallel_vendor_results_and_marks_task_done(tm
 
 def test_datewide_backfill_persists_failed_vendor_attempts(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    task_id = db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-01", "GAP", 1)
+    task_id = db.enqueue_task(
+        "equities_eod", None, "2025-01-01", "2025-01-01", "GAP", 1
+    )
     leased = db.lease_task_by_id(task_id)
     assert leased is not None
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _ForwardFailConnector("alpaca")},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
     )
     service.default_symbols = ["AAPL", "MSFT"]
 
-    changed = service._canonical_runtime._process_backfill_task_for_vendor(leased, "alpaca")
+    changed = service._canonical_runtime._process_backfill_task_for_vendor(
+        leased, "alpaca"
+    )
 
     assert changed == []
-    attempts = db.vendor_attempts_for_task("canonical::equities_eod::__ALL__::2025-01-01::2025-01-01::GAP")
+    attempts = db.vendor_attempts_for_task(
+        "canonical::equities_eod::__ALL__::2025-01-01::2025-01-01::GAP"
+    )
     assert len(attempts) == 1
     assert attempts[0].vendor == "alpaca"
     assert attempts[0].status == "FAILED"
     assert attempts[0].last_error == "alpaca unavailable"
 
 
-def test_datewide_backfill_keeps_partial_progress_and_defers_remaining_symbols(tmp_path: Path) -> None:
+def test_datewide_backfill_keeps_partial_progress_and_defers_remaining_symbols(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    task_id = db.enqueue_task("equities_eod", None, "2025-01-02", "2025-01-02", "GAP", 1)
+    task_id = db.enqueue_task(
+        "equities_eod", None, "2025-01-02", "2025-01-02", "GAP", 1
+    )
     leased = db.lease_task_by_id(task_id)
     assert leased is not None
     alpaca = _SelectiveBackfillConnector("alpaca", ["AAPL"])
     service = DataNodeService(
         db=db,
         connectors={"alpaca": alpaca},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
     )
     service.default_symbols = ["AAPL", "MSFT"]
 
-    changed = service._canonical_runtime._process_backfill_task_for_vendor(leased, "alpaca")
+    changed = service._canonical_runtime._process_backfill_task_for_vendor(
+        leased, "alpaca"
+    )
 
     assert changed == ["2025-01-02"]
-    stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-02" / "data.parquet")
+    stored = pd.read_parquet(
+        tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-02" / "data.parquet"
+    )
     assert stored["symbol"].tolist() == ["AAPL"]
     with sqlite3.connect(tmp_path / "control" / "node.sqlite") as connection:
-        row = connection.execute("SELECT status, last_error FROM backfill_queue WHERE id = ?", (task_id,)).fetchone()
+        row = connection.execute(
+            "SELECT status, last_error FROM backfill_queue WHERE id = ?", (task_id,)
+        ).fetchone()
     assert row is not None
     assert row[0] == "PENDING"
     assert "remaining_symbols=1" in (row[1] or "")
 
 
-def test_canonical_planner_batch_uses_atomic_symbol_tasks_and_multisymbol_fetch(tmp_path: Path) -> None:
+def test_canonical_planner_batch_uses_atomic_symbol_tasks_and_multisymbol_fetch(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _MultiSymbolBackfillConnector("alpaca")},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -820,15 +1032,23 @@ def test_canonical_planner_batch_uses_atomic_symbol_tasks_and_multisymbol_fetch(
         )
     tasks = service._canonical_runtime._lease_canonical_batch("alpaca")
 
-    changed = service._canonical_runtime._process_canonical_planner_batch(batch=tasks, vendor="alpaca", exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_batch(
+        batch=tasks, vendor="alpaca", exchange="XNYS"
+    )
 
     assert changed == ["2025-01-02"]
     connector = service.connectors["alpaca"]
     assert isinstance(connector, _MultiSymbolBackfillConnector)
-    assert connector.calls == [("equities_eod", ["AAPL", "MSFT", "NVDA"], "2025-01-02", "2025-01-02")]
-    stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-02" / "data.parquet")
+    assert connector.calls == [
+        ("equities_eod", ["AAPL", "MSFT", "NVDA"], "2025-01-02", "2025-01-02")
+    ]
+    stored = pd.read_parquet(
+        tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-02" / "data.parquet"
+    )
     assert sorted(stored["symbol"].tolist()) == ["AAPL", "MSFT", "NVDA"]
-    statuses = {task.task_key: db.get_planner_task(task.task_key).status for task in tasks}
+    statuses = {
+        task.task_key: db.get_planner_task(task.task_key).status for task in tasks
+    }
     assert set(statuses.values()) == {"SUCCESS"}
 
 
@@ -864,12 +1084,19 @@ def test_expand_reference_jobs_respects_batch_jobs() -> None:
     assert expanded[0]["symbols"] == ["AAPL", "MSFT"]
 
 
-def test_append_reference_frame_deduplicates_dict_valued_rows_without_crashing(tmp_path: Path) -> None:
+def test_append_reference_frame_deduplicates_dict_valued_rows_without_crashing(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -898,12 +1125,19 @@ def test_append_reference_frame_deduplicates_dict_valued_rows_without_crashing(t
     assert stored.iloc[0]["accession"] == "0000320193-26-000001"
 
 
-def test_append_reference_frame_deduplicates_ndarray_valued_rows_without_crashing(tmp_path: Path) -> None:
+def test_append_reference_frame_deduplicates_ndarray_valued_rows_without_crashing(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -934,12 +1168,19 @@ def test_append_reference_frame_deduplicates_ndarray_valued_rows_without_crashin
     assert stored.iloc[0]["symbol"] == "AAPL"
 
 
-def test_process_planner_queue_survives_auxiliary_lane_exception(tmp_path: Path) -> None:
+def test_process_planner_queue_survives_auxiliary_lane_exception(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -955,12 +1196,19 @@ def test_process_planner_queue_survives_auxiliary_lane_exception(tmp_path: Path)
     assert changed == []
 
 
-def test_process_planner_queue_heartbeats_while_waiting_on_pending_lane(tmp_path: Path) -> None:
+def test_process_planner_queue_heartbeats_while_waiting_on_pending_lane(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         worker_id="rpi-01",
@@ -990,20 +1238,29 @@ def test_process_planner_queue_heartbeats_while_waiting_on_pending_lane(tmp_path
 
     service._drain_canonical_lane = drain_canonical_lane  # type: ignore[method-assign]
 
-    changed = service.process_planner_queue(heartbeat_fn=heartbeat, heartbeat_interval_seconds=0.01)
+    changed = service.process_planner_queue(
+        heartbeat_fn=heartbeat, heartbeat_interval_seconds=0.01
+    )
 
     assert slow_lane_started.is_set()
     assert heartbeat_calls
     assert changed == ["2026-01-02", "2026-01-03"]
 
 
-def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(tmp_path: Path) -> None:
+def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.enqueue_task("equities_eod", "AAPL", "2026-03-31", "2026-03-31", "GAP", 1)
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -1037,7 +1294,12 @@ def test_ensure_planner_backlog_seeded_when_planner_is_empty(tmp_path: Path) -> 
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -1051,12 +1313,19 @@ def test_ensure_planner_backlog_seeded_when_planner_is_empty(tmp_path: Path) -> 
     assert planner_tasks[0].task_family == "canonical_bars"
 
 
-def test_ensure_planner_backlog_seeded_refreshes_existing_backlog_once_per_day(tmp_path: Path, monkeypatch) -> None:
+def test_ensure_planner_backlog_seeded_refreshes_existing_backlog_once_per_day(
+    tmp_path: Path, monkeypatch
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -1090,12 +1359,19 @@ def test_ensure_planner_backlog_seeded_refreshes_existing_backlog_once_per_day(t
     assert calls == ["2026-04-03", "2026-04-04"]
 
 
-def test_seed_planner_tasks_with_heartbeat_reports_progress_for_large_refresh(tmp_path: Path, monkeypatch) -> None:
+def test_seed_planner_tasks_with_heartbeat_reports_progress_for_large_refresh(
+    tmp_path: Path, monkeypatch
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -1145,12 +1421,19 @@ def test_seed_planner_tasks_with_heartbeat_reports_progress_for_large_refresh(tm
     assert len(heartbeats) == 6
 
 
-def test_ensure_planner_backlog_seeded_with_heartbeat_refreshes_once_per_day(tmp_path: Path, monkeypatch) -> None:
+def test_ensure_planner_backlog_seeded_with_heartbeat_refreshes_once_per_day(
+    tmp_path: Path, monkeypatch
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -1158,25 +1441,44 @@ def test_ensure_planner_backlog_seeded_with_heartbeat_refreshes_once_per_day(tmp
 
     calls: list[tuple[str | None, object | None]] = []
 
-    def fake_seed(*, trading_date: str | None = None, heartbeat_fn=None, heartbeat_task_interval: int = 256) -> None:  # noqa: ANN001
+    def fake_seed(
+        *,
+        trading_date: str | None = None,
+        heartbeat_fn=None,
+        heartbeat_task_interval: int = 256,
+    ) -> None:  # noqa: ANN001
         calls.append((trading_date, heartbeat_fn))
 
     monkeypatch.setattr(service, "_seed_planner_tasks_with_heartbeat", fake_seed)
 
-    heartbeat = lambda: None
-    service._ensure_planner_backlog_seeded_with_heartbeat(trading_date="2026-04-03", heartbeat_fn=heartbeat)
-    service._ensure_planner_backlog_seeded_with_heartbeat(trading_date="2026-04-03", heartbeat_fn=heartbeat)
-    service._ensure_planner_backlog_seeded_with_heartbeat(trading_date="2026-04-04", heartbeat_fn=heartbeat)
+    def heartbeat() -> None:
+        return None
+    service._ensure_planner_backlog_seeded_with_heartbeat(
+        trading_date="2026-04-03", heartbeat_fn=heartbeat
+    )
+    service._ensure_planner_backlog_seeded_with_heartbeat(
+        trading_date="2026-04-03", heartbeat_fn=heartbeat
+    )
+    service._ensure_planner_backlog_seeded_with_heartbeat(
+        trading_date="2026-04-04", heartbeat_fn=heartbeat
+    )
 
     assert calls == [("2026-04-03", heartbeat), ("2026-04-04", heartbeat)]
 
 
-def test_process_planner_queue_reuses_daily_seed_guard(tmp_path: Path, monkeypatch) -> None:
+def test_process_planner_queue_reuses_daily_seed_guard(
+    tmp_path: Path, monkeypatch
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -1198,7 +1500,9 @@ def test_process_planner_queue_reuses_daily_seed_guard(tmp_path: Path, monkeypat
     assert calls == ["2026-04-03", "2026-04-04"]
 
 
-def test_lease_canonical_batch_scans_past_front_slice_starvation(tmp_path: Path) -> None:
+def test_lease_canonical_batch_scans_past_front_slice_starvation(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
@@ -1206,7 +1510,12 @@ def test_lease_canonical_batch_scans_past_front_slice_starvation(tmp_path: Path)
             "alpaca": _MultiSymbolBackfillConnector("alpaca"),
             "tiingo": _BackfillConnector("tiingo"),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1235,7 +1544,9 @@ def test_lease_canonical_batch_scans_past_front_slice_starvation(tmp_path: Path)
             state={"scope_kind": "symbol_range"},
         )
         if idx < 256:
-            leased = db.lease_planner_task_by_key(task_key=task_key, lease_owner="alpaca-worker")
+            leased = db.lease_planner_task_by_key(
+                task_key=task_key, lease_owner="alpaca-worker"
+            )
             assert leased is not None
 
     batch = service._canonical_runtime._lease_canonical_batch("tiingo")
@@ -1244,7 +1555,9 @@ def test_lease_canonical_batch_scans_past_front_slice_starvation(tmp_path: Path)
     assert batch[0].symbols == ("SYM0256",)
 
 
-def test_lease_canonical_batch_avoids_full_progress_map_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lease_canonical_batch_avoids_full_progress_map_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
@@ -1252,7 +1565,12 @@ def test_lease_canonical_batch_avoids_full_progress_map_scan(tmp_path: Path, mon
             "alpaca": _MultiSymbolBackfillConnector("alpaca"),
             "tiingo": _BackfillConnector("tiingo"),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1298,7 +1616,12 @@ def test_lease_canonical_batch_prioritizes_small_partial_tail(tmp_path: Path) ->
             "alpaca": _MultiSymbolBackfillConnector("alpaca"),
             "tiingo": _BackfillConnector("tiingo"),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1357,7 +1680,9 @@ def test_lease_canonical_batch_prioritizes_small_partial_tail(tmp_path: Path) ->
     assert batch[0].task_key == "canonical::small_partial"
 
 
-def test_lease_canonical_batch_prioritizes_repair_before_rolling_partial(tmp_path: Path) -> None:
+def test_lease_canonical_batch_prioritizes_repair_before_rolling_partial(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
@@ -1365,7 +1690,12 @@ def test_lease_canonical_batch_prioritizes_repair_before_rolling_partial(tmp_pat
             "alpaca": _MultiSymbolBackfillConnector("alpaca"),
             "tiingo": _BackfillConnector("tiingo"),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1381,7 +1711,11 @@ def test_lease_canonical_batch_prioritizes_repair_before_rolling_partial(tmp_pat
         end_date="2026-04-10",
         symbols=["ROLL"],
         eligible_vendors=["alpaca", "tiingo"],
-        payload={"scope_kind": "symbol_range", "backlog_class": "rolling", "trading_days": ["2026-03-16"]},
+        payload={
+            "scope_kind": "symbol_range",
+            "backlog_class": "rolling",
+            "trading_days": ["2026-03-16"],
+        },
     )
     db.update_planner_task_progress(
         task_key="canonical::rolling_partial",
@@ -1408,7 +1742,12 @@ def test_lease_canonical_batch_prioritizes_repair_before_rolling_partial(tmp_pat
         symbols=["FIX"],
         eligible_vendors=["alpaca", "tiingo"],
         output_name="equities_bars",
-        payload={"scope_kind": "symbol_range", "backlog_class": "repair", "trading_days": ["2026-04-10"], "repair": True},
+        payload={
+            "scope_kind": "symbol_range",
+            "backlog_class": "repair",
+            "trading_days": ["2026-04-10"],
+            "repair": True,
+        },
     )
     db.update_planner_task_progress(
         task_key="canonical_repair::2026-04-10::000",
@@ -1425,7 +1764,9 @@ def test_lease_canonical_batch_prioritizes_repair_before_rolling_partial(tmp_pat
     assert batch[0].task_key == "canonical_repair::2026-04-10::000"
 
 
-def test_reclaim_startup_leases_releases_same_owner_rolling_tasks_for_repair(tmp_path: Path) -> None:
+def test_reclaim_startup_leases_releases_same_owner_rolling_tasks_for_repair(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
@@ -1433,7 +1774,12 @@ def test_reclaim_startup_leases_releases_same_owner_rolling_tasks_for_repair(tmp
             "alpaca": _MultiSymbolBackfillConnector("alpaca"),
             "tiingo": _BackfillConnector("tiingo"),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1450,7 +1796,11 @@ def test_reclaim_startup_leases_releases_same_owner_rolling_tasks_for_repair(tmp
         end_date="2026-04-10",
         symbols=["ROLL"],
         eligible_vendors=["alpaca", "tiingo"],
-        payload={"scope_kind": "symbol_range", "backlog_class": "rolling", "trading_days": ["2026-03-16"]},
+        payload={
+            "scope_kind": "symbol_range",
+            "backlog_class": "rolling",
+            "trading_days": ["2026-03-16"],
+        },
     )
     db.update_planner_task_progress(
         task_key="canonical::rolling_partial",
@@ -1465,7 +1815,9 @@ def test_reclaim_startup_leases_releases_same_owner_rolling_tasks_for_repair(tmp
         error="alpaca partial",
         backoff_minutes=0,
     )
-    leased_task = db.lease_planner_task_by_key(task_key="canonical::rolling_partial", lease_owner="rpi-01")
+    leased_task = db.lease_planner_task_by_key(
+        task_key="canonical::rolling_partial", lease_owner="rpi-01"
+    )
     assert leased_task is not None
     leased_attempt = db.lease_vendor_attempt(
         task_key="canonical::rolling_partial",
@@ -1473,7 +1825,11 @@ def test_reclaim_startup_leases_releases_same_owner_rolling_tasks_for_repair(tmp
         planner_group="rolling_canonical",
         vendor="alpaca",
         lease_owner="rpi-01",
-        payload={"symbols": ["ROLL"], "start_date": "2026-03-16", "end_date": "2026-04-10"},
+        payload={
+            "symbols": ["ROLL"],
+            "start_date": "2026-03-16",
+            "end_date": "2026-04-10",
+        },
     )
     assert leased_attempt is not None
     db.upsert_planner_task(
@@ -1488,7 +1844,12 @@ def test_reclaim_startup_leases_releases_same_owner_rolling_tasks_for_repair(tmp
         symbols=["FIX"],
         eligible_vendors=["alpaca", "tiingo"],
         output_name="equities_bars",
-        payload={"scope_kind": "symbol_range", "backlog_class": "repair", "trading_days": ["2026-04-10"], "repair": True},
+        payload={
+            "scope_kind": "symbol_range",
+            "backlog_class": "repair",
+            "trading_days": ["2026-04-10"],
+            "repair": True,
+        },
     )
     db.update_planner_task_progress(
         task_key="canonical_repair::2026-04-10::000",
@@ -1501,7 +1862,11 @@ def test_reclaim_startup_leases_releases_same_owner_rolling_tasks_for_repair(tmp
 
     service._reclaim_startup_leases()
 
-    reclaimed = next(task for task in db.fetch_planner_tasks(task_family="canonical_bars") if task.task_key == "canonical::rolling_partial")
+    reclaimed = next(
+        task
+        for task in db.fetch_planner_tasks(task_family="canonical_bars")
+        if task.task_key == "canonical::rolling_partial"
+    )
     assert reclaimed.status == "PARTIAL"
     attempt = db.vendor_attempts_for_task("canonical::rolling_partial")[0]
     assert attempt.status == "FAILED"
@@ -1513,15 +1878,24 @@ def test_reclaim_startup_leases_releases_same_owner_rolling_tasks_for_repair(tmp
     assert batch[0].task_key == "canonical_repair::2026-04-10::000"
 
 
-def test_permanent_vendor_failure_does_not_terminally_poison_task_when_alternatives_remain(tmp_path: Path) -> None:
+def test_permanent_vendor_failure_does_not_terminally_poison_task_when_alternatives_remain(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={
-            "alpaca": _PermanentFailBackfillConnector("alpaca", "alpaca request failed: 403 forbidden"),
+            "alpaca": _PermanentFailBackfillConnector(
+                "alpaca", "alpaca request failed: 403 forbidden"
+            ),
             "tiingo": _BackfillConnector("tiingo"),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1547,20 +1921,29 @@ def test_permanent_vendor_failure_does_not_terminally_poison_task_when_alternati
         remaining_symbols=["AAPL"],
         state={"scope_kind": "symbol_range"},
     )
-    task = db.lease_planner_task_by_key(task_key="canonical::AAPL", lease_owner=service.worker_id)
+    task = db.lease_planner_task_by_key(
+        task_key="canonical::AAPL", lease_owner=service.worker_id
+    )
 
     assert task is not None
-    changed = service._canonical_runtime._process_canonical_planner_batch(batch=[task], vendor="alpaca", exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_batch(
+        batch=[task], vendor="alpaca", exchange="XNYS"
+    )
 
     assert changed == []
     refreshed = db.get_planner_task("canonical::AAPL")
     assert refreshed is not None
     assert refreshed.status == "PARTIAL"
-    attempts = {(attempt.vendor, attempt.status) for attempt in db.vendor_attempts_for_task("canonical::AAPL")}
+    attempts = {
+        (attempt.vendor, attempt.status)
+        for attempt in db.vendor_attempts_for_task("canonical::AAPL")
+    }
     assert ("alpaca", "PERMANENT_FAILED") in attempts
 
 
-def test_canonical_partial_success_is_immediately_reeligible_when_alternative_vendor_remains(tmp_path: Path) -> None:
+def test_canonical_partial_success_is_immediately_reeligible_when_alternative_vendor_remains(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
@@ -1568,7 +1951,12 @@ def test_canonical_partial_success_is_immediately_reeligible_when_alternative_ve
             "alpaca": _SelectiveBackfillConnector("alpaca", ["AAPL"]),
             "tiingo": _BackfillConnector("tiingo"),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1584,7 +1972,10 @@ def test_canonical_partial_success_is_immediately_reeligible_when_alternative_ve
         end_date="2025-01-03",
         symbols=["AAPL"],
         eligible_vendors=["alpaca", "tiingo"],
-        payload={"scope_kind": "symbol_range", "trading_days": ["2025-01-02", "2025-01-03"]},
+        payload={
+            "scope_kind": "symbol_range",
+            "trading_days": ["2025-01-02", "2025-01-03"],
+        },
     )
     db.update_planner_task_progress(
         task_key="canonical::AAPL::chunk0",
@@ -1594,27 +1985,40 @@ def test_canonical_partial_success_is_immediately_reeligible_when_alternative_ve
         remaining_symbols=["AAPL"],
         state={"scope_kind": "symbol_range"},
     )
-    task = db.lease_planner_task_by_key(task_key="canonical::AAPL::chunk0", lease_owner=service.worker_id)
+    task = db.lease_planner_task_by_key(
+        task_key="canonical::AAPL::chunk0", lease_owner=service.worker_id
+    )
 
     assert task is not None
-    changed = service._canonical_runtime._process_canonical_planner_batch(batch=[task], vendor="alpaca", exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_batch(
+        batch=[task], vendor="alpaca", exchange="XNYS"
+    )
 
     assert changed == ["2025-01-02"]
     refreshed = db.get_planner_task("canonical::AAPL::chunk0")
     assert refreshed is not None
     assert refreshed.status == "PARTIAL"
     assert refreshed.next_eligible_at is not None
-    delta = datetime.fromisoformat(refreshed.next_eligible_at) - datetime.now(tz=service_module.UTC)
+    delta = datetime.fromisoformat(refreshed.next_eligible_at) - datetime.now(
+        tz=service_module.UTC
+    )
     assert delta.total_seconds() < 60
 
 
-def test_canonical_partial_task_can_retry_same_vendor_after_stale_success(tmp_path: Path) -> None:
+def test_canonical_partial_task_can_retry_same_vendor_after_stale_success(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     alpaca = _BackfillConnector("alpaca")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": alpaca},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1646,16 +2050,26 @@ def test_canonical_partial_task_can_retry_same_vendor_after_stale_success(tmp_pa
         planner_group="canonical_bars_backlog",
         vendor="alpaca",
         lease_owner="worker-0",
-        payload={"symbols": ["TECK"], "start_date": "2025-12-16", "end_date": "2025-12-16"},
+        payload={
+            "symbols": ["TECK"],
+            "start_date": "2025-12-16",
+            "end_date": "2025-12-16",
+        },
     )
     assert seeded is not None
-    db.mark_vendor_attempt_success(task_key="canonical::TECK::stale_success", vendor="alpaca", rows_returned=1)
-    db.mark_planner_task_partial("canonical::TECK::stale_success", error="remaining_units=1", backoff_minutes=0)
+    db.mark_vendor_attempt_success(
+        task_key="canonical::TECK::stale_success", vendor="alpaca", rows_returned=1
+    )
+    db.mark_planner_task_partial(
+        "canonical::TECK::stale_success", error="remaining_units=1", backoff_minutes=0
+    )
 
     batch = service._canonical_runtime._lease_canonical_batch("alpaca")
 
     assert len(batch) == 1
-    changed = service._canonical_runtime._process_canonical_planner_batch(batch=batch, vendor="alpaca", exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_batch(
+        batch=batch, vendor="alpaca", exchange="XNYS"
+    )
 
     assert changed == ["2025-12-16"]
     refreshed = db.get_planner_task("canonical::TECK::stale_success")
@@ -1666,13 +2080,20 @@ def test_canonical_partial_task_can_retry_same_vendor_after_stale_success(tmp_pa
     assert progress.remaining_units == 0
 
 
-def test_canonical_partial_task_permanently_fails_when_retry_adds_no_new_coverage(tmp_path: Path) -> None:
+def test_canonical_partial_task_permanently_fails_when_retry_adds_no_new_coverage(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     alpaca = _BackfillConnector("alpaca")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": alpaca},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1688,7 +2109,10 @@ def test_canonical_partial_task_permanently_fails_when_retry_adds_no_new_coverag
         end_date="2025-12-17",
         symbols=["TECK"],
         eligible_vendors=["alpaca"],
-        payload={"scope_kind": "symbol_range", "trading_days": ["2025-12-16", "2025-12-17"]},
+        payload={
+            "scope_kind": "symbol_range",
+            "trading_days": ["2025-12-16", "2025-12-17"],
+        },
     )
     db.update_planner_task_progress(
         task_key="canonical::TECK::dead_tail",
@@ -1702,7 +2126,9 @@ def test_canonical_partial_task_permanently_fails_when_retry_adds_no_new_coverag
     first_batch = service._canonical_runtime._lease_canonical_batch("alpaca")
 
     assert len(first_batch) == 1
-    first_changed = service._canonical_runtime._process_canonical_planner_batch(batch=first_batch, vendor="alpaca", exchange="XNYS")
+    first_changed = service._canonical_runtime._process_canonical_planner_batch(
+        batch=first_batch, vendor="alpaca", exchange="XNYS"
+    )
 
     assert first_changed == ["2025-12-16"]
     first_refresh = db.get_planner_task("canonical::TECK::dead_tail")
@@ -1717,7 +2143,9 @@ def test_canonical_partial_task_permanently_fails_when_retry_adds_no_new_coverag
         reason="test immediate stale retry",
     )
     assert released == 1
-    second_task = db.lease_planner_task_by_key(task_key="canonical::TECK::dead_tail", lease_owner=service.worker_id)
+    second_task = db.lease_planner_task_by_key(
+        task_key="canonical::TECK::dead_tail", lease_owner=service.worker_id
+    )
 
     assert second_task is not None
     second_changed = service._canonical_runtime._process_canonical_planner_batch(
@@ -1731,14 +2159,23 @@ def test_canonical_partial_task_permanently_fails_when_retry_adds_no_new_coverag
     assert refreshed is not None
     assert refreshed.status == "PERMANENT_FAILED"
     assert refreshed.last_error == "alpaca: no incremental canonical coverage"
-    attempts = {(attempt.vendor, attempt.status, attempt.last_error) for attempt in db.vendor_attempts_for_task("canonical::TECK::dead_tail")}
-    assert ("alpaca", "PERMANENT_FAILED", "no incremental canonical coverage") in attempts
+    attempts = {
+        (attempt.vendor, attempt.status, attempt.last_error)
+        for attempt in db.vendor_attempts_for_task("canonical::TECK::dead_tail")
+    }
+    assert (
+        "alpaca",
+        "PERMANENT_FAILED",
+        "no incremental canonical coverage",
+    ) in attempts
     progress = db.fetch_planner_task_progress("canonical::TECK::dead_tail")
     assert progress is not None
     assert progress.remaining_units == 1
 
 
-def test_canonical_vendor_budget_failure_does_not_back_off_other_available_vendors(tmp_path: Path) -> None:
+def test_canonical_vendor_budget_failure_does_not_back_off_other_available_vendors(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
@@ -1746,7 +2183,12 @@ def test_canonical_vendor_budget_failure_does_not_back_off_other_available_vendo
             "tiingo": _BudgetFailConnector(),
             "alpaca": _BackfillConnector("alpaca"),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1772,34 +2214,53 @@ def test_canonical_vendor_budget_failure_does_not_back_off_other_available_vendo
         remaining_symbols=["AAPL"],
         state={"scope_kind": "symbol_range"},
     )
-    task = db.lease_planner_task_by_key(task_key="canonical::AAPL::budget", lease_owner=service.worker_id)
+    task = db.lease_planner_task_by_key(
+        task_key="canonical::AAPL::budget", lease_owner=service.worker_id
+    )
 
     assert task is not None
-    changed = service._canonical_runtime._process_canonical_planner_batch(batch=[task], vendor="tiingo", exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_batch(
+        batch=[task], vendor="tiingo", exchange="XNYS"
+    )
 
     assert changed == []
     refreshed = db.get_planner_task("canonical::AAPL::budget")
     assert refreshed is not None
     assert refreshed.status == "PARTIAL"
     assert refreshed.next_eligible_at is not None
-    delta = datetime.fromisoformat(refreshed.next_eligible_at) - datetime.now(tz=service_module.UTC)
+    delta = datetime.fromisoformat(refreshed.next_eligible_at) - datetime.now(
+        tz=service_module.UTC
+    )
     assert delta.total_seconds() < 60
 
 
-def test_canonical_vendor_selection_skips_symbol_windows_before_learned_vendor_floor(tmp_path: Path) -> None:
+def test_canonical_vendor_selection_skips_symbol_windows_before_learned_vendor_floor(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     alpaca = _BackfillConnector("alpaca")
     tiingo = _BackfillConnector("tiingo")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": alpaca, "tiingo": tiingo},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
     )
     for task_key, start_date, end_date, status, error in [
-        ("canonical::APLD::early", "2021-05-05", "2021-06-02", "PERMANENT_FAILED", "empty planner canonical result"),
+        (
+            "canonical::APLD::early",
+            "2021-05-05",
+            "2021-06-02",
+            "PERMANENT_FAILED",
+            "empty planner canonical result",
+        ),
         ("canonical::APLD::late", "2022-03-18", "2022-04-14", "SUCCESS", None),
     ]:
         attempt = db.lease_vendor_attempt(
@@ -1808,13 +2269,25 @@ def test_canonical_vendor_selection_skips_symbol_windows_before_learned_vendor_f
             planner_group="canonical_bars_backlog",
             vendor="alpaca",
             lease_owner="worker-1",
-            payload={"symbols": ["APLD"], "start_date": start_date, "end_date": end_date},
+            payload={
+                "symbols": ["APLD"],
+                "start_date": start_date,
+                "end_date": end_date,
+            },
         )
         assert attempt is not None
         if status == "SUCCESS":
-            db.mark_vendor_attempt_success(task_key=task_key, vendor="alpaca", rows_returned=20)
+            db.mark_vendor_attempt_success(
+                task_key=task_key, vendor="alpaca", rows_returned=20
+            )
         else:
-            db.mark_vendor_attempt_failed(task_key=task_key, vendor="alpaca", error=str(error), backoff_minutes=0, permanent=True)
+            db.mark_vendor_attempt_failed(
+                task_key=task_key,
+                vendor="alpaca",
+                error=str(error),
+                backoff_minutes=0,
+                permanent=True,
+            )
     db.upsert_planner_task(
         task_key="canonical::APLD::current",
         task_family="canonical_bars",
@@ -1836,24 +2309,35 @@ def test_canonical_vendor_selection_skips_symbol_windows_before_learned_vendor_f
         remaining_symbols=["APLD"],
         state={"scope_kind": "symbol_range"},
     )
-    task = db.lease_planner_task_by_key(task_key="canonical::APLD::current", lease_owner=service.worker_id)
+    task = db.lease_planner_task_by_key(
+        task_key="canonical::APLD::current", lease_owner=service.worker_id
+    )
 
     assert task is not None
-    changed = service._canonical_runtime._process_canonical_planner_task(task, exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_task(
+        task, exchange="XNYS"
+    )
 
     assert changed == ["2021-07-01"]
     assert alpaca.calls == []
     assert len(tiingo.calls) == 1
 
 
-def test_canonical_vendor_selection_skips_tiingo_before_supported_ticker_start_date(tmp_path: Path) -> None:
+def test_canonical_vendor_selection_skips_tiingo_before_supported_ticker_start_date(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     alpaca = _BackfillConnector("alpaca")
     tiingo = _BackfillConnector("tiingo")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": alpaca, "tiingo": tiingo},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1861,7 +2345,14 @@ def test_canonical_vendor_selection_skips_tiingo_before_supported_ticker_start_d
     reference_root = tmp_path / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
-        [{"symbol": "APLD", "exchange": "XNAS", "start_date": "2022-03-18", "end_date": "2026-04-09"}]
+        [
+            {
+                "symbol": "APLD",
+                "exchange": "XNAS",
+                "start_date": "2022-03-18",
+                "end_date": "2026-04-09",
+            }
+        ]
     ).to_parquet(reference_root / "tiingo_supported_tickers.parquet", index=False)
     db.upsert_planner_task(
         task_key="canonical::APLD::tiingo_meta",
@@ -1884,10 +2375,14 @@ def test_canonical_vendor_selection_skips_tiingo_before_supported_ticker_start_d
         remaining_symbols=["APLD"],
         state={"scope_kind": "symbol_range"},
     )
-    task = db.lease_planner_task_by_key(task_key="canonical::APLD::tiingo_meta", lease_owner=service.worker_id)
+    task = db.lease_planner_task_by_key(
+        task_key="canonical::APLD::tiingo_meta", lease_owner=service.worker_id
+    )
 
     assert task is not None
-    changed = service._canonical_runtime._process_canonical_planner_task(task, exchange="XNYS")
+    changed = service._canonical_runtime._process_canonical_planner_task(
+        task, exchange="XNYS"
+    )
 
     assert changed == ["2021-07-01"]
     assert alpaca.calls == [("equities_eod", ["APLD"], "2021-07-01", "2021-07-29")]
@@ -1898,12 +2393,19 @@ def test_lease_canonical_batch_skips_budget_blocked_vendor_lane(tmp_path: Path) 
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     tiingo_budget = BudgetManager({"tiingo": {"rpm": 1, "daily_cap": 10}})
     tiingo_budget.record_spend("tiingo", task_kind="FORWARD")
-    alpaca = _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}}))
+    alpaca = _BudgetedBackfillConnector(
+        "alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})
+    )
     tiingo = _BudgetedBackfillConnector("tiingo", tiingo_budget)
     service = DataNodeService(
         db=db,
         connectors={"alpaca": alpaca, "tiingo": tiingo},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1936,18 +2438,27 @@ def test_lease_canonical_batch_skips_budget_blocked_vendor_lane(tmp_path: Path) 
     assert alpaca_batch[0].task_key == "canonical::AAPL::budget"
 
 
-def test_lease_canonical_batch_skips_temporarily_throttled_vendor_lane(tmp_path: Path) -> None:
+def test_lease_canonical_batch_skips_temporarily_throttled_vendor_lane(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     tiingo_budget = BudgetManager({"tiingo": {"rpm": 10, "daily_cap": 100}})
     for _ in range(3):
         tiingo_budget.record_spend("tiingo", task_kind="FORWARD")
         tiingo_budget.record_remote_rate_limit("tiingo")
-    alpaca = _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}}))
+    alpaca = _BudgetedBackfillConnector(
+        "alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})
+    )
     tiingo = _BudgetedBackfillConnector("tiingo", tiingo_budget)
     service = DataNodeService(
         db=db,
         connectors={"alpaca": alpaca, "tiingo": tiingo},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -1980,16 +2491,25 @@ def test_lease_canonical_batch_skips_temporarily_throttled_vendor_lane(tmp_path:
     assert alpaca_batch[0].task_key == "canonical::AAPL::throttle"
 
 
-def test_release_budget_blocked_canonical_tasks_clears_task_backoff_for_spendable_alternate(tmp_path: Path) -> None:
+def test_release_budget_blocked_canonical_tasks_clears_task_backoff_for_spendable_alternate(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     tiingo_budget = BudgetManager({"tiingo": {"rpm": 1, "daily_cap": 10}})
     tiingo_budget.record_spend("tiingo", task_kind="FORWARD")
-    alpaca = _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}}))
+    alpaca = _BudgetedBackfillConnector(
+        "alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})
+    )
     tiingo = _BudgetedBackfillConnector("tiingo", tiingo_budget)
     service = DataNodeService(
         db=db,
         connectors={"alpaca": alpaca, "tiingo": tiingo},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2020,24 +2540,39 @@ def test_release_budget_blocked_canonical_tasks_clears_task_backoff_for_spendabl
     )
 
     released = service._release_budget_blocked_canonical_tasks()
-    task = next(task for task in db.fetch_planner_tasks(task_family="canonical_bars") if task.task_key == "canonical::AAPL::release")
+    task = next(
+        task
+        for task in db.fetch_planner_tasks(task_family="canonical_bars")
+        if task.task_key == "canonical::AAPL::release"
+    )
 
     assert released == 1
     assert task.next_eligible_at is None
     assert task.status == "PARTIAL"
-    assert task.last_error == "released budget-blocked canonical task to alternate vendor"
+    assert (
+        task.last_error == "released budget-blocked canonical task to alternate vendor"
+    )
 
 
-def test_release_budget_blocked_canonical_tasks_clears_task_backoff_for_reusable_success_vendor(tmp_path: Path) -> None:
+def test_release_budget_blocked_canonical_tasks_clears_task_backoff_for_reusable_success_vendor(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    alpaca = _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}}))
+    alpaca = _BudgetedBackfillConnector(
+        "alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})
+    )
     tiingo_budget = BudgetManager({"tiingo": {"rpm": 1, "daily_cap": 10}})
     tiingo_budget.record_spend("tiingo", task_kind="FORWARD")
     tiingo = _BudgetedBackfillConnector("tiingo", tiingo_budget)
     service = DataNodeService(
         db=db,
         connectors={"alpaca": alpaca, "tiingo": tiingo},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2069,10 +2604,16 @@ def test_release_budget_blocked_canonical_tasks_clears_task_backoff_for_reusable
         planner_group="canonical_bars_backlog",
         vendor="alpaca",
         lease_owner="worker-0",
-        payload={"symbols": ["TECK"], "start_date": "2025-12-16", "end_date": "2026-01-14"},
+        payload={
+            "symbols": ["TECK"],
+            "start_date": "2025-12-16",
+            "end_date": "2026-01-14",
+        },
     )
     assert attempt is not None
-    db.mark_vendor_attempt_success(task_key="canonical::TECK::release", vendor="alpaca", rows_returned=20)
+    db.mark_vendor_attempt_success(
+        task_key="canonical::TECK::release", vendor="alpaca", rows_returned=20
+    )
     db.mark_planner_task_partial(
         "canonical::TECK::release",
         error="tiingo: budget exhausted for vendor=tiingo",
@@ -2086,19 +2627,31 @@ def test_release_budget_blocked_canonical_tasks_clears_task_backoff_for_reusable
     )
 
     released = service._release_budget_blocked_canonical_tasks()
-    task = next(task for task in db.fetch_planner_tasks(task_family="canonical_bars") if task.task_key == "canonical::TECK::release")
+    task = next(
+        task
+        for task in db.fetch_planner_tasks(task_family="canonical_bars")
+        if task.task_key == "canonical::TECK::release"
+    )
 
     assert released == 1
     assert task.next_eligible_at is None
     assert task.status == "PARTIAL"
-    assert task.last_error == "released budget-blocked canonical task to alternate vendor"
+    assert (
+        task.last_error == "released budget-blocked canonical task to alternate vendor"
+    )
 
 
 def test_backfill_lane_widths_prioritize_alpaca_before_tiingo(tmp_path: Path) -> None:
     runtime = CanonicalRuntime(
         db=DataNodeDB(tmp_path / "control" / "node.sqlite"),
-        connectors={"alpaca": _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})),
-                    "tiingo": _BudgetedBackfillConnector("tiingo", BudgetManager({"tiingo": {"rpm": 10, "daily_cap": 100}}))},
+        connectors={
+            "alpaca": _BudgetedBackfillConnector(
+                "alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})
+            ),
+            "tiingo": _BudgetedBackfillConnector(
+                "tiingo", BudgetManager({"tiingo": {"rpm": 10, "daily_cap": 100}})
+            ),
+        },
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
         capability_audit_state={},
@@ -2168,7 +2721,12 @@ def test_bootstrap_canonical_ledger_seeds_manifest_and_units(tmp_path: Path) -> 
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2183,8 +2741,12 @@ def test_bootstrap_canonical_ledger_seeds_manifest_and_units(tmp_path: Path) -> 
     ).to_parquet(partition / "data.parquet", index=False)
 
     result = service.bootstrap_canonical_ledger()
-    manifest = db.get_raw_partition_manifest(dataset="equities_eod", trading_date="2025-12-16")
-    units = db.fetch_canonical_units_for_date(dataset="equities_eod", trading_date="2025-12-16")
+    manifest = db.get_raw_partition_manifest(
+        dataset="equities_eod", trading_date="2025-12-16"
+    )
+    units = db.fetch_canonical_units_for_date(
+        dataset="equities_eod", trading_date="2025-12-16"
+    )
 
     assert result["bootstrapped_dates"] == 1
     assert manifest is not None
@@ -2198,10 +2760,19 @@ def test_repair_canonical_backlog_seeds_targeted_repair_tasks(tmp_path: Path) ->
     service = DataNodeService(
         db=db,
         connectors={
-            "alpaca": _BudgetedBackfillConnector("alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})),
-            "tiingo": _BudgetedBackfillConnector("tiingo", BudgetManager({"tiingo": {"rpm": 10, "daily_cap": 100}})),
+            "alpaca": _BudgetedBackfillConnector(
+                "alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})
+            ),
+            "tiingo": _BudgetedBackfillConnector(
+                "tiingo", BudgetManager({"tiingo": {"rpm": 10, "daily_cap": 100}})
+            ),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2209,13 +2780,17 @@ def test_repair_canonical_backlog_seeds_targeted_repair_tasks(tmp_path: Path) ->
     service.default_symbols = ["AAPL", "MSFT"]
     partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16"
     partition.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{"date": "2025-12-16", "symbol": "AAPL", "source_name": "alpaca"}]).to_parquet(
+    pd.DataFrame(
+        [{"date": "2025-12-16", "symbol": "AAPL", "source_name": "alpaca"}]
+    ).to_parquet(
         partition / "data.parquet",
         index=False,
     )
     service.bootstrap_canonical_ledger()
 
-    result = service.repair_canonical_backlog(trading_date="2025-12-16", start_date="2025-12-16", end_date="2025-12-16")
+    result = service.repair_canonical_backlog(
+        trading_date="2025-12-16", start_date="2025-12-16", end_date="2025-12-16"
+    )
     repair_tasks = db.fetch_planner_tasks(task_family="canonical_repair")
 
     assert result["missing_units"] >= 1
@@ -2230,7 +2805,12 @@ def test_verify_recent_canonical_dates_reports_recent_bad_dates(tmp_path: Path) 
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2238,7 +2818,9 @@ def test_verify_recent_canonical_dates_reports_recent_bad_dates(tmp_path: Path) 
     service.default_symbols = ["AAPL", "MSFT"]
     partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16"
     partition.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{"date": "2025-12-16", "symbol": "AAPL", "source_name": "alpaca"}]).to_parquet(
+    pd.DataFrame(
+        [{"date": "2025-12-16", "symbol": "AAPL", "source_name": "alpaca"}]
+    ).to_parquet(
         partition / "data.parquet",
         index=False,
     )
@@ -2251,12 +2833,19 @@ def test_verify_recent_canonical_dates_reports_recent_bad_dates(tmp_path: Path) 
     assert result["recent_bad_dates"] == ["2025-12-16"]
 
 
-def test_write_raw_partition_serializes_concurrent_same_day_writes(tmp_path: Path, monkeypatch) -> None:
+def test_write_raw_partition_serializes_concurrent_same_day_writes(
+    tmp_path: Path, monkeypatch
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2266,12 +2855,17 @@ def test_write_raw_partition_serializes_concurrent_same_day_writes(tmp_path: Pat
 
     def delayed_dedupe(frame: pd.DataFrame) -> pd.DataFrame:
         partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16"
-        if not (partition / "data.parquet").exists() and not entered_stale_read.is_set():
+        if (
+            not (partition / "data.parquet").exists()
+            and not entered_stale_read.is_set()
+        ):
             entered_stale_read.set()
             time.sleep(0.2)
         return original_dedupe(frame)
 
-    monkeypatch.setattr(service._canonical_runtime, "_dedupe_partition_frame", delayed_dedupe)
+    monkeypatch.setattr(
+        service._canonical_runtime, "_dedupe_partition_frame", delayed_dedupe
+    )
 
     base_row = {
         "date": "2025-12-16",
@@ -2291,15 +2885,33 @@ def test_write_raw_partition_serializes_concurrent_same_day_writes(tmp_path: Pat
     frame_b = pd.DataFrame([{**base_row, "symbol": "MSFT"}])
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        future_a = executor.submit(service._write_raw_partition, frame_a, source_name="alpaca")
+        future_a = executor.submit(
+            service._write_raw_partition, frame_a, source_name="alpaca"
+        )
         assert entered_stale_read.wait(timeout=5)
-        future_b = executor.submit(service._write_raw_partition, frame_b, source_name="alpaca")
+        future_b = executor.submit(
+            service._write_raw_partition, frame_b, source_name="alpaca"
+        )
         future_a.result(timeout=5)
         future_b.result(timeout=5)
 
-    output = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "data.parquet")
+    output = pd.read_parquet(
+        tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "data.parquet"
+    )
     assert set(output["symbol"]) == {"AAPL", "MSFT"}
-    assert list((tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "shards").glob("*.parquet")) == []
+    assert (
+        list(
+            (
+                tmp_path
+                / "data"
+                / "raw"
+                / "equities_bars"
+                / "date=2025-12-16"
+                / "shards"
+            ).glob("*.parquet")
+        )
+        == []
+    )
 
 
 def test_write_raw_partition_consumes_merged_shards(tmp_path: Path) -> None:
@@ -2307,7 +2919,12 @@ def test_write_raw_partition_consumes_merged_shards(tmp_path: Path) -> None:
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2327,12 +2944,20 @@ def test_write_raw_partition_consumes_merged_shards(tmp_path: Path) -> None:
         "vendor_ts": pd.Timestamp("2025-12-16"),
     }
 
-    service._write_raw_partition(pd.DataFrame([{**base_row, "symbol": "AAPL"}]), source_name="alpaca")
-    shard_root = tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "shards"
+    service._write_raw_partition(
+        pd.DataFrame([{**base_row, "symbol": "AAPL"}]), source_name="alpaca"
+    )
+    shard_root = (
+        tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "shards"
+    )
     assert list(shard_root.glob("*.parquet")) == []
 
-    service._write_raw_partition(pd.DataFrame([{**base_row, "symbol": "MSFT"}]), source_name="alpaca")
-    output = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "data.parquet")
+    service._write_raw_partition(
+        pd.DataFrame([{**base_row, "symbol": "MSFT"}]), source_name="alpaca"
+    )
+    output = pd.read_parquet(
+        tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16" / "data.parquet"
+    )
 
     assert set(output["symbol"]) == {"AAPL", "MSFT"}
     assert list(shard_root.glob("*.parquet")) == []
@@ -2343,7 +2968,12 @@ def test_load_corp_actions_reference_skips_corrupt_parquet(tmp_path: Path) -> No
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2352,7 +2982,16 @@ def test_load_corp_actions_reference_skips_corrupt_parquet(tmp_path: Path) -> No
     reference_root.mkdir(parents=True, exist_ok=True)
     (reference_root / "corp_actions.parquet").write_text("not parquet")
     pd.DataFrame(
-        [{"symbol": "AAPL", "ex_date": "2025-01-02", "amount": 1.0, "ratio": pd.NA, "event_type": "dividend", "source": "alpha_vantage"}]
+        [
+            {
+                "symbol": "AAPL",
+                "ex_date": "2025-01-02",
+                "amount": 1.0,
+                "ratio": pd.NA,
+                "event_type": "dividend",
+                "source": "alpha_vantage",
+            }
+        ]
     ).to_parquet(reference_root / "dividends.parquet", index=False)
 
     frame = service.load_corp_actions_reference()
@@ -2361,12 +3000,19 @@ def test_load_corp_actions_reference_skips_corrupt_parquet(tmp_path: Path) -> No
     assert sorted(frame["symbol"].astype(str).str.upper().unique().tolist()) == ["AAPL"]
 
 
-def test_load_corp_actions_reference_ignores_unrelated_reference_parquet(tmp_path: Path) -> None:
+def test_load_corp_actions_reference_ignores_unrelated_reference_parquet(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2374,7 +3020,16 @@ def test_load_corp_actions_reference_ignores_unrelated_reference_parquet(tmp_pat
     reference_root = tmp_path / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
-        [{"symbol": "AAPL", "ex_date": "2025-01-02", "amount": 1.0, "ratio": pd.NA, "event_type": "dividend", "source": "alpha_vantage"}]
+        [
+            {
+                "symbol": "AAPL",
+                "ex_date": "2025-01-02",
+                "amount": 1.0,
+                "ratio": pd.NA,
+                "event_type": "dividend",
+                "source": "alpha_vantage",
+            }
+        ]
     ).to_parquet(reference_root / "dividends.parquet", index=False)
     unrelated_path = reference_root / "fred_vintagedates.parquet"
     unrelated_path.write_text("not parquet", encoding="utf-8")
@@ -2390,7 +3045,12 @@ def test_curate_dates_reads_only_changed_raw_partitions(tmp_path: Path) -> None:
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2414,17 +3074,28 @@ def test_curate_dates_reads_only_changed_raw_partitions(tmp_path: Path) -> None:
             ]
         ).to_parquet(partition / "data.parquet", index=False)
 
-    result = service.curate_dates(corp_actions=pd.DataFrame(), changed_dates=["2025-01-03"])
+    result = service.curate_dates(
+        corp_actions=pd.DataFrame(), changed_dates=["2025-01-03"]
+    )
 
-    assert sorted(pd.to_datetime(result.frame["date"]).dt.strftime("%Y-%m-%d").unique().tolist()) == ["2025-01-03"]
+    assert sorted(
+        pd.to_datetime(result.frame["date"]).dt.strftime("%Y-%m-%d").unique().tolist()
+    ) == ["2025-01-03"]
 
 
-def test_curate_dates_quarantines_corrupt_changed_partition_and_continues(tmp_path: Path) -> None:
+def test_curate_dates_quarantines_corrupt_changed_partition_and_continues(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2450,19 +3121,30 @@ def test_curate_dates_quarantines_corrupt_changed_partition_and_continues(tmp_pa
     ).to_parquet(good_partition / "data.parquet", index=False)
     (bad_partition / "data.parquet").write_text("not parquet", encoding="utf-8")
 
-    result = service.curate_dates(corp_actions=pd.DataFrame(), changed_dates=["2025-01-03", "2025-01-04"])
+    result = service.curate_dates(
+        corp_actions=pd.DataFrame(), changed_dates=["2025-01-03", "2025-01-04"]
+    )
 
-    assert sorted(pd.to_datetime(result.frame["date"]).dt.strftime("%Y-%m-%d").unique().tolist()) == ["2025-01-03"]
+    assert sorted(
+        pd.to_datetime(result.frame["date"]).dt.strftime("%Y-%m-%d").unique().tolist()
+    ) == ["2025-01-03"]
     assert not (bad_partition / "data.parquet").exists()
     assert list(bad_partition.glob("data.corrupt.*.parquet"))
 
 
-def test_curate_dates_streams_multiple_changed_dates_without_full_batch_concat(tmp_path: Path) -> None:
+def test_curate_dates_streams_multiple_changed_dates_without_full_batch_concat(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
@@ -2486,24 +3168,38 @@ def test_curate_dates_streams_multiple_changed_dates_without_full_batch_concat(t
             ]
         ).to_parquet(partition / "data.parquet", index=False)
 
-    result = service.curate_dates(corp_actions=pd.DataFrame(), changed_dates=["2025-01-02", "2025-01-03"])
+    result = service.curate_dates(
+        corp_actions=pd.DataFrame(), changed_dates=["2025-01-02", "2025-01-03"]
+    )
 
-    assert sorted(pd.to_datetime(result.frame["date"]).dt.strftime("%Y-%m-%d").unique().tolist()) == ["2025-01-02", "2025-01-03"]
+    assert sorted(
+        pd.to_datetime(result.frame["date"]).dt.strftime("%Y-%m-%d").unique().tolist()
+    ) == ["2025-01-02", "2025-01-03"]
 
 
-def test_run_cluster_forever_reruns_backfill_when_same_day_queue_is_reseeded(tmp_path: Path) -> None:
+def test_run_cluster_forever_reruns_backfill_when_same_day_queue_is_reseeded(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.enqueue_task("equities_eod", None, "2026-04-02", "2026-04-02", "GAP", 1)
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
     coordinator = _ClusterCoordinatorStub()
     coordinator.allowed = set()
-    coordinator.last_success["backfill"] = {"bucket": "2026-04-02", "updated_at": "2026-04-02T16:11:09+00:00"}
+    coordinator.last_success["backfill"] = {
+        "bucket": "2026-04-02",
+        "updated_at": "2026-04-02T16:11:09+00:00",
+    }
     calls: list[str] = []
 
     def process_backfill_queue(**kwargs) -> list[str]:
@@ -2529,19 +3225,29 @@ def test_run_cluster_forever_reruns_backfill_when_same_day_queue_is_reseeded(tmp
     assert "renew:singleton::backfill::2026-04-02" in coordinator._lease_calls
 
 
-def test_run_cluster_forever_renews_backfill_lease_while_backlog_remains(tmp_path: Path) -> None:
+def test_run_cluster_forever_renews_backfill_lease_while_backlog_remains(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.enqueue_task("equities_eod", None, "2026-04-02", "2026-04-02", "GAP", 1)
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
     coordinator = _ClusterCoordinatorStub()
     coordinator.allowed = set()
-    coordinator.last_success["backfill"] = {"bucket": "2026-04-02", "updated_at": "2999-04-02T16:11:09+00:00"}
+    coordinator.last_success["backfill"] = {
+        "bucket": "2026-04-02",
+        "updated_at": "2999-04-02T16:11:09+00:00",
+    }
     calls: list[str] = []
 
     def process_backfill_queue(**kwargs) -> list[str]:
@@ -2567,12 +3273,19 @@ def test_run_cluster_forever_renews_backfill_lease_while_backlog_remains(tmp_pat
     assert "renew:singleton::backfill::2026-04-02" in coordinator._lease_calls
 
 
-def test_run_cluster_forever_curates_only_trading_date_during_audit_curate(tmp_path: Path) -> None:
+def test_run_cluster_forever_curates_only_trading_date_during_audit_curate(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -2589,7 +3302,9 @@ def test_run_cluster_forever_curates_only_trading_date_during_audit_curate(tmp_p
     def capture_curate(*, corp_actions=None, changed_dates=None):  # noqa: ANN001
         captured["changed_dates"] = changed_dates
         service.stop()
-        return service_module.CuratorResult(frame=pd.DataFrame(), adjustment_log=pd.DataFrame())
+        return service_module.CuratorResult(
+            frame=pd.DataFrame(), adjustment_log=pd.DataFrame()
+        )
 
     service.curate_dates = capture_curate  # type: ignore[method-assign]
 
@@ -2607,13 +3322,20 @@ def test_run_cluster_forever_curates_only_trading_date_during_audit_curate(tmp_p
     assert captured["changed_dates"] == ["2026-04-07"]
 
 
-def test_run_cluster_forever_backfill_curates_only_changed_dates(tmp_path: Path) -> None:
+def test_run_cluster_forever_backfill_curates_only_changed_dates(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.enqueue_task("equities_eod", None, "2026-04-02", "2026-04-02", "GAP", 1)
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -2629,7 +3351,9 @@ def test_run_cluster_forever_backfill_curates_only_changed_dates(tmp_path: Path)
     def capture_curate(*, corp_actions=None, changed_dates=None):  # noqa: ANN001
         captured["changed_dates"] = changed_dates
         service.stop()
-        return service_module.CuratorResult(frame=pd.DataFrame(), adjustment_log=pd.DataFrame())
+        return service_module.CuratorResult(
+            frame=pd.DataFrame(), adjustment_log=pd.DataFrame()
+        )
 
     service.process_backfill_queue = process_backfill_queue  # type: ignore[method-assign]
     service.curate_dates = capture_curate  # type: ignore[method-assign]
@@ -2648,7 +3372,9 @@ def test_run_cluster_forever_backfill_curates_only_changed_dates(tmp_path: Path)
     assert captured["changed_dates"] == ["2026-04-01", "2026-04-02"]
 
 
-def test_process_planner_queue_skips_auxiliary_lanes_while_canonical_backlog_exists(tmp_path: Path) -> None:
+def test_process_planner_queue_runs_unrelated_auxiliary_lanes_while_canonical_backlog_exists(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.bulk_upsert_planner_tasks(
         [
@@ -2664,14 +3390,22 @@ def test_process_planner_queue_skips_auxiliary_lanes_while_canonical_backlog_exi
                 "symbols": ["AAPL"],
                 "eligible_vendors": ["alpaca"],
                 "output_name": "equities_bars",
-                "payload": {"scope_kind": "symbol_range", "trading_days": ["2026-03-31"]},
+                "payload": {
+                    "scope_kind": "symbol_range",
+                    "trading_days": ["2026-03-31"],
+                },
             }
         ]
     )
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector(), "alpha_vantage": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -2687,11 +3421,13 @@ def test_process_planner_queue_skips_auxiliary_lanes_while_canonical_backlog_exi
 
     service.process_planner_queue(exchange="XNYS")
 
-    assert calls == ["canonical:alpaca"]
-    assert aux_task_kind_calls == []
+    assert calls == ["canonical:alpaca", "aux:alpha_vantage"]
+    assert aux_task_kind_calls == [{"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"}]
 
 
-def test_process_planner_queue_allows_limited_auxiliary_work_for_small_rolling_tail(tmp_path: Path) -> None:
+def test_process_planner_queue_runs_full_auxiliary_width_during_canonical_tail(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     tasks = [
         {
@@ -2706,7 +3442,15 @@ def test_process_planner_queue_allows_limited_auxiliary_work_for_small_rolling_t
             "symbols": ["HOLX"],
             "eligible_vendors": ["alpaca", "massive"],
             "output_name": "equities_bars",
-            "payload": {"scope_kind": "symbol_range", "trading_days": ["2026-04-08", "2026-04-09", "2026-04-10", "2026-04-13"]},
+            "payload": {
+                "scope_kind": "symbol_range",
+                "trading_days": [
+                    "2026-04-08",
+                    "2026-04-09",
+                    "2026-04-10",
+                    "2026-04-13",
+                ],
+            },
         },
         {
             "task_key": "canonical_bars::equities_eod::00416::0063::2026-03-16::2026-04-13",
@@ -2720,7 +3464,15 @@ def test_process_planner_queue_allows_limited_auxiliary_work_for_small_rolling_t
             "symbols": ["AL"],
             "eligible_vendors": ["alpaca", "massive"],
             "output_name": "equities_bars",
-            "payload": {"scope_kind": "symbol_range", "trading_days": ["2026-04-08", "2026-04-09", "2026-04-10", "2026-04-13"]},
+            "payload": {
+                "scope_kind": "symbol_range",
+                "trading_days": [
+                    "2026-04-08",
+                    "2026-04-09",
+                    "2026-04-10",
+                    "2026-04-13",
+                ],
+            },
         },
     ]
     db.bulk_upsert_planner_tasks(tasks)
@@ -2751,7 +3503,12 @@ def test_process_planner_queue_allows_limited_auxiliary_work_for_small_rolling_t
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector(), "alpha_vantage": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -2767,11 +3524,18 @@ def test_process_planner_queue_allows_limited_auxiliary_work_for_small_rolling_t
 
     service.process_planner_queue(exchange="XNYS")
 
-    assert calls == ["canonical:alpaca", "aux:alpha_vantage"]
-    assert aux_task_kind_calls == [{"REFERENCE", "EVENT", "MACRO"}]
+    assert calls == [
+        "canonical:alpaca",
+        "aux:alpha_vantage",
+        "aux:alpha_vantage",
+        "aux:alpha_vantage",
+    ]
+    assert aux_task_kind_calls == [{"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"}]
 
 
-def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfill(tmp_path: Path) -> None:
+def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfill(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     raw_partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31"
     raw_partition.mkdir(parents=True, exist_ok=True)
@@ -2781,8 +3545,18 @@ def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfil
     )
     service = DataNodeService(
         db=db,
-        connectors={"alpaca": _NoopConnector(), "fred": _NoopConnector(), "massive": _NoopConnector(), "finnhub": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        connectors={
+            "alpaca": _NoopConnector(),
+            "fred": _NoopConnector(),
+            "massive": _NoopConnector(),
+            "finnhub": _NoopConnector(),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -2811,7 +3585,14 @@ def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfil
         now_fn=lambda: datetime.fromisoformat("2026-03-31T18:00:00+00:00"),
         sleep_fn=lambda _seconds: None,
         macro_series_ids=["DGS10"],
-        reference_jobs=[{"source": "alpaca", "dataset": "equities_eod", "symbols": ["AAPL"], "output_name": "noop"}],
+        reference_jobs=[
+            {
+                "source": "alpaca",
+                "dataset": "equities_eod",
+                "symbols": ["AAPL"],
+                "output_name": "noop",
+            }
+        ],
         price_check_symbols=["AAPL"],
     )
 
@@ -2824,7 +3605,12 @@ def test_collect_macro_data_persists_vintage_reference(tmp_path: Path) -> None:
     service = DataNodeService(
         db=db,
         connectors={"fred": _FredConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -2832,24 +3618,45 @@ def test_collect_macro_data_persists_vintage_reference(tmp_path: Path) -> None:
     outputs = service.collect_macro_data(["DGS10"], "2026-03-01", "2026-03-31")
 
     assert tmp_path / "data" / "reference" / "fred_vintagedates.parquet" in outputs
-    vintages = pd.read_parquet(tmp_path / "data" / "reference" / "fred_vintagedates.parquet")
+    vintages = pd.read_parquet(
+        tmp_path / "data" / "reference" / "fred_vintagedates.parquet"
+    )
     assert vintages["series_id"].tolist() == ["DGS10"]
 
 
-def test_collect_macro_data_persists_vintages_even_when_observations_are_empty(tmp_path: Path) -> None:
+def test_collect_macro_data_persists_vintages_even_when_observations_are_empty(
+    tmp_path: Path,
+) -> None:
     class _VintagesOnlyFredConnector:
-        def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        def fetch(
+            self, dataset: str, symbols: list[str], start_date: str, end_date: str
+        ) -> pd.DataFrame:
             if dataset == "macros_treasury":
-                return pd.DataFrame(columns=["series_id", "observation_date", "value", "vintage_date", "ingested_at"])
+                return pd.DataFrame(
+                    columns=[
+                        "series_id",
+                        "observation_date",
+                        "value",
+                        "vintage_date",
+                        "ingested_at",
+                    ]
+                )
             if dataset == "vintagedates":
-                return pd.DataFrame([{"series_id": symbols[0], "vintage_date": end_date}])
+                return pd.DataFrame(
+                    [{"series_id": symbols[0], "vintage_date": end_date}]
+                )
             raise ValueError(dataset)
 
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"fred": _VintagesOnlyFredConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -2857,8 +3664,12 @@ def test_collect_macro_data_persists_vintages_even_when_observations_are_empty(t
     outputs = service.collect_macro_data(["DGS10"], "2026-03-01", "2026-03-31")
 
     assert tmp_path / "data" / "reference" / "fred_vintagedates.parquet" in outputs
-    assert not (tmp_path / "data" / "raw" / "macros_fred" / "series=DGS10" / "data.parquet").exists()
-    vintages = pd.read_parquet(tmp_path / "data" / "reference" / "fred_vintagedates.parquet")
+    assert not (
+        tmp_path / "data" / "raw" / "macros_fred" / "series=DGS10" / "data.parquet"
+    ).exists()
+    vintages = pd.read_parquet(
+        tmp_path / "data" / "reference" / "fred_vintagedates.parquet"
+    )
     assert vintages["series_id"].tolist() == ["DGS10"]
 
 
@@ -2873,23 +3684,34 @@ def test_run_cross_vendor_price_checks_excludes_finnhub(tmp_path: Path) -> None:
             "tiingo": _PriceCheckConnector("tiingo"),
             "finnhub": _PriceCheckConnector("finnhub"),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
     )
 
-    output = service.run_cross_vendor_price_checks(trading_date="2026-04-02", sample_symbols=["AAPL", "MSFT"])
+    output = service.run_cross_vendor_price_checks(
+        trading_date="2026-04-02", sample_symbols=["AAPL", "MSFT"]
+    )
     frame = pd.read_parquet(output)
 
     assert sorted(frame["vendor"].unique().tolist()) == ["massive", "tiingo"]
 
 
-def test_run_cross_vendor_price_checks_logs_backup_fetch_failures(tmp_path: Path, caplog) -> None:
+def test_run_cross_vendor_price_checks_logs_backup_fetch_failures(
+    tmp_path: Path, caplog
+) -> None:
     class _FailingPriceCheckConnector:
         vendor_name = "massive"
 
-        def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+        def fetch(
+            self, dataset: str, symbols: list[str], start_date: str, end_date: str
+        ) -> pd.DataFrame:
             raise TemporaryConnectorError("massive unavailable")
 
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
@@ -2901,24 +3723,34 @@ def test_run_cross_vendor_price_checks_logs_backup_fetch_failures(tmp_path: Path
             "tiingo": _PriceCheckConnector("tiingo"),
             "finnhub": _PriceCheckConnector("finnhub"),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         source_name="alpaca",
     )
 
     with caplog.at_level("WARNING"):
-        output = service.run_cross_vendor_price_checks(trading_date="2026-04-02", sample_symbols=["AAPL", "MSFT"])
+        output = service.run_cross_vendor_price_checks(
+            trading_date="2026-04-02", sample_symbols=["AAPL", "MSFT"]
+        )
 
     frame = pd.read_parquet(output)
     assert sorted(frame["vendor"].unique().tolist()) == ["tiingo"]
     assert any(
-        "price_check_backup_failed" in record.message and "vendor=massive" in record.message
+        "price_check_backup_failed" in record.message
+        and "vendor=massive" in record.message
         for record in caplog.records
     )
 
 
-def test_aux_lane_widths_hold_bar_first_vendors_back_when_canonical_backlog_exists(tmp_path: Path) -> None:
+def test_aux_lane_widths_hold_bar_first_vendors_back_when_canonical_backlog_exists(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
@@ -2932,7 +3764,12 @@ def test_aux_lane_widths_hold_bar_first_vendors_back_when_canonical_backlog_exis
             "sec_edgar": _NoopConnector(),
             "finnhub": _NoopConnector(),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -2951,7 +3788,10 @@ def test_aux_lane_widths_hold_bar_first_vendors_back_when_canonical_backlog_exis
                 "symbols": ["AAPL"],
                 "eligible_vendors": ["alpaca", "twelve_data", "massive"],
                 "output_name": "equities_bars",
-                "payload": {"scope_kind": "symbol_range", "trading_days": ["2026-03-31"]},
+                "payload": {
+                    "scope_kind": "symbol_range",
+                    "trading_days": ["2026-03-31"],
+                },
             }
         ]
     )
@@ -2967,7 +3807,9 @@ def test_aux_lane_widths_hold_bar_first_vendors_back_when_canonical_backlog_exis
     assert widths["sec_edgar"] == 2
 
 
-def test_aux_lane_widths_suppress_research_only_lanes_during_canonical_backlog(tmp_path: Path) -> None:
+def test_aux_lane_widths_only_suppress_research_for_vendors_under_canonical_pressure(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
@@ -2976,7 +3818,12 @@ def test_aux_lane_widths_suppress_research_only_lanes_during_canonical_backlog(t
             "tiingo": _NewsConnector("tiingo"),
             "finnhub": _NewsConnector("finnhub"),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -2995,14 +3842,19 @@ def test_aux_lane_widths_suppress_research_only_lanes_during_canonical_backlog(t
                 "symbols": ["AAPL"],
                 "eligible_vendors": ["alpaca"],
                 "output_name": "equities_bars",
-                "payload": {"scope_kind": "symbol_range", "trading_days": ["2026-03-31"]},
+                "payload": {
+                    "scope_kind": "symbol_range",
+                    "trading_days": ["2026-03-31"],
+                },
             }
         ]
     )
 
     widths = service._aux_lane_widths(task_kinds={"RESEARCH_ONLY"})
 
-    assert widths == {}
+    assert "alpaca" not in widths
+    assert widths["tiingo"] == 1
+    assert widths["finnhub"] == 1
 
 
 def test_aux_lane_widths_can_ignore_canonical_pressure_override(tmp_path: Path) -> None:
@@ -3018,7 +3870,12 @@ def test_aux_lane_widths_can_ignore_canonical_pressure_override(tmp_path: Path) 
             "fmp": _NoopConnector(),
             "sec_edgar": _NoopConnector(),
         },
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3037,34 +3894,54 @@ def test_aux_lane_widths_can_ignore_canonical_pressure_override(tmp_path: Path) 
                 "symbols": ["AAPL"],
                 "eligible_vendors": ["alpaca", "twelve_data", "massive"],
                 "output_name": "equities_bars",
-                "payload": {"scope_kind": "symbol_range", "trading_days": ["2026-03-31"]},
+                "payload": {
+                    "scope_kind": "symbol_range",
+                    "trading_days": ["2026-03-31"],
+                },
             }
         ]
     )
 
-    widths = service._aux_lane_widths(task_kinds={"REFERENCE", "EVENT", "MACRO"}, canonical_pressure=False)
+    widths = service._aux_lane_widths(
+        task_kinds={"REFERENCE", "EVENT", "MACRO"}, canonical_pressure=False
+    )
 
     assert widths["alpaca"] == 1
     assert widths["massive"] == 1
     assert widths["fred"] == 2
 
 
-def test_planned_auxiliary_work_materializes_reference_and_macro_tasks(tmp_path: Path) -> None:
+def test_planned_auxiliary_work_materializes_reference_and_macro_tasks(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     reference_root = tmp_path / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{"ticker": "AAPL", "cik_str": "320193"}]).to_parquet(reference_root / "sec_company_tickers.parquet", index=False)
+    pd.DataFrame([{"ticker": "AAPL", "cik_str": "320193"}]).to_parquet(
+        reference_root / "sec_company_tickers.parquet", index=False
+    )
     service = DataNodeService(
         db=db,
-        connectors={"alpha_vantage": _NoopConnector(), "fred": _FredConnector(), "sec_edgar": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        connectors={
+            "alpha_vantage": _NoopConnector(),
+            "fred": _FredConnector(),
+            "sec_edgar": _NoopConnector(),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         stage_years=5,
     )
     service.default_symbols = ["AAPL", "MSFT"]
 
-    macro_series, reference_jobs = service._auxiliary_runtime._planned_auxiliary_work(trading_date="2026-03-31")
+    macro_series, reference_jobs = service._auxiliary_runtime._planned_auxiliary_work(
+        trading_date="2026-03-31"
+    )
 
     assert "DGS10" in macro_series
     datasets = {job["dataset"] for job in reference_jobs}
@@ -3076,15 +3953,26 @@ def test_planned_auxiliary_work_includes_research_archive_jobs(tmp_path: Path) -
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
-        connectors={"alpaca": _NoopConnector(), "tiingo": _NewsConnector("tiingo"), "finnhub": _NewsConnector("finnhub")},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        connectors={
+            "alpaca": _NoopConnector(),
+            "tiingo": _NewsConnector("tiingo"),
+            "finnhub": _NewsConnector("finnhub"),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
         stage_years=5,
     )
     service.default_symbols = ["AAPL", "MSFT"]
 
-    _macro_series, reference_jobs = service._auxiliary_runtime._planned_auxiliary_work(trading_date="2026-04-10")
+    _macro_series, reference_jobs = service._auxiliary_runtime._planned_auxiliary_work(
+        trading_date="2026-04-10"
+    )
 
     datasets = {job["dataset"] for job in reference_jobs}
     assert "equities_minute" in datasets
@@ -3092,12 +3980,19 @@ def test_planned_auxiliary_work_includes_research_archive_jobs(tmp_path: Path) -
     assert "company_news" in datasets
 
 
-def test_execute_auxiliary_job_writes_news_to_partitioned_archive(tmp_path: Path) -> None:
+def test_execute_auxiliary_job_writes_news_to_partitioned_archive(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"tiingo": _NewsConnector("tiingo")},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3113,7 +4008,9 @@ def test_execute_auxiliary_job_writes_news_to_partitioned_archive(tmp_path: Path
         }
     )
 
-    output = tmp_path / "data" / "raw" / "ticker_news" / "date=2026-04-10" / "data.parquet"
+    output = (
+        tmp_path / "data" / "raw" / "ticker_news" / "date=2026-04-10" / "data.parquet"
+    )
     stored = pd.read_parquet(output)
 
     assert result.failures == []
@@ -3123,7 +4020,58 @@ def test_execute_auxiliary_job_writes_news_to_partitioned_archive(tmp_path: Path
     assert stored.iloc[0]["headline"] == "Alpha"
 
 
-def test_run_cluster_forever_reference_budget_failure_does_not_crash_worker(tmp_path: Path) -> None:
+def test_execute_auxiliary_job_pauses_raw_archive_when_storage_watermark_is_high(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"tiingo": _NewsConnector("tiingo")},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    class _DiskUsage:
+        total = 100
+        used = 93
+        free = 7
+
+    monkeypatch.setenv("TRADEML_STORAGE_PAUSE_LOW_PRIORITY_PERCENT", "92")
+    monkeypatch.setattr(
+        auxiliary_runtime_module.shutil, "disk_usage", lambda _path: _DiskUsage()
+    )
+
+    result = service._auxiliary_runtime._execute_auxiliary_job(
+        {
+            "source": "tiingo",
+            "dataset": "news",
+            "symbols": ["AAPL"],
+            "start_date": "2026-04-09",
+            "end_date": "2026-04-10",
+            "output_name": "ticker_news",
+            "retention_class": "raw_archive",
+        }
+    )
+
+    output = (
+        tmp_path / "data" / "raw" / "ticker_news" / "date=2026-04-10" / "data.parquet"
+    )
+
+    assert result.deferred == 1
+    assert result.state["blocked_reason"] == "storage_watermark"
+    assert not output.exists()
+
+
+def test_run_cluster_forever_reference_budget_failure_does_not_crash_worker(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     raw_partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-03-31"
     raw_partition.mkdir(parents=True, exist_ok=True)
@@ -3133,8 +4081,18 @@ def test_run_cluster_forever_reference_budget_failure_does_not_crash_worker(tmp_
     )
     service = DataNodeService(
         db=db,
-        connectors={"alpaca": _NoopConnector(), "fred": _NoopConnector(), "massive": _BudgetFailConnector(), "finnhub": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        connectors={
+            "alpaca": _NoopConnector(),
+            "fred": _NoopConnector(),
+            "massive": _BudgetFailConnector(),
+            "finnhub": _NoopConnector(),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3158,19 +4116,33 @@ def test_run_cluster_forever_reference_budget_failure_does_not_crash_worker(tmp_
         poll_seconds=0.0,
         now_fn=lambda: datetime.fromisoformat("2026-03-31T18:00:00+00:00"),
         sleep_fn=lambda _seconds: None,
-        reference_jobs=[{"source": "massive", "dataset": "reference_splits", "symbols": ["AAPL"], "output_name": "splits"}],
+        reference_jobs=[
+            {
+                "source": "massive",
+                "dataset": "reference_splits",
+                "symbols": ["AAPL"],
+                "output_name": "splits",
+            }
+        ],
         price_check_symbols=["AAPL"],
     )
 
     assert calls == ["price_checks"]
 
 
-def test_run_cluster_forever_heartbeat_failure_does_not_crash_worker(tmp_path: Path, caplog) -> None:
+def test_run_cluster_forever_heartbeat_failure_does_not_crash_worker(
+    tmp_path: Path, caplog
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3204,12 +4176,19 @@ def test_run_cluster_forever_heartbeat_failure_does_not_crash_worker(tmp_path: P
     assert "scheduler_iteration_failed" in caplog.text
 
 
-def test_build_canonical_coverage_index_streams_partitions_and_skips_unreadable_ones(tmp_path: Path) -> None:
+def test_build_canonical_coverage_index_streams_partitions_and_skips_unreadable_ones(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3229,17 +4208,26 @@ def test_build_canonical_coverage_index_streams_partitions_and_skips_unreadable_
     )
     (bad_partition / "data.parquet").write_text("not parquet", encoding="utf-8")
 
-    coverage = service._canonical_runtime._build_canonical_coverage_index(trading_days=["2026-03-31", "2026-04-01"])
+    coverage = service._canonical_runtime._build_canonical_coverage_index(
+        trading_days=["2026-03-31", "2026-04-01"]
+    )
 
     assert coverage == {"AAPL": {"2026-03-31"}, "MSFT": {"2026-03-31"}}
 
 
-def test_build_canonical_coverage_index_logs_unreadable_partition_once(tmp_path: Path, caplog) -> None:
+def test_build_canonical_coverage_index_logs_unreadable_partition_once(
+    tmp_path: Path, caplog
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3249,22 +4237,37 @@ def test_build_canonical_coverage_index_logs_unreadable_partition_once(tmp_path:
     bad_path.write_text("not parquet", encoding="utf-8")
 
     with caplog.at_level("WARNING"):
-        first = service._canonical_runtime._build_canonical_coverage_index(trading_days=["2026-04-01"])
-        second = service._canonical_runtime._build_canonical_coverage_index(trading_days=["2026-04-01"])
+        first = service._canonical_runtime._build_canonical_coverage_index(
+            trading_days=["2026-04-01"]
+        )
+        second = service._canonical_runtime._build_canonical_coverage_index(
+            trading_days=["2026-04-01"]
+        )
 
     assert first == {}
     assert second == {}
-    matches = [record for record in caplog.records if "skipping_unreadable_raw_partition" in record.message]
+    matches = [
+        record
+        for record in caplog.records
+        if "skipping_unreadable_raw_partition" in record.message
+    ]
     assert len(matches) == 1
     assert str(bad_path) in matches[0].message
 
 
-def test_merge_partition_frame_quarantines_zero_byte_existing_partition(tmp_path: Path) -> None:
+def test_merge_partition_frame_quarantines_zero_byte_existing_partition(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3287,7 +4290,9 @@ def test_merge_partition_frame_quarantines_zero_byte_existing_partition(tmp_path
         ]
     )
 
-    merged = service._canonical_runtime._merge_partition_frame(partition=partition, frame=incoming)
+    merged = service._canonical_runtime._merge_partition_frame(
+        partition=partition, frame=incoming
+    )
 
     assert len(merged) == 1
     assert merged.iloc[0]["symbol"] == "AAPL"
@@ -3296,12 +4301,19 @@ def test_merge_partition_frame_quarantines_zero_byte_existing_partition(tmp_path
     assert quarantined
 
 
-def test_run_cluster_auxiliary_tasks_uses_daily_reference_bucket_until_core_ready(tmp_path: Path) -> None:
+def test_run_cluster_auxiliary_tasks_uses_daily_reference_bucket_until_core_ready(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector(), "fred": _NoopConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3314,7 +4326,14 @@ def test_run_cluster_auxiliary_tasks_uses_daily_reference_bucket_until_core_read
         trading_date="2026-03-31",
         current_et=datetime.fromisoformat("2026-03-31T18:00:00+00:00"),
         macro_series_ids=["DGS10"],
-        reference_jobs=[{"source": "alpaca", "dataset": "assets", "symbols": [], "output_name": "alpaca_assets"}],
+        reference_jobs=[
+            {
+                "source": "alpaca",
+                "dataset": "assets",
+                "symbols": [],
+                "output_name": "alpaca_assets",
+            }
+        ],
         price_check_symbols=["AAPL"],
         source_name=service.source_name,
     )
@@ -3322,12 +4341,22 @@ def test_run_cluster_auxiliary_tasks_uses_daily_reference_bucket_until_core_read
     assert "reference:2026-03-31" in coordinator._lease_calls
 
 
-def test_collect_reference_data_persists_partial_results_before_budget_failure(tmp_path: Path) -> None:
+def test_collect_reference_data_persists_partial_results_before_budget_failure(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
-        connectors={"alpaca": _NoopConnector(), "alpha_vantage": _PartialReferenceConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        connectors={
+            "alpaca": _NoopConnector(),
+            "alpha_vantage": _PartialReferenceConnector(),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3351,12 +4380,23 @@ def test_collect_reference_data_persists_partial_results_before_budget_failure(t
     assert result.deferred
 
 
-def test_collect_reference_data_rebuilds_security_master_outputs(tmp_path: Path) -> None:
+def test_collect_reference_data_rebuilds_security_master_outputs(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
-        connectors={"alpaca": _NoopConnector(), "alpha_vantage": _ListingConnector(), "fmp": _DelistingConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        connectors={
+            "alpaca": _NoopConnector(),
+            "alpha_vantage": _ListingConnector(),
+            "fmp": _DelistingConnector(),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3394,12 +4434,22 @@ def test_collect_reference_data_rebuilds_security_master_outputs(tmp_path: Path)
     assert tmp_path / "data" / "reference" / "ticker_changes.parquet" in result.outputs
 
 
-def test_collect_reference_data_skips_derived_rebuild_when_no_outputs(tmp_path: Path, monkeypatch) -> None:
+def test_collect_reference_data_skips_derived_rebuild_when_no_outputs(
+    tmp_path: Path, monkeypatch
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
-        connectors={"alpaca": _NoopConnector(), "alpha_vantage": _PartialReferenceConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        connectors={
+            "alpaca": _NoopConnector(),
+            "alpha_vantage": _PartialReferenceConnector(),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3407,7 +4457,9 @@ def test_collect_reference_data_skips_derived_rebuild_when_no_outputs(tmp_path: 
     monkeypatch.setattr(
         auxiliary_runtime_module,
         "rebuild_derived_references",
-        lambda _reference_root: (_ for _ in ()).throw(AssertionError("unexpected rebuild")),
+        lambda _reference_root: (_ for _ in ()).throw(
+            AssertionError("unexpected rebuild")
+        ),
     )
 
     result = service.collect_reference_data([])
@@ -3415,12 +4467,19 @@ def test_collect_reference_data_skips_derived_rebuild_when_no_outputs(tmp_path: 
     assert result.outputs == []
 
 
-def test_process_auxiliary_planner_task_marks_reference_success_and_deferred_consistently(tmp_path: Path) -> None:
+def test_process_auxiliary_planner_task_marks_reference_success_and_deferred_consistently(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
         db=db,
         connectors={"alpha_vantage": _PartialReferenceConnector()},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3448,14 +4507,22 @@ def test_process_auxiliary_planner_task_marks_reference_success_and_deferred_con
             state={"scope_kind": "symbol_range"},
         )
 
-    success_task = db.lease_planner_task_by_key(task_key="aux::AAPL", lease_owner=service.worker_id)
-    deferred_task = db.lease_planner_task_by_key(task_key="aux::MSFT", lease_owner=service.worker_id)
+    success_task = db.lease_planner_task_by_key(
+        task_key="aux::AAPL", lease_owner=service.worker_id
+    )
+    deferred_task = db.lease_planner_task_by_key(
+        task_key="aux::MSFT", lease_owner=service.worker_id
+    )
 
     assert success_task is not None
     assert deferred_task is not None
 
-    service._auxiliary_runtime._process_auxiliary_planner_task(success_task, "alpha_vantage")
-    service._auxiliary_runtime._process_auxiliary_planner_task(deferred_task, "alpha_vantage")
+    service._auxiliary_runtime._process_auxiliary_planner_task(
+        success_task, "alpha_vantage"
+    )
+    service._auxiliary_runtime._process_auxiliary_planner_task(
+        deferred_task, "alpha_vantage"
+    )
 
     assert db.get_planner_task("aux::AAPL").status == "SUCCESS"
     assert db.get_planner_task("aux::MSFT").status == "PARTIAL"
@@ -3463,7 +4530,9 @@ def test_process_auxiliary_planner_task_marks_reference_success_and_deferred_con
     assert stored["symbol"].tolist() == ["AAPL"]
 
 
-def test_process_backfill_queue_prefers_tiingo_for_equities_history(tmp_path: Path) -> None:
+def test_process_backfill_queue_prefers_tiingo_for_equities_history(
+    tmp_path: Path,
+) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     db.enqueue_task("equities_eod", "AAPL", "2019-01-02", "2019-01-02", "BOOTSTRAP", 1)
     alpaca = _NoopConnector()
@@ -3471,7 +4540,12 @@ def test_process_backfill_queue_prefers_tiingo_for_equities_history(tmp_path: Pa
     service = DataNodeService(
         db=db,
         connectors={"alpaca": alpaca, "tiingo": tiingo},
-        auditor=PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars")),
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
         curator=Curator(),
         paths=DataNodePaths(root=tmp_path),
     )
@@ -3481,5 +4555,7 @@ def test_process_backfill_queue_prefers_tiingo_for_equities_history(tmp_path: Pa
 
     assert changed == ["2019-01-02"]
     assert tiingo.calls == [("equities_eod", ["AAPL"], "2019-01-02", "2019-01-02")]
-    stored = pd.read_parquet(tmp_path / "data" / "raw" / "equities_bars" / "date=2019-01-02" / "data.parquet")
+    stored = pd.read_parquet(
+        tmp_path / "data" / "raw" / "equities_bars" / "date=2019-01-02" / "data.parquet"
+    )
     assert stored.iloc[0]["source_name"] == "tiingo"

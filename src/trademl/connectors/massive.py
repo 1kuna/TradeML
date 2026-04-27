@@ -26,16 +26,43 @@ class MassiveConnector(HTTPConnector):
     ) -> pd.DataFrame:
         """Fetch normalized Massive datasets."""
         if dataset == "equities_eod":
-            return self._fetch_equities_bars(symbols=symbols, start_date=start_date, end_date=end_date)
+            return self._fetch_equities_bars(
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+                multiplier=1,
+                timespan="day",
+                endpoint_key="equities_eod",
+                task_kind="FORWARD",
+            )
+        if dataset == "equities_minute":
+            return self._fetch_equities_bars(
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+                multiplier=1,
+                timespan="minute",
+                endpoint_key="equities_minute",
+                task_kind="OTHER",
+            )
         if dataset == "reference_splits":
-            return self._fetch_reference(symbols=symbols, endpoint_template="/v3/reference/splits")
+            return self._fetch_reference(
+                symbols=symbols, endpoint_template="/v3/reference/splits"
+            )
         if dataset == "reference_dividends":
-            return self._fetch_reference(symbols=symbols, endpoint_template="/v3/reference/dividends")
+            return self._fetch_reference(
+                symbols=symbols, endpoint_template="/v3/reference/dividends"
+            )
         if dataset == "reference_tickers":
             payload = self.request_json(
                 endpoint="/v3/reference/tickers",
                 endpoint_key="reference_tickers",
-                params={"active": "true", "sort": "ticker", "order": "asc", "limit": 1000},
+                params={
+                    "active": "true",
+                    "sort": "ticker",
+                    "order": "asc",
+                    "limit": 1000,
+                },
             )
             frames: list[pd.DataFrame] = []
             while True:
@@ -45,7 +72,9 @@ class MassiveConnector(HTTPConnector):
                 next_url = payload.get("next_url")
                 if not next_url:
                     break
-                payload = self.request_json_url(url=str(next_url), endpoint_key="reference_tickers")
+                payload = self.request_json_url(
+                    url=str(next_url), endpoint_key="reference_tickers"
+                )
             return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         raise ValueError(f"unsupported dataset for massive: {dataset}")
 
@@ -55,15 +84,20 @@ class MassiveConnector(HTTPConnector):
         symbols: list[str],
         start_date: str | date_type,
         end_date: str | date_type,
+        multiplier: int,
+        timespan: str,
+        endpoint_key: str,
+        task_kind: str,
     ) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
         start = pd.Timestamp(start_date).strftime("%Y-%m-%d")
         end = pd.Timestamp(end_date).strftime("%Y-%m-%d")
         for symbol in symbols:
             payload = self.request_json(
-                endpoint=f"/v2/aggs/ticker/{symbol}/range/1/day/{start}/{end}",
-                endpoint_key="equities_eod",
+                endpoint=f"/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{start}/{end}",
+                endpoint_key=endpoint_key,
                 params={"adjusted": "false", "sort": "asc", "limit": 50000},
+                task_kind=task_kind,
                 logical_units=1,
             )
             while True:
@@ -77,32 +111,54 @@ class MassiveConnector(HTTPConnector):
                     break
                 payload = self.request_json_url(
                     url=str(next_url),
-                    endpoint_key="equities_eod",
-                    task_kind="FORWARD",
+                    endpoint_key=endpoint_key,
+                    task_kind=task_kind,
                     logical_units=1,
                 )
         if not frames:
-            self.budget_manager.record_empty_success(self.vendor_name, endpoint="equities_eod")
+            self.budget_manager.record_empty_success(
+                self.vendor_name, endpoint=endpoint_key
+            )
             return pd.DataFrame(columns=self._bar_columns())
         bars_frame = pd.concat(frames, ignore_index=True)
-        bars_frame["date"] = pd.to_datetime(bars_frame["t"], unit="ms", utc=True).dt.date
+        bars_frame["date"] = pd.to_datetime(
+            bars_frame["t"], unit="ms", utc=True
+        ).dt.date
         bars_frame["ingested_at"] = pd.Timestamp.now(tz="UTC")
         bars_frame["source_name"] = self.vendor_name
-        bars_frame["source_uri"] = "/v2/aggs/ticker"
+        bars_frame["source_uri"] = f"/v2/aggs/ticker/range/{multiplier}/{timespan}"
         bars_frame["vendor_ts"] = pd.to_datetime(bars_frame["t"], unit="ms", utc=True)
         renamed = bars_frame.rename(
-            columns={"o": "open", "h": "high", "l": "low", "c": "close", "vw": "vwap", "v": "volume", "n": "trade_count"}
+            columns={
+                "o": "open",
+                "h": "high",
+                "l": "low",
+                "c": "close",
+                "vw": "vwap",
+                "v": "volume",
+                "n": "trade_count",
+            }
         )
         if "trade_count" not in renamed:
             renamed["trade_count"] = pd.NA
-        return renamed[self._bar_columns()].sort_values(["date", "symbol"]).reset_index(drop=True)
+        return (
+            renamed[self._bar_columns()]
+            .sort_values(["date", "symbol"])
+            .reset_index(drop=True)
+        )
 
-    def _fetch_reference(self, *, symbols: list[str], endpoint_template: str) -> pd.DataFrame:
+    def _fetch_reference(
+        self, *, symbols: list[str], endpoint_template: str
+    ) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
         for symbol in symbols:
             payload = self.request_json(
                 endpoint=endpoint_template,
-                endpoint_key="reference_splits" if "splits" in endpoint_template else "reference_dividends",
+                endpoint_key=(
+                    "reference_splits"
+                    if "splits" in endpoint_template
+                    else "reference_dividends"
+                ),
                 params={"ticker": symbol, "limit": 1000},
                 logical_units=1,
             )

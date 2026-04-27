@@ -775,21 +775,37 @@ Broker: Alpaca (paper trading account, free)
 
 ```
 Pi (runs 24/7):
-  1. After market close: fetch today's EOD bars from Alpaca
-  2. Write parquet to //nas/trademl/data/raw/equities_bars/date=YYYY-MM-DD/data.parquet
-  3. Audit: compare collected dates vs exchange calendar
-  4. Fill gaps: re-request any missing dates
-  5. Update local SQLite (partition_status, backfill_queue)
-  6. Sync partition_status.parquet to NAS for training host visibility
-  7. Sleep → repeat
+  1. Protect canonical EOD first: fetch today's bars, repair missing frozen windows, and keep GREEN coverage moving.
+  2. Saturate every independent vendor lane while canonical work runs: minute bars, ticker news, SEC/FRED/event/reference data.
+  3. Spend unused daily quota before reset; only reserve forward-bar capacity until the final burn-down window.
+  4. Write raw parquet to //nas/trademl/data/raw/{dataset}/date=YYYY-MM-DD/data.parquet with source and vendor timestamp lineage.
+  5. Keep local SQLite on the Pi for leases, attempts, budget state, planner metadata, and watermarks.
+  6. Sync partition_status.parquet and telemetry to NAS for workstation visibility.
+  7. Sleep for a short poll interval, then repeat forever.
 ```
 
 **Schedule:**
 - EOD collection: once daily, ~30 min after market close (allow for data settlement)
-- Gap audit: daily after collection
-- Reference data refresh (corp actions, delistings): weekly
+- Gap audit and repair: daily after collection and during maintenance windows
+- Always-on saturator: continuous, vendor-specific priority queues
+- Reference/event/macro/news/minute archives: continuous quota filler, sorted by planner priority
+- Raw retention: indefinite by default, with watermarks that pause low-priority archive fillers before canonical repair/EOD work
 
-### 6.2 Training Workflow (workstation, manual in Phase 1)
+Minute/news archives are raw research inputs only until dedicated PIT-safe curation exists. They must not enter Phase 1 features directly.
+
+### 6.2 Autopilot North Star
+
+The target operating model is a two-machine loop:
+
+- Raspberry Pi: 24/7/365 capture node that maximizes current/free API throughput without spending paid-upgrade lanes by default.
+- NAS: append-only source of raw and curated parquet, reference state, telemetry, and model artifacts.
+- Mac Mini/workstation: continuous research loop that trains candidate architectures, compares them against the incumbent, and reports cost-aware OOS metrics.
+- Drift monitor: alerts when live or recent retrain metrics degrade materially versus the accepted incumbent, especially IC stability, decile spread, drawdown, turnover, and feature-distribution drift.
+- Promotion rule: new models can become incumbent only after replayable walk-forward evidence, placebo/cost stress, no leakage checks, and manual approval in Phase 1.
+
+Profitability is an empirical target, not an assumption. Every claim must be backed by reproducible out-of-sample tests after costs.
+
+### 6.3 Training Workflow (workstation, manual in Phase 1)
 
 ```
 1. Read data from //nas/trademl/data/curated/
@@ -806,7 +822,7 @@ Pi (runs 24/7):
 Phase 1: run manually from a script or notebook.
 Phase 2: schedule nightly or weekly.
 
-### 6.3 Monitoring (Phase 2+)
+### 6.4 Monitoring (Phase 2+)
 
 - Coverage heatmap: date × dataset GREEN/AMBER/RED
 - Feature drift: change in rank distributions over time

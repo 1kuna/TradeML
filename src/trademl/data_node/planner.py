@@ -64,19 +64,33 @@ def choose_vendor_for_canonical_task(
         if attempt.status in {"SUCCESS", "PERMANENT_FAILED"}:
             blocked.add(attempt.vendor)
             continue
-        if attempt.status == "LEASED" and attempt.lease_expires_at and attempt.lease_expires_at > current_time:
+        if (
+            attempt.status == "LEASED"
+            and attempt.lease_expires_at
+            and attempt.lease_expires_at > current_time
+        ):
             blocked.add(attempt.vendor)
             continue
-        if attempt.status == "FAILED" and attempt.next_eligible_at and attempt.next_eligible_at > current_time:
+        if (
+            attempt.status == "FAILED"
+            and attempt.next_eligible_at
+            and attempt.next_eligible_at > current_time
+        ):
             blocked.add(attempt.vendor)
-    for capability in backfill_capabilities(dataset=task.dataset, connectors=connectors, audit_state=audit_state):
+    for capability in backfill_capabilities(
+        dataset=task.dataset, connectors=connectors, audit_state=audit_state
+    ):
         if not _capability_supports_canonical_task(capability, task):
             continue
         if not _vendor_has_local_budget(
             connector=connectors.get(capability.vendor),
             vendor=capability.vendor,
             dataset=task.dataset,
-            symbol_count=1 if task.symbol is not None else int(getattr(capability, "preferred_batch_size", 1) or 1),
+            symbol_count=(
+                1
+                if task.symbol is not None
+                else int(getattr(capability, "preferred_batch_size", 1) or 1)
+            ),
         ):
             continue
         if capability.vendor not in blocked:
@@ -84,14 +98,18 @@ def choose_vendor_for_canonical_task(
     return None
 
 
-def _capability_supports_canonical_task(capability: VendorCapability, task: BackfillTask) -> bool:
+def _capability_supports_canonical_task(
+    capability: VendorCapability, task: BackfillTask
+) -> bool:
     """Return whether a capability can safely execute the leased canonical task shape."""
     if task.symbol is None and capability.batching_mode == "single_symbol":
         return False
     return True
 
 
-def _vendor_has_local_budget(*, connector: object | None, vendor: str, dataset: str, symbol_count: int) -> bool:
+def _vendor_has_local_budget(
+    *, connector: object | None, vendor: str, dataset: str, symbol_count: int
+) -> bool:
     """Return whether the connector's local budget manager can spend for this task shape now."""
     budget_manager = getattr(connector, "budget_manager", None)
     if budget_manager is None:
@@ -119,10 +137,18 @@ def plan_auxiliary_tasks(
     """Plan deterministic auxiliary tasks based on enabled capabilities and current corpus scope."""
     if not stage_symbols:
         return []
-    current_ts = pd.Timestamp(current_date or datetime.now(tz=UTC).date().isoformat()).normalize()
+    current_ts = pd.Timestamp(
+        current_date or datetime.now(tz=UTC).date().isoformat()
+    ).normalize()
     tasks: list[PlannedTask] = []
-    company_ticker_map = _load_sec_company_tickers(data_root / "data" / "reference" / "sec_company_tickers.parquet")
-    for capability in auxiliary_capabilities(connectors=connectors, audit_state=audit_state, include_research=include_research):
+    company_ticker_map = _load_sec_company_tickers(
+        data_root / "data" / "reference" / "sec_company_tickers.parquet"
+    )
+    for capability in auxiliary_capabilities(
+        connectors=connectors,
+        audit_state=audit_state,
+        include_research=include_research,
+    ):
         task_specs = _materialize_capability_tasks(
             capability=capability,
             stage_symbols=stage_symbols,
@@ -149,15 +175,21 @@ def plan_canonical_bar_tasks(
     """Build atomic symbol-range/date-range canonical bar tasks decoupled from storage partitions."""
     if not stage_symbols or stage_years <= 0:
         return []
-    as_of = pd.Timestamp(current_date or datetime.now(tz=UTC).date().isoformat()).normalize()
+    as_of = pd.Timestamp(
+        current_date or datetime.now(tz=UTC).date().isoformat()
+    ).normalize()
     nominal_start = (as_of - pd.DateOffset(years=max(1, int(stage_years)))).normalize()
-    freeze_end = pd.Timestamp(freeze_report_date).normalize() if freeze_report_date else None
+    freeze_end = (
+        pd.Timestamp(freeze_report_date).normalize() if freeze_report_date else None
+    )
     freeze_start = (
         (freeze_end - pd.DateOffset(years=max(1, int(stage_years)))).normalize()
         if freeze_end is not None
         else None
     )
-    start_anchor = min(nominal_start, freeze_start) if freeze_start is not None else nominal_start
+    start_anchor = (
+        min(nominal_start, freeze_start) if freeze_start is not None else nominal_start
+    )
     start = start_anchor.date()
     end = as_of.date()
     trading_days = [day.isoformat() for day in get_trading_days("XNYS", start, end)]
@@ -175,7 +207,9 @@ def plan_canonical_bar_tasks(
         return []
 
     tasks: list[PlannedTask] = []
-    ordered_symbols = list(dict.fromkeys(str(symbol).upper() for symbol in stage_symbols))
+    ordered_symbols = list(
+        dict.fromkeys(str(symbol).upper() for symbol in stage_symbols)
+    )
     listing_windows = _load_listing_windows(data_root) if data_root is not None else {}
     chunk_index = 0
     index = 0
@@ -204,7 +238,9 @@ def plan_canonical_bar_tasks(
         symbol_chunk_tuple = tuple(symbol_chunk)
         symbol_chunk_id = f"{chunk_index:05d}"
         for date_index in range(0, len(eligible_days), max(1, trading_day_chunk_size)):
-            window = eligible_days[date_index : date_index + max(1, trading_day_chunk_size)]
+            window = eligible_days[
+                date_index : date_index + max(1, trading_day_chunk_size)
+            ]
             if not window:
                 continue
             date_chunk_id = f"{date_index // max(1, trading_day_chunk_size):04d}"
@@ -220,7 +256,11 @@ def plan_canonical_bar_tasks(
                 PlannedTask(
                     task_key=f"canonical_bars::equities_eod::{symbol_chunk_id}::{date_chunk_id}::{start_date}::{end_date}",
                     task_family="canonical_bars",
-                    planner_group="phase1_pinned_canonical" if in_freeze_window else "rolling_canonical",
+                    planner_group=(
+                        "phase1_pinned_canonical"
+                        if in_freeze_window
+                        else "rolling_canonical"
+                    ),
                     dataset="equities_eod",
                     tier="A",
                     priority=5 if in_freeze_window else 10,
@@ -234,12 +274,17 @@ def plan_canonical_bar_tasks(
                     ),
                     payload={
                         "scope_kind": "symbol_range",
-                        "backlog_class": "phase1_pinned" if in_freeze_window else "rolling",
+                        "backlog_class": (
+                            "phase1_pinned" if in_freeze_window else "rolling"
+                        ),
                         "symbol_chunk_id": symbol_chunk_id,
                         "date_chunk_id": date_chunk_id,
                         "symbol_batch_size": len(symbol_chunk_tuple),
                         "trading_days": list(window),
                         "freeze_priority": in_freeze_window,
+                        **_canonical_planner_metadata(
+                            symbol_count=len(symbol_chunk_tuple)
+                        ),
                     },
                 )
             )
@@ -248,17 +293,24 @@ def plan_canonical_bar_tasks(
     return tasks
 
 
-def _canonical_vendors_for_window(*, canonical_vendors: tuple[str, ...], in_freeze_window: bool) -> tuple[str, ...]:
+def _canonical_vendors_for_window(
+    *, canonical_vendors: tuple[str, ...], in_freeze_window: bool
+) -> tuple[str, ...]:
     """Return the vendor set to use for a canonical bar task window."""
     critical_path = tuple(
         vendor
         for vendor in canonical_vendors
-        if (contract := dataset_contract(vendor, "equities_eod")) is not None and contract.critical_path_allowed
+        if (contract := dataset_contract(vendor, "equities_eod")) is not None
+        and contract.critical_path_allowed
     )
     if in_freeze_window:
-        ordered = tuple(vendor for vendor in ("alpaca", "tiingo") if vendor in critical_path)
+        ordered = tuple(
+            vendor for vendor in ("alpaca", "tiingo") if vendor in critical_path
+        )
         return ordered or critical_path or canonical_vendors
-    non_critical = tuple(vendor for vendor in canonical_vendors if vendor not in critical_path)
+    non_critical = tuple(
+        vendor for vendor in canonical_vendors if vendor not in critical_path
+    )
     return critical_path + non_critical if critical_path else canonical_vendors
 
 
@@ -296,10 +348,14 @@ def plan_coverage_tasks(
         include_research=include_research,
         current_date=current_date,
     )
-    return sorted([*canonical, *auxiliary], key=lambda task: (task.priority, task.task_key))
+    return sorted(
+        [*canonical, *auxiliary], key=lambda task: (task.priority, task.task_key)
+    )
 
 
-def _load_listing_windows(data_root: Path | None) -> dict[str, tuple[pd.Timestamp | None, pd.Timestamp | None]]:
+def _load_listing_windows(
+    data_root: Path | None,
+) -> dict[str, tuple[pd.Timestamp | None, pd.Timestamp | None]]:
     """Return symbol-specific IPO/delist windows when listing history is available."""
     if data_root is None:
         return {}
@@ -313,8 +369,12 @@ def _load_listing_windows(data_root: Path | None) -> dict[str, tuple[pd.Timestam
     if frame.empty:
         return {}
     frame["symbol"] = frame["symbol"].astype("string").str.strip().str.upper()
-    frame["ipo_date"] = pd.to_datetime(frame.get("ipo_date"), errors="coerce").dt.normalize()
-    frame["delist_date"] = pd.to_datetime(frame.get("delist_date"), errors="coerce").dt.normalize()
+    frame["ipo_date"] = pd.to_datetime(
+        frame.get("ipo_date"), errors="coerce"
+    ).dt.normalize()
+    frame["delist_date"] = pd.to_datetime(
+        frame.get("delist_date"), errors="coerce"
+    ).dt.normalize()
     windows: dict[str, tuple[pd.Timestamp | None, pd.Timestamp | None]] = {}
     for symbol, group in frame.groupby("symbol", dropna=True):
         ipo_dates = group["ipo_date"].dropna()
@@ -354,8 +414,11 @@ def _materialize_capability_tasks(
     current_ts: pd.Timestamp,
     stage_years: int,
 ) -> list[PlannedTask]:
-    start_date, end_date = _capability_window(capability=capability, current_ts=current_ts, stage_years=stage_years)
+    windows = _capability_windows(
+        capability=capability, current_ts=current_ts, stage_years=stage_years
+    )
     if capability.task_kind == "MACRO":
+        start_date, end_date = windows[0]
         return [
             PlannedTask(
                 task_key=f"{capability.task_kind.lower()}::{capability.dataset}::{series_id}::{start_date}::{end_date}",
@@ -369,12 +432,17 @@ def _materialize_capability_tasks(
                 symbols=(series_id,),
                 output_name=capability.output_name,
                 preferred_vendors=(capability.vendor,),
-                payload={"capability_id": capability.capability_id, "series_id": series_id},
+                payload={
+                    "capability_id": capability.capability_id,
+                    "series_id": series_id,
+                    **_planner_metadata(capability=capability, symbol_count=1),
+                },
             )
             for series_id in default_macro_series()
         ]
 
     if capability.batching_mode == "global":
+        start_date, end_date = windows[0]
         return [
             PlannedTask(
                 task_key=f"{capability.task_kind.lower()}::{capability.dataset}::{start_date}::{end_date}",
@@ -388,12 +456,22 @@ def _materialize_capability_tasks(
                 symbols=(),
                 output_name=capability.output_name,
                 preferred_vendors=(capability.vendor,),
-                payload={"capability_id": capability.capability_id},
+                payload={
+                    "capability_id": capability.capability_id,
+                    **_planner_metadata(capability=capability, symbol_count=1),
+                },
             )
         ]
 
-    if capability.vendor == "sec_edgar" and capability.dataset in {"filing_index", "companyfacts"}:
-        symbols = [company_ticker_map[symbol] for symbol in stage_symbols if symbol in company_ticker_map]
+    if capability.vendor == "sec_edgar" and capability.dataset in {
+        "filing_index",
+        "companyfacts",
+    }:
+        symbols = [
+            company_ticker_map[symbol]
+            for symbol in stage_symbols
+            if symbol in company_ticker_map
+        ]
     else:
         symbols = list(stage_symbols)
     if not symbols:
@@ -403,34 +481,115 @@ def _materialize_capability_tasks(
     for chunk_index in range(0, len(symbols), chunk_size):
         chunk = tuple(symbols[chunk_index : chunk_index + chunk_size])
         chunk_id = f"{chunk_index // chunk_size:03d}"
-        tasks.append(
-            PlannedTask(
-                task_key=f"{capability.task_kind.lower()}::{capability.dataset}::{chunk_id}::{start_date}::{end_date}",
-                task_family="auxiliary",
-                planner_group=capability.planner_group,
-                dataset=capability.dataset,
-                tier=capability.tier,
-                priority=capability.priority,
-                start_date=start_date,
-                end_date=end_date,
-                symbols=chunk,
-                output_name=capability.output_name,
-                preferred_vendors=(capability.vendor,),
-                payload={"capability_id": capability.capability_id, "chunk_id": chunk_id},
+        for window_index, (start_date, end_date) in enumerate(windows):
+            window_id = f"{window_index:04d}"
+            tasks.append(
+                PlannedTask(
+                    task_key=f"{capability.task_kind.lower()}::{capability.dataset}::{chunk_id}::{window_id}::{start_date}::{end_date}",
+                    task_family="auxiliary",
+                    planner_group=capability.planner_group,
+                    dataset=capability.dataset,
+                    tier=capability.tier,
+                    priority=capability.priority,
+                    start_date=start_date,
+                    end_date=end_date,
+                    symbols=chunk,
+                    output_name=capability.output_name,
+                    preferred_vendors=(capability.vendor,),
+                    payload={
+                        "capability_id": capability.capability_id,
+                        "chunk_id": chunk_id,
+                        "window_id": window_id,
+                        **_planner_metadata(
+                            capability=capability, symbol_count=len(chunk)
+                        ),
+                    },
+                )
             )
-        )
     return tasks
 
 
-def _capability_window(*, capability: VendorCapability, current_ts: pd.Timestamp, stage_years: int) -> tuple[str, str]:
+def _capability_windows(
+    *, capability: VendorCapability, current_ts: pd.Timestamp, stage_years: int
+) -> list[tuple[str, str]]:
     end_ts = current_ts.normalize()
+    history_years = max(
+        1,
+        min(
+            int(stage_years), int(capability.expected_history_years or stage_years or 1)
+        ),
+    )
     if capability.dataset == "equities_minute":
-        start_ts = end_ts - pd.Timedelta(days=5)
+        start_ts = end_ts - pd.DateOffset(years=history_years)
+        return _date_chunks(start_ts=start_ts, end_ts=end_ts, chunk_days=5)
     elif capability.dataset in {"news", "company_news"}:
-        start_ts = end_ts - pd.Timedelta(days=7)
+        start_ts = end_ts - pd.DateOffset(years=history_years)
+        return _date_chunks(start_ts=start_ts, end_ts=end_ts, chunk_days=7)
     else:
         start_ts = end_ts - pd.DateOffset(years=max(1, int(stage_years)))
-    return start_ts.strftime("%Y-%m-%d"), end_ts.strftime("%Y-%m-%d")
+    return [(start_ts.strftime("%Y-%m-%d"), end_ts.strftime("%Y-%m-%d"))]
+
+
+def _date_chunks(
+    *, start_ts: pd.Timestamp, end_ts: pd.Timestamp, chunk_days: int
+) -> list[tuple[str, str]]:
+    windows: list[tuple[str, str]] = []
+    cursor = start_ts.normalize()
+    final = end_ts.normalize()
+    step = max(1, int(chunk_days))
+    while cursor <= final:
+        chunk_end = min(cursor + pd.Timedelta(days=step - 1), final)
+        windows.append((cursor.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        cursor = chunk_end + pd.Timedelta(days=1)
+    return windows
+
+
+def _planner_metadata(
+    *, capability: VendorCapability, symbol_count: int
+) -> dict[str, object]:
+    contract = dataset_contract(capability.vendor, capability.dataset)
+    credit_cost = int(getattr(contract, "request_cost_units", 1) or 1)
+    if contract is not None and str(contract.request_cost_basis) == "symbol":
+        credit_cost *= max(1, int(symbol_count))
+    if capability.task_kind == "RESEARCH_ONLY":
+        capture_family = "research_archive"
+        quota_class = "research"
+        retention_class = "raw_archive"
+    elif capability.task_kind == "MACRO":
+        capture_family = "macro"
+        quota_class = "macro"
+        retention_class = "reference"
+    elif capability.task_kind == "EVENT":
+        capture_family = "events"
+        quota_class = "events"
+        retention_class = "reference"
+    else:
+        capture_family = "reference"
+        quota_class = "reference"
+        retention_class = "reference"
+    return {
+        "priority_class": capability.tier,
+        "quota_class": quota_class,
+        "capture_family": capture_family,
+        "credit_cost": credit_cost,
+        "retention_class": retention_class,
+        "source_doc_version": "2026-04-27-free-tier-docs",
+    }
+
+
+def _canonical_planner_metadata(*, symbol_count: int) -> dict[str, object]:
+    contract = dataset_contract("alpaca", "equities_eod")
+    credit_cost = int(getattr(contract, "request_cost_units", 1) or 1)
+    if contract is not None and str(contract.request_cost_basis) == "symbol":
+        credit_cost *= max(1, int(symbol_count))
+    return {
+        "priority_class": "A",
+        "quota_class": "forward",
+        "capture_family": "canonical_eod",
+        "credit_cost": credit_cost,
+        "retention_class": "canonical_raw",
+        "source_doc_version": "2026-04-27-free-tier-docs",
+    }
 
 
 def training_readiness(

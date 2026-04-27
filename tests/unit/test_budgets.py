@@ -42,8 +42,12 @@ def test_daily_cap_enforcement_uses_weighted_units() -> None:
     assert manager.can_spend("twelve_data", task_kind="FORWARD", units=4, now=now)
     manager.record_spend("twelve_data", task_kind="FORWARD", units=4, now=now)
 
-    assert not manager.can_spend("twelve_data", task_kind="FORWARD", units=2, now=now + timedelta(minutes=1))
-    assert manager.can_spend("twelve_data", task_kind="FORWARD", units=1, now=now + timedelta(minutes=1))
+    assert not manager.can_spend(
+        "twelve_data", task_kind="FORWARD", units=2, now=now + timedelta(minutes=1)
+    )
+    assert manager.can_spend(
+        "twelve_data", task_kind="FORWARD", units=1, now=now + timedelta(minutes=1)
+    )
 
 
 def test_forward_reserve_allows_forward_when_other_tasks_are_blocked() -> None:
@@ -51,10 +55,34 @@ def test_forward_reserve_allows_forward_when_other_tasks_are_blocked() -> None:
     now = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
 
     for offset in range(9):
-        manager.record_spend("massive", task_kind="GAP", now=now + timedelta(minutes=offset))
+        manager.record_spend(
+            "massive", task_kind="GAP", now=now + timedelta(minutes=offset)
+        )
 
-    assert not manager.can_spend("massive", task_kind="GAP", now=now + timedelta(minutes=10))
-    assert manager.can_spend("massive", task_kind="FORWARD", now=now + timedelta(minutes=10))
+    assert not manager.can_spend(
+        "massive", task_kind="GAP", now=now + timedelta(minutes=10)
+    )
+    assert manager.can_spend(
+        "massive", task_kind="FORWARD", now=now + timedelta(minutes=10)
+    )
+
+
+def test_forward_reserve_burns_down_near_daily_reset() -> None:
+    manager = BudgetManager(
+        {"alpaca": {"rpm": 100, "daily_cap": 10}}, reserve_fraction=0.20
+    )
+    early = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+    late = datetime(2026, 1, 2, 23, 45, tzinfo=UTC)
+
+    for offset in range(8):
+        manager.record_spend(
+            "alpaca", task_kind="OTHER", now=early + timedelta(minutes=offset)
+        )
+
+    assert not manager.can_spend(
+        "alpaca", task_kind="OTHER", now=early + timedelta(minutes=10)
+    )
+    assert manager.can_spend("alpaca", task_kind="OTHER", now=late)
 
 
 def test_budget_manager_persists_snapshot(tmp_path) -> None:
@@ -87,7 +115,9 @@ def test_budget_manager_persists_weighted_units_and_request_counts(tmp_path) -> 
     now = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
 
     manager.record_spend("twelve_data", task_kind="FORWARD", units=8, now=now)
-    manager.record_spend("twelve_data", task_kind="OTHER", units=3, now=now + timedelta(seconds=1))
+    manager.record_spend(
+        "twelve_data", task_kind="OTHER", units=3, now=now + timedelta(seconds=1)
+    )
 
     payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
     assert payload["vendors"]["twelve_data"]["daily_spend"]["TOTAL"] == 11
@@ -103,7 +133,9 @@ def test_budget_manager_snapshot_persistence_is_thread_safe(tmp_path) -> None:
     now = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
 
     def _spend(offset: int) -> None:
-        manager.record_spend("alpaca", task_kind="OTHER", now=now + timedelta(seconds=offset))
+        manager.record_spend(
+            "alpaca", task_kind="OTHER", now=now + timedelta(seconds=offset)
+        )
 
     with ThreadPoolExecutor(max_workers=16) as executor:
         list(executor.map(_spend, range(64)))
@@ -144,11 +176,26 @@ def test_budget_manager_tracks_endpoint_telemetry(tmp_path) -> None:
     )
     now = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
 
-    manager.record_spend("twelve_data", task_kind="FORWARD", units=8, endpoint="equities_eod", logical_units=8, now=now)
-    manager.record_local_budget_block("twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=1))
-    manager.record_remote_rate_limit("twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=2))
-    manager.record_permanent_failure("twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=3))
-    manager.record_empty_success("twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=4))
+    manager.record_spend(
+        "twelve_data",
+        task_kind="FORWARD",
+        units=8,
+        endpoint="equities_eod",
+        logical_units=8,
+        now=now,
+    )
+    manager.record_local_budget_block(
+        "twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=1)
+    )
+    manager.record_remote_rate_limit(
+        "twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=2)
+    )
+    manager.record_permanent_failure(
+        "twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=3)
+    )
+    manager.record_empty_success(
+        "twelve_data", endpoint="equities_eod", now=now + timedelta(seconds=4)
+    )
 
     payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
     telemetry = payload["vendors"]["twelve_data"]["telemetry"]
@@ -161,3 +208,23 @@ def test_budget_manager_tracks_endpoint_telemetry(tmp_path) -> None:
     assert telemetry["totals"]["empty_successes"] == 1
     assert telemetry["window_counts"]["outbound_requests"] == 1
     assert telemetry["per_endpoint"]["equities_eod"]["request_cost_units"] == 8
+
+
+def test_budget_snapshot_reports_remaining_and_idle_capacity() -> None:
+    manager = BudgetManager(
+        {"alpaca": {"rpm": 10, "daily_cap": 20}}, reserve_fraction=0.10
+    )
+    now = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+
+    manager.record_spend("alpaca", task_kind="FORWARD", units=2, now=now)
+    manager.record_spend(
+        "alpaca", task_kind="OTHER", units=3, now=now + timedelta(seconds=1)
+    )
+
+    vendor = manager.snapshot(now=now + timedelta(seconds=2))["vendors"]["alpaca"]
+
+    assert vendor["remaining_daily_units"] == 15
+    assert vendor["remaining_window_requests"] == 8
+    assert vendor["idle_window_requests"] == 8
+    assert vendor["utilization"]["daily"] == 0.25
+    assert vendor["utilization"]["window"] == 0.2

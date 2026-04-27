@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, date as date_type
 from itertools import islice
+from urllib.parse import parse_qsl, urlparse
 
 import pandas as pd
 
@@ -27,29 +28,78 @@ class TwelveDataConnector(HTTPConnector):
     ) -> pd.DataFrame:
         """Fetch a normalized Twelve Data dataset."""
         if dataset == "equities_eod":
-            return self._fetch_equities(symbols=symbols, start_date=start_date, end_date=end_date)
+            return self._fetch_equities(
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+                interval="1day",
+                endpoint_key="equities_eod",
+                batch_size=8,
+            )
+        if dataset == "equities_minute":
+            return self._fetch_equities(
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+                interval="1min",
+                endpoint_key="equities_minute",
+                batch_size=1,
+            )
         if dataset in {"dividends", "splits"}:
-            return self._fetch_corporate_actions(dataset=dataset, symbols=symbols, start_date=start_date, end_date=end_date)
+            return self._fetch_corporate_actions(
+                dataset=dataset,
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+            )
         if dataset == "earnings_calendar":
             payload = self.request_json(
                 endpoint="/earnings",
                 endpoint_key="earnings_calendar",
-                params={"start_date": pd.Timestamp(start_date).strftime("%Y-%m-%d"), "end_date": pd.Timestamp(end_date).strftime("%Y-%m-%d")},
+                params={
+                    "start_date": pd.Timestamp(start_date).strftime("%Y-%m-%d"),
+                    "end_date": pd.Timestamp(end_date).strftime("%Y-%m-%d"),
+                },
                 task_kind="OTHER",
             )
-            rows = payload.get("earnings", payload.get("data", payload if isinstance(payload, list) else [])) if isinstance(payload, dict) else payload
+            rows = (
+                payload.get(
+                    "earnings",
+                    payload.get("data", payload if isinstance(payload, list) else []),
+                )
+                if isinstance(payload, dict)
+                else payload
+            )
             return pd.DataFrame(rows)
         if dataset == "financial_statements":
             return self._fetch_financial_statements(symbols=symbols)
         if dataset == "stocks":
-            payload = self.request_json(endpoint="/stocks", endpoint_key="stocks", task_kind="OTHER")
-            rows = payload.get("data", payload if isinstance(payload, list) else []) if isinstance(payload, dict) else payload
+            payload = self.request_json(
+                endpoint="/stocks", endpoint_key="stocks", task_kind="OTHER"
+            )
+            rows = (
+                payload.get("data", payload if isinstance(payload, list) else [])
+                if isinstance(payload, dict)
+                else payload
+            )
             return pd.DataFrame(rows)
         if dataset == "price_target":
             frames = []
             for symbol in symbols:
-                payload = self.request_json(endpoint="/price_target", endpoint_key="price_target", params={"symbol": symbol}, task_kind="OTHER", logical_units=1)
-                frames.append(pd.DataFrame([payload.get("data", payload)] if isinstance(payload, dict) else payload))
+                payload = self.request_json(
+                    endpoint="/price_target",
+                    endpoint_key="price_target",
+                    params={"symbol": symbol},
+                    task_kind="OTHER",
+                    logical_units=1,
+                )
+                frames.append(
+                    pd.DataFrame(
+                        [payload.get("data", payload)]
+                        if isinstance(payload, dict)
+                        else payload
+                    )
+                )
             return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if dataset == "insider_transactions":
             frames = []
@@ -61,7 +111,11 @@ class TwelveDataConnector(HTTPConnector):
                     task_kind="OTHER",
                     logical_units=1,
                 )
-                rows = payload.get("data", payload if isinstance(payload, list) else []) if isinstance(payload, dict) else payload
+                rows = (
+                    payload.get("data", payload if isinstance(payload, list) else [])
+                    if isinstance(payload, dict)
+                    else payload
+                )
                 frame = pd.DataFrame(rows)
                 if not frame.empty:
                     frame["symbol"] = symbol
@@ -75,49 +129,91 @@ class TwelveDataConnector(HTTPConnector):
         symbols: list[str],
         start_date: str | date_type,
         end_date: str | date_type,
+        interval: str,
+        endpoint_key: str,
+        batch_size: int,
     ) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
         start = pd.Timestamp(start_date).strftime("%Y-%m-%d")
         end = pd.Timestamp(end_date).strftime("%Y-%m-%d")
-        for batch in _chunked(symbols, 8):
+        for batch in _chunked(symbols, max(1, int(batch_size))):
             batch_units = max(1, len(batch))
-            payload = self.request_json(
-                endpoint="/time_series",
-                endpoint_key="equities_eod",
-                params={
-                    "symbol": ",".join(batch),
-                    "interval": "1day",
-                    "start_date": start,
-                    "end_date": end,
-                    "order": "ASC",
-                    "format": "JSON",
-                },
-                task_kind="FORWARD",
-                budget_units=batch_units,
-                logical_units=len(batch),
-            )
-            for symbol, values in self._iter_time_series_payloads(payload=payload, requested=batch):
-                frame = pd.DataFrame(values)
-                if frame.empty:
-                    continue
-                frame["symbol"] = symbol
-                frame["vendor_ts"] = pd.to_datetime(frame.get("datetime", frame.get("date")), errors="coerce", utc=True)
-                frame["date"] = frame["vendor_ts"].dt.date
-                frame["open"] = pd.to_numeric(frame.get("open"), errors="coerce")
-                frame["high"] = pd.to_numeric(frame.get("high"), errors="coerce")
-                frame["low"] = pd.to_numeric(frame.get("low"), errors="coerce")
-                frame["close"] = pd.to_numeric(frame.get("close"), errors="coerce")
-                frame["volume"] = pd.to_numeric(frame.get("volume"), errors="coerce")
-                frame["vwap"] = pd.NA
-                frame["trade_count"] = pd.NA
-                frame["ingested_at"] = pd.Timestamp.now(tz=UTC)
-                frame["source_name"] = self.vendor_name
-                frame["source_uri"] = "/time_series"
-                frames.append(frame)
+            params = {
+                "symbol": ",".join(batch),
+                "interval": interval,
+                "start_date": start,
+                "end_date": end,
+                "order": "ASC",
+                "format": "JSON",
+                **(
+                    {"outputsize": 5000, "timezone": "UTC"}
+                    if interval == "1min"
+                    else {}
+                ),
+            }
+            while True:
+                payload = self.request_json(
+                    endpoint="/time_series",
+                    endpoint_key=endpoint_key,
+                    params=params,
+                    task_kind="FORWARD",
+                    budget_units=batch_units,
+                    logical_units=len(batch),
+                )
+                for symbol, values in self._iter_time_series_payloads(
+                    payload=payload, requested=batch
+                ):
+                    frame = pd.DataFrame(values)
+                    if frame.empty:
+                        continue
+                    frame["symbol"] = symbol
+                    frame["vendor_ts"] = pd.to_datetime(
+                        frame.get("datetime", frame.get("date")),
+                        errors="coerce",
+                        utc=True,
+                    )
+                    frame["date"] = frame["vendor_ts"].dt.date
+                    frame["open"] = pd.to_numeric(frame.get("open"), errors="coerce")
+                    frame["high"] = pd.to_numeric(frame.get("high"), errors="coerce")
+                    frame["low"] = pd.to_numeric(frame.get("low"), errors="coerce")
+                    frame["close"] = pd.to_numeric(frame.get("close"), errors="coerce")
+                    frame["volume"] = pd.to_numeric(
+                        frame.get("volume"), errors="coerce"
+                    )
+                    frame["vwap"] = pd.NA
+                    frame["trade_count"] = pd.NA
+                    frame["ingested_at"] = pd.Timestamp.now(tz=UTC)
+                    frame["source_name"] = self.vendor_name
+                    frame["source_uri"] = "/time_series"
+                    frames.append(frame)
+                next_params = self._next_time_series_query(payload)
+                if not next_params:
+                    break
+                params = {**params, **next_params}
         if not frames:
-            self.budget_manager.record_empty_success(self.vendor_name, endpoint="equities_eod")
+            self.budget_manager.record_empty_success(
+                self.vendor_name, endpoint=endpoint_key
+            )
             return pd.DataFrame(columns=self._equity_columns())
-        return pd.concat(frames, ignore_index=True)[self._equity_columns()].sort_values(["date", "symbol"]).reset_index(drop=True)
+        return (
+            pd.concat(frames, ignore_index=True)[self._equity_columns()]
+            .sort_values(["vendor_ts", "symbol"])
+            .reset_index(drop=True)
+        )
+
+    @staticmethod
+    def _next_time_series_query(payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            return {}
+        meta = payload.get("meta")
+        if not isinstance(meta, dict):
+            return {}
+        next_query = meta.get("next_api_query")
+        if not next_query:
+            return {}
+        parsed = urlparse(str(next_query))
+        query = parsed.query if parsed.query else str(next_query).lstrip("?")
+        return dict(parse_qsl(query))
 
     @staticmethod
     def _iter_time_series_payloads(
@@ -126,23 +222,34 @@ class TwelveDataConnector(HTTPConnector):
         requested: list[str],
     ) -> list[tuple[str, list[dict[str, object]]]]:
         if isinstance(payload, dict) and "values" in payload:
-            symbol = str(payload.get("meta", {}).get("symbol", requested[0] if requested else "")).upper()
+            symbol = str(
+                payload.get("meta", {}).get("symbol", requested[0] if requested else "")
+            ).upper()
             values = payload.get("values", [])
             return [(symbol, values if isinstance(values, list) else [])]
         if isinstance(payload, dict):
-            requested_lookup = {_normalize_batch_symbol(symbol): str(symbol).upper() for symbol in requested}
+            requested_lookup = {
+                _normalize_batch_symbol(symbol): str(symbol).upper()
+                for symbol in requested
+            }
             rows: list[tuple[str, list[dict[str, object]]]] = []
             for top_level_key, candidate in payload.items():
                 if not isinstance(candidate, dict):
                     continue
-                meta_symbol = str(candidate.get("meta", {}).get("symbol", top_level_key)).upper()
+                meta_symbol = str(
+                    candidate.get("meta", {}).get("symbol", top_level_key)
+                ).upper()
                 normalized_symbol = _normalize_batch_symbol(meta_symbol)
                 fallback_symbol = _normalize_batch_symbol(str(top_level_key))
-                requested_symbol = requested_lookup.get(normalized_symbol) or requested_lookup.get(fallback_symbol)
+                requested_symbol = requested_lookup.get(
+                    normalized_symbol
+                ) or requested_lookup.get(fallback_symbol)
                 if requested_symbol is None:
                     continue
                 values = candidate.get("values", [])
-                rows.append((requested_symbol, values if isinstance(values, list) else []))
+                rows.append(
+                    (requested_symbol, values if isinstance(values, list) else [])
+                )
             return rows
         return []
 
@@ -166,20 +273,38 @@ class TwelveDataConnector(HTTPConnector):
                 task_kind="OTHER",
                 logical_units=1,
             )
-            rows = payload.get(dataset, payload.get("data", payload.get("values", []))) if isinstance(payload, dict) else payload
+            rows = (
+                payload.get(dataset, payload.get("data", payload.get("values", [])))
+                if isinstance(payload, dict)
+                else payload
+            )
             frame = pd.DataFrame(rows)
             if frame.empty:
                 continue
-            frame["symbol"] = payload.get("meta", {}).get("symbol", symbol) if isinstance(payload, dict) else symbol
+            frame["symbol"] = (
+                payload.get("meta", {}).get("symbol", symbol)
+                if isinstance(payload, dict)
+                else symbol
+            )
             frame["event_type"] = "dividend" if dataset == "dividends" else "split"
-            frame["ex_date"] = pd.to_datetime(frame.get("ex_date", frame.get("date")), errors="coerce").dt.date
-            frame["record_date"] = _normalize_optional_date(frame, "record_date", "recordDate").dt.date
-            frame["pay_date"] = _normalize_optional_date(frame, "payment_date", "pay_date", "payDate").dt.date
+            frame["ex_date"] = pd.to_datetime(
+                frame.get("ex_date", frame.get("date")), errors="coerce"
+            ).dt.date
+            frame["record_date"] = _normalize_optional_date(
+                frame, "record_date", "recordDate"
+            ).dt.date
+            frame["pay_date"] = _normalize_optional_date(
+                frame, "payment_date", "pay_date", "payDate"
+            ).dt.date
             if dataset == "dividends":
-                frame["amount"] = pd.to_numeric(frame.get("amount", frame.get("cash_amount")), errors="coerce")
+                frame["amount"] = pd.to_numeric(
+                    frame.get("amount", frame.get("cash_amount")), errors="coerce"
+                )
                 frame["ratio"] = pd.NA
             else:
-                frame["ratio"] = frame.get("ratio", pd.Series(dtype="string")).map(_parse_adjustment_ratio)
+                frame["ratio"] = frame.get("ratio", pd.Series(dtype="string")).map(
+                    _parse_adjustment_ratio
+                )
                 frame["amount"] = pd.NA
             frame["source"] = self.vendor_name
             frame["source_count"] = 1
@@ -187,7 +312,11 @@ class TwelveDataConnector(HTTPConnector):
             frames.append(frame[self._action_columns()])
         if not frames:
             return pd.DataFrame(columns=self._action_columns())
-        return pd.concat(frames, ignore_index=True).dropna(subset=["symbol", "ex_date"]).reset_index(drop=True)
+        return (
+            pd.concat(frames, ignore_index=True)
+            .dropna(subset=["symbol", "ex_date"])
+            .reset_index(drop=True)
+        )
 
     def _fetch_financial_statements(self, *, symbols: list[str]) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
@@ -198,25 +327,67 @@ class TwelveDataConnector(HTTPConnector):
         }
         for symbol in symbols:
             for statement_type, endpoint in endpoints.items():
-                payload = self.request_json(endpoint=endpoint, endpoint_key="financial_statements", params={"symbol": symbol}, task_kind="OTHER", logical_units=1)
-                rows = payload.get(statement_type, payload.get("data", payload if isinstance(payload, list) else [])) if isinstance(payload, dict) else payload
+                payload = self.request_json(
+                    endpoint=endpoint,
+                    endpoint_key="financial_statements",
+                    params={"symbol": symbol},
+                    task_kind="OTHER",
+                    logical_units=1,
+                )
+                rows = (
+                    payload.get(
+                        statement_type,
+                        payload.get(
+                            "data", payload if isinstance(payload, list) else []
+                        ),
+                    )
+                    if isinstance(payload, dict)
+                    else payload
+                )
                 for row in rows:
                     if not isinstance(row, dict):
                         continue
-                    fiscal_date = pd.to_datetime(row.get("fiscal_date", row.get("date")), errors="coerce")
+                    fiscal_date = pd.to_datetime(
+                        row.get("fiscal_date", row.get("date")), errors="coerce"
+                    )
                     frames.append(
                         {
-                            "symbol": payload.get("meta", {}).get("symbol", symbol) if isinstance(payload, dict) else symbol,
+                            "symbol": (
+                                payload.get("meta", {}).get("symbol", symbol)
+                                if isinstance(payload, dict)
+                                else symbol
+                            ),
                             "statement_type": statement_type,
-                            "date": fiscal_date.normalize() if pd.notna(fiscal_date) else pd.NaT,
-                            "as_of_date": fiscal_date.normalize() if pd.notna(fiscal_date) else pd.NaT,
+                            "date": (
+                                fiscal_date.normalize()
+                                if pd.notna(fiscal_date)
+                                else pd.NaT
+                            ),
+                            "as_of_date": (
+                                fiscal_date.normalize()
+                                if pd.notna(fiscal_date)
+                                else pd.NaT
+                            ),
                             "period": row.get("period"),
                             "data": row,
                         }
                     )
         if not frames:
-            return pd.DataFrame(columns=["symbol", "statement_type", "date", "as_of_date", "period", "data"])
-        return pd.DataFrame(frames).sort_values(["symbol", "statement_type", "date"]).reset_index(drop=True)
+            return pd.DataFrame(
+                columns=[
+                    "symbol",
+                    "statement_type",
+                    "date",
+                    "as_of_date",
+                    "period",
+                    "data",
+                ]
+            )
+        return (
+            pd.DataFrame(frames)
+            .sort_values(["symbol", "statement_type", "date"])
+            .reset_index(drop=True)
+        )
 
     @staticmethod
     def _equity_columns() -> list[str]:
@@ -238,7 +409,18 @@ class TwelveDataConnector(HTTPConnector):
 
     @staticmethod
     def _action_columns() -> list[str]:
-        return ["symbol", "event_type", "ex_date", "record_date", "pay_date", "ratio", "amount", "source", "source_count", "ingested_at"]
+        return [
+            "symbol",
+            "event_type",
+            "ex_date",
+            "record_date",
+            "pay_date",
+            "ratio",
+            "amount",
+            "source",
+            "source_count",
+            "ingested_at",
+        ]
 
 
 def _parse_adjustment_ratio(value: object) -> float | pd.NA:
