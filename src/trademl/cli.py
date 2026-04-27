@@ -93,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     train_preflight_parser = train_subparsers.add_parser("preflight", help="Run the training preflight against NAS data.")
     train_preflight_parser.add_argument("--phase", type=int, default=1)
     train_preflight_parser.add_argument("--target", default=None)
+    train_preflight_parser.add_argument("--model-suite", default=None)
     train_start_parser = train_subparsers.add_parser("start", help="Start a detached DGX/workstation training run.")
     train_start_parser.add_argument("--phase", type=int, default=1)
     train_start_parser.add_argument("--report-date", default=None)
@@ -393,7 +394,7 @@ def _dispatch_train(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.train_command == "preflight":
-        print(json.dumps(training_preflight_status(settings, phase=args.phase, target=args.target), indent=2, default=str))
+        print(json.dumps(training_preflight_status(settings, phase=args.phase, target=args.target, model_suite=args.model_suite), indent=2, default=str))
         return 0
     if args.train_command == "start":
         payload = start_training_run(settings, phase=args.phase, report_date=args.report_date, target=args.target)

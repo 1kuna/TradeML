@@ -954,6 +954,7 @@ def training_preflight_status(
     *,
     phase: int,
     target: str | None = None,
+    model_suite: str | None = None,
 ) -> dict[str, Any]:
     """Run split training preflight for the selected target."""
     config_path = settings.repo_root / "configs" / "equities_xs.yml"
@@ -965,6 +966,7 @@ def training_preflight_status(
         targets_config_path=settings.config_path,
         target=target,
         python_executable=sys.executable,
+        model_suite=model_suite,
     )
 
 
@@ -1308,7 +1310,6 @@ def _current_node_runtime(settings: NodeSettings) -> dict[str, Any]:
 def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
     """Collect the live dashboard state used by the main status and budget views."""
     runtime = _current_node_runtime(settings)
-    running = bool(runtime.get("running"))
     planner_summary = _read_planner_summary(settings.db_path)
     queue_counts = _queue_counts_from_planner_summary(planner_summary) or _read_queue_counts(settings.db_path)
     qc_frame = _read_qc_frame(settings.qc_path)
@@ -1490,7 +1491,6 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
 def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
     """Collect the lightweight live snapshot used for continuously updating top-line metrics."""
     runtime = _current_node_runtime(settings)
-    running = bool(runtime.get("running"))
     planner_summary = _read_planner_summary(settings.db_path)
     queue_counts = _queue_counts_from_planner_summary(planner_summary) or _read_queue_counts(settings.db_path)
     qc_frame = _read_qc_frame(settings.qc_path)

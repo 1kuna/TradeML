@@ -1102,7 +1102,6 @@ def test_advance_collection_stage_updates_stage_manifest_and_queue(tmp_path: Pat
         yaml.safe_dump({"current": 0, "symbols": ["AAPL", "MSFT"], "years": 5}, sort_keys=False),
         encoding="utf-8",
     )
-    db = DataNodeDB(local_state / "node.sqlite")
     reference_root = nas_mount / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(

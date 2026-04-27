@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -30,6 +31,10 @@ REMOTE_COMMAND_TIMEOUT_SECONDS = 60
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH_SERVER_ALIVE_INTERVAL_SECONDS = 5
 SSH_SERVER_ALIVE_COUNT_MAX = 2
+MODEL_SUITE_DEPENDENCIES = {
+    "full": ["lightgbm", "optuna"],
+    "advanced": ["catboost", "lightgbm", "optuna"],
+}
 
 
 @dataclass(slots=True)
@@ -491,6 +496,7 @@ def training_preflight(
     target: str | None = None,
     python_executable: str = sys.executable,
     execution_config_path: Path | None = None,
+    model_suite: str | None = None,
 ) -> dict[str, Any]:
     """Run control-plane, target, and dataset preflight before launching long-running work."""
     repo_root = repo_root or config_path.parents[1]
@@ -514,9 +520,10 @@ def training_preflight(
     )
     target_report = _target_preflight(target=resolved_target, config_path=effective_config_path)
     dataset_report = _dataset_preflight(target=resolved_target, config_path=effective_config_path)
-    ok = bool(control["ok"] and target_report.get("ok") and dataset_report.get("ok"))
+    dependency_report = _dependency_preflight(target=resolved_target, model_suite=model_suite)
+    ok = bool(control["ok"] and target_report.get("ok") and dataset_report.get("ok") and dependency_report.get("ok"))
     reason = None
-    for report in (target_report, dataset_report):
+    for report in (target_report, dataset_report, dependency_report):
         if not report.get("ok", False):
             reason = str(report.get("reason"))
             break
@@ -526,6 +533,7 @@ def training_preflight(
         "control": control,
         "target": target_report,
         "dataset": dataset_report,
+        "dependencies": dependency_report,
         "resolved_target": asdict(resolved_target),
     }
     if dataset_report.get("sample_rows") is not None:
@@ -533,6 +541,48 @@ def training_preflight(
         payload["sample_date"] = dataset_report.get("sample_date")
         payload["qc_path"] = dataset_report.get("qc_path")
     return payload
+
+
+def _dependency_preflight(*, target: TrainingTarget, model_suite: str | None) -> dict[str, Any]:
+    """Verify model-suite Python dependencies on the execution target."""
+    suite = str(model_suite or "").strip()
+    required = MODEL_SUITE_DEPENDENCIES.get(suite, [])
+    if not required:
+        return {"ok": True, "model_suite": suite or None, "required": [], "missing": [], "reason": None}
+    body = f"""
+import importlib.util
+import json
+modules = {json.dumps(required)}
+missing = [name for name in modules if importlib.util.find_spec(name) is None]
+print(json.dumps({{"missing": missing}}))
+raise SystemExit(1 if missing else 0)
+"""
+    if target.kind == "local":
+        result = subprocess.run(  # noqa: S603
+            [target.python_executable, "-c", body],
+            cwd=target.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
+        )
+    else:
+        result = _run_ssh_command(target, _remote_python_here_doc(target, body))
+    missing: list[str] = []
+    with contextlib.suppress(json.JSONDecodeError):
+        missing = list(json.loads(result.stdout.strip() or "{}").get("missing") or [])
+    if result.returncode == 0 and not missing:
+        return {"ok": True, "model_suite": suite, "required": required, "missing": [], "reason": None}
+    if not missing:
+        missing = required
+    return {
+        "ok": False,
+        "model_suite": suite,
+        "required": required,
+        "missing": missing,
+        "reason": f"missing python packages for {suite}: {', '.join(missing)}",
+        "stderr": result.stderr.strip(),
+    }
 
 
 def _target_config_path(*, target: TrainingTarget, local_config_path: Path, repo_root: Path) -> Path:
@@ -614,6 +664,7 @@ def launch_training_process(
         target=resolved_target.name,
         python_executable=python_executable,
         execution_config_path=execution_config_path,
+        model_suite=model_suite or ("ridge_only" if phase == 1 else "full"),
     )
     if not preflight["ok"]:
         raise RuntimeError(f"phase {phase} training preflight failed: {preflight['reason']}")

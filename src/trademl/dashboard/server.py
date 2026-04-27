@@ -852,6 +852,8 @@ OPERATOR_HTML_PAGE = """<!doctype html>
       const paperOutputs = program.latest_paper_outputs || program.paper_outputs || {};
       const driftAlerts = program.latest_drift_alerts || program.drift_alerts || [];
       const infraBlocker = program.last_infra_preflight || program.infra_blocker || {};
+      const frontierArchitecture = program.frontier_architecture || {};
+      const dependencyPreflight = program.dependency_preflight || ((program.last_infra_preflight || {}).dependencies || {});
       const readinessPill = document.getElementById('status-readiness-pill');
       readinessPill.textContent = phase1.ready ? 'Phase 1 ready' : 'Phase 1 blocked';
       readinessPill.className = `pill ${phase1.ready ? 'good' : 'warn'}`;
@@ -919,6 +921,8 @@ OPERATOR_HTML_PAGE = """<!doctype html>
         ['Paper orders', paperOutputs.paper_orders_path || '-'],
         ['Drift alerts', formatNumber(driftAlerts.length || 0)],
         ['Infra blocker', infraBlocker.reason || program.wait_reason || '-'],
+        ['Frontier lane', frontierArchitecture.enabled ? 'Advanced-first' : '-'],
+        ['Dependency preflight', dependencyPreflight.ok === false ? (dependencyPreflight.reason || 'Blocked') : (dependencyPreflight.ok ? 'OK' : '-')],
         ['Top rejection', ((experiment.top_gate_failures || [])[0] || []).join(': ') || '-'],
         ['Budget left', formatNumber(((program.budgets || {}).max_total_runs ?? 0) - ((program.budgets || {}).runs_completed ?? 0))],
       ]);

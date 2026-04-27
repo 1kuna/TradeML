@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
 
 from trademl.connectors.alpaca import AlpacaConnector
 from trademl.connectors.alpha_vantage import AlphaVantageConnector

@@ -11,8 +11,6 @@ import os
 import platform
 import socket
 import subprocess
-import sys
-import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -736,7 +734,7 @@ def render_systemd_unit(
             "[Service]",
             "Type=simple",
             f"WorkingDirectory={workspace_root}",
-            f"Environment=PYTHONUNBUFFERED=1",
+            "Environment=PYTHONUNBUFFERED=1",
             f"ExecStart={python_executable} -m trademl.data_node --config {config_path} --root {workspace_root} --env-file {env_path}",
             "Restart=on-failure",
             "RestartSec=15",

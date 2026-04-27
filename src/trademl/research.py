@@ -21,6 +21,7 @@ import pandas as pd
 import yaml
 
 from trademl.experiments import (
+    ARCHITECTURE_FAMILY_PRESETS,
     _atomic_write_json,
     _count_launchable_runs,
     _load_run_manifests,
@@ -91,6 +92,16 @@ DEFAULT_PAPER_POLICY = {
     "enabled": True,
     "rebalance_day": "FRI",
     "no_live_orders": True,
+}
+DEFAULT_FRONTIER_ARCHITECTURE_POLICY = {
+    "enabled": False,
+    "allow_phase1_advanced": False,
+    "trigger_min_completed_runs": 100,
+    "advanced_first": True,
+    "family_size_cap": 6,
+    "sentinel_baseline_runs": 2,
+    "max_advanced_failures_per_epoch": 12,
+    "require_dependency_preflight": True,
 }
 
 
@@ -304,6 +315,12 @@ def supervise_research_program(
         frontier = _update_frontier_memory(state=state, experiment_summary=experiment_summary)
         decision = _determine_program_transition(spec=spec, state=state, frontier=frontier, experiment_summary=experiment_summary, proposal=proposal)
         state["frontier"] = frontier
+        state["frontier_architecture"] = _frontier_architecture_status(
+            spec=spec,
+            state=state,
+            frontier=frontier,
+            experiment_summary=experiment_summary,
+        )
         state["best_candidate_summary"] = _program_best_candidate(frontier=frontier, experiment_summary=experiment_summary)
         state["last_transition"] = decision
         packet = None
@@ -740,6 +757,7 @@ def research_health(
 ) -> dict[str, Any]:
     """Return the operator health surface for a research program."""
     state = read_research_program_state(local_state=local_state, program_id=program_id)
+    spec = _load_research_program_spec(Path(str(state.get("spec_path")))) if state.get("spec_path") else {}
     current_experiment_id = str(state.get("current_experiment_id") or "")
     latest_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=current_experiment_id) if current_experiment_id else {}
     incumbent = read_research_incumbent(local_state=local_state, program_id=program_id)
@@ -767,6 +785,8 @@ def research_health(
         "alerts": alerts,
         "paper": state.get("latest_paper_outputs", {}),
         "infra_blocker": state.get("last_infra_preflight", {}),
+        "frontier_architecture": _frontier_architecture_status(spec=spec, state=state, frontier=dict(state.get("frontier") or {}), experiment_summary=latest_summary) if spec else {},
+        "dependency_preflight": (state.get("last_infra_preflight") or {}).get("dependencies", {}),
         "paths": _research_path_summary(local_state=local_state, data_root=data_root),
     }
 
@@ -965,6 +985,13 @@ def write_research_review_packet(
         "drift_alerts": drift_alerts,
         "alert_result": alert_result,
         "infra_blocker": state.get("last_infra_preflight", {}),
+        "frontier_architecture": _frontier_architecture_status(
+            spec=spec,
+            state=state,
+            frontier=dict(state.get("frontier") or {}),
+            experiment_summary=experiment_summary,
+        ),
+        "dependency_preflight": (state.get("last_infra_preflight") or {}).get("dependencies", {}),
         "paths": _research_path_summary(local_state=local_state, data_root=data_root),
         "top_rejections": experiment_summary.get("top_gate_failures", []),
         "next_direction": state.get("last_transition", {}).get("reason"),
@@ -1202,6 +1229,12 @@ def _initial_program_state(*, spec: dict[str, Any], program_path: Path, poll_sec
         "current_family_signature": None,
         "active_experiment_supervisor": {},
         "frontier": _empty_frontier(),
+        "frontier_architecture": _frontier_architecture_status(
+            spec=spec,
+            state={"budgets": {"runs_completed": 0}},
+            frontier=_empty_frontier(),
+            experiment_summary={},
+        ),
         "budgets": {
             "families_started": 0,
             "runs_completed": 0,
@@ -1379,6 +1412,17 @@ def _determine_program_transition(
                 "novelty_score": novelty,
             }
 
+    frontier_spec = _frontier_architecture_spec(spec=spec, state=state, phase_policy=phase_policy, frontier=frontier, experiment_summary=experiment_summary)
+    if frontier_spec is not None:
+        return {
+            "action": "launch_family",
+            "reason": "frontier architecture policy is testing advanced challengers before more baseline churn",
+            "next_spec": frontier_spec,
+            "family_signature": _family_signature(frontier_spec),
+            "novelty_score": _novelty_score(frontier=frontier, next_spec=frontier_spec),
+            "frontier_architecture": _frontier_architecture_status(spec=spec, state=state, frontier=frontier, experiment_summary=experiment_summary),
+        }
+
     stop_reason = _program_stop_reason(spec=spec, state=state, phase_policy=phase_policy, frontier=frontier, experiment_summary=experiment_summary)
     if stop_reason:
         if _stop_reason_waits_for_data(spec=spec, stop_reason=stop_reason):
@@ -1471,6 +1515,118 @@ def _program_next_spec_from_proposal(
         steering=dict(state.get("steering") or {}),
     )
     return next_spec
+
+
+def _frontier_architecture_policy(spec: dict[str, Any]) -> dict[str, Any]:
+    """Return the controlled advanced-first frontier policy."""
+    return {**DEFAULT_FRONTIER_ARCHITECTURE_POLICY, **dict(spec.get("frontier_architecture_policy") or {})}
+
+
+def _frontier_architecture_status(
+    *,
+    spec: dict[str, Any],
+    state: dict[str, Any],
+    frontier: dict[str, Any],
+    experiment_summary: dict[str, Any],
+) -> dict[str, Any]:
+    policy = _frontier_architecture_policy(spec)
+    advanced_count = int(((frontier.get("lane_stats") or {}).get("architecture_family") or {}).get("advanced_challenger", 0) or 0)
+    return {
+        "policy": policy,
+        "enabled": bool(policy.get("enabled", False)),
+        "runs_completed": int((state.get("budgets") or {}).get("runs_completed", 0) or 0),
+        "trigger_min_completed_runs": int(policy.get("trigger_min_completed_runs") or 0),
+        "advanced_failures_this_epoch": advanced_count,
+        "max_advanced_failures_per_epoch": int(policy.get("max_advanced_failures_per_epoch") or 0),
+        "shortlist_count": int(experiment_summary.get("shortlist_count", 0) or 0),
+    }
+
+
+def _frontier_architecture_spec(
+    *,
+    spec: dict[str, Any],
+    state: dict[str, Any],
+    phase_policy: dict[str, Any],
+    frontier: dict[str, Any],
+    experiment_summary: dict[str, Any],
+) -> dict[str, Any] | None:
+    policy = _frontier_architecture_policy(spec)
+    if not bool(policy.get("enabled", False)):
+        return None
+    phase = _current_ssot_phase(state=state, spec=spec)
+    if phase <= 1 and not bool(policy.get("allow_phase1_advanced", False)):
+        return None
+    if int((state.get("budgets") or {}).get("runs_completed", 0) or 0) < int(policy.get("trigger_min_completed_runs") or 0):
+        return None
+    best_summary = dict(state.get("best_candidate_summary") or {})
+    if int(experiment_summary.get("shortlist_count", 0) or best_summary.get("shortlist_count", 0) or 0) > 0:
+        return None
+    advanced_count = int(((frontier.get("lane_stats") or {}).get("architecture_family") or {}).get("advanced_challenger", 0) or 0)
+    max_advanced = int(policy.get("max_advanced_failures_per_epoch") or 0)
+    if max_advanced > 0 and advanced_count >= max_advanced:
+        return None
+    allowed_data_families = [
+        family
+        for family in list(phase_policy.get("allowed_data_families") or [])
+        if family in MODELING_READY_DATA_FAMILIES
+    ]
+    if not allowed_data_families:
+        allowed_data_families = ["price_only"]
+    best_feature = _best_frontier_lane(frontier=frontier, lane="feature_family", allowed=["price_liquidity", "price_core", "price_short_horizon"], default="price_liquidity")
+    best_data = _best_frontier_lane(frontier=frontier, lane="data_family", allowed=allowed_data_families, default=allowed_data_families[0])
+    sentinel_count = max(0, int(policy.get("sentinel_baseline_runs") or 0))
+    architectures = ["advanced_challenger"]
+    if sentinel_count >= 1:
+        architectures.append("tree_challenger")
+    if sentinel_count >= 2:
+        architectures.append("linear_baseline")
+    if not bool(policy.get("advanced_first", True)):
+        architectures = list(reversed(architectures))
+    next_spec = _make_experiment_spec_from_phase_policy(
+        spec=spec,
+        program_state=state,
+        phase_policy=phase_policy,
+        experiment_id=_next_experiment_id(program_state=state, spec=spec, phase=phase),
+        generation=int(state.get("current_generation", 0) or 0) + 1,
+    )
+    next_spec["matrix"] = _apply_program_steering_to_matrix(
+        matrix={
+            "architecture_family": architectures,
+            "feature_family": [best_feature],
+            "data_family": [best_data],
+            "data_profile": ["phase1_default"],
+            "validation.initial_train_years": [2],
+        },
+        steering=dict(state.get("steering") or {}),
+    )
+    next_spec["proposal_policy"]["family_size_cap"] = int(policy.get("family_size_cap") or phase_policy.get("family_size_cap") or 6)
+    next_spec["frontier_architecture_policy"] = policy
+    next_spec["frontier_architecture"] = True
+    next_spec["search_epoch"] = int(state.get("search_epoch", 0) or 0)
+    if _family_signature(next_spec) in set(frontier.get("tried_family_signatures") or []):
+        return None
+    return next_spec
+
+
+def _best_frontier_lane(*, frontier: dict[str, Any], lane: str, allowed: list[str], default: str) -> str:
+    mapping = {
+        "feature_family": "best_by_feature_family",
+        "data_family": "best_by_data_family",
+        "architecture_family": "best_by_architecture_family",
+    }
+    rows = dict(frontier.get(mapping[lane]) or {})
+    ranked = sorted(
+        (
+            (name, float((payload or {}).get("best_primary_score") or float("-inf")))
+            for name, payload in rows.items()
+            if name in set(allowed)
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if ranked:
+        return ranked[0][0]
+    return default if default in set(allowed) else allowed[0]
 
 
 def _expanded_search_spec(
@@ -2091,6 +2247,7 @@ def _program_family_preflight(
             targets_config_path=targets_config_path,
             target=target_name,
             python_executable=python_executable,
+            model_suite=_most_capable_model_suite(next_spec),
         )
         payload["report_date"] = report_date
         payload["target_paths"] = {
@@ -2116,6 +2273,19 @@ def _program_family_preflight(
                 "controller_local_state": str(local_state),
             },
         }
+
+
+def _most_capable_model_suite(spec: dict[str, Any]) -> str | None:
+    """Return the most dependency-heavy model suite requested by an experiment spec."""
+    suites: list[str] = []
+    matrix = dict(spec.get("matrix") or {})
+    for family in matrix.get("architecture_family") or []:
+        preset = ARCHITECTURE_FAMILY_PRESETS.get(str(family))
+        if preset is not None:
+            suites.append(str(preset["model_suite"]))
+    suites.extend(str(item) for item in matrix.get("model_suite") or [])
+    order = {"advanced": 3, "full": 2, "ridge_only": 1}
+    return max(suites, key=lambda value: order.get(value, 0), default=None)
 
 
 def _program_root(*, local_state: Path, program_id: str) -> Path:

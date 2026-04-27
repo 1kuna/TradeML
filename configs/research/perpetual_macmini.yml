@@ -40,6 +40,15 @@ paper_policy:
   rebalance_day: FRI
   output_root: control/cluster/state/research/paper
   no_live_orders: true
+frontier_architecture_policy:
+  enabled: true
+  allow_phase1_advanced: true
+  trigger_min_completed_runs: 100
+  advanced_first: true
+  family_size_cap: 6
+  sentinel_baseline_runs: 2
+  max_advanced_failures_per_epoch: 12
+  require_dependency_preflight: true
 steering_defaults:
   exploration_breadth: normal
 search_policy:

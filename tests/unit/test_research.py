@@ -259,6 +259,137 @@ def test_determine_program_transition_broadens_search_before_waiting(tmp_path: P
     assert decision["next_spec"]["matrix"]["data_profile"] == ["phase1_default", "phase1_short_window", "phase1_long_window"]
 
 
+def test_frontier_architecture_policy_unlocks_phase1_advanced_first(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec["frontier_architecture_policy"] = {
+        "enabled": True,
+        "allow_phase1_advanced": True,
+        "trigger_min_completed_runs": 100,
+        "advanced_first": True,
+        "family_size_cap": 6,
+        "sentinel_baseline_runs": 2,
+        "max_advanced_failures_per_epoch": 12,
+    }
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 1186
+    state["budgets"]["max_total_runs"] = 5000
+    state["budgets"]["non_improving_families"] = 10
+    frontier = research._empty_frontier()  # noqa: SLF001
+    frontier["best_by_feature_family"] = {
+        "price_liquidity": {"best_primary_score": 0.007},
+        "price_core": {"best_primary_score": 0.004},
+    }
+    frontier["best_by_data_family"] = {
+        "price_plus_liquidity": {"best_primary_score": 0.007},
+        "price_only": {"best_primary_score": 0.005},
+    }
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=frontier,
+        experiment_summary={"experiment_id": "perpetual-macmini-p1-f052", "shortlist_count": 0, "top_gate_failures": []},
+        proposal={},
+    )
+
+    assert decision["action"] == "launch_family"
+    assert "frontier architecture" in decision["reason"]
+    matrix = decision["next_spec"]["matrix"]
+    assert matrix["architecture_family"] == ["advanced_challenger", "tree_challenger", "linear_baseline"]
+    assert matrix["feature_family"] == ["price_liquidity"]
+    assert matrix["data_family"] == ["price_plus_liquidity"]
+    assert decision["next_spec"]["proposal_policy"]["family_size_cap"] == 6
+
+
+def test_frontier_architecture_policy_disabled_preserves_phase1_search(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec["frontier_architecture_policy"] = {"enabled": False, "allow_phase1_advanced": True}
+    spec["budget_policy"]["max_total_runs"] = 5000
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 100
+    state["budgets"]["max_total_runs"] = 5000
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=research._empty_frontier(),  # noqa: SLF001
+        experiment_summary={"experiment_id": "perpetual-macmini-p1-f052", "shortlist_count": 0, "top_gate_failures": []},
+        proposal={},
+    )
+
+    assert decision["action"] == "launch_family"
+    assert "advanced_challenger" not in decision["next_spec"]["matrix"]["architecture_family"]
+
+
+def test_frontier_architecture_policy_respects_advanced_failure_brake(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec["frontier_architecture_policy"] = {
+        "enabled": True,
+        "allow_phase1_advanced": True,
+        "trigger_min_completed_runs": 100,
+        "max_advanced_failures_per_epoch": 12,
+    }
+    spec["budget_policy"]["max_total_runs"] = 5000
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 1186
+    state["budgets"]["max_total_runs"] = 5000
+    frontier = research._empty_frontier()  # noqa: SLF001
+    frontier["lane_stats"]["architecture_family"]["advanced_challenger"] = 12
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=frontier,
+        experiment_summary={"experiment_id": "perpetual-macmini-p1-f052", "shortlist_count": 0, "top_gate_failures": []},
+        proposal={},
+    )
+
+    assert decision["action"] == "launch_family"
+    assert "advanced_challenger" not in decision["next_spec"]["matrix"]["architecture_family"]
+
+
+def test_program_family_preflight_blocks_missing_advanced_dependencies(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "nas"
+    target = SimpleNamespace(
+        name="workstation-remote",
+        kind="ssh",
+        host="192.168.68.70",
+        repo_root=tmp_path / "remote" / "TradeML",
+        data_root=data_root,
+    )
+    monkeypatch.setattr(research, "resolve_training_target", lambda **kwargs: target)
+    monkeypatch.setattr(research, "_resolve_default_report_date", lambda **kwargs: "2026-03-09")
+    captured: dict[str, object] = {}
+
+    def fake_training_preflight(**kwargs):  # noqa: ANN001
+        captured["model_suite"] = kwargs.get("model_suite")
+        return {
+            "ok": False,
+            "reason": "missing python packages for advanced: catboost, lightgbm, optuna",
+            "dependencies": {"ok": False, "missing": ["catboost", "lightgbm", "optuna"]},
+        }
+
+    monkeypatch.setattr(research, "training_preflight", fake_training_preflight)
+
+    payload = research._program_family_preflight(  # noqa: SLF001
+        next_spec={
+            "target": "workstation-remote",
+            "phase": 1,
+            "matrix": {"architecture_family": ["advanced_challenger", "tree_challenger", "linear_baseline"]},
+        },
+        repo_root=tmp_path / "repo",
+        data_root=data_root,
+        local_state=tmp_path / "local",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert captured["model_suite"] == "advanced"
+    assert payload["ok"] is False
+    assert payload["status"] == "INFRA_BLOCKED"
+    assert payload["dependencies"]["missing"] == ["catboost", "lightgbm", "optuna"]
+
+
 def test_resume_if_data_changed_launches_pending_spec(tmp_path: Path, monkeypatch) -> None:
     spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
     state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001

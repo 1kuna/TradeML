@@ -6,7 +6,6 @@ from pathlib import Path
 import pandas as pd
 
 from trademl.calendars.exchange import ExchangeCalendarStore
-from trademl.connectors.base import BaseConnector
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB

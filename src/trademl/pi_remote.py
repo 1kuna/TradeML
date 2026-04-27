@@ -7,10 +7,7 @@ import os
 from pathlib import Path
 import shlex
 import time
-from typing import TYPE_CHECKING, Any, Mapping
-
-if TYPE_CHECKING:
-    import paramiko
+from typing import Any, Mapping
 
 
 DEFAULT_TIMEOUT_SECONDS = 120.0

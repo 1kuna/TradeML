@@ -41,6 +41,47 @@ def test_evaluate_training_gates_requires_macro_vintages(tmp_path: Path) -> None
     assert readiness["freeze_cutoff"]["date"] is None
 
 
+def test_training_preflight_reports_missing_model_suite_dependencies(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "configs" / "equities_xs.yml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("data: {}\n", encoding="utf-8")
+
+    target = training_control.TrainingTarget(
+        name="local",
+        kind="local",
+        default=True,
+        host="localhost",
+        user=None,
+        port=22,
+        repo_root=tmp_path,
+        data_root=tmp_path,
+        python_executable="/usr/bin/python3",
+        env_path=None,
+        identity_file=None,
+        local_runtime_root=tmp_path / "state",
+    )
+    monkeypatch.setattr(training_control, "resolve_training_target", lambda **kwargs: target)
+    monkeypatch.setattr(training_control, "_target_preflight", lambda **kwargs: {"ok": True})
+    monkeypatch.setattr(training_control, "_dataset_preflight", lambda **kwargs: {"ok": True, "sample_rows": 10, "sample_date": "2026-03-09"})
+    monkeypatch.setattr(
+        training_control,
+        "_dependency_preflight",
+        lambda **kwargs: {"ok": False, "reason": "missing python packages for advanced: catboost", "missing": ["catboost"]},
+    )
+
+    payload = training_control.training_preflight(
+        data_root=tmp_path,
+        config_path=config_path,
+        repo_root=tmp_path,
+        local_state=tmp_path / "state",
+        model_suite="advanced",
+    )
+
+    assert payload["ok"] is False
+    assert payload["reason"] == "missing python packages for advanced: catboost"
+    assert payload["dependencies"]["missing"] == ["catboost"]
+
+
 def test_evaluate_training_gates_ignores_unreadable_reference_parquet(tmp_path: Path) -> None:
     reference_root = tmp_path / "data" / "reference"
     reference_root.mkdir(parents=True, exist_ok=True)
