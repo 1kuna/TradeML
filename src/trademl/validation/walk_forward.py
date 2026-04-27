@@ -6,7 +6,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
+
+from trademl.validation.metrics import bucket_metrics, rank_ic
 
 
 @dataclass(slots=True)
@@ -65,14 +66,14 @@ def expanding_walk_forward(
         model.fit(train_X, train_frame[label_col])
         predictions = test_frame[["date", "symbol", label_col]].copy()
         predictions["prediction"] = model.predict(test_X)
-        rank_ic = _spearman(predictions["prediction"], predictions[label_col])
-        decile_spread, hit_rate, bucket_returns = _bucket_metrics(predictions, label_col=label_col)
+        fold_rank_ic = rank_ic(predictions["prediction"], predictions[label_col])
+        decile_spread, hit_rate, bucket_returns = bucket_metrics(predictions, label_col=label_col)
         results.append(
             FoldResult(
                 train_end=pd.Timestamp(purged_train_dates[-1]),
                 test_start=pd.Timestamp(test_dates[0]),
                 test_end=pd.Timestamp(test_dates[-1]),
-                rank_ic=rank_ic,
+                rank_ic=fold_rank_ic,
                 decile_spread=decile_spread,
                 hit_rate=hit_rate,
                 bucket_returns=bucket_returns,
@@ -80,23 +81,3 @@ def expanding_walk_forward(
             )
         )
     return results
-
-
-def _spearman(left: pd.Series, right: pd.Series) -> float:
-    stat, _ = spearmanr(left, right, nan_policy="omit")
-    return float(stat) if stat == stat else 0.0
-
-
-def _bucket_metrics(predictions: pd.DataFrame, *, label_col: str) -> tuple[float, float, dict[str, float]]:
-    scores = predictions.copy()
-    scores["bucket"] = pd.qcut(scores["prediction"].rank(method="first"), q=min(10, len(scores)), labels=False, duplicates="drop")
-    if scores["bucket"].nunique() < 2:
-        return 0.0, 0.0, {}
-    top_bucket = scores["bucket"].max()
-    bottom_bucket = scores["bucket"].min()
-    top = scores.loc[scores["bucket"] == top_bucket, label_col]
-    bottom = scores.loc[scores["bucket"] == bottom_bucket, label_col]
-    decile_spread = float(top.mean() - bottom.mean())
-    hit_rate = float((top > 0).mean())
-    bucket_returns = {str(bucket + 1): float(group[label_col].mean()) for bucket, group in scores.groupby("bucket")}
-    return decile_spread, hit_rate, bucket_returns

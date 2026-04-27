@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from math import isfinite
 
 import pandas as pd
-from scipy.stats import spearmanr
 
+from trademl.validation.metrics import prediction_buckets, rank_ic
 
 @dataclass(slots=True)
 class BacktestResult:
@@ -190,18 +190,12 @@ def _prediction_diagnostics(prediction_frame: pd.DataFrame | None) -> tuple[pd.D
     ic_rows: list[dict[str, object]] = []
     decile_rows: list[dict[str, object]] = []
     for date_value, group in frame.groupby("date"):
-        stat = spearmanr(group["prediction"], group[actual_col], nan_policy="omit").statistic
-        ic_rows.append({"date": date_value, "rank_ic": float(stat) if stat == stat else 0.0})
-        bucket_count = min(10, len(group))
-        if bucket_count < 2:
+        ic_rows.append({"date": date_value, "rank_ic": rank_ic(group["prediction"], group[actual_col])})
+        buckets = prediction_buckets(group["prediction"])
+        if buckets.nunique() < 2:
             continue
         ranked = group.copy()
-        ranked["bucket"] = pd.qcut(
-            ranked["prediction"].rank(method="first"),
-            q=bucket_count,
-            labels=False,
-            duplicates="drop",
-        )
+        ranked["bucket"] = buckets
         for bucket, bucket_group in ranked.groupby("bucket"):
             decile_rows.append(
                 {

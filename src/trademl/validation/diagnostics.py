@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
 
 from trademl.backtest.engine import run_backtest
 from trademl.costs.models import apply_costs
 from trademl.portfolio.build import build_portfolio
+from trademl.validation.metrics import mean_daily_bucket_spread, rank_ic
 
 
 def ic_by_year(predictions: pd.Series, actuals: pd.Series, dates: pd.Series) -> dict[int, float]:
     """Return per-year rank ICs."""
     frame = pd.DataFrame({"prediction": predictions, "actual": actuals, "date": pd.to_datetime(dates)})
     return {
-        int(year): float(spearmanr(group["prediction"], group["actual"], nan_policy="omit").statistic or 0.0)
+        int(year): rank_ic(group["prediction"], group["actual"])
         for year, group in frame.groupby(frame["date"].dt.year)
     }
 
@@ -24,7 +24,7 @@ def ic_by_sector(predictions: pd.Series, actuals: pd.Series, sectors: pd.Series)
     """Return per-sector rank ICs."""
     frame = pd.DataFrame({"prediction": predictions, "actual": actuals, "sector": sectors})
     return {
-        str(sector): float(spearmanr(group["prediction"], group["actual"], nan_policy="omit").statistic or 0.0)
+        str(sector): rank_ic(group["prediction"], group["actual"])
         for sector, group in frame.groupby("sector")
     }
 
@@ -67,7 +67,7 @@ def placebo_test(
         model = model_fn()
         model.fit(train[feature_cols], train[label_col])
         predictions = model.predict(test[feature_cols])
-        score = spearmanr(predictions, test[label_col], nan_policy="omit").statistic or 0.0
+        score = rank_ic(pd.Series(predictions, index=test.index), test[label_col])
         scores.append(float(score))
     return scores
 
@@ -158,35 +158,15 @@ def sign_flip_canary(prediction_frame: pd.DataFrame, *, label_col: str = "label_
             "flipped_ic_by_year": {},
         }
 
-    def _daily_decile_spread(frame: pd.DataFrame) -> float:
-        spreads: list[float] = []
-        for _, group in frame.groupby(pd.to_datetime(frame["date"])):
-            ranked = group.copy()
-            bucket_count = min(10, len(ranked))
-            if bucket_count < 2:
-                continue
-            ranked["bucket"] = pd.qcut(
-                ranked["prediction"].rank(method="first"),
-                q=bucket_count,
-                labels=False,
-                duplicates="drop",
-            )
-            if ranked["bucket"].nunique() < 2:
-                continue
-            top = ranked.loc[ranked["bucket"] == ranked["bucket"].max(), label_col]
-            bottom = ranked.loc[ranked["bucket"] == ranked["bucket"].min(), label_col]
-            spreads.append(float(top.mean() - bottom.mean()))
-        return float(np.mean(spreads)) if spreads else 0.0
-
     original = prediction_frame.copy()
     flipped = prediction_frame.copy()
     flipped["prediction"] = -flipped["prediction"]
-    original_mean_ic = float(spearmanr(original["prediction"], original[label_col], nan_policy="omit").statistic or 0.0)
-    flipped_mean_ic = float(spearmanr(flipped["prediction"], flipped[label_col], nan_policy="omit").statistic or 0.0)
+    original_mean_ic = rank_ic(original["prediction"], original[label_col])
+    flipped_mean_ic = rank_ic(flipped["prediction"], flipped[label_col])
     original_year = ic_by_year(original["prediction"], original[label_col], original["date"])
     flipped_year = ic_by_year(flipped["prediction"], flipped[label_col], flipped["date"])
-    original_spread = _daily_decile_spread(original)
-    flipped_spread = _daily_decile_spread(flipped)
+    original_spread = mean_daily_bucket_spread(original, label_col=label_col)
+    flipped_spread = mean_daily_bucket_spread(flipped, label_col=label_col)
     preferred_direction = "flipped" if (flipped_mean_ic > original_mean_ic and flipped_spread >= original_spread) else "original"
     return {
         "preferred_direction": preferred_direction,

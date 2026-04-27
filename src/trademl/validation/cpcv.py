@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from itertools import combinations
 
 import pandas as pd
-from scipy.stats import spearmanr
+
+from trademl.validation.metrics import rank_ic
 
 
 @dataclass(slots=True)
@@ -68,8 +69,8 @@ def combinatorially_purged_cv(
         predictions = test_frame[["date", "symbol", label_col]].copy()
         predictions["prediction"] = model.predict(test_X)
         retention = float(len(train_frame) / max(1, len(working.dropna(subset=[label_col]))))
-        in_sample_score = float(spearmanr(model.predict(train_X), train_frame[label_col], nan_policy="omit").statistic or 0.0)
-        out_of_sample_score = float(spearmanr(predictions["prediction"], predictions[label_col], nan_policy="omit").statistic or 0.0)
+        in_sample_score = rank_ic(pd.Series(model.predict(train_X), index=train_frame.index), train_frame[label_col])
+        out_of_sample_score = rank_ic(predictions["prediction"], predictions[label_col])
         results.append(
             CPCVFoldResult(
                 fold=fold_idx,
