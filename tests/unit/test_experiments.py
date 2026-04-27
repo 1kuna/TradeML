@@ -299,6 +299,64 @@ def test_primary_rank_ic_prefers_catboost_for_advanced_suite() -> None:
     assert score == 0.05
 
 
+def test_report_preview_preserves_catboost_primary_score() -> None:
+    preview = experiments._report_preview_from_report(  # noqa: SLF001
+        {
+            "coverage": 0.99,
+            "ridge": {"mean_rank_ic": 0.01},
+            "lightgbm": {"mean_rank_ic": 0.02},
+            "catboost": {"mean_rank_ic": 0.05},
+        }
+    )
+
+    assert experiments._preview_primary_score(model_suite="advanced", preview=preview) == 0.05  # noqa: SLF001
+
+
+def test_completed_advanced_manifest_refreshes_missing_catboost_preview() -> None:
+    assert experiments._manifest_needs_report_refresh(  # noqa: SLF001
+        {
+            "status": "COMPLETED",
+            "model_suite": "advanced",
+            "assessment": {"decision": "NO_GO"},
+            "report_preview": {"ridge_mean_rank_ic": 0.01, "lightgbm_mean_rank_ic": 0.02},
+        }
+    )
+
+
+def test_experiment_summary_ignores_unscored_planned_runs_for_best(tmp_path: Path) -> None:
+    def run_row(run_id: str, model_suite: str, status: str, preview: dict[str, float]) -> dict[str, object]:
+        return {
+            "experiment_id": "frontier",
+            "run_id": run_id,
+            "phase": 1,
+            "target": "workstation-remote",
+            "target_kind": "ssh",
+            "report_date": "2026-03-09",
+            "status": status,
+            "model_suite": model_suite,
+            "matrix_values": {"model_suite": model_suite},
+            "evaluation_stage": "PLANNED",
+            "assessment": {},
+            "report_preview": preview,
+        }
+
+    summary = experiments._refresh_experiment_summary(  # noqa: SLF001
+        local_state=tmp_path,
+        experiment_id="frontier",
+        summary={
+            "experiment_id": "frontier",
+            "counts": {"PLANNED": 1, "COMPLETED": 1},
+            "runs": [
+                run_row("planned-ridge", "ridge_only", "PLANNED", {}),
+                run_row("advanced", "advanced", "COMPLETED", {"catboost_mean_rank_ic": -0.006}),
+            ],
+        },
+    )
+
+    assert summary["best_run_id"] == "advanced"
+    assert summary["best_primary_score"] == -0.006
+
+
 def test_classify_failure_treats_remote_import_bootstrap_as_infra() -> None:
     kind = experiments._classify_failure(  # noqa: SLF001
         "remote process is not running\n"

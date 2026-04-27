@@ -340,7 +340,7 @@ def experiment_status(
             runs.append(manifest)
             continue
         if not _manifest_requires_runtime_refresh(manifest):
-            if current_status == "COMPLETED" and not manifest.get("assessment"):
+            if current_status == "COMPLETED" and _manifest_needs_report_refresh(manifest):
                 report = _load_report_payload(
                     manifest=manifest,
                     local_state=local_state,
@@ -351,11 +351,7 @@ def experiment_status(
                 )
                 if report is not None:
                     manifest["assessment"] = report.get("assessment", {})
-                    manifest["report_preview"] = {
-                        "coverage": report.get("coverage"),
-                        "ridge_mean_rank_ic": report.get("ridge", {}).get("mean_rank_ic"),
-                        "lightgbm_mean_rank_ic": report.get("lightgbm", {}).get("mean_rank_ic"),
-                    }
+                    manifest["report_preview"] = _report_preview_from_report(report)
                     _write_run_manifest(local_state=local_state, experiment_id=experiment_id, manifest=manifest)
             runs.append(manifest)
             continue
@@ -383,11 +379,7 @@ def experiment_status(
         if report is not None:
             status = "COMPLETED"
             manifest["assessment"] = report.get("assessment", {})
-            manifest["report_preview"] = {
-                "coverage": report.get("coverage"),
-                "ridge_mean_rank_ic": report.get("ridge", {}).get("mean_rank_ic"),
-                "lightgbm_mean_rank_ic": report.get("lightgbm", {}).get("mean_rank_ic"),
-            }
+            manifest["report_preview"] = _report_preview_from_report(report)
         elif status == "UNKNOWN":
             status = "FAILED"
             manifest["last_error"] = runtime.get("error") or manifest.get("last_error") or "training runtime ended unexpectedly"
@@ -1328,7 +1320,7 @@ def _refresh_experiment_summary(
     best_backtest_net_return = None
     best_decision = None
     best_decision_reason = None
-    best_score = -10.0
+    best_score = float("-inf")
     for run in runs:
         stage = str(run.get("evaluation_stage") or "PLANNED")
         evaluation_counts[stage] = evaluation_counts.get(stage, 0) + 1
@@ -1338,10 +1330,12 @@ def _refresh_experiment_summary(
             gate_failures[str(failure)] = gate_failures.get(str(failure), 0) + 1
         preview = run.get("report_preview") or {}
         score = _preview_primary_score(model_suite=str(run.get("model_suite") or ""), preview=preview)
+        if score is None:
+            continue
         try:
-            numeric = float(score or 0.0)
+            numeric = float(score)
         except (TypeError, ValueError):
-            numeric = 0.0
+            continue
         if numeric > best_score:
             best_score = numeric
             best_run_id = run.get("run_id")
@@ -1474,6 +1468,30 @@ def _primary_rank_ic(*, manifest: dict[str, Any], report: dict[str, Any]) -> flo
             if value is not None:
                 return float(value)
     return float(report.get("ridge", {}).get("mean_rank_ic", 0.0) or 0.0)
+
+
+def _report_preview_from_report(report: dict[str, Any]) -> dict[str, Any]:
+    preview = {
+        "coverage": report.get("coverage"),
+        "ridge_mean_rank_ic": report.get("ridge", {}).get("mean_rank_ic"),
+        "lightgbm_mean_rank_ic": report.get("lightgbm", {}).get("mean_rank_ic"),
+    }
+    catboost = report.get("catboost", {})
+    if isinstance(catboost, dict) and not catboost.get("skipped"):
+        preview["catboost_mean_rank_ic"] = catboost.get("mean_rank_ic")
+    return preview
+
+
+def _manifest_needs_report_refresh(manifest: dict[str, Any]) -> bool:
+    if not manifest.get("assessment"):
+        return True
+    preview = dict(manifest.get("report_preview") or {})
+    model_suite = str(manifest.get("model_suite") or "")
+    if model_suite == "advanced" and "catboost_mean_rank_ic" not in preview:
+        return True
+    if model_suite in {"advanced", "full"} and "lightgbm_mean_rank_ic" not in preview:
+        return True
+    return False
 
 
 def _preview_primary_score(*, model_suite: str, preview: dict[str, Any]) -> float | None:
