@@ -507,7 +507,11 @@ def training_preflight(
         python_executable=python_executable,
     )
     control = {"ok": True, "config_path": str(config_path), "repo_root": str(repo_root)}
-    effective_config_path = execution_config_path or config_path
+    effective_config_path = execution_config_path or _target_config_path(
+        target=resolved_target,
+        local_config_path=config_path,
+        repo_root=repo_root,
+    )
     target_report = _target_preflight(target=resolved_target, config_path=effective_config_path)
     dataset_report = _dataset_preflight(target=resolved_target, config_path=effective_config_path)
     ok = bool(control["ok"] and target_report.get("ok") and dataset_report.get("ok"))
@@ -529,6 +533,17 @@ def training_preflight(
         payload["sample_date"] = dataset_report.get("sample_date")
         payload["qc_path"] = dataset_report.get("qc_path")
     return payload
+
+
+def _target_config_path(*, target: TrainingTarget, local_config_path: Path, repo_root: Path) -> Path:
+    """Map a controller-local repo config path to the execution target repo path."""
+    if target.kind == "local":
+        return local_config_path
+    try:
+        relative = local_config_path.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return local_config_path
+    return target.repo_root / relative
 
 
 def launch_training_process(

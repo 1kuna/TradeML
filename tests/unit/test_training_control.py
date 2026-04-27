@@ -631,6 +631,51 @@ training_targets:
     assert payload["dataset"]["sample_rows"] == 12
 
 
+def test_training_preflight_maps_local_repo_config_to_remote_repo_path(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    (repo_root / "configs").mkdir(parents=True, exist_ok=True)
+    config_path = repo_root / "configs" / "equities_xs.yml"
+    config_path.write_text("data:\n  green_threshold: 0.9\n", encoding="utf-8")
+    node_config = repo_root / "configs" / "node.yml"
+    node_config.write_text(
+        """
+training_targets:
+  workstation-remote:
+    host: 192.168.1.10
+    user: zach
+    repo_root: /srv/trademl
+    data_root: /srv/trademl-data
+    python_executable: /usr/bin/python3
+""".strip(),
+        encoding="utf-8",
+    )
+    seen: dict[str, Path] = {}
+
+    def fake_target_preflight(*, target, config_path):  # noqa: ANN001
+        seen["target_config_path"] = config_path
+        return {"ok": True, "target": target.name, "kind": target.kind}
+
+    def fake_dataset_preflight(*, target, config_path):  # noqa: ANN001
+        seen["dataset_config_path"] = config_path
+        return {"ok": True, "sample_rows": 10}
+
+    monkeypatch.setattr(training_control, "_target_preflight", fake_target_preflight)
+    monkeypatch.setattr(training_control, "_dataset_preflight", fake_dataset_preflight)
+
+    payload = training_control.training_preflight(
+        data_root=tmp_path / "nas",
+        config_path=config_path,
+        repo_root=repo_root,
+        local_state=tmp_path / "state",
+        targets_config_path=node_config,
+        target="workstation-remote",
+    )
+
+    assert payload["ok"] is True
+    assert seen["target_config_path"] == Path("/srv/trademl/configs/equities_xs.yml")
+    assert seen["dataset_config_path"] == Path("/srv/trademl/configs/equities_xs.yml")
+
+
 def test_local_dataset_preflight_uses_parquet_metadata_instead_of_full_read(tmp_path: Path, monkeypatch) -> None:
     repo_root = tmp_path / "repo"
     config_path = repo_root / "configs" / "equities_xs.yml"

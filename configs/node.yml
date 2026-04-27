@@ -23,9 +23,10 @@ training:
 training_targets:
   workstation-remote:
     kind: ssh
-    host: trademl-workstation-remote
+    host: 192.168.68.70
     user: openclaw
     port: 22
+    identity_file: ~/.ssh/id_ed25519_trademl_remote
     repo_root: /Users/openclaw/TradeML
     data_root: /Users/openclaw/atlas_mounts/nas
     python_executable: /Users/openclaw/TradeML/.venv/bin/python
