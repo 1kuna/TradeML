@@ -265,7 +265,7 @@ def run_training(
     }
 
     assessment = _phase_one_assessment(
-        ridge_mean_ic=float(pd.Series([fold.rank_ic for fold in ridge_folds]).mean()) if ridge_folds else 0.0,
+        ridge_mean_ic=_mean_rank_ic(ridge_folds),
         ic_by_year_result=diagnostics["ic_by_year"],
         cost_stress=diagnostics["cost_stress"],
         placebo=diagnostics["placebo"],
@@ -281,49 +281,17 @@ def run_training(
         "skipped_curated_partitions": skipped_curated_partitions,
         "ridge": {
             "alpha": ridge_alpha,
-            "folds": [
-                {
-                    "rank_ic": fold.rank_ic,
-                    "decile_spread": fold.decile_spread,
-                    "hit_rate": fold.hit_rate,
-                    "bucket_returns": fold.bucket_returns,
-                }
-                for fold in ridge_folds
-            ],
-            "mean_rank_ic": float(pd.Series([fold.rank_ic for fold in ridge_folds]).mean()) if ridge_folds else 0.0,
-            "decile_chart_data": {f"fold_{idx + 1}": fold.bucket_returns for idx, fold in enumerate(ridge_folds)},
+            **_fold_report(ridge_folds),
         },
         "lightgbm": (
-            {
-                "folds": [
-                    {
-                        "rank_ic": fold.rank_ic,
-                        "decile_spread": fold.decile_spread,
-                        "hit_rate": fold.hit_rate,
-                        "bucket_returns": fold.bucket_returns,
-                    }
-                    for fold in lgbm_folds
-                ],
-                "mean_rank_ic": float(pd.Series([fold.rank_ic for fold in lgbm_folds]).mean()) if lgbm_folds else 0.0,
-                "decile_chart_data": {f"fold_{idx + 1}": fold.bucket_returns for idx, fold in enumerate(lgbm_folds)},
-            }
+            _fold_report(lgbm_folds)
             if model_suite in {"full", "advanced"}
             else {"skipped": True, "reason": "ridge_only_phase1_baseline"}
         ),
         "catboost": (
             {
                 "params": catboost_params or {},
-                "folds": [
-                    {
-                        "rank_ic": fold.rank_ic,
-                        "decile_spread": fold.decile_spread,
-                        "hit_rate": fold.hit_rate,
-                        "bucket_returns": fold.bucket_returns,
-                    }
-                    for fold in catboost_folds
-                ],
-                "mean_rank_ic": float(pd.Series([fold.rank_ic for fold in catboost_folds]).mean()) if catboost_folds else 0.0,
-                "decile_chart_data": {f"fold_{idx + 1}": fold.bucket_returns for idx, fold in enumerate(catboost_folds)},
+                **_fold_report(catboost_folds),
             }
             if model_suite == "advanced"
             else {"skipped": True, "reason": "advanced_lane_not_selected"}
@@ -357,9 +325,9 @@ def run_training(
                 else None
             ),
             report_preview={
-                "ridge_mean_rank_ic": float(pd.Series([fold.rank_ic for fold in ridge_folds]).mean()) if ridge_folds else 0.0,
-                "lightgbm_mean_rank_ic": float(pd.Series([fold.rank_ic for fold in lgbm_folds]).mean()) if lgbm_folds else 0.0,
-                "catboost_mean_rank_ic": float(pd.Series([fold.rank_ic for fold in catboost_folds]).mean()) if catboost_folds else 0.0,
+                "ridge_mean_rank_ic": _mean_rank_ic(ridge_folds),
+                "lightgbm_mean_rank_ic": _mean_rank_ic(lgbm_folds),
+                "catboost_mean_rank_ic": _mean_rank_ic(catboost_folds),
                 "coverage": coverage,
                 "ridge_alpha": ridge_alpha,
                 "model_suite": model_suite,
@@ -369,6 +337,26 @@ def run_training(
     emit_report(report=report, output_root=output_root, report_date=report_date)
     _write_training_log(output_root=output_root, run_ts=run_ts, report=report)
     return report
+
+
+def _mean_rank_ic(folds: list[Any]) -> float:
+    return float(pd.Series([fold.rank_ic for fold in folds]).mean()) if folds else 0.0
+
+
+def _fold_report(folds: list[Any]) -> dict[str, object]:
+    return {
+        "folds": [
+            {
+                "rank_ic": fold.rank_ic,
+                "decile_spread": fold.decile_spread,
+                "hit_rate": fold.hit_rate,
+                "bucket_returns": fold.bucket_returns,
+            }
+            for fold in folds
+        ],
+        "mean_rank_ic": _mean_rank_ic(folds),
+        "decile_chart_data": {f"fold_{idx + 1}": fold.bucket_returns for idx, fold in enumerate(folds)},
+    }
 
 
 def main() -> int:
