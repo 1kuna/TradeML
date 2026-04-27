@@ -301,6 +301,45 @@ def test_frontier_architecture_policy_unlocks_phase1_advanced_first(tmp_path: Pa
     assert decision["next_spec"]["proposal_policy"]["family_size_cap"] == 6
 
 
+def test_frontier_architecture_policy_continues_until_failure_brake(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec["frontier_architecture_policy"] = {
+        "enabled": True,
+        "allow_phase1_advanced": True,
+        "trigger_min_completed_runs": 100,
+        "sentinel_baseline_runs": 2,
+        "max_advanced_failures_per_epoch": 12,
+    }
+    spec["budget_policy"]["max_total_runs"] = 5000
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 1189
+    state["budgets"]["max_total_runs"] = 5000
+    state["budgets"]["non_improving_families"] = 10
+    frontier = research._empty_frontier()  # noqa: SLF001
+    first = research._frontier_architecture_spec(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        phase_policy=research._phase_policy(spec=spec, phase=1),  # noqa: SLF001
+        frontier=frontier,
+        experiment_summary={"shortlist_count": 0},
+    )
+    assert first is not None
+    frontier["tried_family_signatures"].append(research._family_signature(first))  # noqa: SLF001
+    frontier["lane_stats"]["architecture_family"]["advanced_challenger"] = 1
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=frontier,
+        experiment_summary={"experiment_id": "frontier-advanced-ordered-20260427", "shortlist_count": 0, "top_gate_failures": []},
+        proposal={},
+    )
+
+    assert decision["action"] == "launch_family"
+    assert decision["next_spec"]["frontier_iteration"] == 2
+    assert decision["next_spec"]["matrix"]["architecture_family"][0] == "advanced_challenger"
+
+
 def test_frontier_architecture_policy_disabled_preserves_phase1_search(tmp_path: Path) -> None:
     spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
     spec["frontier_architecture_policy"] = {"enabled": False, "allow_phase1_advanced": True}

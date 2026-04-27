@@ -1602,6 +1602,7 @@ def _frontier_architecture_spec(
     next_spec["proposal_policy"]["family_size_cap"] = int(policy.get("family_size_cap") or phase_policy.get("family_size_cap") or 6)
     next_spec["frontier_architecture_policy"] = policy
     next_spec["frontier_architecture"] = True
+    next_spec["frontier_iteration"] = advanced_count + 1
     next_spec["search_epoch"] = int(state.get("search_epoch", 0) or 0)
     if _family_signature(next_spec) in set(frontier.get("tried_family_signatures") or []):
         return None
@@ -1906,6 +1907,7 @@ def _family_signature(next_spec: dict[str, Any]) -> str:
         "ssot_phase": next_spec.get("ssot_phase", next_spec.get("phase")),
         "campaign_track": next_spec.get("campaign_track"),
         "search_epoch": next_spec.get("search_epoch"),
+        "frontier_iteration": next_spec.get("frontier_iteration"),
         "matrix": next_spec.get("matrix"),
         "predictive_gate": next_spec.get("predictive_gate"),
         "backtest_gate": next_spec.get("backtest_gate"),
