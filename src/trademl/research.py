@@ -1599,6 +1599,12 @@ def _frontier_architecture_spec(
         },
         steering=dict(state.get("steering") or {}),
     )
+    if bool(policy.get("advanced_first", True)):
+        order = {family: idx for idx, family in enumerate(["advanced_challenger", "tree_challenger", "linear_baseline"])}
+        next_spec["matrix"]["architecture_family"] = sorted(
+            list(next_spec["matrix"].get("architecture_family") or []),
+            key=lambda value: order.get(str(value), 100),
+        )
     next_spec["proposal_policy"]["family_size_cap"] = int(policy.get("family_size_cap") or phase_policy.get("family_size_cap") or 6)
     next_spec["frontier_architecture_policy"] = policy
     next_spec["frontier_architecture"] = True

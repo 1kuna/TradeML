@@ -301,6 +301,31 @@ def test_frontier_architecture_policy_unlocks_phase1_advanced_first(tmp_path: Pa
     assert decision["next_spec"]["proposal_policy"]["family_size_cap"] == 6
 
 
+def test_frontier_architecture_advanced_first_overrides_force_pivot_order(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec["frontier_architecture_policy"] = {
+        "enabled": True,
+        "allow_phase1_advanced": True,
+        "trigger_min_completed_runs": 100,
+        "advanced_first": True,
+        "sentinel_baseline_runs": 2,
+    }
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 1186
+    state["budgets"]["max_total_runs"] = 5000
+    state["steering"]["force_pivot"] = True
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=research._empty_frontier(),  # noqa: SLF001
+        experiment_summary={"experiment_id": "perpetual-macmini-p1-f052", "shortlist_count": 0, "top_gate_failures": []},
+        proposal={},
+    )
+
+    assert decision["next_spec"]["matrix"]["architecture_family"] == ["advanced_challenger", "tree_challenger", "linear_baseline"]
+
+
 def test_frontier_architecture_policy_continues_until_failure_brake(tmp_path: Path) -> None:
     spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
     spec["frontier_architecture_policy"] = {
