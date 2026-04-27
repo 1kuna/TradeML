@@ -1170,3 +1170,39 @@ def test_run_ssh_command_returns_timeout_completed_process(tmp_path: Path, monke
 
     assert result.returncode == 124
     assert "timed out" in result.stderr
+
+
+def test_run_ssh_command_uses_noninteractive_bounded_ssh_options(tmp_path: Path, monkeypatch) -> None:
+    target = training_control.TrainingTarget(
+        name="workstation-remote",
+        kind="ssh",
+        default=True,
+        host="trademl-workstation-remote",
+        user="openclaw",
+        port=22,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "data",
+        python_executable="/usr/bin/python3",
+        env_path=None,
+        identity_file=None,
+        local_runtime_root=tmp_path / "state",
+    )
+    observed: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):  # noqa: ANN001
+        observed["command"] = command
+        observed["timeout"] = kwargs["timeout"]
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr(training_control.subprocess, "run", fake_run)
+
+    result = training_control._run_ssh_command(target, "echo hi")  # noqa: SLF001
+
+    assert result.returncode == 0
+    assert observed["timeout"] == training_control.REMOTE_COMMAND_TIMEOUT_SECONDS
+    command = observed["command"]
+    assert "-o" in command
+    assert "BatchMode=yes" in command
+    assert "ConnectTimeout=8" in command
+    assert "ServerAliveInterval=5" in command
+    assert "ServerAliveCountMax=2" in command

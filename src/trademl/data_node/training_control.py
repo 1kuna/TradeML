@@ -27,6 +27,9 @@ from trademl.env import read_env_file
 LOGGER = logging.getLogger(__name__)
 
 REMOTE_COMMAND_TIMEOUT_SECONDS = 60
+SSH_CONNECT_TIMEOUT_SECONDS = 8
+SSH_SERVER_ALIVE_INTERVAL_SECONDS = 5
+SSH_SERVER_ALIVE_COUNT_MAX = 2
 
 
 @dataclass(slots=True)
@@ -241,9 +244,7 @@ def evaluate_training_gates(
     macro_root = data_root / "data" / "raw" / "macros_fred"
     macro_series = {path.name.partition("=")[2] for path in macro_root.glob("series=*")} if macro_root.exists() else set()
     qc_path = data_root / "data" / "qc" / "partition_status.parquet"
-    raw_green_ratio = _raw_green_ratio(qc_path, qc_frame=qc_frame)
     resolved_planner_db = planner_db_path or (data_root / "control" / "node.sqlite")
-    planner_ratio = _planner_bars_ratio(resolved_planner_db)
     freeze_cutoff = recommended_training_cutoff(data_root=data_root, expected_symbol_count=stage_symbol_count)
     frozen_window = _frozen_window_bar_coverage(qc_path=qc_path, report_date=freeze_cutoff.get("date"), qc_frame=qc_frame)
     planner_window_ratio = _planner_window_ratio(
@@ -1191,9 +1192,7 @@ def _remote_python_here_doc(target: TrainingTarget, body: str) -> str:
 
 def _run_ssh_command(target: TrainingTarget, command: str, *, check: bool = False) -> subprocess.CompletedProcess[str]:
     """Run one remote shell command against an SSH training target."""
-    ssh_command = ["ssh", "-p", str(target.port)]
-    if target.identity_file is not None:
-        ssh_command.extend(["-i", str(target.identity_file)])
+    ssh_command = ["ssh", *_ssh_base_options(target), "-p", str(target.port)]
     ssh_command.append(f"{target.user}@{target.host}")
     ssh_command.append(command)
     try:
@@ -1217,9 +1216,7 @@ def _run_ssh_command(target: TrainingTarget, command: str, *, check: bool = Fals
 def _copy_file_to_remote(*, target: TrainingTarget, local_path: Path, remote_path: Path) -> None:
     """Copy one local file onto the remote SSH target."""
     _run_ssh_command(target, f"mkdir -p {shlex.quote(str(remote_path.parent))}", check=True)
-    scp_command = ["scp", "-P", str(target.port)]
-    if target.identity_file is not None:
-        scp_command.extend(["-i", str(target.identity_file)])
+    scp_command = ["scp", *_ssh_base_options(target), "-P", str(target.port)]
     scp_command.extend([str(local_path), f"{target.user}@{target.host}:{remote_path}"])
     try:
         result = subprocess.run(  # noqa: S603
@@ -1233,6 +1230,23 @@ def _copy_file_to_remote(*, target: TrainingTarget, local_path: Path, remote_pat
         raise RuntimeError(f"scp timed out for target={target.name}") from exc
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"scp failed for target={target.name}")
+
+
+def _ssh_base_options(target: TrainingTarget) -> list[str]:
+    """Return noninteractive bounded SSH options for control-plane probes."""
+    options = [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}",
+        "-o",
+        f"ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL_SECONDS}",
+        "-o",
+        f"ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}",
+    ]
+    if target.identity_file is not None:
+        options.extend(["-i", str(target.identity_file)])
+    return options
 
 
 def _remote_process_running(*, target: TrainingTarget, pid: int) -> bool:
