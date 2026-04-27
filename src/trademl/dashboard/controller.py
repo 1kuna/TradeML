@@ -50,6 +50,7 @@ from trademl.data_node.training_control import (
     stop_training_process,
     launch_training_process,
 )
+from trademl.env import read_env_file, write_env_file
 from trademl.experiments import (
     backtest_experiment_survivors,
     evaluate_experiment,
@@ -180,7 +181,7 @@ def resolve_node_settings(
     resolved_env = Path(env_path).expanduser() if env_path else resolved_workspace / ".env"
 
     config = _read_yaml(resolved_config)
-    env_values = _read_env_file(resolved_env)
+    env_values = read_env_file(resolved_env)
     stage = _read_yaml(resolved_workspace / "stage.yml")
     node = config.get("node", {})
     local_state = Path(env_values.get("LOCAL_STATE") or node.get("local_state") or (resolved_workspace / "control")).expanduser()
@@ -286,7 +287,7 @@ def persist_node_settings(
     node["worker_id"] = settings.worker_id
     _write_yaml(settings.config_path, config)
 
-    env_values = _read_env_file(settings.env_path)
+    env_values = read_env_file(settings.env_path)
     env_values.update(
         {
             "TRADEML_ENV": env_values.get("TRADEML_ENV", "local"),
@@ -297,7 +298,7 @@ def persist_node_settings(
             "MAINTENANCE_HOUR_LOCAL": str(maintenance_hour_local),
         }
     )
-    _write_env_file(settings.env_path, env_values)
+    write_env_file(settings.env_path, env_values)
 
     stage = _read_yaml(settings.stage_path)
     if stage:
@@ -387,7 +388,7 @@ def start_node(
     if command is None and stage_symbols:
         launch_command.extend(["--symbols", *stage_symbols])
     env = os.environ.copy()
-    env.update(_read_env_file(settings.env_path))
+    env.update(read_env_file(settings.env_path))
     if passphrase:
         env["TRADEML_CLUSTER_PASSPHRASE"] = passphrase
     with settings.log_path.open("a", encoding="utf-8") as log_handle:
@@ -633,9 +634,9 @@ def leave_cluster(settings: NodeSettings) -> dict[str, Any]:
 
 def persist_cluster_passphrase(settings: NodeSettings, passphrase: str) -> None:
     """Persist the cluster passphrase for non-interactive worker starts."""
-    env_values = _read_env_file(settings.env_path)
+    env_values = read_env_file(settings.env_path)
     env_values["TRADEML_CLUSTER_PASSPHRASE"] = passphrase
-    _write_env_file(settings.env_path, env_values)
+    write_env_file(settings.env_path, env_values)
 
 
 def install_service(settings: NodeSettings, *, service_path: str | None = None) -> dict[str, Any]:
@@ -2674,7 +2675,7 @@ def _coordinator(settings: NodeSettings) -> ClusterCoordinator:
 
 def _runtime_inputs(settings: NodeSettings) -> tuple[dict[str, str], dict[str, dict[str, int]]]:
     """Load the runtime env/config inputs once."""
-    env_values = _read_env_file(settings.env_path)
+    env_values = read_env_file(settings.env_path)
     config = _read_yaml(settings.config_path)
     return env_values, resolve_vendor_budgets(config)
 
@@ -3103,22 +3104,3 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-
-
-def _read_env_file(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        values[key] = value
-    return values
-
-
-def _write_env_file(path: Path, values: dict[str, str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ordered = sorted(values.items())
-    path.write_text("\n".join(f"{key}={value}" for key, value in ordered) + "\n", encoding="utf-8")

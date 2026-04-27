@@ -20,23 +20,13 @@ from trademl.data_node.curator import Curator
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.runtime import build_connectors, build_connector, resolve_vendor_budgets
 from trademl.data_node.service import DataNodePaths, DataNodeService
+from trademl.env import load_dotenv
 from trademl.fleet.cluster import ClusterCoordinator
 
 
 def _build_reference_jobs(*, connectors: dict[str, object], symbols: list[str]) -> list[dict[str, object]]:
     """Build the default weekly reference collection plan from verified connector lanes."""
     return build_reference_jobs_from_registry(connectors=connectors, symbols=symbols)
-
-
-def _load_dotenv(env_path: Path | None) -> None:
-    if env_path is None or not env_path.exists():
-        return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        os.environ.setdefault(key, value)
 
 
 def main() -> int:
@@ -59,7 +49,7 @@ def main() -> int:
         env_path = Path(args.root).expanduser() / ".env"
     elif Path(".env").exists():
         env_path = Path(".env")
-    _load_dotenv(env_path)
+    load_dotenv(env_path)
 
     with Path(args.config).open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)

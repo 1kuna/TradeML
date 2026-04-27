@@ -22,6 +22,7 @@ import yaml
 from trademl.data_node.capabilities import default_macro_series
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.planner import training_readiness
+from trademl.env import read_env_file
 
 LOGGER = logging.getLogger(__name__)
 
@@ -672,7 +673,7 @@ def launch_training_process(
             str(shared_runtime_path),
         ]
         env = os.environ.copy()
-        env.update(_read_env_file(env_path))
+        env.update(read_env_file(env_path))
         try:
             with log_path.open("a", encoding="utf-8") as handle:
                 process = subprocess.Popen(  # noqa: S603
@@ -1360,19 +1361,6 @@ def _planner_window_ratio(
     if expected_units <= 0:
         return None
     return min(1.0, completed_units / expected_units)
-
-
-def _read_env_file(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        values[key] = value
-    return values
 
 
 def _optional_target_value(value: object) -> str | None:

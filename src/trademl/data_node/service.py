@@ -212,11 +212,18 @@ class DataNodeService:
     def process_backfill_queue(
         self,
         *,
+        trading_date: str | None = None,
+        prefer_legacy_backfill: bool = False,
         heartbeat_fn: Callable[[], object] | None = None,
         heartbeat_interval_seconds: float = 30.0,
     ) -> list[str]:
         """Compatibility wrapper that now drains the planner-native queue."""
-        seed_date = datetime.now(tz=UTC).date().isoformat()
+        seed_date = trading_date or datetime.now(tz=UTC).date().isoformat()
+        if prefer_legacy_backfill and self.db.has_pending_backfill():
+            return self._process_legacy_backfill_queue(
+                heartbeat_fn=heartbeat_fn,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+            )
         if len(self.default_symbols) > 1 and not self.db.has_pending_planner_tasks(task_families=("canonical_bars",)) and self.db.has_pending_backfill():
             self._ensure_planner_backlog_seeded(trading_date=seed_date)
             if self.db.has_pending_planner_tasks(task_families=("canonical_bars",)):
@@ -224,6 +231,7 @@ class DataNodeService:
                 if migrated:
                     LOGGER.info("migrated_legacy_backfill_rows count=%s", migrated)
                 return self.process_planner_queue(
+                    trading_date=seed_date,
                     heartbeat_fn=heartbeat_fn,
                     heartbeat_interval_seconds=heartbeat_interval_seconds,
                 )
@@ -234,6 +242,7 @@ class DataNodeService:
                 if migrated:
                     LOGGER.info("migrated_legacy_datewide_backfill count=%s", migrated)
                 return self.process_planner_queue(
+                    trading_date=seed_date,
                     heartbeat_fn=heartbeat_fn,
                     heartbeat_interval_seconds=heartbeat_interval_seconds,
                 )
@@ -243,6 +252,7 @@ class DataNodeService:
                 heartbeat_interval_seconds=heartbeat_interval_seconds,
             )
         return self.process_planner_queue(
+            trading_date=seed_date,
             heartbeat_fn=heartbeat_fn,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
         )
@@ -1091,7 +1101,10 @@ class DataNodeService:
             end_date=audit_end,
             expected_rows=len(symbols),
         )
-        backfill_dates = self.process_backfill_queue()
+        backfill_dates = self.process_backfill_queue(
+            trading_date=trading_date,
+            prefer_legacy_backfill=True,
+        )
         changed_dates = sorted(set(forward_dates + backfill_dates))
         curated = self.curate_dates(
             corp_actions=corp_actions,
@@ -1397,12 +1410,10 @@ class DataNodeService:
 
     def _ensure_planner_backlog_seeded(self, *, trading_date: str) -> None:
         """Refresh planner tasks once per service instance and trading date."""
-        if not self.default_symbols:
-            return
-        if trading_date in self._planner_seed_history:
-            return
-        self._seed_planner_tasks(trading_date=trading_date)
-        self._planner_seed_history.add(trading_date)
+        self._ensure_planner_backlog_seeded_once(
+            trading_date=trading_date,
+            seed_fn=lambda: self._seed_planner_tasks(trading_date=trading_date),
+        )
 
     def _ensure_planner_backlog_seeded_with_heartbeat(
         self,
@@ -1411,14 +1422,21 @@ class DataNodeService:
         heartbeat_fn: Callable[[], object] | None = None,
     ) -> None:
         """Refresh planner tasks once per day while preserving startup liveness."""
+        self._ensure_planner_backlog_seeded_once(
+            trading_date=trading_date,
+            seed_fn=lambda: self._seed_planner_tasks_with_heartbeat(
+                trading_date=trading_date,
+                heartbeat_fn=heartbeat_fn,
+            ),
+        )
+
+    def _ensure_planner_backlog_seeded_once(self, *, trading_date: str, seed_fn: Callable[[], object]) -> None:
+        """Run a planner seed callback once per service instance and trading date."""
         if not self.default_symbols:
             return
         if trading_date in self._planner_seed_history:
             return
-        self._seed_planner_tasks_with_heartbeat(
-            trading_date=trading_date,
-            heartbeat_fn=heartbeat_fn,
-        )
+        seed_fn()
         self._planner_seed_history.add(trading_date)
 
     def _should_run_maintenance(self, *, local_day: str, current_local: datetime, maintenance_hour_local: int) -> bool:

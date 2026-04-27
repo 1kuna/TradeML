@@ -778,29 +778,8 @@ class CanonicalRuntime:
 
     def _process_backfill_task_for_vendor(self, task, vendor: str) -> list[str]:
         task_key = canonical_task_key(task)
-        capability = next(
-            (
-                candidate
-                for candidate in backfill_capabilities(
-                    dataset=task.dataset,
-                    connectors=self.connectors,
-                    audit_state=self.capability_audit_state,
-                )
-                if candidate.vendor == vendor
-            ),
-            None,
-        )
         if task.symbol is None:
             return self._process_parallel_datewide_backfill_task(task=task, coordinator_vendor=vendor)
-        if task.symbol is None and capability is not None and capability.batching_mode == "single_symbol":
-            self.db.mark_vendor_attempt_failed(
-                task_key=task_key,
-                vendor=vendor,
-                error="unsupported canonical task shape for single-symbol vendor",
-                backoff_minutes=60,
-            )
-            self.db.defer_task(task.id, reason=f"{vendor}: unsupported canonical task shape", backoff_minutes=5)
-            return []
         symbols = [task.symbol] if task.symbol else self._default_symbols_getter()
         attempt = self.db.lease_vendor_attempt(
             task_key=task_key,

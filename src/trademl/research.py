@@ -9,7 +9,6 @@ import os
 import re
 import signal
 import subprocess
-import sys
 import time
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -20,17 +19,12 @@ import yaml
 
 from trademl.experiments import (
     _atomic_write_json,
-    _backtest_gate,
-    _predictive_gate,
     _count_launchable_runs,
     _supervision_policy,
     compare_experiment,
-    experiment_status,
     latest_experiment_summary,
-    pause_experiment_supervisor,
     propose_next_experiment_family,
     read_experiment_supervisor_state,
-    resume_experiment_supervisor,
     stop_experiment_supervisor,
     supervise_experiment,
 )

@@ -18,6 +18,7 @@ from trademl.data_node.bootstrap import DEFAULT_STAGE0_SYMBOL_COUNT, Stage0Unive
 from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.vendor_limits import DEFAULT_VENDOR_LIMITS
+from trademl.env import write_env_file
 
 
 def run_wizard(
@@ -131,7 +132,7 @@ def main() -> int:
     }
     nas_write_ok = _test_nas_mount(Path(env_values["NAS_MOUNT"]))
     env_path = Path(args.env_file).expanduser() if args.env_file else root / ".env"
-    _write_env_file(env_path, env_values)
+    write_env_file(env_path, env_values, sort_keys=False)
     stage_symbols = [symbol.strip().upper() for symbol in args.stage_symbol if symbol.strip()]
     if not stage_symbols:
         builder = Stage0UniverseBuilder(
@@ -201,11 +202,6 @@ def _test_nas_mount(path: Path) -> bool:
         return True
     except OSError:
         return False
-
-
-def _write_env_file(path: Path, values: dict[str, str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(f"{key}={value}" for key, value in values.items()) + "\n", encoding="utf-8")
 
 
 def _persist_fstab_entry(*, path: Path, nas_share: str, nas_mount: str) -> Path:

@@ -30,6 +30,7 @@ from trademl import __version__
 from trademl.calendars.exchange import get_trading_days
 from trademl.data_node.bootstrap import resolve_bootstrap_stage
 from trademl.data_node.db import DataNodeDB
+from trademl.env import read_env_file, write_env_file
 
 
 SHARED_SECRET_KEYS = [
@@ -199,7 +200,7 @@ class ClusterCoordinator:
             "vendors": manifest["vendors"],
         }
         _write_yaml(self.config_path, node_payload)
-        env_values = _read_env_file(self.env_path)
+        env_values = read_env_file(self.env_path)
         env_values.update(
             {
                 "TRADEML_ENV": env_values.get("TRADEML_ENV", "local"),
@@ -214,7 +215,7 @@ class ClusterCoordinator:
         for key, value in secrets.items():
             if value:
                 env_values[key] = value
-        _write_env_file(self.env_path, env_values)
+        write_env_file(self.env_path, env_values)
 
     def rebuild_local_state(self, *, local_db_path: Path, current_date: str | None = None) -> dict[str, Any]:
         """Rebuild the local disposable DB from NAS data and cluster manifest."""
@@ -556,7 +557,7 @@ class ClusterCoordinator:
     def _ensure_secret_bundle(self, *, passphrase: str | None) -> None:
         if self.paths.secrets_path.exists():
             return
-        env_values = _read_env_file(self.env_path)
+        env_values = read_env_file(self.env_path)
         shared = {key: env_values.get(key, os.getenv(key, "")) for key in SHARED_SECRET_KEYS if env_values.get(key, os.getenv(key, ""))}
         if not shared:
             return
@@ -954,25 +955,6 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-
-
-def _read_env_file(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        values[key] = value
-    return values
-
-
-def _write_env_file(path: Path, values: dict[str, str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ordered = {key: values[key] for key in sorted(values)}
-    path.write_text("\n".join(f"{key}={value}" for key, value in ordered.items()) + "\n", encoding="utf-8")
 
 
 def _utcnow() -> datetime:
