@@ -241,6 +241,51 @@ def test_materialize_matrix_row_resolves_architecture_feature_and_data_profiles(
     assert row["config_overrides"]["validation.initial_train_years"] == 3
 
 
+def test_frontier_architecture_manifest_order_prefers_advanced(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "local"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    (repo_root / "configs").mkdir(parents=True, exist_ok=True)
+    (repo_root / "configs" / "equities_xs.yml").write_text("data: {}\n", encoding="utf-8")
+    (repo_root / "configs" / "node.yml").write_text("", encoding="utf-8")
+    spec_path = tmp_path / "frontier.yml"
+    spec_path.write_text(
+        yaml.safe_dump(
+            {
+                "experiment_id": "frontier-order",
+                "phase": 1,
+                "frontier_architecture": True,
+                "matrix": {
+                    "architecture_family": ["advanced_challenger", "tree_challenger", "linear_baseline"],
+                    "feature_family": ["price_liquidity"],
+                    "data_family": ["price_plus_liquidity"],
+                    "data_profile": ["phase1_default"],
+                    "validation.initial_train_years": [2],
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(experiments, "_resolve_default_report_date", lambda **kwargs: "2026-03-09")
+
+    experiments.plan_experiment(
+        spec_path=spec_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        targets_config_path=repo_root / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    manifests = experiments._load_run_manifests(local_state=local_state, experiment_id="frontier-order")  # noqa: SLF001
+    assert [manifest["model_suite"] for manifest in manifests] == ["advanced", "full", "ridge_only"]
+    assert [manifest["run_priority"] for manifest in manifests] == [0, 1, 2]
+
+
 def test_primary_rank_ic_prefers_catboost_for_advanced_suite() -> None:
     score = experiments._primary_rank_ic(  # noqa: SLF001
         manifest={"model_suite": "advanced"},

@@ -172,15 +172,17 @@ def plan_experiment(
         config_path = configs_dir / f"{run_id}.yml"
         config_path.write_text(yaml.safe_dump(run_config, sort_keys=False), encoding="utf-8")
         output_root = target.data_root / "experiments" / experiment_id / "runs" / run_id
+        model_suite = row.get("model_suite") or spec.get("model_suite") or ("ridge_only" if phase == 1 else "full")
         base_manifest = {
             "experiment_id": experiment_id,
             "run_id": run_id,
+            "run_priority": _run_priority(row={**row, "model_suite": model_suite}, spec=spec),
             "runtime_name": runtime_name,
             "phase": phase,
             "target": target.name,
             "target_kind": target.kind,
             "report_date": report_date,
-            "model_suite": row.get("model_suite") or spec.get("model_suite") or ("ridge_only" if phase == 1 else "full"),
+            "model_suite": model_suite,
             "matrix_values": row["matrix_values"],
             "config_overrides": row.get("config_overrides", {}),
             "config_path": str(config_path),
@@ -1130,6 +1132,14 @@ def _run_id(matrix_values: dict[str, Any]) -> str:
     return hashlib.sha1(serialized.encode("utf-8")).hexdigest()[:10]
 
 
+def _run_priority(*, row: dict[str, Any], spec: dict[str, Any]) -> int:
+    """Order controlled frontier runs so advanced challengers launch first."""
+    if not bool(spec.get("frontier_architecture", False)):
+        return 100
+    order = {"advanced": 0, "full": 1, "ridge_only": 2}
+    return order.get(str(row.get("model_suite") or ""), 100)
+
+
 def _local_experiment_root(local_state: Path, experiment_id: str) -> Path:
     return local_state / "experiments" / experiment_id
 
@@ -1295,7 +1305,8 @@ def _write_experiment_summary(
 
 def _load_run_manifests(*, local_state: Path, experiment_id: str) -> list[dict[str, Any]]:
     root = _local_experiment_root(local_state, experiment_id) / "runs"
-    return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(root.glob("*.json"))]
+    manifests = [json.loads(path.read_text(encoding="utf-8")) for path in root.glob("*.json")]
+    return sorted(manifests, key=lambda item: (int(item["run_priority"]) if item.get("run_priority") is not None else 100, str(item.get("run_id") or "")))
 
 
 def _refresh_experiment_summary(
