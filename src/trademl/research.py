@@ -1882,6 +1882,14 @@ def _current_data_revision(
         phase = _current_ssot_phase(state=state, spec=spec)
         reference_root = target.data_root / "data" / "reference"
         revision_parts = [f"report:{_resolve_default_report_date(target=target, phase=phase)}"]
+        qc_path = target.data_root / "data" / "qc" / "partition_status.parquet"
+        if qc_path.exists():
+            revision_parts.append(f"partition_status.parquet:{int(qc_path.stat().st_mtime)}")
+        curated_root = target.data_root / "data" / "curated" / "equities_ohlcv_adj"
+        curated_files = [item for item in curated_root.glob("date=*/data.parquet") if item.is_file()]
+        if curated_files:
+            latest_curated = max(curated_files, key=lambda item: (item.parent.name, item.stat().st_mtime))
+            revision_parts.append(f"equities_ohlcv_adj:{latest_curated.parent.name.partition('=')[2]}:{int(latest_curated.stat().st_mtime)}")
         for path in [
             reference_root / "security_master.parquet",
             reference_root / "fundamentals_daily.parquet",

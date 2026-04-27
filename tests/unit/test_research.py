@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -298,6 +299,37 @@ def test_resume_if_data_changed_launches_pending_spec(tmp_path: Path, monkeypatc
     assert state["last_seen_data_revision"] == "2026-03-10"
     assert state["pending_next_spec"] is None
     assert captured["next_spec"]["search_epoch"] == 1
+
+
+def test_current_data_revision_tracks_qc_and_latest_curated_partition(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "nas"
+    qc_path = data_root / "data" / "qc" / "partition_status.parquet"
+    curated_path = data_root / "data" / "curated" / "equities_ohlcv_adj" / "date=2026-04-24" / "data.parquet"
+    qc_path.parent.mkdir(parents=True)
+    curated_path.parent.mkdir(parents=True)
+    qc_path.write_text("qc", encoding="utf-8")
+    curated_path.write_text("curated", encoding="utf-8")
+    monkeypatch.setattr(
+        research,
+        "resolve_training_target",
+        lambda **kwargs: SimpleNamespace(data_root=data_root),
+    )
+    monkeypatch.setattr(research, "_resolve_default_report_date", lambda **kwargs: "2026-04-22")
+
+    revision = research._current_data_revision(  # noqa: SLF001
+        spec={"target": "workstation-remote", "phase_order": [1]},
+        state={"current_phase": 1},
+        repo_root=tmp_path / "repo",
+        data_root=data_root,
+        local_state=tmp_path / "local",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert revision is not None
+    assert "report:2026-04-22" in revision
+    assert "partition_status.parquet" in revision
+    assert "equities_ohlcv_adj:2026-04-24" in revision
 
 
 def test_recover_stalled_active_experiment_relaunches_same_family_when_work_remains(tmp_path: Path, monkeypatch) -> None:
