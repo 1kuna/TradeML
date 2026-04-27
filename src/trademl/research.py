@@ -8,18 +8,23 @@ import json
 import os
 import re
 import signal
+import smtplib
 import subprocess
 import time
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import pandas as pd
 import yaml
 
 from trademl.experiments import (
     _atomic_write_json,
     _count_launchable_runs,
+    _load_run_manifests,
+    _refresh_experiment_summary,
     _supervision_policy,
     compare_experiment,
     latest_experiment_summary,
@@ -28,7 +33,13 @@ from trademl.experiments import (
     stop_experiment_supervisor,
     supervise_experiment,
 )
-from trademl.data_node.training_control import _resolve_default_report_date, resolve_training_target
+from trademl.data_node.training_control import (
+    _resolve_default_report_date,
+    resolve_training_target,
+    training_preflight,
+    training_status_snapshot,
+)
+from trademl.portfolio.build import build_portfolio
 
 DEFAULT_RESEARCH_REVIEW_HOURS = 12
 DEFAULT_BUDGET_POLICY = {
@@ -56,6 +67,31 @@ MODELING_READY_DATA_FAMILIES = {
 DEFAULT_EXHAUSTION_MODE = "wait_for_new_data"
 DEFAULT_EXPANSION_PROFILES = ["phase1_default", "phase1_short_window", "phase1_long_window"]
 DEFAULT_EXPANSION_INITIAL_TRAIN_YEARS = [2, 3]
+DEFAULT_INCUMBENT_POLICY = {
+    "mode": "research",
+    "manual_live_required": True,
+    "max_pbo": 0.5,
+    "min_net_return": 0.0,
+    "min_rank_ic_improvement": 0.002,
+    "min_net_return_improvement": 0.01,
+}
+DEFAULT_DRIFT_POLICY = {
+    "min_coverage": 0.98,
+    "max_infra_failures": 3,
+    "max_hours_without_completed_run": 24,
+    "mature_windows": 3,
+    "min_relative_ic": 0.5,
+    "psi_warn": 0.2,
+}
+DEFAULT_ALERT_POLICY = {
+    "email_enabled": False,
+    "write_files": True,
+}
+DEFAULT_PAPER_POLICY = {
+    "enabled": True,
+    "rebalance_day": "FRI",
+    "no_live_orders": True,
+}
 
 
 def start_research_program(
@@ -126,6 +162,13 @@ def supervise_research_program(
         if not state:
             state = _initial_program_state(spec=spec, program_path=program_path, poll_seconds=resolved_poll)
         state["heartbeat_at"] = datetime.now(tz=UTC).isoformat()
+        state["stale_run_sweep"] = sweep_stale_experiment_runs(
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=python_executable,
+        )
         if state.get("stop_requested"):
             state["status"] = "STOPPED"
             state["completed_at"] = datetime.now(tz=UTC).isoformat()
@@ -136,7 +179,7 @@ def supervise_research_program(
             _write_program_state(local_state=local_state, program_id=program_id, payload=state)
             time.sleep(max(1, resolved_poll))
             continue
-        if state.get("status") == "WAITING_FOR_DATA":
+        if state.get("status") in {"WAITING_FOR_DATA", "INFRA_BLOCKED"}:
             resumed = _resume_if_data_changed(
                 spec=spec,
                 state=state,
@@ -150,9 +193,12 @@ def supervise_research_program(
             )
             if resumed is not None:
                 state.update(resumed)
-                state["status"] = "RUNNING"
-                state["wait_reason"] = None
-                state["waiting_since"] = None
+                if resumed.get("status") == "INFRA_BLOCKED":
+                    state["waiting_since"] = state.get("waiting_since") or datetime.now(tz=UTC).isoformat()
+                else:
+                    state["status"] = "RUNNING"
+                    state["wait_reason"] = None
+                    state["waiting_since"] = None
                 _write_program_state(local_state=local_state, program_id=program_id, payload=state)
                 time.sleep(max(1, resolved_poll))
                 continue
@@ -192,7 +238,10 @@ def supervise_research_program(
                 poll_seconds=resolved_poll,
             )
             state.update(launched)
-            state["status"] = "RUNNING"
+            if launched.get("status") == "INFRA_BLOCKED":
+                state["waiting_since"] = datetime.now(tz=UTC).isoformat()
+            else:
+                state["status"] = "RUNNING"
             _write_program_state(local_state=local_state, program_id=program_id, payload=state)
             time.sleep(max(1, resolved_poll))
             continue
@@ -284,7 +333,10 @@ def supervise_research_program(
                 poll_seconds=resolved_poll,
             )
             state.update(launched)
-            state["status"] = "RUNNING"
+            if launched.get("status") == "INFRA_BLOCKED":
+                state["waiting_since"] = datetime.now(tz=UTC).isoformat()
+            else:
+                state["status"] = "RUNNING"
         elif decision["action"] == "advance_phase":
             state["current_phase"] = int(decision["next_phase"])
             state["current_ssot_phase"] = int(decision["next_phase"])
@@ -303,7 +355,10 @@ def supervise_research_program(
                 poll_seconds=resolved_poll,
             )
             state.update(launched)
-            state["status"] = "RUNNING"
+            if launched.get("status") == "INFRA_BLOCKED":
+                state["waiting_since"] = datetime.now(tz=UTC).isoformat()
+            else:
+                state["status"] = "RUNNING"
         elif decision["action"] == "wait_for_data":
             state["status"] = "WAITING_FOR_DATA"
             state["wait_reason"] = decision["reason"]
@@ -349,6 +404,382 @@ def latest_research_program_summary(*, local_state: Path) -> dict[str, Any]:
     if not roots:
         return {}
     return json.loads(roots[0].read_text(encoding="utf-8"))
+
+
+def sweep_stale_experiment_runs(
+    *,
+    local_state: Path,
+    repo_root: Path,
+    data_root: Path,
+    targets_config_path: Path,
+    python_executable: str,
+) -> dict[str, Any]:
+    """Reconcile stale RUNNING/STARTING experiment manifests across all families."""
+    active_statuses = {"RUNNING", "STARTING"}
+    checked = 0
+    reconciled = 0
+    touched: set[str] = set()
+    errors: list[dict[str, Any]] = []
+    for path in sorted((local_state / "experiments").glob("*/runs/*.json")):
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            errors.append({"path": str(path), "error": str(exc)})
+            continue
+        status = str(manifest.get("status") or "").upper()
+        if status not in active_statuses:
+            continue
+        checked += 1
+        experiment_id = str(manifest.get("experiment_id") or path.parent.parent.name)
+        try:
+            snapshot = training_status_snapshot(
+                repo_root=repo_root,
+                data_root=data_root,
+                local_state=local_state,
+                phase=int(manifest.get("phase") or 1),
+                target=str(manifest.get("target") or "workstation-remote"),
+                targets_config_path=targets_config_path,
+                python_executable=python_executable,
+                runtime_name=str(manifest.get("runtime_name") or f"{experiment_id}-{manifest.get('run_id')}"),
+                tail_lines=20,
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"path": str(path), "run_id": manifest.get("run_id"), "error": str(exc)})
+            continue
+        runtime = dict(snapshot.get("runtime") or {})
+        runtime_status = str(runtime.get("status") or "").lower()
+        running = bool(runtime.get("running"))
+        report_path_value = manifest.get("report_path")
+        report_exists = bool(report_path_value) and Path(str(report_path_value)).exists()
+        updated = dict(manifest)
+        updated["runtime"] = runtime
+        updated["log_tail"] = snapshot.get("log_tail", [])
+        if runtime_status in {"completed", "succeeded", "success"} or report_exists:
+            updated["status"] = "COMPLETED"
+            updated["completed_at"] = runtime.get("finished_at") or datetime.now(tz=UTC).isoformat()
+        elif not running:
+            updated["status"] = "FAILED"
+            updated["failure_kind"] = "infra"
+            updated["last_error"] = str(runtime.get("error") or f"stale {status.lower()} manifest; runtime is not running")
+            updated["completed_at"] = runtime.get("finished_at") or datetime.now(tz=UTC).isoformat()
+        else:
+            _atomic_write_json(path, updated)
+            continue
+        history = list(updated.get("supervisor_history") or [])
+        history.append({"at": datetime.now(tz=UTC).isoformat(), "event": "stale_run_sweep", "status": updated["status"]})
+        updated["supervisor_history"] = history[-50:]
+        _atomic_write_json(path, updated)
+        reconciled += 1
+        touched.add(experiment_id)
+    refreshed = []
+    for experiment_id in sorted(touched):
+        runs = _load_run_manifests(local_state=local_state, experiment_id=experiment_id)
+        counts: dict[str, int] = {}
+        for run in runs:
+            key = str(run.get("status") or "UNKNOWN").upper()
+            counts[key] = counts.get(key, 0) + 1
+        summary = _refresh_experiment_summary(
+            local_state=local_state,
+            experiment_id=experiment_id,
+            summary={"experiment_id": experiment_id, "runs": runs, "counts": counts},
+            data_root=data_root,
+        )
+        refreshed.append({"experiment_id": experiment_id, "counts": summary.get("counts", {})})
+    return {
+        "checked": checked,
+        "reconciled": reconciled,
+        "refreshed": refreshed,
+        "errors": errors,
+        "ran_at": datetime.now(tz=UTC).isoformat(),
+    }
+
+
+def read_research_incumbent(*, local_state: Path, program_id: str) -> dict[str, Any]:
+    """Return the canonical local research incumbent record when present."""
+    path = _incumbent_path(local_state=local_state, program_id=program_id)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def update_research_incumbent(
+    *,
+    program_id: str,
+    local_state: Path,
+    data_root: Path,
+    candidates: list[dict[str, Any]],
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Promote a research incumbent only when strict predictive/backtest gates pass."""
+    merged_policy = {**DEFAULT_INCUMBENT_POLICY, **dict(policy or {})}
+    current = read_research_incumbent(local_state=local_state, program_id=program_id)
+    rejections: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=lambda item: (float(item.get("primary_score") or 0.0), float(item.get("backtest_net_return") or 0.0)), reverse=True):
+        reasons = _incumbent_rejection_reasons(candidate=candidate, incumbent=current, policy=merged_policy)
+        if reasons:
+            rejections.append({"run_id": candidate.get("run_id"), "experiment_id": candidate.get("experiment_id"), "reasons": reasons})
+            continue
+        payload = {
+            **candidate,
+            "program_id": program_id,
+            "mode": "research",
+            "manual_live_required": bool(merged_policy.get("manual_live_required", True)),
+            "promoted_at": datetime.now(tz=UTC).isoformat(),
+            "previous_incumbent": {
+                key: current.get(key)
+                for key in ("experiment_id", "run_id", "primary_score", "backtest_net_return", "promoted_at")
+                if current.get(key) is not None
+            },
+            "last_rejections": rejections,
+        }
+        _write_incumbent_payload(local_state=local_state, data_root=data_root, program_id=program_id, payload=payload)
+        return {"promoted": True, "incumbent": payload, "rejections": rejections}
+    if current:
+        current["last_rejections"] = rejections
+        current["last_reviewed_at"] = datetime.now(tz=UTC).isoformat()
+        _write_incumbent_payload(local_state=local_state, data_root=data_root, program_id=program_id, payload=current)
+    return {"promoted": False, "incumbent": current, "rejections": rejections}
+
+
+def write_paper_outputs_for_incumbent(
+    *,
+    incumbent: dict[str, Any],
+    data_root: Path,
+    local_state: Path,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write deterministic paper-ready signals, weights, and order deltas for the incumbent."""
+    merged_policy = {**DEFAULT_PAPER_POLICY, **dict(policy or {})}
+    if not bool(merged_policy.get("enabled", True)):
+        return {"status": "skipped", "reason": "paper policy disabled"}
+    if not bool(merged_policy.get("no_live_orders", True)):
+        raise ValueError("paper_policy.no_live_orders must remain true in research autopilot")
+    artifacts = dict(incumbent.get("artifacts") or {})
+    predictions_path = Path(str(artifacts.get("primary_predictions_path") or incumbent.get("primary_predictions_path") or ""))
+    if not predictions_path.exists():
+        return {"status": "skipped", "reason": f"missing predictions parquet: {predictions_path}"}
+    predictions = pd.read_parquet(predictions_path)
+    required = {"date", "symbol", "prediction"}
+    missing = required.difference(predictions.columns)
+    if missing:
+        raise ValueError(f"predictions parquet missing required columns: {sorted(missing)}")
+    frame = predictions.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    latest_date = frame["date"].max()
+    latest = frame.loc[frame["date"] == latest_date, ["date", "symbol", "prediction"]].copy()
+    latest = latest.sort_values(["prediction", "symbol"], ascending=[False, True]).reset_index(drop=True)
+    latest["score"] = latest["prediction"].astype(float)
+    latest["rank"] = range(1, len(latest) + 1)
+    latest["source_run_id"] = incumbent.get("run_id")
+    signals = latest[["date", "symbol", "score", "rank", "source_run_id"]].copy()
+    targets = build_portfolio(signals[["date", "symbol", "score"]], {"rebalance_day": merged_policy.get("rebalance_day", "FRI")})
+    previous = _latest_prior_paper_targets(data_root=data_root, local_state=local_state, current_date=latest_date.date().isoformat())
+    orders = _paper_order_deltas(targets=targets, previous=previous)
+    root = _shared_research_root(data_root=data_root) / "paper" / latest_date.date().isoformat()
+    root.mkdir(parents=True, exist_ok=True)
+    signals_path = root / "signals.parquet"
+    targets_path = root / "target_weights.parquet"
+    orders_path = root / "paper_orders.parquet"
+    signals.to_parquet(signals_path, index=False)
+    targets.to_parquet(targets_path, index=False)
+    orders.to_parquet(orders_path, index=False)
+    local_root = _local_research_root(local_state=local_state) / "paper" / latest_date.date().isoformat()
+    local_root.mkdir(parents=True, exist_ok=True)
+    signals.to_parquet(local_root / "signals.parquet", index=False)
+    targets.to_parquet(local_root / "target_weights.parquet", index=False)
+    orders.to_parquet(local_root / "paper_orders.parquet", index=False)
+    return {
+        "status": "written",
+        "date": latest_date.date().isoformat(),
+        "signals_path": str(signals_path),
+        "target_weights_path": str(targets_path),
+        "paper_orders_path": str(orders_path),
+        "local_root": str(local_root),
+        "no_live_orders": True,
+    }
+
+
+def evaluate_research_drift(
+    *,
+    program_id: str,
+    state: dict[str, Any],
+    incumbent: dict[str, Any],
+    latest_summary: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Return alert records for coverage, infra, and mature-performance drift."""
+    merged_policy = {**DEFAULT_DRIFT_POLICY, **dict(policy or {})}
+    now = now or datetime.now(tz=UTC)
+    alerts: list[dict[str, Any]] = []
+    coverage = _latest_summary_coverage(latest_summary)
+    if coverage is not None and coverage < float(merged_policy["min_coverage"]):
+        alerts.append(
+            {
+                "program_id": program_id,
+                "kind": "coverage",
+                "severity": "warning",
+                "message": f"latest research coverage {coverage:.3f} is below {float(merged_policy['min_coverage']):.3f}",
+                "value": coverage,
+            }
+        )
+    failed = int((latest_summary.get("counts") or {}).get("FAILED", 0) or 0)
+    if failed >= int(merged_policy["max_infra_failures"]):
+        alerts.append(
+            {
+                "program_id": program_id,
+                "kind": "infra_failures",
+                "severity": "critical",
+                "message": f"{failed} failed runs in latest experiment summary",
+                "value": failed,
+            }
+        )
+    if str(state.get("status") or "").upper() == "RUNNING":
+        last_completed = state.get("last_completed_run_at")
+        if last_completed:
+            with contextlib.suppress(ValueError):
+                elapsed = now - datetime.fromisoformat(str(last_completed))
+                if elapsed >= timedelta(hours=float(merged_policy["max_hours_without_completed_run"])):
+                    alerts.append(
+                        {
+                            "program_id": program_id,
+                            "kind": "stalled_research",
+                            "severity": "warning",
+                            "message": f"no completed runs for {elapsed.total_seconds() / 3600:.1f} hours while runnable",
+                            "value": elapsed.total_seconds() / 3600,
+                        }
+                    )
+    mature_ics = [float(value) for value in state.get("mature_window_rank_ics", [])[-int(merged_policy["mature_windows"]):]]
+    incumbent_ic = float(incumbent.get("primary_score") or incumbent.get("rank_ic") or 0.0)
+    if len(mature_ics) >= int(merged_policy["mature_windows"]) and incumbent_ic > 0:
+        threshold = incumbent_ic * float(merged_policy["min_relative_ic"])
+        if all(value <= 0.0 or value <= threshold for value in mature_ics):
+            alerts.append(
+                {
+                    "program_id": program_id,
+                    "kind": "mature_ic_drift",
+                    "severity": "critical",
+                    "message": "mature label IC degraded across consecutive windows",
+                    "value": mature_ics,
+                }
+            )
+    for alert in alerts:
+        alert.setdefault("created_at", now.isoformat())
+    return alerts
+
+
+def write_research_alerts(
+    *,
+    program_id: str,
+    alerts: list[dict[str, Any]],
+    local_state: Path,
+    data_root: Path,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist research alerts and optionally send an SMTP notification."""
+    merged_policy = {**DEFAULT_ALERT_POLICY, **dict(policy or {})}
+    if not alerts:
+        return {"status": "skipped", "reason": "no alerts"}
+    stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+    local_root = _local_research_root(local_state=local_state) / "alerts"
+    local_root.mkdir(parents=True, exist_ok=True)
+    payload = {"program_id": program_id, "generated_at": datetime.now(tz=UTC).isoformat(), "alerts": alerts}
+    json_path = local_root / f"{stamp}.json"
+    md_path = local_root / f"{stamp}.md"
+    if bool(merged_policy.get("write_files", True)):
+        _atomic_write_json(json_path, payload)
+        md_path.write_text(_render_alert_markdown(payload), encoding="utf-8")
+        shared_root = _shared_research_root(data_root=data_root) / "alerts"
+        shared_root.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(shared_root / f"{stamp}.json", payload)
+        (shared_root / f"{stamp}.md").write_text(_render_alert_markdown(payload), encoding="utf-8")
+    email = {"status": "skipped", "reason": "email disabled"}
+    if bool(merged_policy.get("email_enabled", False)):
+        email = send_research_alert_email(program_id=program_id, alerts=alerts)
+    return {"status": "written", "json_path": str(json_path), "markdown_path": str(md_path), "email": email}
+
+
+def send_research_alert_email(
+    *,
+    program_id: str,
+    alerts: list[dict[str, Any]],
+    smtp_factory: Callable[[str, int], Any] | None = None,
+) -> dict[str, Any]:
+    """Send research alerts through SMTP when all required env vars are configured."""
+    host = os.getenv("TRADEML_SMTP_HOST")
+    to_addr = os.getenv("TRADEML_ALERT_EMAIL_TO")
+    from_addr = os.getenv("TRADEML_ALERT_EMAIL_FROM")
+    if not host or not to_addr or not from_addr:
+        return {"status": "skipped", "reason": "smtp env not configured"}
+    port = int(os.getenv("TRADEML_SMTP_PORT") or "25")
+    message = EmailMessage()
+    message["Subject"] = f"TradeML research alert: {program_id}"
+    message["To"] = to_addr
+    message["From"] = from_addr
+    message.set_content(_render_alert_markdown({"program_id": program_id, "alerts": alerts}))
+    factory = smtp_factory or smtplib.SMTP
+    with factory(host, port) as smtp:
+        if str(os.getenv("TRADEML_SMTP_STARTTLS", "")).lower() in {"1", "true", "yes"}:
+            smtp.starttls()
+        username = os.getenv("TRADEML_SMTP_USERNAME")
+        password = os.getenv("TRADEML_SMTP_PASSWORD")
+        if username and password:
+            smtp.login(username, password)
+        smtp.send_message(message)
+    return {"status": "sent", "host": host, "port": port, "to": to_addr}
+
+
+def research_health(
+    *,
+    program_id: str,
+    local_state: Path,
+    repo_root: Path,
+    data_root: Path,
+    targets_config_path: Path,
+    python_executable: str,
+) -> dict[str, Any]:
+    """Return the operator health surface for a research program."""
+    state = read_research_program_state(local_state=local_state, program_id=program_id)
+    current_experiment_id = str(state.get("current_experiment_id") or "")
+    latest_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=current_experiment_id) if current_experiment_id else {}
+    incumbent = read_research_incumbent(local_state=local_state, program_id=program_id)
+    sweep = sweep_stale_experiment_runs(
+        local_state=local_state,
+        repo_root=repo_root,
+        data_root=data_root,
+        targets_config_path=targets_config_path,
+        python_executable=python_executable,
+    )
+    alerts = evaluate_research_drift(
+        program_id=program_id,
+        state=state,
+        incumbent=incumbent,
+        latest_summary=latest_summary,
+        policy={},
+    )
+    return {
+        "program_id": program_id,
+        "status": state.get("status"),
+        "wait_reason": state.get("wait_reason"),
+        "current_experiment_id": current_experiment_id,
+        "stale_run_sweep": sweep,
+        "incumbent": incumbent,
+        "alerts": alerts,
+        "paper": state.get("latest_paper_outputs", {}),
+        "infra_blocker": state.get("last_infra_preflight", {}),
+        "paths": _research_path_summary(local_state=local_state, data_root=data_root),
+    }
+
+
+def list_research_alerts(*, local_state: Path, program_id: str, limit: int = 20) -> dict[str, Any]:
+    """Return recent research alert files."""
+    root = _local_research_root(local_state=local_state) / "alerts"
+    paths = sorted(root.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)[:limit]
+    return {
+        "program_id": program_id,
+        "alerts": [json.loads(path.read_text(encoding="utf-8")) for path in paths],
+        "paths": [str(path) for path in paths],
+    }
 
 
 def pause_research_program(*, local_state: Path, program_id: str) -> dict[str, Any]:
@@ -478,6 +909,40 @@ def write_research_review_packet(
             targets_config_path=targets_config_path,
             python_executable=python_executable,
         )
+    spec = {}
+    if state.get("spec_path"):
+        with contextlib.suppress(Exception):
+            spec = _load_research_program_spec(Path(str(state["spec_path"])))
+    incumbent_update = update_research_incumbent(
+        program_id=program_id,
+        local_state=local_state,
+        data_root=data_root,
+        candidates=list(comparison.get("rows") or []),
+        policy=dict(spec.get("incumbent_policy") or {}),
+    )
+    incumbent = incumbent_update.get("incumbent") or read_research_incumbent(local_state=local_state, program_id=program_id)
+    paper_outputs = {}
+    if incumbent:
+        paper_outputs = write_paper_outputs_for_incumbent(
+            incumbent=incumbent,
+            data_root=data_root,
+            local_state=local_state,
+            policy=dict(spec.get("paper_policy") or {}),
+        )
+    drift_alerts = evaluate_research_drift(
+        program_id=program_id,
+        state=state,
+        incumbent=incumbent,
+        latest_summary=experiment_summary,
+        policy=dict(spec.get("drift_policy") or {}),
+    )
+    alert_result = write_research_alerts(
+        program_id=program_id,
+        alerts=drift_alerts,
+        local_state=local_state,
+        data_root=data_root,
+        policy=dict(spec.get("alert_policy") or {}),
+    )
     payload = {
         "program_id": program_id,
         "generated_at": datetime.now(tz=UTC).isoformat(),
@@ -493,6 +958,14 @@ def write_research_review_packet(
         "steering": state.get("steering", {}),
         "experiment_summary": experiment_summary,
         "comparison_best": comparison.get("best"),
+        "incumbent": incumbent,
+        "incumbent_update": incumbent_update,
+        "best_rejected_candidate": _best_rejected_candidate(comparison.get("rows") or [], incumbent_update.get("rejections") or []),
+        "paper_outputs": paper_outputs,
+        "drift_alerts": drift_alerts,
+        "alert_result": alert_result,
+        "infra_blocker": state.get("last_infra_preflight", {}),
+        "paths": _research_path_summary(local_state=local_state, data_root=data_root),
         "top_rejections": experiment_summary.get("top_gate_failures", []),
         "next_direction": state.get("last_transition", {}).get("reason"),
     }
@@ -513,6 +986,9 @@ def write_research_review_packet(
         f"- current_experiment_id: {payload['current_experiment_id'] or '-'}",
         f"- best_candidate: {(payload['best_candidate_summary'] or {}).get('best_candidate') or '-'}",
         f"- best_primary_score: {(payload['best_candidate_summary'] or {}).get('best_primary_score')}",
+        f"- incumbent_run_id: {(payload['incumbent'] or {}).get('run_id') or '-'}",
+        f"- paper_outputs: {(payload['paper_outputs'] or {}).get('paper_orders_path') or '-'}",
+        f"- alert_count: {len(payload['drift_alerts'])}",
         f"- last_transition: {(payload['last_transition'] or {}).get('reason') or '-'}",
         "",
         "## Top rejections",
@@ -520,13 +996,150 @@ def write_research_review_packet(
         "",
         "## Best comparison row",
         f"- {json.dumps(payload['comparison_best'], default=str)}",
+        "",
+        "## Best rejected candidate",
+        f"- {json.dumps(payload['best_rejected_candidate'], default=str)}",
     ]
     md_path.write_text("\n".join(md_lines), encoding="utf-8")
     result = {"json_path": str(json_path), "markdown_path": str(md_path)}
     state["latest_review_packet"] = result
     state["last_review_packet_at"] = datetime.now(tz=UTC).isoformat()
+    state["incumbent"] = incumbent
+    state["latest_paper_outputs"] = paper_outputs
+    state["latest_drift_alerts"] = drift_alerts
     _write_program_state(local_state=local_state, program_id=program_id, payload=state)
     return result
+
+
+def _incumbent_rejection_reasons(*, candidate: dict[str, Any], incumbent: dict[str, Any], policy: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    decision = candidate.get("decision") or (candidate.get("assessment") or {}).get("decision")
+    primary_score = _safe_float(candidate.get("primary_score") or candidate.get("rank_ic"))
+    net_return = _safe_float(candidate.get("backtest_net_return") or candidate.get("net_return"))
+    pbo = _safe_float(candidate.get("pbo"))
+    if not bool(candidate.get("shortlisted")):
+        reasons.append("candidate was not shortlisted")
+    if not bool(candidate.get("survived_predictive", candidate.get("shortlisted", False))):
+        reasons.append("predictive gates did not pass")
+    if str(decision) != "GO":
+        reasons.append("assessment.decision != GO")
+    if not bool(candidate.get("years_positive")):
+        reasons.append("not all years positive")
+    if str(candidate.get("backtest_status") or "COMPLETED").upper() != "COMPLETED":
+        reasons.append("backtest did not complete")
+    if net_return is None or net_return < float(policy["min_net_return"]):
+        reasons.append("cost-positive backtest gate failed")
+    if pbo is None or pbo > float(policy["max_pbo"]):
+        reasons.append(f"pbo>{policy['max_pbo']}")
+    if primary_score is None:
+        reasons.append("missing rank IC")
+    if incumbent and primary_score is not None and net_return is not None:
+        incumbent_score = _safe_float(incumbent.get("primary_score") or incumbent.get("rank_ic")) or 0.0
+        incumbent_return = _safe_float(incumbent.get("backtest_net_return") or incumbent.get("net_return")) or 0.0
+        score_improved = primary_score >= incumbent_score + float(policy["min_rank_ic_improvement"])
+        return_improved = net_return >= incumbent_return + float(policy["min_net_return_improvement"])
+        if not (score_improved or return_improved):
+            reasons.append("does not improve incumbent")
+    return reasons
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _incumbent_path(*, local_state: Path, program_id: str) -> Path:
+    return _local_research_root(local_state=local_state) / "incumbents" / f"{program_id}.json"
+
+
+def _write_incumbent_payload(*, local_state: Path, data_root: Path, program_id: str, payload: dict[str, Any]) -> None:
+    local_path = _incumbent_path(local_state=local_state, program_id=program_id)
+    _atomic_write_json(local_path, payload)
+    shared_path = _shared_research_root(data_root=data_root) / "incumbents" / f"{program_id}.json"
+    _atomic_write_json(shared_path, payload)
+
+
+def _local_research_root(*, local_state: Path) -> Path:
+    return local_state / "research"
+
+
+def _shared_research_root(*, data_root: Path) -> Path:
+    return data_root / "control" / "cluster" / "state" / "research"
+
+
+def _latest_prior_paper_targets(*, data_root: Path, local_state: Path, current_date: str) -> pd.DataFrame:
+    roots = [
+        _shared_research_root(data_root=data_root) / "paper",
+        _local_research_root(local_state=local_state) / "paper",
+    ]
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.glob("*/target_weights.parquet"):
+            if path.parent.name < current_date:
+                candidates.append(path)
+    if not candidates:
+        return pd.DataFrame(columns=["date", "symbol", "score", "target_weight"])
+    latest = max(candidates, key=lambda path: path.parent.name)
+    return pd.read_parquet(latest)
+
+
+def _paper_order_deltas(*, targets: pd.DataFrame, previous: pd.DataFrame) -> pd.DataFrame:
+    current = targets[["symbol", "target_weight"]].copy() if not targets.empty else pd.DataFrame(columns=["symbol", "target_weight"])
+    current = current.rename(columns={"target_weight": "target_weight"})
+    previous_frame = previous[["symbol", "target_weight"]].copy() if not previous.empty else pd.DataFrame(columns=["symbol", "target_weight"])
+    previous_frame = previous_frame.rename(columns={"target_weight": "previous_weight"})
+    merged = current.merge(previous_frame, on="symbol", how="outer")
+    merged["target_weight"] = pd.to_numeric(merged["target_weight"], errors="coerce").fillna(0.0)
+    merged["previous_weight"] = pd.to_numeric(merged["previous_weight"], errors="coerce").fillna(0.0)
+    merged["order_delta"] = merged["target_weight"] - merged["previous_weight"]
+    merged["action"] = "HOLD"
+    merged.loc[merged["order_delta"] > 0, "action"] = "BUY"
+    merged.loc[merged["order_delta"] < 0, "action"] = "SELL"
+    if not targets.empty and "date" in targets.columns:
+        merged["date"] = pd.to_datetime(targets["date"].max())
+    return merged.sort_values(["action", "symbol"]).reset_index(drop=True)
+
+
+def _latest_summary_coverage(summary: dict[str, Any]) -> float | None:
+    coverages: list[float] = []
+    for run in list(summary.get("runs") or []):
+        preview = dict(run.get("report_preview") or {})
+        value = preview.get("coverage")
+        if value is not None:
+            numeric = _safe_float(value)
+            if numeric is not None:
+                coverages.append(numeric)
+    return min(coverages) if coverages else None
+
+
+def _render_alert_markdown(payload: dict[str, Any]) -> str:
+    lines = [f"# Research alerts: {payload.get('program_id')}", ""]
+    for alert in payload.get("alerts", []) or []:
+        lines.append(f"- [{alert.get('severity', 'info')}] {alert.get('kind')}: {alert.get('message')}")
+    return "\n".join(lines)
+
+
+def _research_path_summary(*, local_state: Path, data_root: Path) -> dict[str, str]:
+    return {
+        "local_research_root": str(_local_research_root(local_state=local_state)),
+        "shared_research_root": str(_shared_research_root(data_root=data_root)),
+        "local_state": str(local_state),
+        "data_root": str(data_root),
+    }
+
+
+def _best_rejected_candidate(rows: list[dict[str, Any]], rejections: list[dict[str, Any]]) -> dict[str, Any] | None:
+    rejected_ids = {item.get("run_id"): item.get("reasons", []) for item in rejections}
+    for row in sorted(rows, key=lambda item: float(item.get("primary_score") or 0.0), reverse=True):
+        if row.get("run_id") in rejected_ids:
+            return {**row, "rejection_reasons": rejected_ids[row.get("run_id")]}
+    return None
 
 
 def _load_research_program_spec(path: Path) -> dict[str, Any]:
@@ -1398,6 +2011,21 @@ def _launch_program_family(
     python_executable: str,
     poll_seconds: int,
 ) -> dict[str, Any]:
+    preflight = _program_family_preflight(
+        next_spec=next_spec,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        targets_config_path=targets_config_path,
+        python_executable=python_executable,
+    )
+    if not bool(preflight.get("ok", False)):
+        return {
+            "status": "INFRA_BLOCKED",
+            "wait_reason": f"research preflight failed: {preflight.get('reason')}",
+            "last_infra_preflight": preflight,
+            "pending_next_spec": deepcopy(next_spec),
+        }
     spec_path = _program_root(local_state=local_state, program_id=program_id) / "specs" / f"{next_spec['experiment_id']}.yml"
     spec_path.parent.mkdir(parents=True, exist_ok=True)
     spec_path.write_text(yaml.safe_dump(next_spec, sort_keys=False), encoding="utf-8")
@@ -1423,6 +2051,63 @@ def _launch_program_family(
         "current_campaign_track": str(next_spec.get("campaign_track") or "baseline"),
         "active_experiment_supervisor": payload,
     }
+
+
+def _program_family_preflight(
+    *,
+    next_spec: dict[str, Any],
+    repo_root: Path,
+    data_root: Path,
+    local_state: Path,
+    targets_config_path: Path,
+    python_executable: str,
+) -> dict[str, Any]:
+    target_name = str(next_spec.get("target") or "workstation-remote")
+    phase = int(next_spec.get("ssot_phase", next_spec.get("phase", 1)) or 1)
+    config_path = repo_root / "configs" / "equities_xs.yml"
+    try:
+        target = resolve_training_target(
+            target_name=target_name,
+            targets_config_path=targets_config_path,
+            repo_root=repo_root,
+            data_root=data_root,
+            local_state=local_state,
+            python_executable=python_executable,
+        )
+        report_date = _resolve_default_report_date(target=target, phase=phase)
+        payload = training_preflight(
+            data_root=data_root,
+            config_path=config_path,
+            repo_root=repo_root,
+            local_state=local_state,
+            targets_config_path=targets_config_path,
+            target=target_name,
+            python_executable=python_executable,
+        )
+        payload["report_date"] = report_date
+        payload["target_paths"] = {
+            "target_name": target.name,
+            "target_kind": target.kind,
+            "target_host": target.host,
+            "target_repo_root": str(target.repo_root),
+            "target_data_root": str(target.data_root),
+            "controller_data_root": str(data_root),
+            "controller_local_state": str(local_state),
+        }
+        if not bool(payload.get("ok", False)):
+            payload.setdefault("status", "INFRA_BLOCKED")
+        return payload
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "status": "INFRA_BLOCKED",
+            "reason": str(exc),
+            "target_paths": {
+                "target_name": target_name,
+                "controller_data_root": str(data_root),
+                "controller_local_state": str(local_state),
+            },
+        }
 
 
 def _program_root(*, local_state: Path, program_id: str) -> Path:

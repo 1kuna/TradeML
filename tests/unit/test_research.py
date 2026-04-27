@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 import pytest
 import yaml
 
@@ -809,3 +811,254 @@ def test_supervise_research_program_clears_prior_stop_markers(tmp_path: Path, mo
 
     assert result["status"] == "STOPPED"
     assert result["stop_reason"] == "no_initial_phase_spec"
+
+
+def test_launch_program_family_blocks_when_research_preflight_fails(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    next_spec = {
+        "experiment_id": "perpetual-macmini-p1-f001",
+        "phase": 1,
+        "ssot_phase": 1,
+        "generation": 0,
+        "campaign_track": "baseline",
+        "matrix": {"architecture_family": ["linear_baseline"]},
+    }
+
+    monkeypatch.setattr(
+        research,
+        "_program_family_preflight",
+        lambda **kwargs: {
+            "ok": False,
+            "status": "INFRA_BLOCKED",
+            "reason": "missing qc parquet: /remote/data/qc/partition_status.parquet",
+            "target_paths": {"data_root": "/remote"},
+        },
+    )
+    monkeypatch.setattr(
+        research,
+        "supervise_experiment",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("blocked preflight must not launch experiments")),
+    )
+
+    payload = research._launch_program_family(  # noqa: SLF001
+        program_id="perpetual-macmini",
+        program_state={},
+        next_spec=next_spec,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=local_state,
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    assert payload["status"] == "INFRA_BLOCKED"
+    assert payload["wait_reason"].startswith("research preflight failed")
+    assert payload["pending_next_spec"] == next_spec
+    assert not (local_state / "research_programs" / "perpetual-macmini" / "specs").exists()
+
+
+def test_sweep_stale_experiment_runs_reconciles_dead_remote_runtime(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    run_root = local_state / "experiments" / "exp-a" / "runs"
+    run_root.mkdir(parents=True)
+    manifest = {
+        "experiment_id": "exp-a",
+        "run_id": "run-a",
+        "phase": 1,
+        "target": "workstation-remote",
+        "status": "RUNNING",
+        "model_suite": "ridge_only",
+        "matrix_values": {},
+        "runtime_name": "exp-a-run-a",
+        "report_date": "2026-04-22",
+        "report_path": str(tmp_path / "missing-report.json"),
+        "output_root": str(tmp_path / "output"),
+        "supervisor_history": [],
+    }
+    (run_root / "run-a.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    monkeypatch.setattr(
+        research,
+        "training_status_snapshot",
+        lambda **kwargs: {
+            "runtime": {
+                "status": "failed",
+                "running": False,
+                "error": "remote process is no longer running",
+            },
+            "log_tail": ["dead"],
+        },
+    )
+
+    result = research.sweep_stale_experiment_runs(
+        local_state=local_state,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    stored = json.loads((run_root / "run-a.json").read_text(encoding="utf-8"))
+    assert result["reconciled"] == 1
+    assert stored["status"] == "FAILED"
+    assert stored["failure_kind"] == "infra"
+    assert "no longer running" in stored["last_error"]
+    summary = json.loads((local_state / "experiments" / "exp-a" / "summary.json").read_text(encoding="utf-8"))
+    assert summary["counts"]["FAILED"] == 1
+
+
+def test_update_research_incumbent_promotes_only_fully_gated_candidate(tmp_path: Path) -> None:
+    local_state = tmp_path / "local"
+    data_root = tmp_path / "nas"
+    policy = {
+        "max_pbo": 0.5,
+        "min_net_return": 0.0,
+        "min_rank_ic_improvement": 0.002,
+        "min_net_return_improvement": 0.01,
+    }
+    strong = {
+        "experiment_id": "exp-a",
+        "run_id": "strong",
+        "shortlisted": True,
+        "survived_predictive": True,
+        "decision": "GO",
+        "years_positive": True,
+        "primary_score": 0.031,
+        "backtest_net_return": 0.12,
+        "pbo": 0.2,
+        "assessment": {"decision": "GO"},
+        "backtest_status": "COMPLETED",
+        "artifacts": {"primary_predictions_path": str(tmp_path / "predictions.parquet")},
+    }
+    weak = {**strong, "run_id": "weak", "primary_score": 0.032, "backtest_net_return": 0.121}
+
+    promoted = research.update_research_incumbent(
+        program_id="perpetual-macmini",
+        local_state=local_state,
+        data_root=data_root,
+        candidates=[strong],
+        policy=policy,
+    )
+    rejected = research.update_research_incumbent(
+        program_id="perpetual-macmini",
+        local_state=local_state,
+        data_root=data_root,
+        candidates=[weak],
+        policy=policy,
+    )
+
+    assert promoted["promoted"] is True
+    assert rejected["promoted"] is False
+    incumbent = research.read_research_incumbent(local_state=local_state, program_id="perpetual-macmini")
+    assert incumbent["run_id"] == "strong"
+    assert "does not improve incumbent" in rejected["rejections"][0]["reasons"]
+    assert (data_root / "control" / "cluster" / "state" / "research" / "incumbents" / "perpetual-macmini.json").exists()
+
+
+def test_write_paper_outputs_for_incumbent_is_deterministic(tmp_path: Path) -> None:
+    predictions_path = tmp_path / "predictions.parquet"
+    pd.DataFrame(
+        {
+            "date": ["2026-04-24", "2026-04-24", "2026-04-24", "2026-04-24", "2026-04-24"],
+            "symbol": ["A", "B", "C", "D", "E"],
+            "prediction": [0.4, 0.1, 0.3, 0.2, 0.0],
+        }
+    ).to_parquet(predictions_path, index=False)
+    incumbent = {
+        "program_id": "perpetual-macmini",
+        "run_id": "strong",
+        "artifacts": {"primary_predictions_path": str(predictions_path)},
+    }
+
+    first = research.write_paper_outputs_for_incumbent(
+        incumbent=incumbent,
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        policy={"enabled": True, "rebalance_day": "FRI", "no_live_orders": True},
+    )
+    second = research.write_paper_outputs_for_incumbent(
+        incumbent=incumbent,
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        policy={"enabled": True, "rebalance_day": "FRI", "no_live_orders": True},
+    )
+
+    assert first["date"] == "2026-04-24"
+    assert first["paper_orders_path"] == second["paper_orders_path"]
+    signals = pd.read_parquet(first["signals_path"])
+    orders = pd.read_parquet(first["paper_orders_path"])
+    assert signals["symbol"].tolist()[0] == "A"
+    assert orders.loc[orders["symbol"] == "A", "order_delta"].iloc[0] == pytest.approx(1.0)
+
+
+def test_research_alerts_write_files_and_skip_email_without_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("TRADEML_SMTP_HOST", raising=False)
+    monkeypatch.delenv("TRADEML_ALERT_EMAIL_TO", raising=False)
+
+    alerts = research.evaluate_research_drift(
+        program_id="perpetual-macmini",
+        state={"status": "RUNNING", "last_completed_run_at": "2026-04-24T00:00:00+00:00"},
+        incumbent={"primary_score": 0.03},
+        latest_summary={
+            "counts": {"FAILED": 4, "COMPLETED": 0},
+            "runs": [{"report_preview": {"coverage": 0.95}}],
+        },
+        policy={"min_coverage": 0.98, "max_infra_failures": 3, "max_hours_without_completed_run": 24},
+        now=datetime.fromisoformat("2026-04-26T12:00:00+00:00"),
+    )
+    result = research.write_research_alerts(
+        program_id="perpetual-macmini",
+        alerts=alerts,
+        local_state=tmp_path / "local",
+        data_root=tmp_path / "nas",
+        policy={"email_enabled": True, "write_files": True},
+    )
+
+    assert {alert["kind"] for alert in alerts} >= {"coverage", "infra_failures", "stalled_research"}
+    assert Path(result["json_path"]).exists()
+    assert Path(result["markdown_path"]).exists()
+    assert result["email"]["status"] == "skipped"
+
+
+def test_send_research_alert_email_uses_configured_smtp(monkeypatch) -> None:
+    sent: dict[str, object] = {}
+
+    class FakeSMTP:
+        def __init__(self, host, port):  # noqa: ANN001
+            sent["connect"] = (host, port)
+
+        def __enter__(self):  # noqa: ANN001
+            return self
+
+        def __exit__(self, *args):  # noqa: ANN001
+            return None
+
+        def starttls(self):  # noqa: ANN001
+            sent["starttls"] = True
+
+        def login(self, username, password):  # noqa: ANN001
+            sent["login"] = (username, password)
+
+        def send_message(self, message):  # noqa: ANN001
+            sent["message"] = message
+
+    monkeypatch.setenv("TRADEML_SMTP_HOST", "smtp.example.test")
+    monkeypatch.setenv("TRADEML_SMTP_PORT", "2525")
+    monkeypatch.setenv("TRADEML_ALERT_EMAIL_TO", "ops@example.test")
+    monkeypatch.setenv("TRADEML_ALERT_EMAIL_FROM", "trademl@example.test")
+    monkeypatch.setenv("TRADEML_SMTP_STARTTLS", "1")
+    monkeypatch.setenv("TRADEML_SMTP_USERNAME", "user")
+    monkeypatch.setenv("TRADEML_SMTP_PASSWORD", "pass")
+
+    result = research.send_research_alert_email(
+        program_id="perpetual-macmini",
+        alerts=[{"kind": "coverage", "severity": "warning", "message": "low coverage"}],
+        smtp_factory=FakeSMTP,
+    )
+
+    assert result["status"] == "sent"
+    assert sent["connect"] == ("smtp.example.test", 2525)
+    assert sent["login"] == ("user", "pass")
+    assert "coverage" in sent["message"].get_content()

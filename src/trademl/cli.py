@@ -55,9 +55,12 @@ from trademl.experiments import (
     supervise_experiment,
 )
 from trademl.research import (
+    list_research_alerts,
     latest_research_program_summary,
     pause_research_program,
+    read_research_incumbent,
     read_research_program_state,
+    research_health,
     resume_research_program,
     start_research_program,
     steer_research_program,
@@ -206,6 +209,13 @@ def main(argv: list[str] | None = None) -> int:
     research_frontier.add_argument("--program-id", default=None)
     research_review = research_subparsers.add_parser("review-packet", help="Write a research review packet.")
     research_review.add_argument("--program-id", required=True)
+    research_health_parser = research_subparsers.add_parser("health", help="Show hardened research health.")
+    research_health_parser.add_argument("--program-id", required=True)
+    research_incumbent = research_subparsers.add_parser("incumbent", help="Show the current research incumbent.")
+    research_incumbent.add_argument("--program-id", required=True)
+    research_alerts = research_subparsers.add_parser("alerts", help="Show recent research alerts.")
+    research_alerts.add_argument("--program-id", required=True)
+    research_alerts.add_argument("--limit", type=int, default=20)
     research_steer = research_subparsers.add_parser("steer", help="Persist manual steering for a research program.")
     research_steer.add_argument("--program-id", required=True)
     research_steer.add_argument("--prefer-architecture", action="append", default=None)
@@ -592,6 +602,25 @@ def _dispatch_research(args: argparse.Namespace) -> int:
             targets_config_path=targets_config_path,
             python_executable=sys.executable,
         )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "health":
+        payload = research_health(
+            program_id=args.program_id,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "incumbent":
+        payload = read_research_incumbent(local_state=local_state, program_id=args.program_id)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "alerts":
+        payload = list_research_alerts(local_state=local_state, program_id=args.program_id, limit=int(args.limit))
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.research_command == "steer":

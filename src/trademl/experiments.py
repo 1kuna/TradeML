@@ -867,6 +867,7 @@ def compare_experiment(
         rows.append(
             {
                 "run_id": manifest["run_id"],
+                "experiment_id": manifest.get("experiment_id"),
                 "target": manifest["target"],
                 "model_suite": manifest["model_suite"],
                 "matrix_values": manifest["matrix_values"],
@@ -875,8 +876,11 @@ def compare_experiment(
                 "lightgbm_mean_rank_ic": report.get("lightgbm", {}).get("mean_rank_ic"),
                 "pbo": report.get("diagnostics", {}).get("pbo"),
                 "dsr": report.get("diagnostics", {}).get("dsr"),
+                "years_positive": bool(report.get("diagnostics", {}).get("ic_by_year"))
+                and all(float(value) > 0 for value in (report.get("diagnostics", {}).get("ic_by_year") or {}).values()),
                 "decision": report.get("assessment", {}).get("decision"),
                 "decision_reason": report.get("assessment", {}).get("reason"),
+                "assessment": report.get("assessment", {}),
                 "evaluation_stage": manifest.get("evaluation_stage"),
                 "gate_failures": manifest.get("gate_failures", []),
                 "survived_predictive": bool(manifest.get("survived_predictive")),
@@ -884,6 +888,7 @@ def compare_experiment(
                 "shortlisted": bool(manifest.get("shortlisted")),
                 "backtest_net_return": (backtest_summary or {}).get("net_return"),
                 "backtest_turnover": (backtest_summary or {}).get("turnover"),
+                "artifacts": report.get("artifacts", {}),
                 "report_path": str(manifest.get("report_path")),
                 "primary_score": primary_score,
             }

@@ -848,6 +848,10 @@ OPERATOR_HTML_PAGE = """<!doctype html>
       const proposal = health.proposal_summary || {};
       const program = health.research_program_summary || {};
       const bestCandidate = (program.best_candidate_summary || {});
+      const incumbent = program.incumbent || {};
+      const paperOutputs = program.latest_paper_outputs || program.paper_outputs || {};
+      const driftAlerts = program.latest_drift_alerts || program.drift_alerts || [];
+      const infraBlocker = program.last_infra_preflight || program.infra_blocker || {};
       const readinessPill = document.getElementById('status-readiness-pill');
       readinessPill.textContent = phase1.ready ? 'Phase 1 ready' : 'Phase 1 blocked';
       readinessPill.className = `pill ${phase1.ready ? 'good' : 'warn'}`;
@@ -896,6 +900,7 @@ OPERATOR_HTML_PAGE = """<!doctype html>
       renderKeyValue('winner-board', [
         ['Program', program.program_id || '-'],
         ['Best candidate', bestCandidate.best_candidate || experiment.best_candidate || 'No winner yet'],
+        ['Research incumbent', incumbent.run_id || '-'],
         ['Primary score', formatDecimal(bestCandidate.best_primary_score ?? experiment.best_primary_score)],
         ['Backtest net', formatDecimal(bestCandidate.best_backtest_net_return ?? experiment.best_backtest_net_return)],
         ['Decision', bestCandidate.best_decision || experiment.best_decision || 'No GO yet'],
@@ -911,6 +916,9 @@ OPERATOR_HTML_PAGE = """<!doctype html>
         ['Completed', formatNumber((experiment.counts || {}).COMPLETED ?? 0)],
         ['Shortlisted', formatNumber(experiment.shortlist_count ?? 0)],
         ['Predictive survivors', formatNumber((experiment.evaluation_counts || {}).SURVIVES_PREDICTIVE ?? 0)],
+        ['Paper orders', paperOutputs.paper_orders_path || '-'],
+        ['Drift alerts', formatNumber(driftAlerts.length || 0)],
+        ['Infra blocker', infraBlocker.reason || program.wait_reason || '-'],
         ['Top rejection', ((experiment.top_gate_failures || [])[0] || []).join(': ') || '-'],
         ['Budget left', formatNumber(((program.budgets || {}).max_total_runs ?? 0) - ((program.budgets || {}).runs_completed ?? 0))],
       ]);

@@ -17,6 +17,29 @@ budget_policy:
   max_infra_failures: 3
 review_policy:
   cadence_hours: 12
+incumbent_policy:
+  mode: research
+  manual_live_required: true
+  max_pbo: 0.5
+  min_net_return: 0.0
+  min_rank_ic_improvement: 0.002
+  min_net_return_improvement: 0.01
+drift_policy:
+  min_coverage: 0.98
+  mature_windows: 3
+  min_relative_ic: 0.5
+  psi_warn: 0.2
+  max_infra_failures: 3
+  max_hours_without_completed_run: 24
+alert_policy:
+  cadence_hours: 168
+  email_enabled: true
+  write_files: true
+paper_policy:
+  enabled: true
+  rebalance_day: FRI
+  output_root: control/cluster/state/research/paper
+  no_live_orders: true
 steering_defaults:
   exploration_breadth: normal
 search_policy:
