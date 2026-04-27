@@ -2987,170 +2987,154 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
 def dispatch_dashboard_action(settings: NodeSettings, action: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Run a dashboard action endpoint against controller helpers."""
-    if action == "start-node":
-        return start_node(settings, passphrase=_optional_str(payload.get("passphrase")))
-    if action == "stop-node":
-        return stop_node(settings)
-    if action == "restart-node":
-        return restart_node(settings, passphrase=_optional_str(payload.get("passphrase")))
-    if action == "join-cluster":
-        return join_cluster(settings, passphrase=_optional_str(payload.get("passphrase")))
-    if action == "rebuild-state":
-        return rebuild_cluster_state(settings, passphrase=_optional_str(payload.get("passphrase")))
-    if action == "leave-cluster":
-        return leave_cluster(settings)
-    if action == "install-service":
-        return install_service(settings, service_path=_optional_str(payload.get("service_path")))
-    if action == "update-worker":
-        return update_worker(settings)
-    if action == "reset-worker":
-        return reset_worker(settings, passphrase=_optional_str(payload.get("passphrase")))
-    if action == "uninstall-worker":
-        return uninstall_worker(settings)
-    if action == "run-vendor-audit":
-        return run_vendor_audit(settings)
-    if action == "replan-coverage":
-        return replan_coverage(settings)
-    if action == "bootstrap-ledger":
-        return bootstrap_canonical_ledger(settings)
-    if action == "repair-canonical":
-        return repair_canonical_backlog(
-            settings,
-            trading_date=_optional_str(payload.get("trading_date")),
-            start_date=_optional_str(payload.get("start_date")),
-            end_date=_optional_str(payload.get("end_date")),
-            symbol=_optional_str(payload.get("symbol")),
-            verify_only=bool(payload.get("verify_only")),
-        )
-    if action == "verify-recent":
-        return verify_recent_canonical_dates(
-            settings,
-            days=int(payload.get("days") or 7),
-            dataset=str(payload.get("dataset") or "equities_eod"),
-            verify_only=bool(payload.get("verify_only")),
-        )
-    if action == "repair-status":
-        return repair_status(settings)
-    if action == "lane-health":
-        return lane_health(settings, dataset=str(payload.get("dataset") or "equities_eod"))
-    if action == "train-preflight":
-        return training_preflight_status(
-            settings,
-            phase=int(payload.get("phase") or 1),
-            target=_optional_str(payload.get("target")),
-        )
-    if action == "train-start":
-        return start_training_run(
-            settings,
-            phase=int(payload.get("phase") or 1),
-            report_date=_optional_str(payload.get("report_date")),
-            target=_optional_str(payload.get("target")),
-        )
-    if action == "train-stop":
-        return stop_training_run(
-            settings,
-            phase=int(payload.get("phase") or 1),
-            target=_optional_str(payload.get("target")),
-        )
-    if action == "train-status":
-        return training_runtime_status(
-            settings,
-            phase=int(payload.get("phase") or 1),
-            target=_optional_str(payload.get("target")),
-        )
-    if action == "train-logs":
-        return training_runtime_logs(
-            settings,
-            phase=int(payload.get("phase") or 1),
-            target=_optional_str(payload.get("target")),
-            tail_lines=int(payload.get("tail_lines") or 50),
-        )
-    if action == "experiments-supervise":
-        return start_experiment_supervisor(
-            settings,
-            spec_path=str(payload.get("spec_path") or (settings.repo_root / "configs" / "experiments" / "phase1_remote_baseline_sweep.yml")),
-            poll_seconds=int(payload["poll_seconds"]) if payload.get("poll_seconds") is not None else None,
-            detach=bool(payload.get("detach", True)),
-        )
-    if action == "experiments-pause":
-        return pause_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
-    if action == "experiments-resume":
-        return resume_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
-    if action == "experiments-stop":
-        return stop_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
-    if action == "experiments-evaluate":
-        return evaluate_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
-    if action == "experiments-backtest":
-        return backtest_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
-    if action == "experiments-propose-next":
-        return propose_experiment_family(settings, experiment_id=str(payload.get("experiment_id") or "").strip())
-    if action == "research-start":
-        return start_research_supervisor(
-            settings,
-            program_path=str(payload.get("program_path") or (settings.repo_root / "configs" / "research" / "perpetual_macmini.yml")),
-            poll_seconds=int(payload["poll_seconds"]) if payload.get("poll_seconds") is not None else None,
-            detach=bool(payload.get("detach", True)),
-        )
-    if action == "research-pause":
-        return pause_research(settings, program_id=str(payload.get("program_id") or "").strip())
-    if action == "research-resume":
-        return resume_research(settings, program_id=str(payload.get("program_id") or "").strip())
-    if action == "research-stop":
-        return stop_research(settings, program_id=str(payload.get("program_id") or "").strip())
-    if action == "research-status":
-        return research_status(settings, program_id=str(payload.get("program_id") or "").strip())
-    if action == "research-review-packet":
-        return research_review_packet(settings, program_id=str(payload.get("program_id") or "").strip())
-    if action == "research-steer":
-        return steer_research(
-            settings,
-            program_id=str(payload.get("program_id") or "").strip(),
-            prefer_architecture_families=[str(value).strip() for value in list(payload.get("prefer_architecture_families") or []) if str(value).strip()],
-            avoid_architecture_families=[str(value).strip() for value in list(payload.get("avoid_architecture_families") or []) if str(value).strip()],
-            prefer_data_families=[str(value).strip() for value in list(payload.get("prefer_data_families") or []) if str(value).strip()],
-            avoid_data_families=[str(value).strip() for value in list(payload.get("avoid_data_families") or []) if str(value).strip()],
-            freeze_phase=int(payload["freeze_phase"]) if payload.get("freeze_phase") is not None else None,
-            force_pivot=bool(payload.get("force_pivot")) if payload.get("force_pivot") is not None else None,
-            exploration_breadth=_optional_str(payload.get("exploration_breadth")),
-        )
-    if action == "save-settings":
-        return persist_node_settings(
-            settings,
-            nas_share=str(payload.get("nas_share") or settings.nas_share),
-            nas_mount=str(payload.get("nas_mount") or settings.nas_mount),
-            collection_time_et=str(payload.get("collection_time_et") or settings.collection_time_et),
-            maintenance_hour_local=int(payload.get("maintenance_hour_local") or settings.maintenance_hour_local),
-            fstab_path=_optional_str(payload.get("fstab_path")),
-        )
-    if action == "update-secret":
-        key = str(payload.get("key") or "").strip()
-        if not key:
-            raise ValueError("secret key is required")
-        passphrase = _optional_str(payload.get("passphrase"))
-        if not passphrase:
-            raise ValueError("cluster passphrase is required")
-        return update_cluster_secrets(settings, passphrase=passphrase, updates={key: str(payload.get("value") or "")})
-    if action == "rotate-passphrase":
-        old_passphrase = _optional_str(payload.get("old_passphrase"))
-        new_passphrase = _optional_str(payload.get("new_passphrase"))
-        if not old_passphrase or not new_passphrase:
-            raise ValueError("old and new passphrases are required")
-        return rotate_cluster_passphrase(settings, old_passphrase=old_passphrase, new_passphrase=new_passphrase)
-    if action == "force-release-lease":
-        lease_id = str(payload.get("lease_id") or "").strip()
-        if not lease_id:
-            raise ValueError("lease_id is required")
-        return {"released": force_release_lease(settings, lease_id), "lease_id": lease_id}
-    if action == "advance-stage":
-        target_stage = int(payload.get("target_stage") or 0)
-        return advance_collection_stage(
-            settings,
-            target_stage=target_stage,
-            symbol_count=int(payload.get("symbol_count")) if payload.get("symbol_count") is not None else None,
-            years=int(payload.get("years")) if payload.get("years") is not None else None,
-            passphrase=_optional_str(payload.get("passphrase")),
-        )
+    handler = _DASHBOARD_ACTIONS.get(action)
+    if handler is not None:
+        return handler(settings, payload)
     raise ValueError(f"unsupported action: {action}")
+
+
+def _cluster_secret_update(settings: NodeSettings, payload: dict[str, Any]) -> dict[str, Any]:
+    key = str(payload.get("key") or "").strip()
+    if not key:
+        raise ValueError("secret key is required")
+    passphrase = _optional_str(payload.get("passphrase"))
+    if not passphrase:
+        raise ValueError("cluster passphrase is required")
+    return update_cluster_secrets(settings, passphrase=passphrase, updates={key: str(payload.get("value") or "")})
+
+
+def _cluster_passphrase_rotation(settings: NodeSettings, payload: dict[str, Any]) -> dict[str, Any]:
+    old_passphrase = _optional_str(payload.get("old_passphrase"))
+    new_passphrase = _optional_str(payload.get("new_passphrase"))
+    if not old_passphrase or not new_passphrase:
+        raise ValueError("old and new passphrases are required")
+    return rotate_cluster_passphrase(settings, old_passphrase=old_passphrase, new_passphrase=new_passphrase)
+
+
+def _force_release_lease(settings: NodeSettings, payload: dict[str, Any]) -> dict[str, Any]:
+    lease_id = str(payload.get("lease_id") or "").strip()
+    if not lease_id:
+        raise ValueError("lease_id is required")
+    return {"released": force_release_lease(settings, lease_id), "lease_id": lease_id}
+
+
+def _list_payload(payload: dict[str, Any], key: str) -> list[str]:
+    return [str(value).strip() for value in list(payload.get(key) or []) if str(value).strip()]
+
+
+DashboardAction = Callable[[NodeSettings, dict[str, Any]], dict[str, Any]]
+
+
+_DASHBOARD_ACTIONS: dict[str, DashboardAction] = {
+    "start-node": lambda settings, payload: start_node(settings, passphrase=_optional_str(payload.get("passphrase"))),
+    "stop-node": lambda settings, _payload: stop_node(settings),
+    "restart-node": lambda settings, payload: restart_node(settings, passphrase=_optional_str(payload.get("passphrase"))),
+    "join-cluster": lambda settings, payload: join_cluster(settings, passphrase=_optional_str(payload.get("passphrase"))),
+    "rebuild-state": lambda settings, payload: rebuild_cluster_state(settings, passphrase=_optional_str(payload.get("passphrase"))),
+    "leave-cluster": lambda settings, _payload: leave_cluster(settings),
+    "install-service": lambda settings, payload: install_service(settings, service_path=_optional_str(payload.get("service_path"))),
+    "update-worker": lambda settings, _payload: update_worker(settings),
+    "reset-worker": lambda settings, payload: reset_worker(settings, passphrase=_optional_str(payload.get("passphrase"))),
+    "uninstall-worker": lambda settings, _payload: uninstall_worker(settings),
+    "run-vendor-audit": lambda settings, _payload: run_vendor_audit(settings),
+    "replan-coverage": lambda settings, _payload: replan_coverage(settings),
+    "bootstrap-ledger": lambda settings, _payload: bootstrap_canonical_ledger(settings),
+    "repair-canonical": lambda settings, payload: repair_canonical_backlog(
+        settings,
+        trading_date=_optional_str(payload.get("trading_date")),
+        start_date=_optional_str(payload.get("start_date")),
+        end_date=_optional_str(payload.get("end_date")),
+        symbol=_optional_str(payload.get("symbol")),
+        verify_only=bool(payload.get("verify_only")),
+    ),
+    "verify-recent": lambda settings, payload: verify_recent_canonical_dates(
+        settings,
+        days=int(payload.get("days") or 7),
+        dataset=str(payload.get("dataset") or "equities_eod"),
+        verify_only=bool(payload.get("verify_only")),
+    ),
+    "repair-status": lambda settings, _payload: repair_status(settings),
+    "lane-health": lambda settings, payload: lane_health(settings, dataset=str(payload.get("dataset") or "equities_eod")),
+    "train-preflight": lambda settings, payload: training_preflight_status(
+        settings,
+        phase=int(payload.get("phase") or 1),
+        target=_optional_str(payload.get("target")),
+    ),
+    "train-start": lambda settings, payload: start_training_run(
+        settings,
+        phase=int(payload.get("phase") or 1),
+        report_date=_optional_str(payload.get("report_date")),
+        target=_optional_str(payload.get("target")),
+    ),
+    "train-stop": lambda settings, payload: stop_training_run(
+        settings,
+        phase=int(payload.get("phase") or 1),
+        target=_optional_str(payload.get("target")),
+    ),
+    "train-status": lambda settings, payload: training_runtime_status(
+        settings,
+        phase=int(payload.get("phase") or 1),
+        target=_optional_str(payload.get("target")),
+    ),
+    "train-logs": lambda settings, payload: training_runtime_logs(
+        settings,
+        phase=int(payload.get("phase") or 1),
+        target=_optional_str(payload.get("target")),
+        tail_lines=int(payload.get("tail_lines") or 50),
+    ),
+    "experiments-supervise": lambda settings, payload: start_experiment_supervisor(
+        settings,
+        spec_path=str(payload.get("spec_path") or (settings.repo_root / "configs" / "experiments" / "phase1_remote_baseline_sweep.yml")),
+        poll_seconds=int(payload["poll_seconds"]) if payload.get("poll_seconds") is not None else None,
+        detach=bool(payload.get("detach", True)),
+    ),
+    "experiments-pause": lambda settings, payload: pause_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip()),
+    "experiments-resume": lambda settings, payload: resume_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip()),
+    "experiments-stop": lambda settings, payload: stop_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip()),
+    "experiments-evaluate": lambda settings, payload: evaluate_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip()),
+    "experiments-backtest": lambda settings, payload: backtest_experiments(settings, experiment_id=str(payload.get("experiment_id") or "").strip()),
+    "experiments-propose-next": lambda settings, payload: propose_experiment_family(settings, experiment_id=str(payload.get("experiment_id") or "").strip()),
+    "research-start": lambda settings, payload: start_research_supervisor(
+        settings,
+        program_path=str(payload.get("program_path") or (settings.repo_root / "configs" / "research" / "perpetual_macmini.yml")),
+        poll_seconds=int(payload["poll_seconds"]) if payload.get("poll_seconds") is not None else None,
+        detach=bool(payload.get("detach", True)),
+    ),
+    "research-pause": lambda settings, payload: pause_research(settings, program_id=str(payload.get("program_id") or "").strip()),
+    "research-resume": lambda settings, payload: resume_research(settings, program_id=str(payload.get("program_id") or "").strip()),
+    "research-stop": lambda settings, payload: stop_research(settings, program_id=str(payload.get("program_id") or "").strip()),
+    "research-status": lambda settings, payload: research_status(settings, program_id=str(payload.get("program_id") or "").strip()),
+    "research-review-packet": lambda settings, payload: research_review_packet(settings, program_id=str(payload.get("program_id") or "").strip()),
+    "research-steer": lambda settings, payload: steer_research(
+        settings,
+        program_id=str(payload.get("program_id") or "").strip(),
+        prefer_architecture_families=_list_payload(payload, "prefer_architecture_families"),
+        avoid_architecture_families=_list_payload(payload, "avoid_architecture_families"),
+        prefer_data_families=_list_payload(payload, "prefer_data_families"),
+        avoid_data_families=_list_payload(payload, "avoid_data_families"),
+        freeze_phase=int(payload["freeze_phase"]) if payload.get("freeze_phase") is not None else None,
+        force_pivot=bool(payload.get("force_pivot")) if payload.get("force_pivot") is not None else None,
+        exploration_breadth=_optional_str(payload.get("exploration_breadth")),
+    ),
+    "save-settings": lambda settings, payload: persist_node_settings(
+        settings,
+        nas_share=str(payload.get("nas_share") or settings.nas_share),
+        nas_mount=str(payload.get("nas_mount") or settings.nas_mount),
+        collection_time_et=str(payload.get("collection_time_et") or settings.collection_time_et),
+        maintenance_hour_local=int(payload.get("maintenance_hour_local") or settings.maintenance_hour_local),
+        fstab_path=_optional_str(payload.get("fstab_path")),
+    ),
+    "update-secret": _cluster_secret_update,
+    "rotate-passphrase": _cluster_passphrase_rotation,
+    "force-release-lease": _force_release_lease,
+    "advance-stage": lambda settings, payload: advance_collection_stage(
+        settings,
+        target_stage=int(payload.get("target_stage") or 0),
+        symbol_count=int(payload.get("symbol_count")) if payload.get("symbol_count") is not None else None,
+        years=int(payload.get("years")) if payload.get("years") is not None else None,
+        passphrase=_optional_str(payload.get("passphrase")),
+    ),
+}
 
 
 def create_dashboard_server(host: str, port: int, *, settings: NodeSettings) -> DashboardHTTPServer:
