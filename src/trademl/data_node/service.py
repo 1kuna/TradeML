@@ -7,6 +7,7 @@ import logging
 import signal
 import threading
 import uuid
+from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -439,32 +440,74 @@ class DataNodeService:
             1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values())
         )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            aux_active: dict[str, int] = defaultdict(int)
+
+            def submit_auxiliary_lane(vendor: str) -> None:
+                futures[executor.submit(self._drain_auxiliary_lane, vendor)] = (
+                    f"auxiliary:{vendor}"
+                )
+                aux_active[vendor] += 1
+
             for vendor, width in canonical_lane_widths.items():
                 for _ in range(max(1, width)):
                     futures[
                         executor.submit(self._drain_canonical_lane, vendor, exchange)
-                    ] = "canonical"
+                    ] = f"canonical:{vendor}"
             for vendor, width in aux_lane_widths.items():
                 for _ in range(max(1, width)):
-                    futures[executor.submit(self._drain_auxiliary_lane, vendor)] = (
-                        "auxiliary"
-                    )
-            for task_type, future in self._drain_lane_futures(
-                futures,
-                heartbeat_fn=heartbeat_fn,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-            ):
-                try:
-                    result = future.result()
-                except Exception:
-                    LOGGER.exception(
-                        "planner_lane_failed lane=%s worker_id=%s",
-                        task_type,
-                        self.worker_id,
-                    )
+                    submit_auxiliary_lane(vendor)
+            last_heartbeat = monotonic()
+            last_pending_log = monotonic()
+            while futures:
+                done, _pending = wait(
+                    list(futures), return_when=FIRST_COMPLETED, timeout=0.5
+                )
+                if not done:
+                    now = monotonic()
+                    if (
+                        heartbeat_fn is not None
+                        and (now - last_heartbeat) >= heartbeat_interval_seconds
+                    ):
+                        try:
+                            heartbeat_fn()
+                        except Exception:
+                            LOGGER.exception(
+                                "planner_queue_heartbeat_failed worker_id=%s",
+                                self.worker_id,
+                            )
+                        last_heartbeat = now
+                    if (now - last_pending_log) >= max(5.0, heartbeat_interval_seconds):
+                        lane_counts: dict[str, int] = {}
+                        for lane in futures.values():
+                            lane_counts[lane] = lane_counts.get(lane, 0) + 1
+                        LOGGER.warning(
+                            "planner_queue_waiting worker_id=%s pending=%s",
+                            self.worker_id,
+                            lane_counts,
+                        )
+                        last_pending_log = now
                     continue
-                if task_type == "canonical":
-                    changed_dates.extend(result)
+                for future in done:
+                    task_type = futures.pop(future)
+                    lane_kind, _, vendor = task_type.partition(":")
+                    if lane_kind == "auxiliary":
+                        aux_active[vendor] = max(0, aux_active[vendor] - 1)
+                    try:
+                        result = future.result()
+                    except Exception:
+                        LOGGER.exception(
+                            "planner_lane_failed lane=%s worker_id=%s",
+                            task_type,
+                            self.worker_id,
+                        )
+                        continue
+                    if lane_kind == "canonical":
+                        changed_dates.extend(result)
+                    elif lane_kind == "auxiliary" and result:
+                        if not self._stop_event.is_set() and aux_active[vendor] < max(
+                            1, int(aux_lane_widths.get(vendor, 1))
+                        ):
+                            submit_auxiliary_lane(vendor)
         return sorted(set(changed_dates))
 
     def _allow_auxiliary_during_canonical_tail(self) -> bool:
@@ -1175,45 +1218,46 @@ class DataNodeService:
         return changed_dates
 
     def _drain_auxiliary_lane(self, vendor: str) -> list[str]:
-        """Drain auxiliary planner tasks for a single vendor lane."""
-        while not self._stop_event.is_set():
-            task = None
-            if self._should_prioritize_minute_lane(vendor):
-                task = self.db.lease_next_planner_task(
-                    lease_owner=self.worker_id,
-                    task_families=("supplemental_research",),
-                    datasets=("equities_minute",),
-                    vendor=vendor,
-                )
-            if task is None:
-                task = self.db.lease_next_planner_task(
-                    lease_owner=self.worker_id,
-                    task_families=(
-                        "security_master",
-                        "corp_actions",
-                        "events_filings",
-                        "macro",
-                        "supplemental_research",
-                    ),
-                    vendor=vendor,
-                )
-            if task is None:
-                break
-            cooldown = self.db.get_active_vendor_lane_cooldown(
-                vendor=vendor, dataset=task.dataset
+        """Process one eligible auxiliary task for a vendor lane."""
+        if self._stop_event.is_set():
+            return []
+        task = None
+        if self._should_prioritize_minute_lane(vendor):
+            task = self.db.lease_next_planner_task(
+                lease_owner=self.worker_id,
+                task_families=("supplemental_research",),
+                datasets=("equities_minute",),
+                vendor=vendor,
             )
-            if cooldown is not None:
-                self.db.mark_planner_task_partial(
-                    task.task_key,
-                    error=(
-                        f"{vendor}:{task.dataset}: lane cooldown until "
-                        f"{cooldown.cooldown_until}"
-                    ),
-                    backoff_minutes=30,
-                )
-                continue
-            self._auxiliary_runtime._process_auxiliary_planner_task(task, vendor)
-        return []
+        if task is None:
+            task = self.db.lease_next_planner_task(
+                lease_owner=self.worker_id,
+                task_families=(
+                    "security_master",
+                    "corp_actions",
+                    "events_filings",
+                    "macro",
+                    "supplemental_research",
+                ),
+                vendor=vendor,
+            )
+        if task is None:
+            return []
+        cooldown = self.db.get_active_vendor_lane_cooldown(
+            vendor=vendor, dataset=task.dataset
+        )
+        if cooldown is not None:
+            self.db.mark_planner_task_partial(
+                task.task_key,
+                error=(
+                    f"{vendor}:{task.dataset}: lane cooldown until "
+                    f"{cooldown.cooldown_until}"
+                ),
+                backoff_minutes=30,
+            )
+            return [task.task_key]
+        self._auxiliary_runtime._process_auxiliary_planner_task(task, vendor)
+        return [task.task_key]
 
     def _should_prioritize_minute_lane(self, vendor: str) -> bool:
         """Return whether this vendor should pull minute archive work before fillers."""

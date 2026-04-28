@@ -4116,6 +4116,45 @@ def test_process_planner_queue_runs_full_auxiliary_width_during_canonical_tail(
     assert aux_task_kind_calls == [{"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"}]
 
 
+def test_process_planner_queue_refills_auxiliary_vendor_lanes_without_waiting_for_next_cycle(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector(), "finnhub": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+    calls: list[str] = []
+    remaining = {"alpaca": 2, "finnhub": 1}
+
+    service._ensure_planner_backlog_seeded = lambda **kwargs: None  # type: ignore[method-assign]
+    service._canonical_runtime._backfill_lane_widths = lambda: {}  # type: ignore[method-assign]
+    service._aux_lane_widths = lambda **kwargs: {"alpaca": 1, "finnhub": 1}  # type: ignore[method-assign]
+
+    def drain_auxiliary_lane(vendor: str) -> list[str]:
+        calls.append(vendor)
+        if remaining[vendor] <= 0:
+            return []
+        remaining[vendor] -= 1
+        return [f"{vendor}:{remaining[vendor]}"]
+
+    service._drain_auxiliary_lane = drain_auxiliary_lane  # type: ignore[method-assign]
+
+    service.process_planner_queue(exchange="XNYS")
+
+    assert calls.count("alpaca") == 3
+    assert calls.count("finnhub") == 2
+
+
 def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfill(
     tmp_path: Path,
 ) -> None:
