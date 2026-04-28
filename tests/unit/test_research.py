@@ -1633,6 +1633,26 @@ def test_research_alerts_write_files_and_skip_email_without_env(tmp_path: Path, 
     assert result["email"]["status"] == "skipped"
 
 
+def test_research_alert_cadence_suppresses_unchanged_alert_set() -> None:
+    alerts = [{"kind": "coverage", "severity": "warning", "message": "low coverage", "value": 0.95}]
+    signature = research._research_alert_signature(alerts)  # noqa: SLF001
+    state = {
+        "last_alert_at": datetime.now().astimezone().isoformat(),
+        "latest_alert_signature": signature,
+    }
+
+    assert research._research_alerts_due(  # noqa: SLF001
+        state=state,
+        policy={"cadence_hours": 168},
+        alert_signature=signature,
+    ) is False
+    assert research._research_alerts_due(  # noqa: SLF001
+        state=state,
+        policy={"cadence_hours": 168},
+        alert_signature=research._research_alert_signature([{**alerts[0], "kind": "infra_failures"}]),  # noqa: SLF001
+    ) is True
+
+
 def test_send_research_alert_email_uses_configured_smtp(monkeypatch) -> None:
     sent: dict[str, object] = {}
 

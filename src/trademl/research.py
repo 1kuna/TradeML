@@ -89,6 +89,7 @@ DEFAULT_DRIFT_POLICY = {
 DEFAULT_ALERT_POLICY = {
     "email_enabled": False,
     "write_files": True,
+    "cadence_hours": 168,
 }
 DEFAULT_PAPER_POLICY = {
     "enabled": True,
@@ -843,6 +844,37 @@ def _research_launchd_status(program_id: str) -> dict[str, Any]:
     return status
 
 
+def _research_alert_signature(alerts: list[dict[str, Any]]) -> str:
+    """Return a stable signature for the current alert set."""
+    if not alerts:
+        return ""
+    normalized = [
+        {
+            "kind": alert.get("kind"),
+            "severity": alert.get("severity"),
+            "message": alert.get("message"),
+            "value": alert.get("value"),
+        }
+        for alert in alerts
+    ]
+    return hashlib.sha1(json.dumps(normalized, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _research_alerts_due(*, state: dict[str, Any], policy: dict[str, Any], alert_signature: str) -> bool:
+    """Return whether the current alert set should write/send now."""
+    if not alert_signature:
+        return True
+    merged_policy = {**DEFAULT_ALERT_POLICY, **dict(policy or {})}
+    if state.get("latest_alert_signature") != alert_signature:
+        return True
+    last = state.get("last_alert_at")
+    if not last:
+        return True
+    with contextlib.suppress(ValueError):
+        return (datetime.now(tz=UTC) - datetime.fromisoformat(str(last))) >= timedelta(hours=float(merged_policy["cadence_hours"]))
+    return True
+
+
 def pause_research_program(*, local_state: Path, program_id: str) -> dict[str, Any]:
     """Pause one perpetual research program."""
     state = read_research_program_state(local_state=local_state, program_id=program_id)
@@ -1012,13 +1044,22 @@ def write_research_review_packet(
         latest_summary=experiment_summary,
         policy=dict(spec.get("drift_policy") or {}),
     )
-    alert_result = write_research_alerts(
-        program_id=program_id,
-        alerts=drift_alerts,
-        local_state=local_state,
-        data_root=data_root,
-        policy=dict(spec.get("alert_policy") or {}),
-    )
+    alert_policy = dict(spec.get("alert_policy") or {})
+    alert_signature = _research_alert_signature(drift_alerts)
+    if _research_alerts_due(state=state, policy=alert_policy, alert_signature=alert_signature):
+        alert_result = write_research_alerts(
+            program_id=program_id,
+            alerts=drift_alerts,
+            local_state=local_state,
+            data_root=data_root,
+            policy=alert_policy,
+        )
+    else:
+        alert_result = {
+            "status": "skipped",
+            "reason": "alert cadence not due for unchanged alert set",
+            "alert_signature": alert_signature,
+        }
     payload = {
         "program_id": program_id,
         "generated_at": datetime.now(tz=UTC).isoformat(),
@@ -1091,6 +1132,9 @@ def write_research_review_packet(
     state["incumbent"] = incumbent
     state["latest_paper_outputs"] = paper_outputs
     state["latest_drift_alerts"] = drift_alerts
+    if alert_result.get("status") == "written":
+        state["last_alert_at"] = datetime.now(tz=UTC).isoformat()
+        state["latest_alert_signature"] = alert_signature
     _write_program_state(local_state=local_state, program_id=program_id, payload=state)
     return result
 
