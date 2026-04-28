@@ -27,7 +27,6 @@ from trademl.data_node.capabilities import (
     auxiliary_capabilities,
     canonical_qc_capabilities,
     default_macro_series,
-    vendor_profile,
 )
 from trademl.data_node.db import DataNodeDB, PlannerTask
 from trademl.data_node.planner import plan_auxiliary_tasks
@@ -458,31 +457,13 @@ class AuxiliaryRuntime:
         self, *, task_kinds: set[str], canonical_pressure: bool | None = None
     ) -> dict[str, int]:
         widths: dict[str, int] = {}
-        any_canonical_pressure = (
-            self.db.has_pending_planner_tasks(task_families=("canonical_bars",))
-            or self.db.has_pending_backfill()
-            if canonical_pressure is None
-            else bool(canonical_pressure)
-        )
+        _ = canonical_pressure
         for job in auxiliary_capabilities(
             connectors=self.connectors,
             audit_state=self.capability_audit_state,
             include_research=True,
         ):
             if job.task_kind not in task_kinds:
-                continue
-            profile = vendor_profile(job.vendor)
-            vendor_pressure = (
-                any_canonical_pressure
-                and self._vendor_has_canonical_pressure(job.vendor)
-            )
-            if vendor_pressure and job.task_kind == "RESEARCH_ONLY":
-                continue
-            if (
-                vendor_pressure
-                and profile is not None
-                and profile.saturation_policy in {"canonical_first", "canonical_only"}
-            ):
                 continue
             width = int(job.lane_width or 1)
             widths[job.vendor] = max(widths.get(job.vendor, 0), width)

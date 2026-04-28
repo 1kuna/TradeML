@@ -4155,6 +4155,51 @@ def test_process_planner_queue_refills_auxiliary_vendor_lanes_without_waiting_fo
     assert calls.count("finnhub") == 2
 
 
+def test_auxiliary_lane_widths_do_not_suppress_vendors_with_canonical_pressure(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    db.upsert_planner_task(
+        task_key="canonical_repair::equities_eod::2026-04-27::000",
+        task_family="canonical_repair",
+        planner_group="canonical_repair",
+        dataset="equities_eod",
+        tier="A",
+        priority=8,
+        start_date="2026-04-27",
+        end_date="2026-04-27",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca", "tiingo", "massive"],
+        output_name="equities_bars",
+        payload={"scope_kind": "symbol_range", "trading_days": ["2026-04-27"]},
+    )
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _NoopConnector(),
+            "tiingo": _NoopConnector(),
+            "massive": _NoopConnector(),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    widths = service._aux_lane_widths(
+        task_kinds={"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"},
+        canonical_pressure=True,
+    )
+
+    assert widths["alpaca"] >= 1
+    assert widths["tiingo"] >= 1
+    assert widths["massive"] >= 1
+
+
 def test_run_cluster_forever_opportunistically_runs_auxiliary_jobs_after_backfill(
     tmp_path: Path,
 ) -> None:
@@ -4370,7 +4415,7 @@ def test_run_cross_vendor_price_checks_logs_backup_fetch_failures(
     )
 
 
-def test_aux_lane_widths_hold_bar_first_vendors_back_when_canonical_backlog_exists(
+def test_aux_lane_widths_keep_bar_first_vendors_hot_when_canonical_backlog_exists(
     tmp_path: Path,
 ) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
@@ -4420,16 +4465,16 @@ def test_aux_lane_widths_hold_bar_first_vendors_back_when_canonical_backlog_exis
 
     widths = service._aux_lane_widths(task_kinds={"REFERENCE", "EVENT", "MACRO"})
 
-    assert "alpaca" not in widths
+    assert widths["alpaca"] == 1
     assert widths["twelve_data"] == 1
-    assert "massive" not in widths
+    assert widths["massive"] == 1
     assert widths["alpha_vantage"] == 1
     assert widths["fred"] == 2
     assert widths["fmp"] == 1
     assert widths["sec_edgar"] == 2
 
 
-def test_aux_lane_widths_only_suppress_research_for_vendors_under_canonical_pressure(
+def test_aux_lane_widths_keep_research_vendors_hot_under_canonical_pressure(
     tmp_path: Path,
 ) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
@@ -4474,7 +4519,7 @@ def test_aux_lane_widths_only_suppress_research_for_vendors_under_canonical_pres
 
     widths = service._aux_lane_widths(task_kinds={"RESEARCH_ONLY"})
 
-    assert "alpaca" not in widths
+    assert widths["alpaca"] == 1
     assert widths["tiingo"] == 1
     assert widths["finnhub"] == 1
 
