@@ -1604,6 +1604,42 @@ def test_write_paper_outputs_for_incumbent_is_deterministic(tmp_path: Path) -> N
     assert orders.loc[orders["symbol"] == "A", "order_delta"].iloc[0] == pytest.approx(1.0)
 
 
+def test_write_shadow_paper_outputs_for_candidate_is_non_tradable(tmp_path: Path) -> None:
+    predictions_path = tmp_path / "predictions.parquet"
+    pd.DataFrame(
+        {
+            "date": ["2026-04-24", "2026-04-24", "2026-04-24", "2026-04-24", "2026-04-24"],
+            "symbol": ["A", "B", "C", "D", "E"],
+            "prediction": [0.4, 0.1, 0.3, 0.2, 0.0],
+        }
+    ).to_parquet(predictions_path, index=False)
+    candidate = {
+        "program_id": "perpetual-macmini",
+        "run_id": "candidate",
+        "artifacts": {"primary_predictions_path": str(predictions_path)},
+    }
+
+    first = research.write_shadow_paper_outputs_for_candidate(
+        candidate=candidate,
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        policy={"enabled": True, "rebalance_day": "FRI", "no_live_orders": True},
+    )
+    second = research.write_shadow_paper_outputs_for_candidate(
+        candidate=candidate,
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        policy={"enabled": True, "rebalance_day": "FRI", "no_live_orders": True},
+    )
+
+    assert first["non_incumbent"] is True
+    assert first["not_trade_approved"] is True
+    assert first["no_live_orders"] is True
+    assert first["shadow_orders_path"] == second["shadow_orders_path"]
+    assert "/shadow_paper/" in first["shadow_orders_path"]
+    assert Path(first["shadow_orders_path"]).exists()
+
+
 def test_research_alerts_write_files_and_skip_email_without_env(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("TRADEML_SMTP_HOST", raising=False)
     monkeypatch.delenv("TRADEML_ALERT_EMAIL_TO", raising=False)

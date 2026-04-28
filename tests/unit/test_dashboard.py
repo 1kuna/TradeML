@@ -1526,6 +1526,8 @@ def test_collect_dashboard_status_snapshot_includes_health_and_experiment_summar
     assert snapshot["health"]["experiment_supervisor"]["status"] == "RUNNING"
     assert snapshot["health"]["proposal_summary"]["recommended_experiment_id"] == "phase1-next"
     assert snapshot["default_training_target"]["name"] == "local"
+    assert snapshot["current_state"]["pi"]["status"] in {"online", "degraded", "offline"}
+    assert "codex_issue_bucket" in snapshot
 
 
 def test_collect_dashboard_status_snapshot_skips_inactive_phase2_probe(tmp_path: Path, monkeypatch) -> None:

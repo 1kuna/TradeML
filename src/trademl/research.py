@@ -599,13 +599,57 @@ def write_paper_outputs_for_incumbent(
     policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write deterministic paper-ready signals, weights, and order deltas for the incumbent."""
+    return _write_paper_outputs(
+        source=incumbent,
+        data_root=data_root,
+        local_state=local_state,
+        policy=policy,
+        shared_family="paper",
+        local_family="paper",
+        path_prefix="",
+        non_incumbent=False,
+    )
+
+
+def write_shadow_paper_outputs_for_candidate(
+    *,
+    candidate: dict[str, Any],
+    data_root: Path,
+    local_state: Path,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write deterministic non-tradable shadow paper outputs for a non-incumbent candidate."""
+    return _write_paper_outputs(
+        source=candidate,
+        data_root=data_root,
+        local_state=local_state,
+        policy=policy,
+        shared_family="shadow_paper",
+        local_family="shadow_paper",
+        path_prefix="shadow_",
+        non_incumbent=True,
+    )
+
+
+def _write_paper_outputs(
+    *,
+    source: dict[str, Any],
+    data_root: Path,
+    local_state: Path,
+    policy: dict[str, Any] | None,
+    shared_family: str,
+    local_family: str,
+    path_prefix: str,
+    non_incumbent: bool,
+) -> dict[str, Any]:
+    """Write deterministic paper-style signals, weights, and order deltas."""
     merged_policy = {**DEFAULT_PAPER_POLICY, **dict(policy or {})}
     if not bool(merged_policy.get("enabled", True)):
         return {"status": "skipped", "reason": "paper policy disabled"}
     if not bool(merged_policy.get("no_live_orders", True)):
         raise ValueError("paper_policy.no_live_orders must remain true in research autopilot")
-    artifacts = dict(incumbent.get("artifacts") or {})
-    predictions_path = Path(str(artifacts.get("primary_predictions_path") or incumbent.get("primary_predictions_path") or ""))
+    artifacts = dict(source.get("artifacts") or {})
+    predictions_path = Path(str(artifacts.get("primary_predictions_path") or source.get("primary_predictions_path") or ""))
     if not predictions_path.exists():
         return {"status": "skipped", "reason": f"missing predictions parquet: {predictions_path}"}
     predictions = pd.read_parquet(predictions_path)
@@ -620,25 +664,25 @@ def write_paper_outputs_for_incumbent(
     latest = latest.sort_values(["prediction", "symbol"], ascending=[False, True]).reset_index(drop=True)
     latest["score"] = latest["prediction"].astype(float)
     latest["rank"] = range(1, len(latest) + 1)
-    latest["source_run_id"] = incumbent.get("run_id")
+    latest["source_run_id"] = source.get("run_id")
     signals = latest[["date", "symbol", "score", "rank", "source_run_id"]].copy()
     targets = build_portfolio(signals[["date", "symbol", "score"]], {"rebalance_day": merged_policy.get("rebalance_day", "FRI")})
     previous = _latest_prior_paper_targets(data_root=data_root, local_state=local_state, current_date=latest_date.date().isoformat())
     orders = _paper_order_deltas(targets=targets, previous=previous)
-    root = _shared_research_root(data_root=data_root) / "paper" / latest_date.date().isoformat()
+    root = _shared_research_root(data_root=data_root) / shared_family / latest_date.date().isoformat()
     root.mkdir(parents=True, exist_ok=True)
-    signals_path = root / "signals.parquet"
-    targets_path = root / "target_weights.parquet"
-    orders_path = root / "paper_orders.parquet"
+    signals_path = root / f"{path_prefix}signals.parquet"
+    targets_path = root / f"{path_prefix}target_weights.parquet"
+    orders_path = root / f"{path_prefix}paper_orders.parquet"
     signals.to_parquet(signals_path, index=False)
     targets.to_parquet(targets_path, index=False)
     orders.to_parquet(orders_path, index=False)
-    local_root = _local_research_root(local_state=local_state) / "paper" / latest_date.date().isoformat()
+    local_root = _local_research_root(local_state=local_state) / local_family / latest_date.date().isoformat()
     local_root.mkdir(parents=True, exist_ok=True)
-    signals.to_parquet(local_root / "signals.parquet", index=False)
-    targets.to_parquet(local_root / "target_weights.parquet", index=False)
-    orders.to_parquet(local_root / "paper_orders.parquet", index=False)
-    return {
+    signals.to_parquet(local_root / f"{path_prefix}signals.parquet", index=False)
+    targets.to_parquet(local_root / f"{path_prefix}target_weights.parquet", index=False)
+    orders.to_parquet(local_root / f"{path_prefix}paper_orders.parquet", index=False)
+    payload = {
         "status": "written",
         "date": latest_date.date().isoformat(),
         "signals_path": str(signals_path),
@@ -647,6 +691,17 @@ def write_paper_outputs_for_incumbent(
         "local_root": str(local_root),
         "no_live_orders": True,
     }
+    if non_incumbent:
+        payload.update(
+            {
+                "non_incumbent": True,
+                "not_trade_approved": True,
+                "shadow_signals_path": str(signals_path),
+                "shadow_target_weights_path": str(targets_path),
+                "shadow_orders_path": str(orders_path),
+            }
+        )
+    return payload
 
 
 def evaluate_research_drift(
@@ -1037,6 +1092,16 @@ def write_research_review_packet(
             local_state=local_state,
             policy=dict(spec.get("paper_policy") or {}),
         )
+    shadow_paper_outputs = {}
+    if not incumbent:
+        shadow_candidate = _best_candidate_with_predictions(list(comparison.get("rows") or []))
+        if shadow_candidate:
+            shadow_paper_outputs = write_shadow_paper_outputs_for_candidate(
+                candidate=shadow_candidate,
+                data_root=data_root,
+                local_state=local_state,
+                policy=dict(spec.get("paper_policy") or {}),
+            )
     drift_alerts = evaluate_research_drift(
         program_id=program_id,
         state=state,
@@ -1079,6 +1144,7 @@ def write_research_review_packet(
         "incumbent_update": incumbent_update,
         "best_rejected_candidate": _best_rejected_candidate(comparison.get("rows") or [], incumbent_update.get("rejections") or []),
         "paper_outputs": paper_outputs,
+        "shadow_paper_outputs": shadow_paper_outputs,
         "drift_alerts": drift_alerts,
         "alert_result": alert_result,
         "infra_blocker": state.get("last_infra_preflight", {}),
@@ -1113,6 +1179,7 @@ def write_research_review_packet(
         f"- best_primary_score: {(payload['best_candidate_summary'] or {}).get('best_primary_score')}",
         f"- incumbent_run_id: {(payload['incumbent'] or {}).get('run_id') or '-'}",
         f"- paper_outputs: {(payload['paper_outputs'] or {}).get('paper_orders_path') or '-'}",
+        f"- shadow_paper_outputs: {(payload['shadow_paper_outputs'] or {}).get('shadow_orders_path') or '-'}",
         f"- alert_count: {len(payload['drift_alerts'])}",
         f"- last_transition: {(payload['last_transition'] or {}).get('reason') or '-'}",
         "",
@@ -1131,6 +1198,7 @@ def write_research_review_packet(
     state["last_review_packet_at"] = datetime.now(tz=UTC).isoformat()
     state["incumbent"] = incumbent
     state["latest_paper_outputs"] = paper_outputs
+    state["latest_shadow_paper_outputs"] = shadow_paper_outputs
     state["latest_drift_alerts"] = drift_alerts
     if alert_result.get("status") == "written":
         state["last_alert_at"] = datetime.now(tz=UTC).isoformat()
@@ -1178,6 +1246,25 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _best_candidate_with_predictions(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return the strongest candidate that exposes a primary predictions artifact."""
+    eligible = []
+    for candidate in candidates:
+        artifacts = dict(candidate.get("artifacts") or {})
+        if artifacts.get("primary_predictions_path") or candidate.get("primary_predictions_path"):
+            eligible.append(candidate)
+    if not eligible:
+        return {}
+    return sorted(
+        eligible,
+        key=lambda item: (
+            float(item.get("primary_score") or item.get("rank_ic") or 0.0),
+            float(item.get("backtest_net_return") or item.get("net_return") or 0.0),
+        ),
+        reverse=True,
+    )[0]
 
 
 def _incumbent_path(*, local_state: Path, program_id: str) -> Path:

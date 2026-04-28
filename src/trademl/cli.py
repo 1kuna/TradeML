@@ -14,6 +14,7 @@ import yaml
 from trademl.dashboard.controller import (
     bootstrap_canonical_ledger,
     collect_dashboard_snapshot,
+    collect_dashboard_status_snapshot,
     force_release_lease,
     install_service,
     join_cluster,
@@ -41,6 +42,7 @@ from trademl.dashboard.controller import (
     update_cluster_secrets,
     verify_recent_canonical_dates,
 )
+from trademl.fleet.autopilot import collect_fleet_health
 from trademl.experiments import (
     backtest_experiment_survivors,
     compare_experiment,
@@ -243,6 +245,20 @@ def main(argv: list[str] | None = None) -> int:
     research_steer.add_argument("--force-pivot", action="store_true")
     research_steer.add_argument("--exploration-breadth", default=None)
 
+    fleet_parser = subparsers.add_parser("fleet", help="Inspect fleet-level autopilot health.")
+    fleet_parser.add_argument("--workspace-root", default=None)
+    fleet_parser.add_argument("--config", default=None)
+    fleet_parser.add_argument("--env-file", default=None)
+    fleet_subparsers = fleet_parser.add_subparsers(dest="fleet_command", required=True)
+    fleet_health = fleet_subparsers.add_parser("health", help="Show one current-state verdict for Pi, Mac, NAS, and research.")
+    fleet_health.add_argument("--pi-host", default=None)
+    fleet_health.add_argument("--pi-user", default="zach")
+    fleet_health.add_argument("--pi-password-env", default="TRADEML_PI_PASSWORD")
+    fleet_health.add_argument("--mac-host", default=None)
+    fleet_health.add_argument("--mac-user", default="openclaw")
+    fleet_health.add_argument("--mac-password-env", default="TRADEML_MAC_PASSWORD")
+    fleet_health.add_argument("--heal", action="store_true")
+
     args = parser.parse_args(argv)
     if args.command == "dashboard":
         return _launch_dashboard(args)
@@ -252,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
         return _dispatch_experiments(args)
     if args.command == "research":
         return _dispatch_research(args)
+    if args.command == "fleet":
+        return _dispatch_fleet(args)
     settings = resolve_node_settings(
         workspace_root=args.workspace_root,
         config_path=args.config,
@@ -363,6 +381,30 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(show_leases(settings, family=args.family), indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported node command: {args.node_command}")
+
+
+def _dispatch_fleet(args: argparse.Namespace) -> int:
+    settings = resolve_node_settings(
+        workspace_root=args.workspace_root,
+        config_path=args.config,
+        env_path=args.env_file,
+    )
+    if args.fleet_command == "health":
+        snapshot = collect_dashboard_status_snapshot(settings)
+        pi = (
+            {"host": args.pi_host, "user": args.pi_user, "password_env": args.pi_password_env}
+            if args.pi_host
+            else None
+        )
+        mac = (
+            {"host": args.mac_host, "user": args.mac_user, "password_env": args.mac_password_env}
+            if args.mac_host
+            else None
+        )
+        payload = collect_fleet_health(local_snapshot=snapshot, data_root=settings.nas_mount, pi=pi, mac=mac, heal=bool(args.heal))
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    raise SystemExit(f"unsupported fleet command: {args.fleet_command}")
 
 
 def _launch_dashboard(args: argparse.Namespace) -> int:

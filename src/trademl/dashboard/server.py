@@ -501,12 +501,10 @@ OPERATOR_HTML_PAGE = """<!doctype html>
     </div>
 
     <div class="summary-grid">
-      <div class="card"><div class="label">Node</div><div class="value" id="metric-node-status">-</div><div class="delta mono" id="metric-node-detail">-</div></div>
-      <div class="card"><div class="label">Total Datapoints</div><div class="value" id="metric-coverage">-</div><div class="delta" id="metric-coverage-detail">-</div></div>
-      <div class="card"><div class="label">Phase 1</div><div class="value" id="metric-canonical">-</div><div class="delta" id="metric-remaining">-</div></div>
-      <div class="card"><div class="label">Research Queue</div><div class="value" id="metric-raw-rows">-</div><div class="delta" id="metric-updated">-</div></div>
-      <div class="card"><div class="label">Training</div><div class="value" id="metric-gate">-</div><div class="delta" id="metric-gate-detail">-</div></div>
-      <div class="card"><div class="label">Best Result</div><div class="value" id="metric-eta">-</div><div class="delta" id="metric-freeze-cutoff">-</div></div>
+      <div class="card"><div class="label">Systems</div><div class="value" id="metric-node-status">-</div><div class="delta mono" id="metric-node-detail">-</div></div>
+      <div class="card"><div class="label">Architecture</div><div class="value" id="metric-coverage">-</div><div class="delta" id="metric-coverage-detail">-</div></div>
+      <div class="card"><div class="label">Profit</div><div class="value" id="metric-canonical">-</div><div class="delta" id="metric-remaining">-</div></div>
+      <div class="card"><div class="label">Codex</div><div class="value" id="metric-raw-rows">-</div><div class="delta" id="metric-updated">-</div></div>
     </div>
 
     <div class="toolbar" style="margin-top:18px">
@@ -797,26 +795,26 @@ OPERATOR_HTML_PAGE = """<!doctype html>
       const runtime = snapshot.runtime || {};
       const collection = snapshot.collection_status || {};
       const readiness = (snapshot.training_readiness || {}).phase1 || {};
-      document.getElementById('metric-node-status').textContent = runtime.running ? 'Running' : 'Stopped';
-      document.getElementById('metric-node-detail').textContent = runtime.pid ? `PID ${runtime.pid}` : 'Waiting for worker';
-      document.getElementById('metric-coverage').textContent = formatNumber(collection.raw_vendor_rows ?? 0);
-      document.getElementById('metric-coverage-detail').textContent = currentStatusSnapshot?.latest_raw_date
-        ? `Latest raw ${currentStatusSnapshot.latest_raw_date}`
-        : 'Waiting for raw data';
+      const state = currentStatusSnapshot?.current_state || {};
+      const pi = state.pi || {};
+      const mac = state.mac || {};
+      const architecture = state.architecture || {};
+      const profit = state.profit || {};
+      const codex = state.codex || {};
+      document.getElementById('metric-node-status').textContent = state.verdict || (runtime.running ? 'Running' : 'Stopped');
+      document.getElementById('metric-node-detail').textContent = `Pi ${pi.status || '-'} · Mac ${mac.status || '-'}`;
+      document.getElementById('metric-coverage').textContent = architecture.state || 'No incumbent';
+      document.getElementById('metric-coverage-detail').textContent = architecture.decision || architecture.reason || '-';
       const pinnedRemaining = collection.phase1_pinned_remaining_units;
       const rollingRemaining = collection.rolling_remaining_units ?? 0;
       const repairRemaining = collection.repair_remaining_units ?? 0;
       const totalRemaining = collection.canonical_remaining_units ?? (rollingRemaining + repairRemaining);
-      document.getElementById('metric-canonical').textContent = readiness.ready
-        ? 'Ready'
-        : formatPercent(collection.training_critical_percent ?? 0);
-      document.getElementById('metric-remaining').textContent = readiness.ready
-        ? 'Pinned gate locked'
-        : `${formatNumber(pinnedRemaining ?? rollingRemaining)} pinned left`;
-      document.getElementById('metric-raw-rows').textContent = totalRemaining > 0
-        ? formatNumber(totalRemaining)
-        : 'Clear';
-      document.getElementById('metric-updated').textContent = `${formatNumber(collection.rolling_remaining_units ?? 0)} rolling · ${formatNumber(repairRemaining)} repair`;
+      document.getElementById('metric-canonical').textContent = profit.headline || 'No validated PnL';
+      document.getElementById('metric-remaining').textContent = profit.detail || '-';
+      document.getElementById('metric-raw-rows').textContent = state.action || 'OK';
+      document.getElementById('metric-updated').textContent = codex.open_count
+        ? `${formatNumber(codex.open_count)} issue(s): ${(codex.latest || {}).message || 'inspect bucket'}`
+        : `${formatNumber(totalRemaining)} collection units open`;
     }
 
     function renderBudgets(snapshot) {
@@ -847,6 +845,7 @@ OPERATOR_HTML_PAGE = """<!doctype html>
       const supervisor = health.experiment_supervisor || {};
       const proposal = health.proposal_summary || {};
       const program = health.research_program_summary || {};
+      const currentState = snapshot.current_state || {};
       const bestCandidate = (program.best_candidate_summary || {});
       const incumbent = program.incumbent || {};
       const paperOutputs = program.latest_paper_outputs || program.paper_outputs || {};
@@ -879,6 +878,8 @@ OPERATOR_HTML_PAGE = """<!doctype html>
         return `<option value="${target.name}" ${selected}>${target.label || target.name}</option>`;
       }).join('');
       renderKeyValue('progress-board', [
+        ['Current state', currentState.verdict || '-'],
+        ['Codex action', currentState.action || '-'],
         ['Total datapoints', formatNumber(snapshot.raw_datapoints ?? 0)],
         ['Latest raw date', snapshot.latest_raw_date ?? '-'],
         ['Phase 1', phase1.ready ? 'Ready to train' : 'Still filling'],
@@ -901,6 +902,7 @@ OPERATOR_HTML_PAGE = """<!doctype html>
       ]);
       document.getElementById('training-log-preview').textContent = trainingStatus.log_tail || 'No training log available yet.';
       renderKeyValue('winner-board', [
+        ['Architecture state', (currentState.architecture || {}).state || '-'],
         ['Program', program.program_id || '-'],
         ['Best candidate', bestCandidate.best_candidate || experiment.best_candidate || 'No winner yet'],
         ['Research incumbent', incumbent.run_id || '-'],
@@ -921,6 +923,7 @@ OPERATOR_HTML_PAGE = """<!doctype html>
         ['Shortlisted', formatNumber(experiment.shortlist_count ?? 0)],
         ['Predictive survivors', formatNumber((experiment.evaluation_counts || {}).SURVIVES_PREDICTIVE ?? 0)],
         ['Paper orders', paperOutputs.paper_orders_path || '-'],
+        ['Shadow paper', (program.latest_shadow_paper_outputs || {}).shadow_orders_path || '-'],
         ['Drift alerts', formatNumber(driftAlerts.length || 0)],
         ['Infra blocker', infraBlocker.reason || program.wait_reason || '-'],
         ['Frontier lane', frontierArchitecture.enabled ? 'Advanced-first' : '-'],
@@ -966,16 +969,6 @@ OPERATOR_HTML_PAGE = """<!doctype html>
         stage: run.evaluation_stage || run.status,
         shortlisted: run.shortlisted ? 'yes' : 'no',
       })));
-      document.getElementById('metric-gate').textContent = trainingRuntime.running || runtimeStatus === 'running'
-        ? 'Running'
-        : trainingRuntime.status === 'completed'
-          ? 'Complete'
-          : 'Idle';
-      document.getElementById('metric-gate-detail').textContent = trainingRuntime.target || defaultTarget.name || 'No target selected';
-      document.getElementById('metric-eta').textContent = experiment.best_candidate || 'No winner';
-      document.getElementById('metric-freeze-cutoff').textContent = experiment.best_decision
-        ? `${experiment.best_decision} · ${formatDecimal(experiment.best_primary_score)}`
-        : 'No promoted run yet';
       document.getElementById('status-updated').textContent = `Status refreshed ${new Date().toLocaleTimeString()}`;
     }
 

@@ -84,6 +84,12 @@ from trademl.fleet.cluster import (
     systemd_journal_tail,
     systemd_status,
 )
+from trademl.fleet.autopilot import (
+    build_current_state_summary,
+    collect_current_state_issues,
+    read_codex_issue_bucket,
+    write_codex_issue_bucket,
+)
 from trademl.reference.universe import build_stage1_universe, build_time_varying_universe
 
 LOGGER = logging.getLogger(__name__)
@@ -1526,6 +1532,14 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "audit": audit,
         "coverage_plan": coverage_plan,
     }
+    issues = collect_current_state_issues(snapshot)
+    bucket = write_codex_issue_bucket(data_root=settings.nas_mount, issues=issues)
+    bucket_state = read_codex_issue_bucket(data_root=settings.nas_mount)
+    if not bucket_state["issues"] and bucket.get("issues"):
+        bucket_state = {"issue_root": bucket["issue_root"], "issues": bucket["issues"], "summary": bucket["summary"]}
+    snapshot["codex_issue_bucket"] = bucket_state
+    snapshot["current_state"] = build_current_state_summary(snapshot, issues=bucket_state["issues"])
+    snapshot["current_state"]["codex"]["issue_root"] = bucket["issue_root"]
     return snapshot
 
 
