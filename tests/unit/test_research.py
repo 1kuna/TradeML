@@ -301,6 +301,61 @@ def test_frontier_architecture_policy_unlocks_phase1_advanced_first(tmp_path: Pa
     assert decision["next_spec"]["proposal_policy"]["family_size_cap"] == 6
 
 
+def test_initial_phase_spec_uses_frontier_lane_when_history_trigger_is_met(
+    tmp_path: Path,
+) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec["frontier_architecture_policy"] = {
+        "enabled": True,
+        "allow_phase1_advanced": True,
+        "trigger_min_completed_runs": 100,
+        "advanced_first": True,
+        "sentinel_baseline_runs": 2,
+    }
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 1186
+    state["budgets"]["max_total_runs"] = 5000
+
+    next_spec = research._build_initial_phase_experiment_spec(program_state=state, spec=spec)  # noqa: SLF001
+
+    assert next_spec is not None
+    assert next_spec["frontier_architecture"] is True
+    assert next_spec["matrix"]["architecture_family"] == [
+        "advanced_challenger",
+        "tree_challenger",
+        "linear_baseline",
+    ]
+
+
+def test_bootstrap_research_state_counts_completed_training_history(
+    tmp_path: Path,
+) -> None:
+    program_path = _program_spec(tmp_path)
+    spec = research._load_research_program_spec(program_path)  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=program_path, poll_seconds=30)  # noqa: SLF001
+    run_root = tmp_path / "training_runs"
+    run_root.mkdir()
+    for idx in range(1, 4):
+        (run_root / f"experiment_perpetual-macmini-p1-f{idx:03d}__abc{idx}.json").write_text(
+            json.dumps({"status": "completed", "phase": 1}),
+            encoding="utf-8",
+        )
+    (run_root / "debug_running.json").write_text(
+        json.dumps({"status": "running", "phase": 1}),
+        encoding="utf-8",
+    )
+
+    bootstrapped = research._bootstrap_research_state_from_training_history(  # noqa: SLF001
+        local_state=tmp_path,
+        state=state,
+    )
+
+    assert bootstrapped["budgets"]["runs_completed"] == 3
+    assert bootstrapped["budgets"]["families_started"] == 3
+    assert bootstrapped["budgets"]["phase_run_counts"] == {"1": 3}
+    assert bootstrapped["last_transition"]["action"] == "bootstrap_training_history"
+
+
 def test_frontier_architecture_advanced_first_overrides_force_pivot_order(tmp_path: Path) -> None:
     spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
     spec["frontier_architecture_policy"] = {

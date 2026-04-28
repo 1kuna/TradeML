@@ -164,6 +164,16 @@ def supervise_research_program(
         program_id=program_id,
         payload=_initial_program_state(spec=spec, program_path=program_path, poll_seconds=resolved_poll),
     )
+    state = _bootstrap_research_state_from_training_history(
+        local_state=local_state,
+        state=state,
+    )
+    state["frontier_architecture"] = _frontier_architecture_status(
+        spec=spec,
+        state=state,
+        frontier=dict(state.get("frontier") or _empty_frontier()),
+        experiment_summary={},
+    )
     state["status"] = "RUNNING"
     state["stop_reason"] = None
     state["completed_at"] = None
@@ -1278,10 +1288,106 @@ def _empty_frontier() -> dict[str, Any]:
     }
 
 
+def _bootstrap_research_state_from_training_history(
+    *, local_state: Path, state: dict[str, Any]
+) -> dict[str, Any]:
+    """Seed a fresh research state from legacy training-run manifests."""
+    budgets = dict(state.get("budgets") or {})
+    frontier = dict(state.get("frontier") or _empty_frontier())
+    if int(budgets.get("runs_completed", 0) or 0) > 0 or frontier.get("family_history"):
+        return state
+    completed = [
+        manifest
+        for manifest in _legacy_training_history_manifests(local_state=local_state)
+        if str(manifest.get("status") or "").lower()
+        in {"completed", "succeeded", "success"}
+    ]
+    if not completed:
+        return state
+    phase_run_counts: dict[str, int] = {}
+    experiment_ids: set[str] = set()
+    max_family = 0
+    for manifest in completed:
+        phase_key = str(int(manifest.get("phase") or 1))
+        phase_run_counts[phase_key] = phase_run_counts.get(phase_key, 0) + 1
+        experiment_id = _legacy_training_experiment_id(manifest)
+        if experiment_id:
+            experiment_ids.add(experiment_id)
+            max_family = max(max_family, _family_sequence(experiment_id) or 0)
+    budgets["runs_completed"] = len(completed)
+    budgets["phase_run_counts"] = {
+        **dict(budgets.get("phase_run_counts") or {}),
+        **phase_run_counts,
+    }
+    budgets["families_started"] = max(
+        int(budgets.get("families_started", 0) or 0),
+        max_family,
+        len(experiment_ids),
+    )
+    state["budgets"] = budgets
+    state["frontier"] = frontier
+    state["last_transition"] = {
+        "action": "bootstrap_training_history",
+        "reason": "seeded fresh research supervisor from existing training run manifests",
+        "runs_completed": len(completed),
+        "families_started": budgets["families_started"],
+    }
+    return state
+
+
+def _legacy_training_history_manifests(*, local_state: Path) -> list[dict[str, Any]]:
+    roots = [local_state / "training_runs", local_state / "control" / "training_runs"]
+    paths: set[Path] = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        paths.update(path for path in root.glob("*.json") if path.is_file())
+        paths.update(path for path in root.glob("*/*.json") if path.is_file())
+    manifests: list[dict[str, Any]] = []
+    for path in sorted(paths):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload.setdefault("_manifest_path", str(path))
+        manifests.append(payload)
+    return manifests
+
+
+def _legacy_training_experiment_id(manifest: dict[str, Any]) -> str | None:
+    value = manifest.get("experiment_id")
+    if value:
+        return str(value)
+    path_value = manifest.get("_manifest_path")
+    if path_value:
+        name = Path(str(path_value)).name
+        if name.startswith("experiment_") and "__" in name:
+            return name.removeprefix("experiment_").split("__", 1)[0]
+    report_path = manifest.get("report_path")
+    if report_path:
+        parts = Path(str(report_path)).parts
+        if "experiments" in parts:
+            index = parts.index("experiments")
+            if index + 1 < len(parts):
+                return parts[index + 1]
+    return None
+
+
 def _build_initial_phase_experiment_spec(*, program_state: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any] | None:
     phase_policy = _phase_policy(spec=spec, phase=_current_ssot_phase(state=program_state, spec=spec))
     if phase_policy is None:
         return None
+    frontier_spec = _frontier_architecture_spec(
+        spec=spec,
+        state=program_state,
+        phase_policy=phase_policy,
+        frontier=dict(program_state.get("frontier") or _empty_frontier()),
+        experiment_summary={},
+    )
+    if frontier_spec is not None:
+        return frontier_spec
     return _make_experiment_spec_from_phase_policy(
         spec=spec,
         program_state=program_state,

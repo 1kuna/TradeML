@@ -1,5 +1,5 @@
 program_id: perpetual-macmini
-target: workstation-remote
+target: local
 ssot_phase_order:
   - 1
   - 2
