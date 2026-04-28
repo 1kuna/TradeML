@@ -1188,6 +1188,8 @@ class DataNodeDB:
                             status = 'LEASED',
                             leased_at = ?,
                             lease_expires_at = ?,
+                            next_eligible_at = NULL,
+                            last_error = NULL,
                             payload_json = COALESCE(?, payload_json),
                             updated_at = ?
                         WHERE task_key = ? AND vendor = ?

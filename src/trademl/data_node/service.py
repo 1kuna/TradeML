@@ -130,7 +130,7 @@ class DataNodeService:
             default_symbols_getter=lambda: self.default_symbols,
             stop_requested=self._stop_event.is_set,
             write_raw_partition_fn=lambda frame, source_name: self._write_raw_partition(
-                frame, source_name=source_name
+                frame, source_name=source_name, verify_repairs=False
             ),
         )
 
@@ -187,7 +187,7 @@ class DataNodeService:
         return self.source_name, pd.DataFrame()
 
     def _write_raw_partition(
-        self, frame: pd.DataFrame, *, source_name: str
+        self, frame: pd.DataFrame, *, source_name: str, verify_repairs: bool = True
     ) -> list[str]:
         shard_id = f"write-{uuid.uuid4().hex}"
         changed_dates = self._canonical_runtime._write_raw_shard_partition(
@@ -215,7 +215,7 @@ class DataNodeService:
                 expected_rows=expected_rows,
                 qc_code=qc_code,
             )
-        if changed_dates:
+        if changed_dates and verify_repairs:
             verification = self._verify_and_seed_canonical_repairs(
                 trading_date=max(changed_dates),
                 changed_dates=changed_dates,

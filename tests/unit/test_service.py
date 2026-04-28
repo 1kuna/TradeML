@@ -3308,6 +3308,51 @@ def test_write_raw_partition_consumes_merged_shards(tmp_path: Path) -> None:
     assert list(shard_root.glob("*.parquet")) == []
 
 
+def test_write_raw_partition_can_skip_repair_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    service.default_symbols = ["AAPL"]
+    monkeypatch.setattr(
+        service,
+        "_verify_and_seed_canonical_repairs",
+        lambda **kwargs: pytest.fail("canonical worker writes must not verify repairs"),
+    )
+    frame = pd.DataFrame(
+        [
+            {
+                "date": "2025-12-16",
+                "symbol": "AAPL",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "volume": 100,
+                "ingested_at": pd.Timestamp.now(tz="UTC"),
+                "source_name": "alpaca",
+                "vendor_ts": pd.Timestamp("2025-12-16"),
+            }
+        ]
+    )
+
+    changed = service._write_raw_partition(
+        frame, source_name="alpaca", verify_repairs=False
+    )
+
+    assert changed == ["2025-12-16"]
+
+
 def test_load_corp_actions_reference_skips_corrupt_parquet(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(

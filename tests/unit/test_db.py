@@ -310,6 +310,40 @@ def test_requeue_retryable_failures_moves_rate_limited_rows_back_to_pending(tmp_
     assert statuses[permanent_id] == "FAILED"
 
 
+def test_vendor_attempt_release_clears_stale_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    now = db_module.utc_now()
+    monkeypatch.setattr(db_module, "utc_now", lambda: now)
+    first = database.lease_vendor_attempt(
+        task_key="macro::DGS10",
+        task_family="macro",
+        planner_group="reference_events_backlog",
+        vendor="fred",
+        lease_owner="worker-a",
+    )
+    assert first is not None
+    database.mark_vendor_attempt_failed(
+        task_key="macro::DGS10",
+        vendor="fred",
+        error="fred request failed: old 400",
+        backoff_minutes=5,
+    )
+
+    monkeypatch.setattr(db_module, "utc_now", lambda: now + timedelta(minutes=6))
+    leased = database.lease_vendor_attempt(
+        task_key="macro::DGS10",
+        task_family="macro",
+        planner_group="reference_events_backlog",
+        vendor="fred",
+        lease_owner="worker-a",
+    )
+
+    assert leased is not None
+    assert leased.status == "LEASED"
+    assert leased.last_error is None
+    assert leased.next_eligible_at is None
+
+
 def test_planner_task_lifecycle_and_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     database = DataNodeDB(tmp_path / "node.sqlite")
     now = db_module.utc_now()
