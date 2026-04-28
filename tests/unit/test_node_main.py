@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+import json
 import os
 from pathlib import Path
 
@@ -7,6 +9,8 @@ from trademl.data_node.__main__ import (
     _apply_collection_runtime_env,
     _build_reference_jobs,
     _resolve_vendor_budgets,
+    _runtime_watchdog_alert,
+    _write_watchdog_alert,
     _should_rebuild_local_state,
 )
 
@@ -93,3 +97,50 @@ def test_should_rebuild_local_state_only_when_missing_or_forced(
 
     monkeypatch.setenv("TRADEML_FORCE_REBUILD", "1")
     assert _should_rebuild_local_state(local_db_path=db_path) is True
+
+
+def test_runtime_watchdog_alerts_when_live_pid_heartbeat_is_stale(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime_path = tmp_path / "node_runtime.json"
+    heartbeat_at = datetime.now(tz=UTC) - timedelta(minutes=10)
+    runtime_path.write_text(
+        json.dumps(
+            {
+                "running": True,
+                "pid": 123,
+                "mode": "cluster",
+                "worker_id": "rpi-01",
+                "heartbeat_at": heartbeat_at.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("trademl.data_node.__main__._pid_alive", lambda pid: True)
+
+    alert = _runtime_watchdog_alert(
+        runtime_path=runtime_path,
+        now=datetime.now(tz=UTC),
+        stale_after_seconds=300,
+    )
+
+    assert alert is not None
+    assert alert["alert_type"] == "node_runtime_heartbeat_stale"
+    assert alert["worker_id"] == "rpi-01"
+
+
+def test_write_watchdog_alert_records_json_and_markdown(tmp_path: Path) -> None:
+    alert = {
+        "alert_type": "node_runtime_heartbeat_stale",
+        "created_at": "2026-04-28T00:00:00+00:00",
+        "age_seconds": 600,
+        "pid": 123,
+        "mode": "cluster",
+        "worker_id": "rpi-01",
+        "heartbeat_at": "2026-04-27T23:50:00+00:00",
+    }
+
+    _write_watchdog_alert(alerts_root=tmp_path / "alerts", alert=alert)
+
+    assert (tmp_path / "alerts" / "node_watchdog_latest.json").exists()
+    assert list((tmp_path / "alerts").glob("*_node_watchdog.md"))

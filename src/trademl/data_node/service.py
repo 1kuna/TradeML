@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import signal
 import threading
@@ -23,7 +24,7 @@ from trademl.data_node.auxiliary_runtime import (
     AuxiliaryRuntime,
     ReferenceCollectionResult,
 )
-from trademl.data_node.capabilities import forward_capabilities
+from trademl.data_node.capabilities import auxiliary_capabilities, forward_capabilities
 from trademl.data_node.canonical_runtime import CanonicalRuntime
 from trademl.data_node.curator import Curator, CuratorResult
 from trademl.data_node.db import DataNodeDB
@@ -1176,21 +1177,56 @@ class DataNodeService:
     def _drain_auxiliary_lane(self, vendor: str) -> list[str]:
         """Drain auxiliary planner tasks for a single vendor lane."""
         while not self._stop_event.is_set():
-            task = self.db.lease_next_planner_task(
-                lease_owner=self.worker_id,
-                task_families=(
-                    "security_master",
-                    "corp_actions",
-                    "events_filings",
-                    "macro",
-                    "supplemental_research",
-                ),
-                vendor=vendor,
-            )
+            task = None
+            if self._should_prioritize_minute_lane(vendor):
+                task = self.db.lease_next_planner_task(
+                    lease_owner=self.worker_id,
+                    task_families=("supplemental_research",),
+                    datasets=("equities_minute",),
+                    vendor=vendor,
+                )
+            if task is None:
+                task = self.db.lease_next_planner_task(
+                    lease_owner=self.worker_id,
+                    task_families=(
+                        "security_master",
+                        "corp_actions",
+                        "events_filings",
+                        "macro",
+                        "supplemental_research",
+                    ),
+                    vendor=vendor,
+                )
             if task is None:
                 break
             self._auxiliary_runtime._process_auxiliary_planner_task(task, vendor)
         return []
+
+    def _should_prioritize_minute_lane(self, vendor: str) -> bool:
+        """Return whether this vendor should pull minute archive work before fillers."""
+        if not self.db.has_pending_planner_tasks(
+            task_families=("supplemental_research",), datasets=("equities_minute",)
+        ):
+            return False
+        has_minute_capability = any(
+            capability.vendor == vendor
+            and capability.dataset == "equities_minute"
+            and capability.task_kind == "RESEARCH_ONLY"
+            for capability in auxiliary_capabilities(
+                connectors=self.connectors,
+                audit_state=self.capability_audit_state,
+                include_research=True,
+            )
+        )
+        if not has_minute_capability:
+            return False
+        macro_pressure = self.db.has_pending_planner_tasks(task_families=("macro",))
+        canonical_pressure = self.db.has_pending_planner_tasks(
+            task_families=("canonical_bars", "canonical_repair")
+        )
+        return not macro_pressure and (
+            not canonical_pressure or self._allow_auxiliary_during_canonical_tail()
+        )
 
     def collect_reference_data(
         self, jobs: list[dict[str, object]]
@@ -1462,15 +1498,13 @@ class DataNodeService:
 
         def heartbeat_worker(mode: str = "cluster", trading_date: str | None = None) -> object:
             if runtime_heartbeat_fn is not None:
-                payload: dict[str, object] = {
-                    "running": True,
-                    "worker_id": self.worker_id,
-                    "mode": mode,
-                    "heartbeat_at": datetime.now(tz=UTC).isoformat(),
-                }
-                if trading_date is not None:
-                    payload["trading_date"] = trading_date
-                runtime_heartbeat_fn(payload)
+                runtime_heartbeat_fn(
+                    self._runtime_heartbeat_payload(
+                        current=datetime.now(tz=UTC),
+                        mode=mode,
+                        trading_date=trading_date,
+                    )
+                )
             return coordinator.heartbeat_worker()
 
         def before_iteration(
@@ -1694,13 +1728,11 @@ class DataNodeService:
             trading_date = current_et.date().isoformat()
             if runtime_heartbeat_fn is not None:
                 runtime_heartbeat_fn(
-                    {
-                        "running": True,
-                        "worker_id": self.worker_id,
-                        "mode": runtime_mode,
-                        "heartbeat_at": current.isoformat(),
-                        "trading_date": trading_date,
-                    }
+                    self._runtime_heartbeat_payload(
+                        current=current,
+                        mode=runtime_mode,
+                        trading_date=trading_date,
+                    )
                 )
             try:
                 if before_iteration_fn is not None:
@@ -1714,6 +1746,13 @@ class DataNodeService:
                 self._ensure_planner_backlog_seeded(
                     trading_date=trading_date, skip_when_backlog_exists=True
                 )
+                completed = self.db.mark_completed_planner_progress_success(
+                    task_families=("canonical_bars", "canonical_repair")
+                )
+                if completed:
+                    LOGGER.warning(
+                        "completed_stale_canonical_progress_tasks count=%s", completed
+                    )
                 released = self._release_budget_blocked_canonical_tasks()
                 if released:
                     LOGGER.warning(
@@ -1785,6 +1824,24 @@ class DataNodeService:
 
             if not self._stop_event.is_set():
                 sleep_fn(poll_seconds)
+
+    def _runtime_heartbeat_payload(
+        self, *, current: datetime, mode: str, trading_date: str | None = None
+    ) -> dict[str, object]:
+        """Build the durable node runtime heartbeat payload."""
+        payload: dict[str, object] = {
+            "running": True,
+            "worker_id": self.worker_id,
+            "mode": mode,
+            "heartbeat_at": current.isoformat(),
+        }
+        if trading_date is not None:
+            payload["trading_date"] = trading_date
+        with contextlib.suppress(Exception):
+            payload["lane_throughput"] = self.db.summarize_lane_throughput(
+                minutes=15, limit=16
+            )
+        return payload
 
     def _reclaim_startup_leases(self) -> None:
         """Release stale logical leases held by this worker across process restarts."""

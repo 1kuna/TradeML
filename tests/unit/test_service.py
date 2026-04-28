@@ -1327,6 +1327,55 @@ def test_run_cluster_forever_updates_runtime_heartbeat(tmp_path: Path) -> None:
     assert heartbeats[-1]["worker_id"] == "local-worker"
     assert heartbeats[-1]["mode"] == "cluster"
     assert heartbeats[-1]["trading_date"] == "2026-03-31"
+    assert heartbeats[-1]["lane_throughput"] == []
+
+
+def test_drain_auxiliary_lane_prioritizes_minute_when_pressure_is_low(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+    for task_key, dataset, priority in (
+        ("profile::AAPL", "company_profile", 70),
+        ("minute::AAPL", "equities_minute", 205),
+    ):
+        db.upsert_planner_task(
+            task_key=task_key,
+            task_family="supplemental_research",
+            planner_group="supplemental_research_backlog",
+            dataset=dataset,
+            tier="B",
+            priority=priority,
+            start_date="2026-04-01",
+            end_date="2026-04-01",
+            symbols=["AAPL"],
+            eligible_vendors=["alpaca"],
+            output_name=dataset,
+            payload={"scope_kind": "symbol_range"},
+        )
+    processed: list[str] = []
+
+    def process_task(task, vendor):  # noqa: ANN001
+        processed.append(task.task_key)
+        service.stop()
+
+    service._auxiliary_runtime._process_auxiliary_planner_task = process_task  # type: ignore[method-assign]
+
+    service._drain_auxiliary_lane("alpaca")
+
+    assert processed == ["minute::AAPL"]
 
 
 def test_run_cluster_forever_backfill_renews_runtime_heartbeat(tmp_path: Path) -> None:

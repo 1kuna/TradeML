@@ -344,6 +344,87 @@ def test_vendor_attempt_release_clears_stale_error(tmp_path: Path, monkeypatch: 
     assert leased.next_eligible_at is None
 
 
+def test_summarize_lane_throughput_reports_rows_per_minute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    now = db_module.utc_now()
+    monkeypatch.setattr(db_module, "utc_now", lambda: now)
+    database.upsert_planner_task(
+        task_key="minute::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="equities_minute",
+        tier="B",
+        priority=205,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_minute",
+        payload={"scope_kind": "symbol_range"},
+    )
+    assert database.lease_vendor_attempt(
+        task_key="minute::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        vendor="alpaca",
+        lease_owner="worker-a",
+    )
+    database.mark_vendor_attempt_success(
+        task_key="minute::AAPL", vendor="alpaca", rows_returned=300
+    )
+
+    throughput = database.summarize_lane_throughput(minutes=15)
+
+    assert throughput[0]["vendor"] == "alpaca"
+    assert throughput[0]["dataset"] == "equities_minute"
+    assert throughput[0]["rows_returned"] == 300
+    assert throughput[0]["rows_per_minute"] == pytest.approx(20.0)
+
+
+def test_mark_completed_planner_progress_success_clears_stale_active_tasks(
+    tmp_path: Path,
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    database.upsert_planner_task(
+        task_key="canonical::done",
+        task_family="canonical_bars",
+        planner_group="phase1_pinned_canonical",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_bars",
+        payload={"scope_kind": "symbol_range"},
+    )
+    database.update_planner_task_progress(
+        task_key="canonical::done",
+        expected_units=1,
+        completed_units=1,
+        remaining_units=0,
+        completed_symbols=["AAPL"],
+        remaining_symbols=[],
+        state={"trading_days": ["2026-04-01"]},
+    )
+    database.mark_planner_task_partial(
+        "canonical::done", error="old partial", backoff_minutes=30
+    )
+
+    completed = database.mark_completed_planner_progress_success(
+        task_families=("canonical_bars",)
+    )
+    task = database.get_planner_task("canonical::done")
+
+    assert completed == 1
+    assert task is not None
+    assert task.status == "SUCCESS"
+    assert task.last_error is None
+
+
 def test_planner_task_lifecycle_and_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     database = DataNodeDB(tmp_path / "node.sqlite")
     now = db_module.utc_now()

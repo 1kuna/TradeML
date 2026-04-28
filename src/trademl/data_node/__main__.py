@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import signal
 import sys
+import threading
+from time import sleep
 from typing import Callable
 
 import yaml
@@ -118,6 +120,7 @@ def main() -> int:
         worker_id=str(worker_id),
         started_at=started_at,
     )
+    _start_runtime_watchdog(local_state=local_state)
     runtime_heartbeat({"running": True, "mode": "startup"})
     db = DataNodeDB(local_state / "node.sqlite")
     data_root = Path(
@@ -321,6 +324,134 @@ def _runtime_heartbeat_writer(
         _write_runtime_json(runtime_path, payload)
 
     return write
+
+
+def _start_runtime_watchdog(
+    *,
+    local_state: Path,
+    stale_after_seconds: int | None = None,
+    poll_seconds: int | None = None,
+) -> threading.Thread:
+    """Start a daemon watchdog that records stale live runtime heartbeats."""
+    threshold = int(
+        stale_after_seconds
+        if stale_after_seconds is not None
+        else os.getenv("TRADEML_NODE_WATCHDOG_STALE_SECONDS", "300")
+    )
+    interval = int(
+        poll_seconds
+        if poll_seconds is not None
+        else os.getenv("TRADEML_NODE_WATCHDOG_POLL_SECONDS", "60")
+    )
+    runtime_path = local_state / "node_runtime.json"
+    alerts_root = local_state / "alerts"
+    thread = threading.Thread(
+        target=_runtime_watchdog_loop,
+        kwargs={
+            "runtime_path": runtime_path,
+            "alerts_root": alerts_root,
+            "stale_after_seconds": max(1, threshold),
+            "poll_seconds": max(1, interval),
+        },
+        name="trademl-node-watchdog",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _runtime_watchdog_loop(
+    *,
+    runtime_path: Path,
+    alerts_root: Path,
+    stale_after_seconds: int,
+    poll_seconds: int,
+) -> None:
+    last_alert_key: str | None = None
+    while True:
+        alert = _runtime_watchdog_alert(
+            runtime_path=runtime_path,
+            now=datetime.now(tz=UTC),
+            stale_after_seconds=stale_after_seconds,
+        )
+        if alert is not None:
+            alert_key = str(alert.get("heartbeat_at"))
+            if alert_key != last_alert_key:
+                _write_watchdog_alert(alerts_root=alerts_root, alert=alert)
+                last_alert_key = alert_key
+        sleep(poll_seconds)
+
+
+def _runtime_watchdog_alert(
+    *, runtime_path: Path, now: datetime, stale_after_seconds: int
+) -> dict[str, object] | None:
+    """Return an alert payload when the node heartbeat is stale but PID is alive."""
+    if not runtime_path.exists():
+        return None
+    try:
+        runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not runtime.get("running"):
+        return None
+    pid = runtime.get("pid")
+    if not isinstance(pid, int) or not _pid_alive(pid):
+        return None
+    heartbeat_text = str(runtime.get("heartbeat_at") or "")
+    try:
+        heartbeat_at = datetime.fromisoformat(heartbeat_text)
+    except ValueError:
+        return None
+    if heartbeat_at.tzinfo is None:
+        heartbeat_at = heartbeat_at.replace(tzinfo=UTC)
+    age_seconds = int((now - heartbeat_at).total_seconds())
+    if age_seconds < int(stale_after_seconds):
+        return None
+    return {
+        "alert_type": "node_runtime_heartbeat_stale",
+        "created_at": now.isoformat(),
+        "age_seconds": age_seconds,
+        "stale_after_seconds": int(stale_after_seconds),
+        "pid": pid,
+        "mode": runtime.get("mode"),
+        "worker_id": runtime.get("worker_id"),
+        "heartbeat_at": heartbeat_text,
+        "runtime_path": str(runtime_path),
+    }
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _write_watchdog_alert(*, alerts_root: Path, alert: dict[str, object]) -> None:
+    alerts_root.mkdir(parents=True, exist_ok=True)
+    created = str(alert["created_at"]).replace(":", "").replace("+", "_")
+    json_path = alerts_root / f"{created}_node_watchdog.json"
+    md_path = alerts_root / f"{created}_node_watchdog.md"
+    latest_path = alerts_root / "node_watchdog_latest.json"
+    json_path.write_text(json.dumps(alert, indent=2, sort_keys=True), encoding="utf-8")
+    latest_path.write_text(json.dumps(alert, indent=2, sort_keys=True), encoding="utf-8")
+    md_path.write_text(
+        "\n".join(
+            [
+                "# TradeML Node Watchdog Alert",
+                "",
+                f"- Type: {alert['alert_type']}",
+                f"- Worker: {alert.get('worker_id')}",
+                f"- Mode: {alert.get('mode')}",
+                f"- PID: {alert.get('pid')}",
+                f"- Heartbeat age seconds: {alert.get('age_seconds')}",
+                f"- Last heartbeat: {alert.get('heartbeat_at')}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _write_runtime_json(path: Path, payload: dict[str, object]) -> None:

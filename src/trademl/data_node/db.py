@@ -382,6 +382,12 @@ class DataNodeDB:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_vendor_attempts_updated_lane
+                ON vendor_attempts(updated_at, vendor, task_family, planner_group)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS planner_task_progress (
                   task_key             TEXT PRIMARY KEY,
                   expected_units       INTEGER NOT NULL,
@@ -1107,7 +1113,12 @@ class DataNodeDB:
             return None
         return row["updated_at"]
 
-    def has_pending_planner_tasks(self, *, task_families: tuple[str, ...] | None = None) -> bool:
+    def has_pending_planner_tasks(
+        self,
+        *,
+        task_families: tuple[str, ...] | None = None,
+        datasets: tuple[str, ...] | None = None,
+    ) -> bool:
         """Return whether any planner task is eligible to run."""
         query = """
             SELECT 1
@@ -1120,6 +1131,10 @@ class DataNodeDB:
             placeholders = ",".join("?" for _ in task_families)
             query += f" AND task_family IN ({placeholders})"
             params.extend(task_families)
+        if datasets:
+            placeholders = ",".join("?" for _ in datasets)
+            query += f" AND dataset IN ({placeholders})"
+            params.extend(datasets)
         query += " LIMIT 1"
         with self._connect() as connection:
             row = connection.execute(query, params).fetchone()
@@ -1407,6 +1422,85 @@ class DataNodeDB:
             ],
         }
 
+    def summarize_lane_throughput(
+        self, *, minutes: int = 15, limit: int | None = None
+    ) -> list[dict[str, object]]:
+        """Return recent row throughput by vendor and planner lane."""
+        window_minutes = max(1, int(minutes))
+        since = (utc_now() - timedelta(minutes=window_minutes)).isoformat()
+        params: list[object] = [since]
+        query = """
+            SELECT va.vendor AS vendor,
+                   va.task_family AS task_family,
+                   va.planner_group AS planner_group,
+                   COALESCE(pt.dataset, '') AS dataset,
+                   COUNT(*) AS attempts,
+                   SUM(CASE WHEN va.status = 'SUCCESS' THEN 1 ELSE 0 END) AS successes,
+                   SUM(CASE WHEN va.status = 'FAILED' THEN 1 ELSE 0 END) AS failures,
+                   SUM(CASE WHEN va.status = 'LEASED' THEN 1 ELSE 0 END) AS leased,
+                   SUM(COALESCE(va.rows_returned, 0)) AS rows_returned,
+                   MAX(va.updated_at) AS latest_update
+            FROM vendor_attempts va
+            LEFT JOIN planner_tasks pt ON pt.task_key = va.task_key
+            WHERE va.updated_at >= ?
+            GROUP BY va.vendor, va.task_family, va.planner_group, COALESCE(pt.dataset, '')
+            ORDER BY rows_returned DESC, attempts DESC, va.vendor ASC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [
+            {
+                "vendor": str(row["vendor"]),
+                "task_family": str(row["task_family"]),
+                "planner_group": str(row["planner_group"]),
+                "dataset": str(row["dataset"] or ""),
+                "attempts": int(row["attempts"] or 0),
+                "successes": int(row["successes"] or 0),
+                "failures": int(row["failures"] or 0),
+                "leased": int(row["leased"] or 0),
+                "rows_returned": int(row["rows_returned"] or 0),
+                "rows_per_minute": float(row["rows_returned"] or 0)
+                / float(window_minutes),
+                "latest_update": row["latest_update"],
+            }
+            for row in rows
+        ]
+
+    def mark_completed_planner_progress_success(
+        self, *, task_families: tuple[str, ...]
+    ) -> int:
+        """Mark active planner tasks successful when persisted progress is complete."""
+        if not task_families:
+            return 0
+        placeholders = ",".join("?" for _ in task_families)
+        timestamp = utc_now().isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE planner_tasks
+                SET status = 'SUCCESS',
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    lease_expires_at = NULL,
+                    next_eligible_at = NULL,
+                    last_error = NULL,
+                    updated_at = ?
+                WHERE task_family IN ({placeholders})
+                  AND status IN ('PENDING', 'PARTIAL', 'FAILED', 'LEASED')
+                  AND EXISTS (
+                    SELECT 1
+                    FROM planner_task_progress progress
+                    WHERE progress.task_key = planner_tasks.task_key
+                      AND progress.remaining_units <= 0
+                  )
+                """,
+                [timestamp, *task_families],
+            )
+        return int(cursor.rowcount)
+
     def upsert_planner_task(
         self,
         *,
@@ -1595,6 +1689,7 @@ class DataNodeDB:
         planner_group: str | None = None,
         statuses: tuple[str, ...] | None = None,
         vendor: str | None = None,
+        datasets: tuple[str, ...] | None = None,
         updated_after: str | None = None,
         limit: int | None = None,
         offset: int | None = None,
@@ -1620,6 +1715,10 @@ class DataNodeDB:
         if vendor:
             clauses.append("eligible_vendors_json LIKE ?")
             params.append(f'%"{vendor}"%')
+        if datasets:
+            placeholders = ",".join("?" for _ in datasets)
+            clauses.append(f"dataset IN ({placeholders})")
+            params.extend(datasets)
         if updated_after:
             clauses.append("updated_at >= ?")
             params.append(updated_after)
@@ -1642,6 +1741,7 @@ class DataNodeDB:
         lease_owner: str,
         task_families: tuple[str, ...] | None = None,
         vendor: str | None = None,
+        datasets: tuple[str, ...] | None = None,
         now: datetime | None = None,
         lease_ttl_seconds: int = 300,
         limit: int = 256,
@@ -1655,6 +1755,7 @@ class DataNodeDB:
                 task_families=task_families,
                 statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
                 vendor=vendor,
+                datasets=datasets,
                 limit=limit,
                 offset=page * limit,
             )
