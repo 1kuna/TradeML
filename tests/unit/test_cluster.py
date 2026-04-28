@@ -270,6 +270,9 @@ def test_render_and_install_systemd_service(tmp_path: Path) -> None:
         env_path=env_path,
     )
     assert "ExecStart=/usr/bin/python3 -m trademl.data_node" in unit
+    assert "Restart=always" in unit
+    assert "StartLimitIntervalSec=0" in unit
+    assert "KillSignal=SIGINT" in unit
 
     result = install_systemd_service(
         python_executable="/usr/bin/python3",

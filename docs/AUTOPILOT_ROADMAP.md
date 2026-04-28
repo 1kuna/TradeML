@@ -5,6 +5,7 @@ This is the north-star operating model for TradeML. `SSOT.md` remains canonical;
 ## 1. Pi Capture Loop
 
 - Run the data node continuously on the Raspberry Pi.
+- Keep the node under systemd with `Restart=always`; a clean-but-unexpected process exit should not leave collection offline.
 - Keep canonical EOD integrity first: forward bars, repair tasks, and frozen-window coverage gates.
 - Saturate independent quota lanes every poll cycle: Alpaca minute bars, Tiingo/Finnhub news, SEC filings/companyfacts, FRED vintages, and low-rate Massive/Twelve Data fillers.
 - Burn down unused daily reserve near reset so current/free entitlements do not idle.
