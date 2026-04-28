@@ -497,6 +497,7 @@ class AuxiliaryRuntime:
             tasks = self.db.fetch_planner_tasks(
                 task_families=("canonical_bars", "canonical_repair"),
                 statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+                vendor=vendor,
                 limit=limit,
                 offset=page * limit,
             )

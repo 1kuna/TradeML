@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -505,6 +505,46 @@ def test_prune_planner_tasks_removes_stale_tasks_and_attempts(tmp_path: Path) ->
     assert database.get_planner_task("drop") is None
     assert database.fetch_planner_task_progress("drop") is None
     assert database.get_planner_task("keep") is not None
+
+
+def test_bulk_upsert_planner_tasks_skips_unchanged_row_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    row = {
+        "task_key": "canonical::2026-04-01::000",
+        "task_family": "canonical_bars",
+        "planner_group": "rolling_canonical",
+        "dataset": "equities_eod",
+        "tier": "A",
+        "priority": 5,
+        "start_date": "2026-04-01",
+        "end_date": "2026-04-01",
+        "symbols": ["AAPL"],
+        "eligible_vendors": ["alpaca"],
+        "output_name": "equities_bars",
+        "payload": {"scope_kind": "symbol_range"},
+    }
+    first_now = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
+    second_now = datetime(2026, 4, 1, 12, 5, tzinfo=UTC)
+    third_now = datetime(2026, 4, 1, 12, 10, tzinfo=UTC)
+    monkeypatch.setattr(db_module, "utc_now", lambda: first_now)
+    database.bulk_upsert_planner_tasks([row])
+    first = database.get_planner_task("canonical::2026-04-01::000")
+    assert first is not None
+
+    monkeypatch.setattr(db_module, "utc_now", lambda: second_now)
+    database.bulk_upsert_planner_tasks([dict(row)])
+    unchanged = database.get_planner_task("canonical::2026-04-01::000")
+    assert unchanged is not None
+    assert unchanged.updated_at == first.updated_at
+
+    changed = {**row, "priority": 4}
+    monkeypatch.setattr(db_module, "utc_now", lambda: third_now)
+    database.bulk_upsert_planner_tasks([changed])
+    refreshed = database.get_planner_task("canonical::2026-04-01::000")
+    assert refreshed is not None
+    assert refreshed.updated_at == third_now.isoformat()
 
 
 def test_canonical_progress_uses_durable_unit_ledger(tmp_path: Path) -> None:

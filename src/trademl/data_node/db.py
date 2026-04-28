@@ -376,6 +376,12 @@ class DataNodeDB:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_planner_tasks_lease_order
+                ON planner_tasks(status, priority, created_at, task_key)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS planner_task_progress (
                   task_key             TEXT PRIMARY KEY,
                   expected_units       INTEGER NOT NULL,
@@ -1528,6 +1534,17 @@ class DataNodeDB:
                   output_name = excluded.output_name,
                   payload_json = excluded.payload_json,
                   updated_at = excluded.updated_at
+                WHERE planner_tasks.task_family IS NOT excluded.task_family
+                   OR planner_tasks.planner_group IS NOT excluded.planner_group
+                   OR planner_tasks.dataset IS NOT excluded.dataset
+                   OR planner_tasks.tier IS NOT excluded.tier
+                   OR planner_tasks.priority IS NOT excluded.priority
+                   OR planner_tasks.start_date IS NOT excluded.start_date
+                   OR planner_tasks.end_date IS NOT excluded.end_date
+                   OR planner_tasks.symbols_json IS NOT excluded.symbols_json
+                   OR planner_tasks.eligible_vendors_json IS NOT excluded.eligible_vendors_json
+                   OR planner_tasks.output_name IS NOT excluded.output_name
+                   OR planner_tasks.payload_json IS NOT excluded.payload_json
                 """,
                 prepared,
             )
@@ -1575,6 +1592,7 @@ class DataNodeDB:
         task_families: tuple[str, ...] | None = None,
         planner_group: str | None = None,
         statuses: tuple[str, ...] | None = None,
+        vendor: str | None = None,
         updated_after: str | None = None,
         limit: int | None = None,
         offset: int | None = None,
@@ -1597,6 +1615,9 @@ class DataNodeDB:
             placeholders = ",".join("?" for _ in statuses)
             clauses.append(f"status IN ({placeholders})")
             params.extend(statuses)
+        if vendor:
+            clauses.append("eligible_vendors_json LIKE ?")
+            params.append(f'%"{vendor}"%')
         if updated_after:
             clauses.append("updated_at >= ?")
             params.append(updated_after)
@@ -1631,6 +1652,7 @@ class DataNodeDB:
             candidates = self.fetch_planner_tasks(
                 task_families=task_families,
                 statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+                vendor=vendor,
                 limit=limit,
                 offset=page * limit,
             )

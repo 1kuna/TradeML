@@ -343,6 +343,7 @@ def recommended_training_cutoff(
     *,
     data_root: Path,
     expected_symbol_count: int,
+    manifest_db_path: Path | None = None,
     max_partitions: int = 120,
     lag_days: int = 30,
     as_of: date | str | None = None,
@@ -350,7 +351,11 @@ def recommended_training_cutoff(
     pin_if_available: bool = True,
 ) -> dict[str, Any]:
     """Return the latest complete canonical date at or before the lagged training freeze window."""
-    pinned = read_pinned_phase_freeze(data_root=data_root, phase=phase)
+    pinned = (
+        read_pinned_phase_freeze(data_root=data_root, phase=phase)
+        if pin_if_available
+        else None
+    )
     if pinned is not None:
         return {
             **pinned,
@@ -359,7 +364,7 @@ def recommended_training_cutoff(
         }
 
     anchor = pd.Timestamp(as_of or date.today().isoformat()).normalize() - pd.Timedelta(days=lag_days)
-    manifest_db = data_root / "control" / "node.sqlite"
+    manifest_db = manifest_db_path or (data_root / "control" / "node.sqlite")
     raw_root = data_root / "data" / "raw" / "equities_bars"
     if expected_symbol_count <= 0 or (not manifest_db.exists() and not raw_root.exists()):
         return {

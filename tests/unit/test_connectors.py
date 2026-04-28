@@ -644,7 +644,8 @@ def test_alpha_vantage_and_fred_connectors() -> None:
     assert "amount" in corp_actions.columns
     assert observations.iloc[0]["series_id"] == "DGS10"
     assert observations.iloc[0]["value"] == pytest.approx(4.2)
-    assert fred_session.calls[0][2]["limit"] == 100000
+    assert fred_session.calls[0][2]["limit"] == 10000
+    assert fred_session.calls[0][2]["offset"] == 0
 
 
 def test_fred_vintagedates_uses_supported_limit() -> None:
@@ -661,7 +662,73 @@ def test_fred_vintagedates_uses_supported_limit() -> None:
     vintages = fred.fetch("vintagedates", ["DGS10"], "2024-01-01", "2024-01-31")
 
     assert vintages["series_id"].tolist() == ["DGS10", "DGS10"]
-    assert fred_session.calls[0][2]["limit"] == 100000
+    assert fred_session.calls[0][2]["limit"] == 10000
+    assert fred_session.calls[0][2]["offset"] == 0
+
+
+def test_fred_observations_paginates_at_supported_limit() -> None:
+    fred_session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "observations": [
+                        {
+                            "date": f"2024-01-{(index % 28) + 1:02d}",
+                            "value": "4.2",
+                            "realtime_start": "2024-01-01",
+                        }
+                        for index in range(10000)
+                    ]
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "observations": [
+                        {
+                            "date": "2024-02-01",
+                            "value": "4.3",
+                            "realtime_start": "2024-02-01",
+                        }
+                    ]
+                },
+            ),
+        ]
+    )
+    fred = FredConnector(
+        base_url="https://api.stlouisfed.org",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=fred_session,
+    )
+
+    observations = fred.fetch("macros_treasury", ["DGS10"], "2024-01-01", "2024-02-01")
+
+    assert len(observations) == 10001
+    assert [call[2]["offset"] for call in fred_session.calls] == [0, 10000]
+    assert {call[2]["limit"] for call in fred_session.calls} == {10000}
+
+
+def test_fred_vintagedates_paginates_at_supported_limit() -> None:
+    fred_session = FakeSession(
+        [
+            FakeResponse(200, {"vintage_dates": ["2024-01-01"] * 10000}),
+            FakeResponse(200, {"vintage_dates": ["2024-02-01"]}),
+        ]
+    )
+    fred = FredConnector(
+        base_url="https://api.stlouisfed.org",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=fred_session,
+    )
+
+    vintages = fred.fetch("vintagedates", ["DGS10"], "2024-01-01", "2024-02-01")
+
+    assert len(vintages) == 10001
+    assert [call[2]["offset"] for call in fred_session.calls] == [0, 10000]
+    assert {call[2]["limit"] for call in fred_session.calls} == {10000}
 
 
 def test_alpha_vantage_corp_actions_normalize_splits_and_dividends() -> None:

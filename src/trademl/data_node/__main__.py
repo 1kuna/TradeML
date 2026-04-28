@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
+import faulthandler
 import json
 import os
 from pathlib import Path
+import signal
 import sys
 from typing import Callable
 
@@ -30,6 +32,8 @@ from trademl.data_node.runtime import (
 from trademl.data_node.service import DataNodePaths, DataNodeService
 from trademl.env import load_dotenv
 from trademl.fleet.cluster import ClusterCoordinator
+
+_STACK_DUMP_HANDLE = None
 
 
 def _build_reference_jobs(
@@ -78,6 +82,7 @@ def main() -> int:
         else Path(config["node"]["local_state"]).expanduser()
     )
     local_state = Path(os.getenv("LOCAL_STATE", str(local_state_default))).expanduser()
+    _install_stack_dump_handler(local_state=local_state)
     vendor_limits = resolve_vendor_budgets(config)
     budgets = BudgetManager(
         vendor_limits,
@@ -240,6 +245,15 @@ def _should_rebuild_local_state(*, local_db_path: Path) -> bool:
     }:
         return True
     return not local_db_path.exists()
+
+
+def _install_stack_dump_handler(*, local_state: Path) -> None:
+    """Install an operator-triggered stack dump for stuck Pi workers."""
+    global _STACK_DUMP_HANDLE
+    log_dir = local_state / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _STACK_DUMP_HANDLE = (log_dir / "stack_dumps.log").open("a", encoding="utf-8")
+    faulthandler.register(signal.SIGUSR1, file=_STACK_DUMP_HANDLE, all_threads=True)
 
 
 def _load_stage_symbols(root: Path) -> list[str]:

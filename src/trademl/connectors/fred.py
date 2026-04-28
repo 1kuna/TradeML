@@ -8,6 +8,8 @@ import pandas as pd
 
 from trademl.connectors.base import HTTPConnector
 
+FRED_PAGE_LIMIT = 10000
+
 
 class FredConnector(HTTPConnector):
     """Fetch macro series and vintage dates from FRED."""
@@ -32,18 +34,30 @@ class FredConnector(HTTPConnector):
         if dataset == "vintagedates":
             frames = []
             for series_id in symbols:
-                payload = self.request_json(
-                    endpoint="/fred/series/vintagedates",
-                    endpoint_key="vintagedates",
-                    params={"series_id": series_id, "limit": 100000},
-                    task_kind="OTHER",
-                    logical_units=1,
-                )
+                vintage_dates = []
+                offset = 0
+                while True:
+                    payload = self.request_json(
+                        endpoint="/fred/series/vintagedates",
+                        endpoint_key="vintagedates",
+                        params={
+                            "series_id": series_id,
+                            "limit": FRED_PAGE_LIMIT,
+                            "offset": offset,
+                        },
+                        task_kind="OTHER",
+                        logical_units=1,
+                    )
+                    page = list(payload.get("vintage_dates", []))
+                    vintage_dates.extend(page)
+                    if len(page) < FRED_PAGE_LIMIT:
+                        break
+                    offset += FRED_PAGE_LIMIT
                 frames.append(
                     pd.DataFrame(
                         {
                             "series_id": series_id,
-                            "vintage_date": payload.get("vintage_dates", []),
+                            "vintage_date": vintage_dates,
                         }
                     )
                 )
@@ -69,20 +83,31 @@ class FredConnector(HTTPConnector):
     ) -> pd.DataFrame:
         frames = []
         for series_id in symbols:
-            payload = self.request_json(
-                endpoint="/fred/series/observations",
-                endpoint_key="macros_treasury",
-                params={
-                    "series_id": series_id,
-                    "observation_start": pd.Timestamp(start_date).strftime("%Y-%m-%d"),
-                    "observation_end": pd.Timestamp(end_date).strftime("%Y-%m-%d"),
-                    "limit": 100000,
-                    "sort_order": "asc",
-                },
-                task_kind="OTHER",
-                logical_units=1,
-            )
-            frame = pd.DataFrame(payload.get("observations", []))
+            observations = []
+            offset = 0
+            while True:
+                payload = self.request_json(
+                    endpoint="/fred/series/observations",
+                    endpoint_key="macros_treasury",
+                    params={
+                        "series_id": series_id,
+                        "observation_start": pd.Timestamp(start_date).strftime(
+                            "%Y-%m-%d"
+                        ),
+                        "observation_end": pd.Timestamp(end_date).strftime("%Y-%m-%d"),
+                        "limit": FRED_PAGE_LIMIT,
+                        "offset": offset,
+                        "sort_order": "asc",
+                    },
+                    task_kind="OTHER",
+                    logical_units=1,
+                )
+                page = list(payload.get("observations", []))
+                observations.extend(page)
+                if len(page) < FRED_PAGE_LIMIT:
+                    break
+                offset += FRED_PAGE_LIMIT
+            frame = pd.DataFrame(observations)
             if frame.empty:
                 continue
             frame["series_id"] = series_id

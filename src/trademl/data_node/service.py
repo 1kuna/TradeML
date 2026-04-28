@@ -57,6 +57,14 @@ class DataNodePaths:
         return self.root / "data" / "reference"
 
 
+@dataclass(slots=True)
+class CanonicalRepairSeedResult:
+    """Repair task keys valid for a verification pass and newly seeded."""
+
+    valid_task_keys: set[str]
+    seeded_task_keys: set[str]
+
+
 class DataNodeService:
     """Collect raw bars, audit completeness, curate data, and sync QC state."""
 
@@ -409,9 +417,10 @@ class DataNodeService:
         heartbeat_interval_seconds: float = 30.0,
     ) -> list[str]:
         """Process planner-native canonical and auxiliary work."""
-        self._ensure_planner_backlog_seeded(
-            trading_date=trading_date or datetime.now(tz=UTC).date().isoformat()
-        )
+        if not self.db.has_pending_planner_tasks():
+            self._ensure_planner_backlog_seeded(
+                trading_date=trading_date or datetime.now(tz=UTC).date().isoformat()
+            )
         changed_dates: list[str] = []
         futures: dict[object, str] = {}
         canonical_lane_widths = self._canonical_runtime._backfill_lane_widths()
@@ -482,12 +491,16 @@ class DataNodeService:
                 return False
         return True
 
-    def _seed_planner_tasks(self, *, trading_date: str | None = None) -> None:
+    def _seed_planner_tasks(
+        self, *, trading_date: str | None = None, verify_repairs: bool = True
+    ) -> dict[str, int]:
         """Seed or refresh planner tasks from the current stage definition."""
         if not self.default_symbols:
-            return
-        self._seed_planner_tasks_with_heartbeat(
-            trading_date=trading_date, heartbeat_fn=None
+            return {"seeded_repair_tasks": 0}
+        return self._seed_planner_tasks_with_heartbeat(
+            trading_date=trading_date,
+            heartbeat_fn=None,
+            verify_repairs=verify_repairs,
         )
 
     def _seed_planner_tasks_with_heartbeat(
@@ -496,7 +509,8 @@ class DataNodeService:
         trading_date: str | None = None,
         heartbeat_fn: Callable[[], object] | None = None,
         heartbeat_task_interval: int = 256,
-    ) -> None:
+        verify_repairs: bool = True,
+    ) -> dict[str, int]:
         """Seed planner tasks, optionally heartbeating during long startup refreshes."""
         heartbeat_every = max(1, int(heartbeat_task_interval))
         if heartbeat_fn is not None:
@@ -510,6 +524,7 @@ class DataNodeService:
             data_root=self.paths.root,
             expected_symbol_count=len(self.default_symbols),
             as_of=as_of_date,
+            manifest_db_path=Path(self.db.path),
         )
         if heartbeat_fn is not None:
             heartbeat_fn()
@@ -648,21 +663,24 @@ class DataNodeService:
             )
             if reopened:
                 LOGGER.warning("reopened_regressed_canonical_tasks count=%s", reopened)
-        repair_seeded = self._verify_and_seed_canonical_repairs(
-            trading_date=as_of_date,
-            changed_dates=None,
-            symbol_filter=None,
-            verify_only=False,
-        )
-        if heartbeat_fn is not None:
-            heartbeat_fn()
-        if repair_seeded.get("seeded_tasks", 0):
-            LOGGER.warning(
-                "seeded_canonical_repairs count=%s", repair_seeded["seeded_tasks"]
+        repair_seeded: dict[str, object] = {"seeded_tasks": 0}
+        if verify_repairs:
+            repair_seeded = self._verify_and_seed_canonical_repairs(
+                trading_date=as_of_date,
+                changed_dates=None,
+                symbol_filter=None,
+                verify_only=False,
             )
+            if heartbeat_fn is not None:
+                heartbeat_fn()
+            if repair_seeded.get("seeded_tasks", 0):
+                LOGGER.warning(
+                    "seeded_canonical_repairs count=%s", repair_seeded["seeded_tasks"]
+                )
         released = self._release_budget_blocked_canonical_tasks()
         if released:
             LOGGER.warning("released_budget_blocked_canonical_tasks count=%s", released)
+        return {"seeded_repair_tasks": int(repair_seeded.get("seeded_tasks", 0))}
 
     def bootstrap_canonical_ledger(self) -> dict[str, object]:
         """Seed the durable canonical ledger from the current raw corpus once."""
@@ -764,13 +782,16 @@ class DataNodeService:
         before_all_blocked = self.db.count_repairable_stale_success_canonical_tasks(
             only_future_blocked=False
         )
-        self._seed_planner_tasks(trading_date=as_of_date)
+        planner_seeded = self._seed_planner_tasks(trading_date=as_of_date)
         verification = self._verify_and_seed_canonical_repairs(
             trading_date=as_of_date,
             start_date=start_date,
             end_date=end_date,
             symbol_filter=symbol,
             verify_only=verify_only,
+        )
+        verification["seeded_tasks"] = int(verification.get("seeded_tasks", 0)) + int(
+            planner_seeded.get("seeded_repair_tasks", 0)
         )
         after_future_blocked = self.db.count_repairable_stale_success_canonical_tasks(
             only_future_blocked=True
@@ -877,6 +898,7 @@ class DataNodeService:
             else None
         )
         valid_repair_keys: set[str] = set()
+        seeded_repair_keys: set[str] = set()
         for day_value in target_dates:
             manifest = self.db.get_raw_partition_manifest(
                 dataset="equities_eod", trading_date=day_value
@@ -905,7 +927,8 @@ class DataNodeService:
                         freeze_start=freeze_start,
                         freeze_end=freeze_end,
                     )
-                    valid_repair_keys.update(seeded)
+                    valid_repair_keys.update(seeded.valid_task_keys)
+                    seeded_repair_keys.update(seeded.seeded_task_keys)
                 continue
             try:
                 frame = pd.read_parquet(path, columns=["symbol"])
@@ -934,7 +957,8 @@ class DataNodeService:
                         freeze_start=freeze_start,
                         freeze_end=freeze_end,
                     )
-                    valid_repair_keys.update(seeded)
+                    valid_repair_keys.update(seeded.valid_task_keys)
+                    seeded_repair_keys.update(seeded.seeded_task_keys)
                 continue
             actual_symbols = sorted(
                 frame.get("symbol", pd.Series(dtype="string"))
@@ -998,14 +1022,15 @@ class DataNodeService:
                         freeze_start=freeze_start,
                         freeze_end=freeze_end,
                     )
-                    valid_repair_keys.update(seeded)
+                    valid_repair_keys.update(seeded.valid_task_keys)
+                    seeded_repair_keys.update(seeded.seeded_task_keys)
         if not verify_only:
             self.db.prune_planner_tasks(
                 task_families=("canonical_repair",), valid_task_keys=valid_repair_keys
             )
         return {
             "verified_dates": len(target_dates),
-            "seeded_tasks": len(valid_repair_keys),
+            "seeded_tasks": len(seeded_repair_keys),
             "unreadable_dates": unreadable_dates,
             "quarantined_units": quarantined_units,
             "missing_units": missing_units,
@@ -1020,10 +1045,12 @@ class DataNodeService:
         freeze_start: pd.Timestamp | None,
         freeze_end: pd.Timestamp | None,
         chunk_size: int = 25,
-    ) -> set[str]:
+    ) -> CanonicalRepairSeedResult:
         """Create deterministic repair tasks for a missing/quarantined symbol-date scope."""
         if not symbols:
-            return set()
+            return CanonicalRepairSeedResult(
+                valid_task_keys=set(), seeded_task_keys=set()
+            )
         normalized = sorted({str(symbol).upper() for symbol in symbols})
         in_freeze_window = (
             freeze_start is not None
@@ -1039,9 +1066,26 @@ class DataNodeService:
         task_rows: list[dict[str, object]] = []
         progress_rows: list[dict[str, object]] = []
         task_keys: set[str] = set()
+        seeded_keys: set[str] = set()
         for index in range(0, len(normalized), max(1, chunk_size)):
             chunk = normalized[index : index + max(1, chunk_size)]
             task_key = f"canonical_repair::equities_eod::{trading_date}::{index // max(1, chunk_size):03d}"
+            task_keys.add(task_key)
+            existing_task = self.db.get_planner_task(task_key)
+            existing_progress = self.db.fetch_planner_task_progress(task_key)
+            if (
+                existing_task is not None
+                and existing_progress is not None
+                and existing_task.status in {"PENDING", "PARTIAL", "FAILED", "LEASED"}
+                and existing_task.task_family == "canonical_repair"
+                and existing_task.planner_group == "canonical_repair"
+                and existing_task.dataset == "equities_eod"
+                and existing_task.start_date == trading_date
+                and existing_task.end_date == trading_date
+                and tuple(sorted(str(symbol).upper() for symbol in existing_task.symbols))
+                == tuple(chunk)
+            ):
+                continue
             task_rows.append(
                 {
                     "task_key": task_key,
@@ -1074,10 +1118,12 @@ class DataNodeService:
                     "state": {"scope_kind": "symbol_range", "backlog_class": "repair"},
                 }
             )
-            task_keys.add(task_key)
+            seeded_keys.add(task_key)
         self.db.bulk_upsert_planner_tasks(task_rows)
         self.db.bulk_update_planner_task_progress(progress_rows)
-        return task_keys
+        return CanonicalRepairSeedResult(
+            valid_task_keys=task_keys, seeded_task_keys=seeded_keys
+        )
 
     def _release_budget_blocked_canonical_tasks(self) -> int:
         """Clear poisoned task-level backoff when another canonical vendor can run now."""
@@ -1372,6 +1418,10 @@ class DataNodeService:
             prefer_legacy_backfill=True,
         )
         changed_dates = sorted(set(forward_dates + backfill_dates))
+        if not changed_dates:
+            raw_path = self.paths.raw_equities / f"date={trading_date}" / "data.parquet"
+            if raw_path.exists():
+                changed_dates = [trading_date]
         curated = self.curate_dates(
             corp_actions=corp_actions,
             changed_dates=(
@@ -1661,7 +1711,9 @@ class DataNodeService:
                         trading_date=trading_date,
                     )
 
-                self._ensure_planner_backlog_seeded(trading_date=trading_date)
+                self._ensure_planner_backlog_seeded(
+                    trading_date=trading_date, skip_when_backlog_exists=True
+                )
                 released = self._release_budget_blocked_canonical_tasks()
                 if released:
                     LOGGER.warning(
@@ -1773,11 +1825,14 @@ class DataNodeService:
             return False
         return True
 
-    def _ensure_planner_backlog_seeded(self, *, trading_date: str) -> None:
+    def _ensure_planner_backlog_seeded(
+        self, *, trading_date: str, skip_when_backlog_exists: bool = False
+    ) -> None:
         """Refresh planner tasks once per service instance and trading date."""
         self._ensure_planner_backlog_seeded_once(
             trading_date=trading_date,
             seed_fn=lambda: self._seed_planner_tasks(trading_date=trading_date),
+            skip_when_backlog_exists=skip_when_backlog_exists,
         )
 
     def _ensure_planner_backlog_seeded_with_heartbeat(
@@ -1792,16 +1847,27 @@ class DataNodeService:
             seed_fn=lambda: self._seed_planner_tasks_with_heartbeat(
                 trading_date=trading_date,
                 heartbeat_fn=heartbeat_fn,
+                verify_repairs=False,
             ),
+            skip_when_backlog_exists=True,
         )
 
     def _ensure_planner_backlog_seeded_once(
-        self, *, trading_date: str, seed_fn: Callable[[], object]
+        self,
+        *,
+        trading_date: str,
+        seed_fn: Callable[[], object],
+        skip_when_backlog_exists: bool = False,
     ) -> None:
         """Run a planner seed callback once per service instance and trading date."""
         if not self.default_symbols:
             return
         if trading_date in self._planner_seed_history:
+            return
+        if skip_when_backlog_exists and self.db.count_planner_tasks_by_family(
+            statuses=("PENDING", "PARTIAL", "FAILED", "LEASED")
+        ):
+            self._planner_seed_history.add(trading_date)
             return
         seed_fn()
         self._planner_seed_history.add(trading_date)

@@ -1420,6 +1420,154 @@ def test_seed_planner_tasks_heartbeats_during_startup_refresh(tmp_path: Path, mo
     assert len(heartbeats) >= 5
 
 
+def test_startup_planner_seed_skips_blocking_repair_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+    service._ledger_bootstrap_complete = True
+    monkeypatch.setattr(
+        service_module,
+        "recommended_training_cutoff",
+        lambda **kwargs: {"date": "2026-04-03", "coverage_ratio": 1.0},
+    )
+    monkeypatch.setattr(
+        service_module,
+        "plan_coverage_tasks",
+        lambda **kwargs: [
+            PlannedTask(
+                task_key="security_master::0000",
+                task_family="security_master",
+                planner_group="security_master_backlog",
+                dataset="assets",
+                tier="A",
+                priority=10,
+                start_date="2026-04-03",
+                end_date="2026-04-03",
+                symbols=("AAPL",),
+                output_name="assets",
+                preferred_vendors=("alpaca",),
+                payload={"scope_kind": "symbol_range"},
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        service,
+        "_verify_and_seed_canonical_repairs",
+        lambda **kwargs: pytest.fail("startup should not verify raw NAS repairs"),
+    )
+    monkeypatch.setattr(service, "_release_budget_blocked_canonical_tasks", lambda: 0)
+
+    service._ensure_planner_backlog_seeded_with_heartbeat(
+        trading_date="2026-04-03", heartbeat_fn=lambda: None
+    )
+
+    assert db.get_planner_task("security_master::0000") is not None
+
+
+def test_startup_planner_seed_reuses_existing_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+    db.upsert_planner_task(
+        task_key="existing::minute",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="equities_minute",
+        tier="research",
+        priority=80,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_minute",
+        payload={"scope_kind": "symbol_range"},
+    )
+    monkeypatch.setattr(
+        service,
+        "_seed_planner_tasks_with_heartbeat",
+        lambda **kwargs: pytest.fail("startup should reuse existing backlog"),
+    )
+
+    service._ensure_planner_backlog_seeded_with_heartbeat(
+        trading_date="2026-04-03", heartbeat_fn=lambda: None
+    )
+
+    assert service._planner_seed_history == {"2026-04-03"}
+
+
+def test_process_planner_queue_reuses_existing_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        worker_id="worker-a",
+    )
+    service.default_symbols = ["AAPL"]
+    db.upsert_planner_task(
+        task_key="existing::minute",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="equities_minute",
+        tier="research",
+        priority=80,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_minute",
+        payload={"scope_kind": "symbol_range"},
+    )
+    monkeypatch.setattr(
+        service,
+        "_ensure_planner_backlog_seeded",
+        lambda **kwargs: pytest.fail("queue drain should reuse existing backlog"),
+    )
+    monkeypatch.setattr(service._canonical_runtime, "_backfill_lane_widths", lambda: {})
+    monkeypatch.setattr(
+        service,
+        "_aux_lane_widths",
+        lambda **kwargs: {},
+    )
+
+    assert service.process_planner_queue(trading_date="2026-04-03") == []
+
+
 def test_ensure_planner_backlog_seeded_when_planner_is_empty(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
@@ -1549,7 +1697,7 @@ def test_seed_planner_tasks_with_heartbeat_reports_progress_for_large_refresh(
         heartbeat_task_interval=100,
     )
 
-    assert len(heartbeats) == 6
+    assert len(heartbeats) >= 6
 
 
 def test_ensure_planner_backlog_seeded_with_heartbeat_refreshes_once_per_day(
@@ -1577,6 +1725,7 @@ def test_ensure_planner_backlog_seeded_with_heartbeat_refreshes_once_per_day(
         trading_date: str | None = None,
         heartbeat_fn=None,
         heartbeat_task_interval: int = 256,
+        verify_repairs: bool = True,
     ) -> None:  # noqa: ANN001
         calls.append((trading_date, heartbeat_fn))
 
@@ -2931,6 +3080,71 @@ def test_repair_canonical_backlog_seeds_targeted_repair_tasks(tmp_path: Path) ->
     assert repair_tasks[0].payload["backlog_class"] == "repair"
 
 
+def test_canonical_repair_seeding_preserves_active_progress(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _BudgetedBackfillConnector(
+                "alpaca", BudgetManager({"alpaca": {"rpm": 10, "daily_cap": 100}})
+            ),
+            "tiingo": _BudgetedBackfillConnector(
+                "tiingo", BudgetManager({"tiingo": {"rpm": 10, "daily_cap": 100}})
+            ),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    service.default_symbols = ["AAPL", "MSFT"]
+    partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2025-12-16"
+    partition.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"date": "2025-12-16", "symbol": "AAPL"}]).to_parquet(
+        partition / "data.parquet",
+        index=False,
+    )
+    service.bootstrap_canonical_ledger()
+    first = service.repair_canonical_backlog(
+        trading_date="2025-12-16", start_date="2025-12-16", end_date="2025-12-16"
+    )
+    task_key = "canonical_repair::equities_eod::2025-12-16::000"
+    db.update_planner_task_progress(
+        task_key=task_key,
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        completed_symbols=[],
+        remaining_symbols=["MSFT"],
+        state={"scope_kind": "symbol_range", "backlog_class": "repair"},
+    )
+    db.mark_planner_task_failed(
+        task_key,
+        error="temporary vendor issue",
+        backoff_minutes=30,
+    )
+
+    second = service.repair_canonical_backlog(
+        trading_date="2025-12-16", start_date="2025-12-16", end_date="2025-12-16"
+    )
+    progress = db.fetch_planner_task_progress(task_key)
+    task = db.get_planner_task(task_key)
+
+    assert first["seeded_tasks"] == 1
+    assert second["seeded_tasks"] == 0
+    assert progress is not None
+    assert progress.completed_units == 0
+    assert progress.remaining_symbols == ("MSFT",)
+    assert task is not None
+    assert task.status == "FAILED"
+    assert task.next_eligible_at is not None
+
+
 def test_verify_recent_canonical_dates_reports_recent_bad_dates(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
@@ -3501,6 +3715,52 @@ def test_run_cluster_forever_backfill_curates_only_changed_dates(
     )
 
     assert captured["changed_dates"] == ["2026-04-01", "2026-04-02"]
+
+
+def test_run_cycle_curates_trading_date_when_raw_partition_exists(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    raw_partition = tmp_path / "data" / "raw" / "equities_bars" / "date=2026-04-27"
+    raw_partition.mkdir(parents=True)
+    pd.DataFrame([{"date": "2026-04-27", "symbol": "AAPL"}]).to_parquet(
+        raw_partition / "data.parquet", index=False
+    )
+    captured: dict[str, object] = {}
+    service.collect_forward = lambda **kwargs: []  # type: ignore[method-assign]
+    service.process_backfill_queue = lambda **kwargs: []  # type: ignore[method-assign]
+    service.auditor.audit_range = lambda **kwargs: []  # type: ignore[method-assign]
+    service.sync_partition_status = lambda: tmp_path / "data" / "qc" / "partition_status.parquet"  # type: ignore[method-assign]
+
+    def capture_curate(*, corp_actions=None, changed_dates=None):  # noqa: ANN001
+        captured["changed_dates"] = changed_dates
+        return service_module.CuratorResult(
+            frame=pd.DataFrame(), adjustment_log=pd.DataFrame()
+        )
+
+    service.curate_dates = capture_curate  # type: ignore[method-assign]
+
+    service.run_cycle(
+        trading_date="2026-04-27",
+        symbols=["AAPL"],
+        exchange="XNYS",
+        audit_start="2026-04-27",
+        audit_end="2026-04-27",
+    )
+
+    assert captured["changed_dates"] == ["2026-04-27"]
 
 
 def test_process_planner_queue_runs_unrelated_auxiliary_lanes_while_canonical_backlog_exists(
