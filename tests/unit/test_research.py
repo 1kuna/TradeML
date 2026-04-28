@@ -1503,6 +1503,7 @@ def test_research_health_uses_post_sweep_experiment_summary(tmp_path: Path, monk
 
     monkeypatch.setattr(research, "sweep_stale_experiment_runs", fake_sweep)
     monkeypatch.setattr(research, "evaluate_research_drift", fake_drift)
+    monkeypatch.setattr(research, "launch_agent_status", lambda label: {"loaded": True, "state": "running", "pid": 42, "label": label})
 
     payload = research.research_health(
         program_id="perpetual-macmini",
@@ -1514,6 +1515,8 @@ def test_research_health_uses_post_sweep_experiment_summary(tmp_path: Path, monk
     )
 
     assert payload["stale_run_sweep"]["reconciled"] == 1
+    assert payload["launchd"]["label"] == "com.trademl.research.perpetual-macmini"
+    assert payload["launchd"]["state"] == "running"
     assert captured["summary"] == {"experiment_id": "exp-a", "counts": {"COMPLETED": 1}}
 
 

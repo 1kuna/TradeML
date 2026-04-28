@@ -35,6 +35,7 @@ from trademl.experiments import (
     stop_experiment_supervisor,
     supervise_experiment,
 )
+from trademl.fleet.launchd import launch_agent_status
 from trademl.data_node.training_control import (
     _resolve_default_report_date,
     resolve_training_target,
@@ -816,6 +817,7 @@ def research_health(
         "alerts": alerts,
         "paper": state.get("latest_paper_outputs", {}),
         "infra_blocker": state.get("last_infra_preflight", {}),
+        "launchd": _research_launchd_status(program_id),
         "frontier_architecture": _frontier_architecture_status(spec=spec, state=state, frontier=dict(state.get("frontier") or {}), experiment_summary=latest_summary) if spec else {},
         "dependency_preflight": (state.get("last_infra_preflight") or {}).get("dependencies", {}),
         "paths": _research_path_summary(local_state=local_state, data_root=data_root),
@@ -831,6 +833,11 @@ def list_research_alerts(*, local_state: Path, program_id: str, limit: int = 20)
         "alerts": [json.loads(path.read_text(encoding="utf-8")) for path in paths],
         "paths": [str(path) for path in paths],
     }
+
+
+def _research_launchd_status(program_id: str) -> dict[str, Any]:
+    """Return launchd status for the conventional research LaunchAgent label."""
+    return launch_agent_status(f"com.trademl.research.{program_id}")
 
 
 def pause_research_program(*, local_state: Path, program_id: str) -> dict[str, Any]:
@@ -1031,6 +1038,7 @@ def write_research_review_packet(
         "drift_alerts": drift_alerts,
         "alert_result": alert_result,
         "infra_blocker": state.get("last_infra_preflight", {}),
+        "launchd": _research_launchd_status(program_id),
         "frontier_architecture": _frontier_architecture_status(
             spec=spec,
             state=state,

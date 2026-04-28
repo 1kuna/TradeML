@@ -854,6 +854,7 @@ OPERATOR_HTML_PAGE = """<!doctype html>
       const infraBlocker = program.last_infra_preflight || program.infra_blocker || {};
       const frontierArchitecture = program.frontier_architecture || {};
       const dependencyPreflight = program.dependency_preflight || ((program.last_infra_preflight || {}).dependencies || {});
+      const launchd = program.launchd || {};
       const readinessPill = document.getElementById('status-readiness-pill');
       readinessPill.textContent = phase1.ready ? 'Phase 1 ready' : 'Phase 1 blocked';
       readinessPill.className = `pill ${phase1.ready ? 'good' : 'warn'}`;
@@ -911,6 +912,7 @@ OPERATOR_HTML_PAGE = """<!doctype html>
       const queueActive = Boolean(program.status || supervisor.status || experiment.experiment_id);
       renderKeyValue('research-board', [
         ['Queue status', program.status || (queueActive ? 'Active' : 'Idle')],
+        ['Launch agent', launchd.loaded ? `${launchd.state || 'loaded'}${launchd.pid ? ` · pid ${launchd.pid}` : ''}` : (launchd.reason || '-')],
         ['Program phase', program.current_phase ? `Phase ${program.current_phase}` : '-'],
         ['Active family', program.current_experiment_id || experiment.experiment_id || '-'],
         ['Runs', `${formatNumber((program.budgets || {}).runs_completed ?? experiment.run_count ?? 0)} total`],
