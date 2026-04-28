@@ -421,8 +421,17 @@ def read_research_program_state(*, local_state: Path, program_id: str) -> dict[s
     payload = json.loads(path.read_text(encoding="utf-8"))
     pid = payload.get("pid")
     status = str(payload.get("status") or "").upper()
-    if isinstance(pid, int) and status in {"RUNNING", "PAUSED", "STARTING", "STOPPING"} and not _is_local_process_running(pid):
+    active_statuses = {"RUNNING", "PAUSED", "STARTING", "STOPPING"}
+    stopped_reason: str | None = None
+    if isinstance(pid, int) and status in active_statuses and not _is_local_process_running(pid):
+        stopped_reason = f"local supervisor pid {pid} is not running"
+    elif status in active_statuses and _program_heartbeat_stale(payload):
+        stopped_reason = "research supervisor heartbeat is stale"
+    if stopped_reason:
         payload["status"] = "STOPPED"
+        payload["stop_reason"] = stopped_reason
+        payload["completed_at"] = payload.get("completed_at") or datetime.now(tz=UTC).isoformat()
+        _write_program_state(local_state=local_state, program_id=program_id, payload=payload)
     return payload
 
 
@@ -465,7 +474,7 @@ def sweep_stale_experiment_runs(
                 data_root=data_root,
                 local_state=local_state,
                 phase=int(manifest.get("phase") or 1),
-                target=str(manifest.get("target") or "workstation-remote"),
+                target=str(manifest.get("target") or "local"),
                 targets_config_path=targets_config_path,
                 python_executable=python_executable,
                 runtime_name=str(manifest.get("runtime_name") or f"{experiment_id}-{manifest.get('run_id')}"),
@@ -1226,10 +1235,12 @@ def _initial_program_state(*, spec: dict[str, Any], program_path: Path, poll_sec
         "status": "RUNNING",
         "started_at": datetime.now(tz=UTC).isoformat(),
         "heartbeat_at": datetime.now(tz=UTC).isoformat(),
+        "completed_at": None,
         "pid": os.getpid(),
         "poll_seconds": poll_seconds,
         "paused": False,
         "stop_requested": False,
+        "stop_reason": None,
         "current_phase": default_phase,
         "current_ssot_phase": default_phase,
         "current_track": str(spec.get("default_campaign_track") or "baseline"),
@@ -1459,7 +1470,7 @@ def _make_experiment_spec_from_phase_policy(
             or spec.get("default_campaign_track")
             or "baseline"
         ),
-        "target": str(spec.get("target") or "workstation-remote"),
+        "target": str(spec.get("target") or "local"),
         "report_date_policy": str(phase_policy.get("report_date_policy") or spec.get("report_date_policy") or "phase1_freeze"),
         "max_concurrent": int(phase_policy.get("max_concurrent") or spec.get("max_concurrent") or 1),
         "supervision": {
@@ -1607,7 +1618,7 @@ def _program_next_spec_from_proposal(
     next_spec = deepcopy(proposal.get("next_spec") or {})
     if not next_spec:
         return None
-    next_spec["target"] = str(spec.get("target") or next_spec.get("target") or "workstation-remote")
+    next_spec["target"] = str(spec.get("target") or next_spec.get("target") or "local")
     next_spec["supervision"] = {
         **dict(next_spec.get("supervision") or {}),
         "auto_backtest_survivors": True,
@@ -2292,7 +2303,7 @@ def _current_data_revision(
 ) -> str | None:
     try:
         target = resolve_training_target(
-            target_name=str(spec.get("target") or "workstation-remote"),
+            target_name=str(spec.get("target") or "local"),
             targets_config_path=targets_config_path,
             repo_root=repo_root,
             data_root=data_root,
@@ -2495,7 +2506,7 @@ def _program_family_preflight(
     targets_config_path: Path,
     python_executable: str,
 ) -> dict[str, Any]:
-    target_name = str(next_spec.get("target") or "workstation-remote")
+    target_name = str(next_spec.get("target") or "local")
     phase = int(next_spec.get("ssot_phase", next_spec.get("phase", 1)) or 1)
     config_path = repo_root / "configs" / "equities_xs.yml"
     try:
@@ -2711,6 +2722,22 @@ def _current_ssot_phase(*, state: dict[str, Any], spec: dict[str, Any]) -> int:
 def _exploration_multiplier(value: str) -> float:
     mapping = {"low": 0.75, "normal": 1.0, "high": 1.5}
     return mapping.get(str(value).lower(), 1.0)
+
+
+def _program_heartbeat_stale(payload: dict[str, Any]) -> bool:
+    """Return whether a supervisor heartbeat is too old to trust as running."""
+    heartbeat = payload.get("heartbeat_at")
+    if not heartbeat:
+        return False
+    try:
+        heartbeat_at = datetime.fromisoformat(str(heartbeat))
+    except ValueError:
+        return True
+    if heartbeat_at.tzinfo is None:
+        heartbeat_at = heartbeat_at.replace(tzinfo=UTC)
+    poll_seconds = int(payload.get("poll_seconds") or 30)
+    max_age = timedelta(seconds=max(300, poll_seconds * 6))
+    return datetime.now(tz=UTC) - heartbeat_at > max_age
 
 
 def _is_local_process_running(pid: int) -> bool:

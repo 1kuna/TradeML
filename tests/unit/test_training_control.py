@@ -672,6 +672,35 @@ training_targets:
     assert payload["dataset"]["sample_rows"] == 12
 
 
+def test_target_preflight_reports_missing_identity_file_before_ssh(tmp_path: Path, monkeypatch) -> None:
+    target = training_control.TrainingTarget(
+        name="workstation-remote",
+        kind="ssh",
+        default=True,
+        host="100.102.98.14",
+        user="openclaw",
+        port=22,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "data",
+        python_executable="/usr/bin/python3",
+        env_path=None,
+        identity_file=tmp_path / "missing_key",
+        local_runtime_root=tmp_path / "state",
+    )
+
+    monkeypatch.setattr(
+        training_control,
+        "_run_ssh_command",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("missing identity should block before ssh")),
+    )
+
+    payload = training_control._target_preflight(target=target, config_path=tmp_path / "config.yml")  # noqa: SLF001
+
+    assert payload["ok"] is False
+    assert payload["target"] == "workstation-remote"
+    assert "ssh identity file does not exist" in payload["reason"]
+
+
 def test_training_preflight_maps_local_repo_config_to_remote_repo_path(tmp_path: Path, monkeypatch) -> None:
     repo_root = tmp_path / "repo"
     (repo_root / "configs").mkdir(parents=True, exist_ok=True)

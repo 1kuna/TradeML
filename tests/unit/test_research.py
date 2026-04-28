@@ -129,6 +129,27 @@ def test_determine_program_transition_advances_phase_when_unlock_gate_met(tmp_pa
     assert decision["next_spec"]["phase"] == 2
 
 
+def test_initial_research_family_defaults_to_local_target_when_unspecified(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec.pop("target", None)
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+
+    next_spec = research._build_initial_phase_experiment_spec(program_state=state, spec=spec)  # noqa: SLF001
+
+    assert next_spec is not None
+    assert next_spec["target"] == "local"
+
+
+def test_initial_research_state_clears_prior_stop_markers(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+
+    assert state["completed_at"] is None
+    assert state["stop_reason"] is None
+    assert state["stop_requested"] is False
+
+
 def test_determine_program_transition_prefers_phase_unlock_over_phase_budget_stop(tmp_path: Path) -> None:
     spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
     state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
@@ -1140,6 +1161,24 @@ def test_read_research_program_state_marks_dead_pid_stopped(tmp_path: Path, monk
     payload = research.read_research_program_state(local_state=local_state, program_id="perpetual-macmini")
 
     assert payload["status"] == "STOPPED"
+
+
+def test_read_research_program_state_marks_stale_heartbeat_stopped(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    state_path = local_state / "research_programs" / "perpetual-macmini" / "program_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_heartbeat = (datetime.now(tz=research.UTC) - research.timedelta(minutes=20)).isoformat()
+    state_path.write_text(
+        json.dumps({"pid": 8765, "status": "RUNNING", "heartbeat_at": stale_heartbeat, "poll_seconds": 30}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(research, "_is_local_process_running", lambda pid: True)
+
+    payload = research.read_research_program_state(local_state=local_state, program_id="perpetual-macmini")
+
+    assert payload["status"] == "STOPPED"
+    assert payload["stop_reason"] == "research supervisor heartbeat is stale"
+    assert json.loads(state_path.read_text(encoding="utf-8"))["status"] == "STOPPED"
 
 
 def test_supervise_research_program_clears_prior_stop_markers(tmp_path: Path, monkeypatch) -> None:

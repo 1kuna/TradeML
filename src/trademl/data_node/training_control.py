@@ -1022,6 +1022,17 @@ def _target_preflight(*, target: TrainingTarget, config_path: Path) -> dict[str,
         }
     if not target.host or not target.user:
         return {"ok": False, "target": target.name, "kind": target.kind, "reason": "ssh target requires host and user"}
+    if target.identity_file is not None and not target.identity_file.exists():
+        return {
+            "ok": False,
+            "target": target.name,
+            "kind": target.kind,
+            "host": target.host,
+            "repo_root": str(target.repo_root),
+            "data_root": str(target.data_root),
+            "python_executable": target.python_executable,
+            "reason": f"ssh identity file does not exist: {target.identity_file}",
+        }
     command = " && ".join(
         [
             f"test -d {shlex.quote(str(target.repo_root))}",
