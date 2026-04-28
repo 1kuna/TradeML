@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -1168,3 +1169,97 @@ def test_read_experiment_supervisor_state_marks_dead_pid_stopped(tmp_path: Path,
 
     assert payload["status"] == "STOPPED"
     assert payload["active_run_ids"] == []
+    assert payload["stop_reason"] == "local experiment supervisor pid 4321 is not running"
+
+
+def test_read_experiment_supervisor_state_marks_stale_heartbeat_stopped(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    path = local_state / "experiment_supervisors" / "phase1-baselines.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stale_heartbeat = (datetime.now(tz=experiments.UTC) - experiments.timedelta(minutes=20)).isoformat()
+    path.write_text(
+        json.dumps(
+            {
+                "pid": 4321,
+                "status": "RUNNING",
+                "heartbeat_at": stale_heartbeat,
+                "poll_seconds": 30,
+                "active_run_ids": ["run-a"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(experiments, "_is_local_process_running", lambda pid: True)
+
+    payload = experiments.read_experiment_supervisor_state(local_state=local_state, experiment_id="phase1-baselines")
+
+    assert payload["status"] == "STOPPED"
+    assert payload["active_run_ids"] == []
+    assert payload["stop_reason"] == "experiment supervisor heartbeat is stale"
+    assert json.loads(path.read_text(encoding="utf-8"))["status"] == "STOPPED"
+
+
+def test_ensure_supervisor_state_clears_stale_stop_markers_when_restarting(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    path = local_state / "experiment_supervisors" / "phase1-baselines.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"status": "STOPPED", "completed_at": "2026-04-01T00:00:00+00:00", "stop_reason": "old"}),
+        encoding="utf-8",
+    )
+
+    state = experiments._ensure_supervisor_state(  # noqa: SLF001
+        local_state=local_state,
+        experiment_id="phase1-baselines",
+        payload={
+            "experiment_id": "phase1-baselines",
+            "status": "RUNNING",
+            "completed_at": None,
+            "stop_reason": None,
+            "stop_requested": False,
+        },
+    )
+
+    assert state["completed_at"] is None
+    assert state["stop_reason"] is None
+    assert state["stop_requested"] is False
+
+
+def test_stop_experiment_supervisor_stops_active_training_runs(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    experiment_id = "phase1-baselines"
+    supervisor_path = local_state / "experiment_supervisors" / f"{experiment_id}.json"
+    run_root = local_state / "experiments" / experiment_id / "runs"
+    supervisor_path.parent.mkdir(parents=True, exist_ok=True)
+    run_root.mkdir(parents=True)
+    supervisor_path.write_text(
+        json.dumps({"pid": 4321, "status": "RUNNING", "active_run_ids": ["run-a"]}),
+        encoding="utf-8",
+    )
+    (run_root / "run-a.json").write_text(
+        json.dumps({"run_id": "run-a", "phase": 1, "target": "local", "runtime_name": "runtime-a"}),
+        encoding="utf-8",
+    )
+    killed: list[int] = []
+    stopped: list[dict[str, object]] = []
+    monkeypatch.setattr(experiments, "_is_local_process_running", lambda pid: True)
+    monkeypatch.setattr(experiments.os, "kill", lambda pid, signal: killed.append(pid))
+
+    def fake_stop_training_process(**kwargs):  # noqa: ANN001
+        stopped.append(kwargs)
+        return {"stopped": True}
+
+    monkeypatch.setattr(experiments, "stop_training_process", fake_stop_training_process)
+
+    payload = experiments.stop_experiment_supervisor(
+        local_state=local_state,
+        experiment_id=experiment_id,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert killed == [4321]
+    assert payload["stopped_training_runs"] == [{"run_id": "run-a", "stopped": True}]
+    assert stopped[0]["runtime_name"] == "runtime-a"

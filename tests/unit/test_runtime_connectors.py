@@ -15,7 +15,7 @@ def test_resolve_vendor_budgets_keeps_defaults_for_new_connectors() -> None:
 
     assert budgets["alpaca"] == {"rpm": 200, "daily_cap": 20000}
     assert budgets["tiingo"] == {"rpm": 158, "daily_cap": 95000}
-    assert budgets["twelve_data"] == {"rpm": 7, "daily_cap": 760}
+    assert budgets["twelve_data"] == {"rpm": 8, "daily_cap": 800}
 
 
 def test_build_connectors_uses_endpoint_compatible_base_urls() -> None:
@@ -53,3 +53,15 @@ def test_build_connectors_can_share_one_budget_manager() -> None:
 
     assert connectors["alpaca"].budget_manager is shared_budget_manager
     assert connectors["tiingo"].budget_manager is shared_budget_manager
+
+
+def test_build_connectors_omits_sec_edgar_without_explicit_user_agent() -> None:
+    connectors = build_connectors(
+        env_values={
+            "ALPACA_API_KEY": "alpaca-key",
+            "ALPACA_API_SECRET": "alpaca-secret",
+        },
+        vendor_limits=resolve_vendor_budgets({"vendors": {}}),
+    )
+
+    assert "sec_edgar" not in connectors

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -643,6 +644,64 @@ def test_resume_if_data_changed_launches_pending_spec(tmp_path: Path, monkeypatc
     assert captured["next_spec"]["search_epoch"] == 1
 
 
+def test_resume_if_data_changed_keeps_waiting_when_revision_unchanged(tmp_path: Path, monkeypatch) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["status"] = "WAITING_FOR_DATA"
+    state["last_seen_data_revision"] = "2026-03-09"
+    state["pending_next_spec"] = {"experiment_id": "perpetual-macmini-p1-f002", "phase": 1}
+    monkeypatch.setattr(research, "_current_data_revision", lambda **kwargs: "2026-03-09")
+    monkeypatch.setattr(
+        research,
+        "_launch_program_family",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("unchanged data should not launch")),
+    )
+
+    resumed = research._resume_if_data_changed(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    assert resumed is None
+
+
+def test_resume_if_data_changed_retries_infra_blocked_without_data_revision_change(tmp_path: Path, monkeypatch) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["status"] = "INFRA_BLOCKED"
+    state["last_seen_data_revision"] = "2026-03-09"
+    state["pending_next_spec"] = {"experiment_id": "perpetual-macmini-p1-f002", "phase": 1}
+    monkeypatch.setattr(research, "_current_data_revision", lambda **kwargs: "2026-03-09")
+    launched_payload = {"current_experiment_id": "perpetual-macmini-p1-f002", "active_experiment_supervisor": {"pid": 999}}
+
+    monkeypatch.setattr(research, "_launch_program_family", lambda **kwargs: launched_payload)
+
+    resumed = research._resume_if_data_changed(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    assert resumed == launched_payload
+    assert state["search_epoch"] == 0
+    assert state["last_seen_data_revision"] == "2026-03-09"
+    assert state["pending_next_spec"] is None
+    assert state["last_infra_retry_at"]
+
+
 def test_current_data_revision_tracks_qc_and_latest_curated_partition(tmp_path: Path, monkeypatch) -> None:
     data_root = tmp_path / "nas"
     qc_path = data_root / "data" / "qc" / "partition_status.parquet"
@@ -925,6 +984,42 @@ def test_update_frontier_memory_records_lane_coverage_and_best_scores(tmp_path: 
     assert frontier["best_by_phase"]["1"]["best_primary_score"] == 0.031
     assert frontier["family_history"][-1]["search_epoch"] == 0
     assert frontier["family_history"][-1]["architecture_families"] == ["linear_baseline", "tree_challenger"]
+    assert frontier["processed_experiment_ids"] == ["perpetual-macmini-p1-f001"]
+
+
+def test_update_frontier_memory_is_idempotent_for_same_experiment_summary(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["current_phase"] = 1
+    state["current_experiment_id"] = "perpetual-macmini-p1-f001"
+    state["current_family_signature"] = "family-sig-001"
+    summary = {
+        "experiment_id": "perpetual-macmini-p1-f001",
+        "best_candidate": "full",
+        "best_primary_score": 0.031,
+        "best_decision": "NO_GO",
+        "shortlist_count": 0,
+        "run_count": 2,
+        "top_gate_failures": [["rank_ic<0.01", 1]],
+        "runs": [
+            {
+                "experiment_id": "perpetual-macmini-p1-f001",
+                "run_id": "run-a",
+                "model_suite": "full",
+                "matrix_values": {"architecture_family": "tree_challenger"},
+                "report_preview": {"lightgbm_mean_rank_ic": 0.031},
+            }
+        ],
+    }
+
+    first = research._update_frontier_memory(state=state, experiment_summary=summary)  # noqa: SLF001
+    budgets_after_first = deepcopy(state["budgets"])
+    state["frontier"] = first
+    second = research._update_frontier_memory(state=state, experiment_summary=summary)  # noqa: SLF001
+
+    assert second["family_history"] == first["family_history"]
+    assert second["lane_stats"] == first["lane_stats"]
+    assert state["budgets"] == budgets_after_first
 
 
 def test_update_frontier_memory_preserves_family_counter_beyond_history_cap(tmp_path: Path) -> None:
@@ -1346,6 +1441,45 @@ def test_sweep_stale_experiment_runs_reconciles_dead_remote_runtime(tmp_path: Pa
     assert "no longer running" in stored["last_error"]
     summary = json.loads((local_state / "experiments" / "exp-a" / "summary.json").read_text(encoding="utf-8"))
     assert summary["counts"]["FAILED"] == 1
+
+
+def test_research_health_uses_post_sweep_experiment_summary(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    program_path = _program_spec(tmp_path)
+    state = research._initial_program_state(  # noqa: SLF001
+        spec=research._load_research_program_spec(program_path),  # noqa: SLF001
+        program_path=program_path,
+        poll_seconds=30,
+    )
+    state["current_experiment_id"] = "exp-a"
+    research._write_program_state(local_state=local_state, program_id="perpetual-macmini", payload=state)  # noqa: SLF001
+    summary_path = local_state / "experiments" / "exp-a" / "summary.json"
+    summary_path.parent.mkdir(parents=True)
+    summary_path.write_text(json.dumps({"experiment_id": "exp-a", "counts": {"RUNNING": 1}}), encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_sweep(**kwargs):  # noqa: ANN001
+        summary_path.write_text(json.dumps({"experiment_id": "exp-a", "counts": {"COMPLETED": 1}}), encoding="utf-8")
+        return {"checked": 1, "reconciled": 1, "refreshed": [{"experiment_id": "exp-a"}], "errors": []}
+
+    def fake_drift(**kwargs):  # noqa: ANN001
+        captured["summary"] = kwargs["latest_summary"]
+        return []
+
+    monkeypatch.setattr(research, "sweep_stale_experiment_runs", fake_sweep)
+    monkeypatch.setattr(research, "evaluate_research_drift", fake_drift)
+
+    payload = research.research_health(
+        program_id="perpetual-macmini",
+        local_state=local_state,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert payload["stale_run_sweep"]["reconciled"] == 1
+    assert captured["summary"] == {"experiment_id": "exp-a", "counts": {"COMPLETED": 1}}
 
 
 def test_update_research_incumbent_promotes_only_fully_gated_candidate(tmp_path: Path) -> None:

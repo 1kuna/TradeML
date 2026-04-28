@@ -94,7 +94,6 @@ def main() -> int:
         env_values=os.environ,
         vendor_limits=vendor_limits,
         budget_manager_factory=lambda _vendor: budgets,
-        sec_edgar_user_agent="TradeML/0.1 test@example.com",
     )
     connector = build_connector(
         vendor="alpaca",

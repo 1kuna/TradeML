@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 import contextlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,7 @@ from trademl.data_node.training_control import (
     resolve_training_target,
     resolve_training_targets,
     shared_training_runtime_path,
+    stop_training_process,
     training_status_snapshot,
 )
 
@@ -632,6 +633,7 @@ def supervise_experiment(
             "status": "RUNNING",
             "started_at": datetime.now(tz=UTC).isoformat(),
             "heartbeat_at": datetime.now(tz=UTC).isoformat(),
+            "completed_at": None,
             "pid": None,
             "poll_seconds": resolved_poll,
             "last_error": None,
@@ -640,6 +642,7 @@ def supervise_experiment(
             "queue_counts": {},
             "paused": False,
             "stop_requested": False,
+            "stop_reason": None,
         },
     )
     state["pid"] = state.get("pid") or None
@@ -760,9 +763,18 @@ def read_experiment_supervisor_state(*, local_state: Path, experiment_id: str) -
     payload = json.loads(path.read_text(encoding="utf-8"))
     pid = payload.get("pid")
     status = str(payload.get("status") or "").upper()
-    if isinstance(pid, int) and status in {"RUNNING", "PAUSED", "STARTING", "STOPPING"} and not _is_local_process_running(pid):
+    active_statuses = {"RUNNING", "PAUSED", "STARTING", "STOPPING"}
+    stopped_reason: str | None = None
+    if isinstance(pid, int) and status in active_statuses and not _is_local_process_running(pid):
+        stopped_reason = f"local experiment supervisor pid {pid} is not running"
+    elif status in active_statuses and _supervisor_heartbeat_stale(payload):
+        stopped_reason = "experiment supervisor heartbeat is stale"
+    if stopped_reason:
         payload["status"] = "STOPPED"
         payload["active_run_ids"] = []
+        payload["stop_reason"] = stopped_reason
+        payload["completed_at"] = payload.get("completed_at") or datetime.now(tz=UTC).isoformat()
+        _write_supervisor_state(local_state=local_state, experiment_id=experiment_id, payload=payload)
     return payload
 
 
@@ -777,7 +789,15 @@ def pause_experiment_supervisor(*, local_state: Path, experiment_id: str) -> dic
     return state
 
 
-def stop_experiment_supervisor(*, local_state: Path, experiment_id: str) -> dict[str, Any]:
+def stop_experiment_supervisor(
+    *,
+    local_state: Path,
+    experiment_id: str,
+    repo_root: Path | None = None,
+    data_root: Path | None = None,
+    targets_config_path: Path | None = None,
+    python_executable: str = sys.executable,
+) -> dict[str, Any]:
     """Request supervisor shutdown and terminate the local process when present."""
     state = read_experiment_supervisor_state(local_state=local_state, experiment_id=experiment_id)
     if not state:
@@ -789,6 +809,16 @@ def stop_experiment_supervisor(*, local_state: Path, experiment_id: str) -> dict
     if isinstance(pid, int):
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
+    state["stopped_training_runs"] = _stop_active_training_runs(
+        local_state=local_state,
+        experiment_id=experiment_id,
+        run_ids=[str(run_id) for run_id in list(state.get("active_run_ids") or [])],
+        repo_root=repo_root,
+        data_root=data_root,
+        targets_config_path=targets_config_path,
+        python_executable=python_executable,
+    )
+    _write_supervisor_state(local_state=local_state, experiment_id=experiment_id, payload=state)
     return state
 
 
@@ -1961,9 +1991,11 @@ def _spawn_supervisor_process(
         "status": "STARTING",
         "started_at": datetime.now(tz=UTC).isoformat(),
         "heartbeat_at": datetime.now(tz=UTC).isoformat(),
+        "completed_at": None,
         "poll_seconds": poll_seconds,
         "paused": False,
         "stop_requested": False,
+        "stop_reason": None,
         "active_run_ids": [],
         "queue_counts": {},
         "log_path": str(log_path),
@@ -2010,7 +2042,49 @@ def _spawn_supervisor_process(
 
 def _ensure_supervisor_state(*, local_state: Path, experiment_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     state = read_experiment_supervisor_state(local_state=local_state, experiment_id=experiment_id)
-    return {**payload, **state}
+    merged = {**payload, **state}
+    if str(payload.get("status") or "").upper() in {"RUNNING", "STARTING"}:
+        for key in ("completed_at", "stop_reason", "stop_requested"):
+            if key in payload:
+                merged[key] = payload[key]
+    return merged
+
+
+def _stop_active_training_runs(
+    *,
+    local_state: Path,
+    experiment_id: str,
+    run_ids: list[str],
+    repo_root: Path | None,
+    data_root: Path | None,
+    targets_config_path: Path | None,
+    python_executable: str,
+) -> list[dict[str, Any]]:
+    """Stop active training processes owned by an experiment supervisor."""
+    if not run_ids or repo_root is None or data_root is None:
+        return []
+    stopped: list[dict[str, Any]] = []
+    for run_id in run_ids:
+        manifest_path = local_state / "experiments" / experiment_id / "runs" / f"{run_id}.json"
+        if not manifest_path.exists():
+            stopped.append({"run_id": run_id, "stopped": False, "reason": "missing run manifest"})
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            result = stop_training_process(
+                repo_root=repo_root,
+                data_root=data_root,
+                local_state=local_state,
+                phase=int(manifest.get("phase") or 1),
+                target=str(manifest.get("target") or "local"),
+                targets_config_path=targets_config_path,
+                python_executable=python_executable,
+                runtime_name=str(manifest.get("runtime_name") or f"{experiment_id}-{run_id}"),
+            )
+            stopped.append({"run_id": run_id, **result})
+        except Exception as exc:  # noqa: BLE001
+            stopped.append({"run_id": run_id, "stopped": False, "reason": str(exc)})
+    return stopped
 
 
 def _supervisor_state_path(*, local_state: Path, experiment_id: str) -> Path:
@@ -2024,6 +2098,22 @@ def _supervisor_log_path(*, local_state: Path, experiment_id: str) -> Path:
 def _write_supervisor_state(*, local_state: Path, experiment_id: str, payload: dict[str, Any]) -> None:
     path = _supervisor_state_path(local_state=local_state, experiment_id=experiment_id)
     _atomic_write_json(path, payload)
+
+
+def _supervisor_heartbeat_stale(payload: dict[str, Any]) -> bool:
+    """Return whether a supervisor heartbeat is too old to trust as running."""
+    heartbeat = payload.get("heartbeat_at")
+    if not heartbeat:
+        return False
+    try:
+        heartbeat_at = datetime.fromisoformat(str(heartbeat))
+    except ValueError:
+        return True
+    if heartbeat_at.tzinfo is None:
+        heartbeat_at = heartbeat_at.replace(tzinfo=UTC)
+    poll_seconds = int(payload.get("poll_seconds") or 30)
+    max_age = timedelta(seconds=max(300, poll_seconds * 6))
+    return datetime.now(tz=UTC) - heartbeat_at > max_age
 
 
 def _run_ready_for_retry(*, manifest: dict[str, Any], supervision: dict[str, Any]) -> bool:
@@ -2105,10 +2195,6 @@ def _data_expansion_recommendations(*, predictive_survivors: list[dict[str, Any]
 
 
 def _is_local_process_running(pid: int) -> bool:
-    try:
-        Path(f"/proc/{pid}")
-    except Exception:
-        pass
     try:
         os.kill(pid, 0)
     except OSError:

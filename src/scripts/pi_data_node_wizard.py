@@ -105,6 +105,7 @@ def main() -> int:
     parser.add_argument("--fred-api-key", default="")
     parser.add_argument("--fmp-api-key", default="")
     parser.add_argument("--massive-api-key", default="")
+    parser.add_argument("--sec-edgar-user-agent", default="")
     parser.add_argument("--cluster-passphrase", default="")
     parser.add_argument("--stage-symbol", action="append", default=[])
     parser.add_argument("--start-node", action="store_true")
@@ -128,8 +129,10 @@ def main() -> int:
         "FRED_API_KEY": args.fred_api_key or _prompt("FRED API key", os.getenv("FRED_API_KEY", "")),
         "FMP_API_KEY": args.fmp_api_key or _prompt("FMP API key", os.getenv("FMP_API_KEY", "")),
         "MASSIVE_API_KEY": args.massive_api_key or _prompt("Massive API key", os.getenv("MASSIVE_API_KEY", "")),
-        "SEC_EDGAR_USER_AGENT": os.getenv("SEC_EDGAR_USER_AGENT", "TradeML/0.1 contact@example.com"),
     }
+    sec_edgar_user_agent = args.sec_edgar_user_agent or os.getenv("SEC_EDGAR_USER_AGENT", "")
+    if sec_edgar_user_agent:
+        env_values["SEC_EDGAR_USER_AGENT"] = sec_edgar_user_agent
     nas_write_ok = _test_nas_mount(Path(env_values["NAS_MOUNT"]))
     env_path = Path(args.env_file).expanduser() if args.env_file else root / ".env"
     write_env_file(env_path, env_values, sort_keys=False)

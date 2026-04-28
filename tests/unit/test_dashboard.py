@@ -89,6 +89,20 @@ def test_persist_node_settings_updates_config_env_stage_and_fstab(tmp_path: Path
     assert "//192.168.1.20/trademl" in fstab_path.read_text(encoding="utf-8")
 
 
+def test_mount_writable_probe_does_not_create_missing_mount_path(tmp_path: Path) -> None:
+    missing_mount = tmp_path / "missing-nas"
+
+    assert dashboard_controller._check_mount_writable(missing_mount) is False
+    assert not missing_mount.exists()
+
+
+def test_mount_writable_probe_accepts_existing_writable_directory(tmp_path: Path) -> None:
+    mount_path = tmp_path / "nas"
+    mount_path.mkdir()
+
+    assert dashboard_controller._check_mount_writable(mount_path) is True
+
+
 def test_resolve_node_settings_autodetects_populated_worker_workspace(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     workspace = home / "trademl-node"

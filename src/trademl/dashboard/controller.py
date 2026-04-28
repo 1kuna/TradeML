@@ -1103,7 +1103,14 @@ def stop_experiments(
     experiment_id: str,
 ) -> dict[str, Any]:
     """Stop an experiment supervisor."""
-    return stop_experiment_supervisor(local_state=settings.local_state, experiment_id=experiment_id)
+    return stop_experiment_supervisor(
+        local_state=settings.local_state,
+        experiment_id=experiment_id,
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+    )
 
 
 def evaluate_experiments(
@@ -1207,7 +1214,14 @@ def stop_research(
     program_id: str,
 ) -> dict[str, Any]:
     """Stop a research program."""
-    return stop_research_program(local_state=settings.local_state, program_id=program_id)
+    return stop_research_program(
+        local_state=settings.local_state,
+        program_id=program_id,
+        repo_root=settings.repo_root,
+        data_root=settings.nas_mount,
+        targets_config_path=settings.config_path,
+        python_executable=sys.executable,
+    )
 
 
 def research_review_packet(
@@ -2715,7 +2729,6 @@ def _service_from_settings(settings: NodeSettings) -> DataNodeService:
         env_values=env_values,
         vendor_limits=vendor_limits,
         budget_manager_factory=lambda _vendor: budgets,
-        sec_edgar_user_agent=env_values.get("SEC_EDGAR_USER_AGENT", "TradeML/0.1 test@example.com"),
     )
     stage = _read_yaml(settings.stage_path)
     db = DataNodeDB(settings.db_path)
@@ -3083,8 +3096,9 @@ def _check_host_reachable(host: str, *, port: int = 445, timeout_seconds: float 
 
 
 def _check_mount_writable(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
     try:
-        path.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=path, delete=True):
             return True
     except OSError:

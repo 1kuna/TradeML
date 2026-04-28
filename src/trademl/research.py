@@ -10,6 +10,7 @@ import re
 import signal
 import smtplib
 import subprocess
+import sys
 import time
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -779,7 +780,6 @@ def research_health(
     state = read_research_program_state(local_state=local_state, program_id=program_id)
     spec = _load_research_program_spec(Path(str(state.get("spec_path")))) if state.get("spec_path") else {}
     current_experiment_id = str(state.get("current_experiment_id") or "")
-    latest_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=current_experiment_id) if current_experiment_id else {}
     incumbent = read_research_incumbent(local_state=local_state, program_id=program_id)
     sweep = sweep_stale_experiment_runs(
         local_state=local_state,
@@ -788,6 +788,7 @@ def research_health(
         targets_config_path=targets_config_path,
         python_executable=python_executable,
     )
+    latest_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=current_experiment_id) if current_experiment_id else {}
     alerts = evaluate_research_drift(
         program_id=program_id,
         state=state,
@@ -833,7 +834,15 @@ def pause_research_program(*, local_state: Path, program_id: str) -> dict[str, A
     return state
 
 
-def stop_research_program(*, local_state: Path, program_id: str) -> dict[str, Any]:
+def stop_research_program(
+    *,
+    local_state: Path,
+    program_id: str,
+    repo_root: Path | None = None,
+    data_root: Path | None = None,
+    targets_config_path: Path | None = None,
+    python_executable: str = sys.executable,
+) -> dict[str, Any]:
     """Stop one perpetual research program."""
     state = read_research_program_state(local_state=local_state, program_id=program_id)
     if not state:
@@ -848,7 +857,14 @@ def stop_research_program(*, local_state: Path, program_id: str) -> dict[str, An
     current_experiment_id = state.get("current_experiment_id")
     if current_experiment_id:
         with contextlib.suppress(Exception):
-            stop_experiment_supervisor(local_state=local_state, experiment_id=str(current_experiment_id))
+            stop_experiment_supervisor(
+                local_state=local_state,
+                experiment_id=str(current_experiment_id),
+                repo_root=repo_root,
+                data_root=data_root,
+                targets_config_path=targets_config_path,
+                python_executable=python_executable,
+            )
     return state
 
 
@@ -1296,6 +1312,7 @@ def _empty_frontier() -> dict[str, Any]:
         "best_by_data_family": {},
         "recent_rejection_reasons": [],
         "family_history": [],
+        "processed_experiment_ids": [],
     }
 
 
@@ -1991,6 +2008,18 @@ def _update_frontier_memory(*, state: dict[str, Any], experiment_summary: dict[s
     if signature not in tried:
         tried.add(signature)
         frontier["tried_family_signatures"] = sorted(tried)
+    processed_ids = set(frontier.get("processed_experiment_ids") or [])
+    family_history = list(frontier.get("family_history") or [])
+    already_processed = experiment_id in processed_ids or any(
+        isinstance(item, dict)
+        and (item.get("experiment_id") == experiment_id or item.get("family_signature") == signature)
+        for item in family_history
+    )
+    if already_processed:
+        if experiment_id:
+            processed_ids.add(experiment_id)
+            frontier["processed_experiment_ids"] = sorted(processed_ids)[-200:]
+        return frontier
     current_phase = _current_ssot_phase(state=state, spec={"phase_order": [state.get("current_ssot_phase") or state.get("current_phase") or 1]})
     best_score = experiment_summary.get("best_primary_score")
     if best_score is not None:
@@ -2025,7 +2054,6 @@ def _update_frontier_memory(*, state: dict[str, Any], experiment_summary: dict[s
     top_failures = list(experiment_summary.get("top_gate_failures") or [])
     if top_failures:
         frontier["recent_rejection_reasons"] = [item[0] for item in top_failures[:5]]
-    family_history = list(frontier.get("family_history") or [])
     family_history.append(
         {
             "experiment_id": experiment_id,
@@ -2062,6 +2090,8 @@ def _update_frontier_memory(*, state: dict[str, Any], experiment_summary: dict[s
         }
     )
     frontier["family_history"] = family_history[-50:]
+    processed_ids.add(experiment_id)
+    frontier["processed_experiment_ids"] = sorted(processed_ids)[-200:]
     budgets = state.setdefault("budgets", {})
     budgets["families_started"] = max(
         int(budgets.get("families_started", 0) or 0),
@@ -2356,6 +2386,29 @@ def _resume_if_data_changed(
     python_executable: str,
     poll_seconds: int,
 ) -> dict[str, Any] | None:
+    if str(state.get("status") or "").upper() == "INFRA_BLOCKED":
+        if not _infra_retry_due(state=state, poll_seconds=poll_seconds):
+            return None
+        next_spec = deepcopy(state.get("pending_next_spec") or {})
+        if not next_spec:
+            return None
+        state["last_infra_retry_at"] = datetime.now(tz=UTC).isoformat()
+        launched = _launch_program_family(
+            program_id=str(spec["program_id"]),
+            program_state=state,
+            next_spec=next_spec,
+            repo_root=repo_root,
+            data_root=data_root,
+            local_state=local_state,
+            env_path=env_path,
+            targets_config_path=targets_config_path,
+            python_executable=python_executable,
+            poll_seconds=poll_seconds,
+        )
+        if launched.get("status") != "INFRA_BLOCKED":
+            state["pending_next_spec"] = None
+        return launched
+
     current_revision = _current_data_revision(
         spec=spec,
         state=state,
@@ -2390,6 +2443,21 @@ def _resume_if_data_changed(
     )
     state["pending_next_spec"] = None
     return launched
+
+
+def _infra_retry_due(*, state: dict[str, Any], poll_seconds: int) -> bool:
+    """Return whether an infra-blocked pending family should retry preflight."""
+    last_retry = state.get("last_infra_retry_at")
+    if not last_retry:
+        return True
+    try:
+        last_retry_at = datetime.fromisoformat(str(last_retry))
+    except ValueError:
+        return True
+    if last_retry_at.tzinfo is None:
+        last_retry_at = last_retry_at.replace(tzinfo=UTC)
+    retry_seconds = max(300, int(poll_seconds) * 5)
+    return datetime.now(tz=UTC) - last_retry_at >= timedelta(seconds=retry_seconds)
 
 
 def _recover_stalled_active_experiment(

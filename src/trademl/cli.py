@@ -478,7 +478,14 @@ def _dispatch_experiments(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.experiments_command == "stop":
-        payload = stop_experiment_supervisor(local_state=local_state, experiment_id=args.experiment)
+        payload = stop_experiment_supervisor(
+            local_state=local_state,
+            experiment_id=args.experiment,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.experiments_command == "evaluate":
@@ -583,7 +590,14 @@ def _dispatch_research(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.research_command == "stop":
-        payload = stop_research_program(local_state=local_state, program_id=args.program_id)
+        payload = stop_research_program(
+            local_state=local_state,
+            program_id=args.program_id,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.research_command == "frontier":
