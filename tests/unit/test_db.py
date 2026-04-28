@@ -383,6 +383,57 @@ def test_summarize_lane_throughput_reports_rows_per_minute(
     assert throughput[0]["rows_per_minute"] == pytest.approx(20.0)
 
 
+def test_summarize_lane_throughput_includes_active_budget_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    now = datetime(2026, 4, 28, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(db_module, "utc_now", lambda: now)
+    database.upsert_planner_task(
+        task_key="news::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="company_news",
+        tier="B",
+        priority=220,
+        start_date="2026-04-01",
+        end_date="2026-04-28",
+        symbols=["AAPL"],
+        eligible_vendors=["finnhub"],
+        output_name="ticker_news",
+        payload={"scope_kind": "symbol_range"},
+    )
+    assert database.lease_vendor_attempt(
+        task_key="news::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        vendor="finnhub",
+        lease_owner="worker-a",
+    )
+    database.mark_vendor_attempt_failed(
+        task_key="news::AAPL",
+        vendor="finnhub",
+        error="budget exhausted for vendor=finnhub",
+        backoff_minutes=30,
+    )
+    database.upsert_vendor_lane_health(
+        vendor="finnhub",
+        dataset="company_news",
+        state="BUDGET_BLOCKED",
+        cooldown_until=(now + timedelta(minutes=30)).isoformat(),
+        recent_local_budget_blocks=2,
+    )
+
+    throughput = database.summarize_lane_throughput(minutes=15)
+
+    assert throughput[0]["vendor"] == "finnhub"
+    assert throughput[0]["dataset"] == "company_news"
+    assert throughput[0]["lane_state"] == "BUDGET_BLOCKED"
+    assert throughput[0]["cooldown_until"] == "2026-04-28T12:30:00+00:00"
+    assert throughput[0]["blocked_reason"] == "budget_exhausted"
+    assert throughput[0]["recent_local_budget_blocks"] == 2
+
+
 def test_mark_completed_planner_progress_success_clears_stale_active_tasks(
     tmp_path: Path,
 ) -> None:

@@ -136,6 +136,19 @@ class _PartialReferenceConnector:
         )
 
 
+class _BudgetBlockedAuxiliaryConnector:
+    vendor_name = "finnhub"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        self.calls.append((dataset, tuple(symbols)))
+        raise TemporaryConnectorError("budget exhausted for vendor=finnhub")
+
+
 class _SecCompanyfactsConnector:
     vendor_name = "sec_edgar"
 
@@ -1409,6 +1422,58 @@ def test_drain_auxiliary_lane_prioritizes_minute_when_pressure_is_low(
     service._drain_auxiliary_lane("alpaca")
 
     assert processed == ["minute::AAPL"]
+
+
+def test_budget_blocked_auxiliary_lane_defers_peer_tasks_without_retry_storm(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    connector = _BudgetBlockedAuxiliaryConnector()
+    service = DataNodeService(
+        db=db,
+        connectors={"finnhub": connector},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    for symbol in ("AAPL", "MSFT"):
+        db.upsert_planner_task(
+            task_key=f"news::{symbol}",
+            task_family="supplemental_research",
+            planner_group="supplemental_research_backlog",
+            dataset="company_news",
+            tier="B",
+            priority=220,
+            start_date="2026-04-01",
+            end_date="2026-04-28",
+            symbols=[symbol],
+            eligible_vendors=["finnhub"],
+            output_name="ticker_news",
+            payload={"scope_kind": "symbol_range"},
+        )
+
+    service._drain_auxiliary_lane("finnhub")
+
+    assert connector.calls == [("company_news", ("AAPL",))]
+    lane = db.get_vendor_lane_health(vendor="finnhub", dataset="company_news")
+    assert lane is not None
+    assert lane.state == "BUDGET_BLOCKED"
+    assert lane.cooldown_until is not None
+    assert lane.recent_local_budget_blocks == 1
+    first = db.get_planner_task("news::AAPL")
+    second = db.get_planner_task("news::MSFT")
+    assert first is not None
+    assert second is not None
+    assert first.status == "PARTIAL"
+    assert second.status == "PARTIAL"
+    assert first.next_eligible_at is not None
+    assert second.next_eligible_at == lane.cooldown_until
+    assert "budget exhausted" in str(second.last_error)
 
 
 def test_run_cluster_forever_backfill_renews_runtime_heartbeat(tmp_path: Path) -> None:

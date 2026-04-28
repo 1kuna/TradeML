@@ -9,7 +9,7 @@ import os
 import shutil
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import sleep
 from typing import Any, Callable
@@ -562,8 +562,13 @@ class AuxiliaryRuntime:
         if budget_manager is not None and not budget_manager.can_spend(
             vendor, task_kind="OTHER", units=request_units
         ):
+            self._mark_budget_blocked_lane(vendor=vendor, dataset=str(job["dataset"]))
             return AuxiliaryExecutionResult(
-                outputs=[], failures=[], deferred=1, rows_returned=0, state={}
+                outputs=[],
+                failures=[],
+                deferred=1,
+                rows_returned=0,
+                state={"blocked_reason": "budget_exhausted"},
             )
         effective_task_key = task_key or self._aux_task_key(job)
         leased = self.db.lease_vendor_attempt(
@@ -613,6 +618,9 @@ class AuxiliaryRuntime:
         except ConnectorError as exc:
             message = str(exc)
             if "budget exhausted" in message:
+                self._mark_budget_blocked_lane(
+                    vendor=vendor, dataset=str(job["dataset"]), reason=message
+                )
                 self.db.mark_vendor_attempt_failed(
                     task_key=effective_task_key,
                     vendor=vendor,
@@ -620,7 +628,11 @@ class AuxiliaryRuntime:
                     backoff_minutes=30,
                 )
                 return AuxiliaryExecutionResult(
-                    outputs=[], failures=[], deferred=1, rows_returned=0, state={}
+                    outputs=[],
+                    failures=[],
+                    deferred=1,
+                    rows_returned=0,
+                    state={"blocked_reason": "budget_exhausted"},
                 )
             self.db.mark_vendor_attempt_failed(
                 task_key=effective_task_key,
@@ -663,6 +675,45 @@ class AuxiliaryRuntime:
         if payload_cost is not None:
             return max(1, int(payload_cost))
         return max(1, int(job.get("request_units", 1) or 1))
+
+    def _mark_budget_blocked_lane(
+        self,
+        *,
+        vendor: str,
+        dataset: str,
+        reason: str = "budget exhausted",
+        cooldown_minutes: int = 30,
+    ) -> str:
+        """Cool down one auxiliary vendor/dataset lane after budget exhaustion."""
+        cooldown_until = (
+            datetime.now(tz=UTC) + timedelta(minutes=cooldown_minutes)
+        ).isoformat()
+        existing = self.db.get_vendor_lane_health(vendor=vendor, dataset=dataset)
+        self.db.upsert_vendor_lane_health(
+            vendor=vendor,
+            dataset=dataset,
+            state="BUDGET_BLOCKED",
+            cooldown_until=cooldown_until,
+            recent_local_budget_blocks=(
+                1
+                if existing is None
+                else int(existing.recent_local_budget_blocks or 0) + 1
+            ),
+        )
+        self.db.defer_planner_tasks_for_vendor_dataset(
+            vendor=vendor,
+            dataset=dataset,
+            next_eligible_at=cooldown_until,
+            error=f"{vendor}:{dataset}: {reason}",
+            task_families=(
+                "security_master",
+                "corp_actions",
+                "events_filings",
+                "macro",
+                "supplemental_research",
+            ),
+        )
+        return cooldown_until
 
     def _storage_watermark_blocks_low_priority(self, job: dict[str, object]) -> bool:
         """Return whether raw archive fillers should pause for disk pressure."""

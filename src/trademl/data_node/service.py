@@ -1199,6 +1199,19 @@ class DataNodeService:
                 )
             if task is None:
                 break
+            cooldown = self.db.get_active_vendor_lane_cooldown(
+                vendor=vendor, dataset=task.dataset
+            )
+            if cooldown is not None:
+                self.db.mark_planner_task_partial(
+                    task.task_key,
+                    error=(
+                        f"{vendor}:{task.dataset}: lane cooldown until "
+                        f"{cooldown.cooldown_until}"
+                    ),
+                    backoff_minutes=30,
+                )
+                continue
             self._auxiliary_runtime._process_auxiliary_planner_task(task, vendor)
         return []
 

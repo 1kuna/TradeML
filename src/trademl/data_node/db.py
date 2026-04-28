@@ -1036,6 +1036,18 @@ class DataNodeDB:
             ).fetchone()
         return VendorLaneHealth(**dict(row)) if row is not None else None
 
+    def get_active_vendor_lane_cooldown(
+        self, *, vendor: str, dataset: str, now: datetime | None = None
+    ) -> VendorLaneHealth | None:
+        """Return active cooldown state for a vendor/dataset lane."""
+        lane = self.get_vendor_lane_health(vendor=vendor, dataset=dataset)
+        if lane is None or not lane.cooldown_until:
+            return None
+        reference_time = (now or utc_now()).isoformat()
+        if lane.cooldown_until <= reference_time:
+            return None
+        return lane
+
     def vendor_lane_health_map(self, *, dataset: str) -> dict[str, VendorLaneHealth]:
         """Return lane-health rows keyed by vendor."""
         with self._connect() as connection:
@@ -1044,6 +1056,49 @@ class DataNodeDB:
                 (dataset,),
             ).fetchall()
         return {str(row["vendor"]): VendorLaneHealth(**dict(row)) for row in rows}
+
+    def defer_planner_tasks_for_vendor_dataset(
+        self,
+        *,
+        vendor: str,
+        dataset: str,
+        next_eligible_at: str,
+        error: str,
+        task_families: tuple[str, ...] | None = None,
+    ) -> int:
+        """Defer eligible planner tasks for one budget-blocked vendor/dataset lane."""
+        clauses = [
+            "dataset = ?",
+            "eligible_vendors_json LIKE ?",
+            "status IN ('PENDING', 'PARTIAL', 'FAILED')",
+        ]
+        where_params: list[object] = [dataset, f'%"{vendor}"%']
+        if task_families:
+            placeholders = ",".join("?" for _ in task_families)
+            clauses.append(f"task_family IN ({placeholders})")
+            where_params.extend(task_families)
+        params: list[object] = [
+            next_eligible_at,
+            error,
+            utc_now().isoformat(),
+            *where_params,
+        ]
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE planner_tasks
+                SET status = 'PARTIAL',
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    lease_expires_at = NULL,
+                    next_eligible_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE {" AND ".join(clauses)}
+                """,
+                params,
+            )
+        return int(cursor.rowcount)
 
     def fetch_partition_status(self) -> list[sqlite3.Row]:
         """Return the mirrored partition ledger for testing and sync."""
@@ -1451,12 +1506,28 @@ class DataNodeDB:
             params.append(max(1, int(limit)))
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
-        return [
-            {
+            health_rows = connection.execute(
+                """
+                SELECT *
+                FROM vendor_lane_health
+                WHERE cooldown_until IS NOT NULL
+                  AND cooldown_until > ?
+                """,
+                (utc_now().isoformat(),),
+            ).fetchall()
+        health = {
+            (str(row["vendor"]), str(row["dataset"])): VendorLaneHealth(**dict(row))
+            for row in health_rows
+        }
+        summaries: list[dict[str, object]] = []
+        for row in rows:
+            dataset = str(row["dataset"] or "")
+            lane = health.get((str(row["vendor"]), dataset))
+            item = {
                 "vendor": str(row["vendor"]),
                 "task_family": str(row["task_family"]),
                 "planner_group": str(row["planner_group"]),
-                "dataset": str(row["dataset"] or ""),
+                "dataset": dataset,
                 "attempts": int(row["attempts"] or 0),
                 "successes": int(row["successes"] or 0),
                 "failures": int(row["failures"] or 0),
@@ -1466,8 +1537,20 @@ class DataNodeDB:
                 / float(window_minutes),
                 "latest_update": row["latest_update"],
             }
-            for row in rows
-        ]
+            if lane is not None:
+                item.update(
+                    {
+                        "lane_state": lane.state,
+                        "cooldown_until": lane.cooldown_until,
+                        "blocked_reason": "budget_exhausted"
+                        if lane.state == "BUDGET_BLOCKED"
+                        else lane.state.lower(),
+                        "recent_local_budget_blocks": lane.recent_local_budget_blocks,
+                        "recent_remote_429s": lane.recent_remote_429s,
+                    }
+                )
+            summaries.append(item)
+        return summaries
 
     def mark_completed_planner_progress_success(
         self, *, task_families: tuple[str, ...]
