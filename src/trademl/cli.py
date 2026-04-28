@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 from trademl.dashboard.controller import (
     bootstrap_canonical_ledger,
     collect_dashboard_snapshot,
@@ -54,6 +56,7 @@ from trademl.experiments import (
     stop_experiment_supervisor,
     supervise_experiment,
 )
+from trademl.fleet.launchd import install_research_launch_agent
 from trademl.research import (
     list_research_alerts,
     latest_research_program_summary,
@@ -198,6 +201,13 @@ def main(argv: list[str] | None = None) -> int:
     research_start.add_argument("--program", required=True)
     research_start.add_argument("--poll-seconds", type=int, default=None)
     research_start.add_argument("--detach", action="store_true")
+    research_launchd = research_subparsers.add_parser("install-launchd", help="Install a macOS LaunchAgent for a research program.")
+    research_launchd.add_argument("--program", required=True)
+    research_launchd.add_argument("--poll-seconds", type=int, default=None)
+    research_launchd.add_argument("--label", default=None)
+    research_launchd.add_argument("--plist-path", default=None)
+    research_launchd.add_argument("--python-executable", default=None)
+    research_launchd.add_argument("--load", action="store_true")
     research_status = research_subparsers.add_parser("status", help="Show research program state.")
     research_status.add_argument("--program-id", required=True)
     research_pause = research_subparsers.add_parser("pause", help="Pause a research program.")
@@ -566,6 +576,24 @@ def _dispatch_research(args: argparse.Namespace) -> int:
             poll_seconds=args.poll_seconds,
             detach=bool(args.detach),
             **common,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "install-launchd":
+        program_path = Path(args.program).expanduser()
+        spec = yaml.safe_load(program_path.read_text(encoding="utf-8")) or {}
+        program_id = str(spec.get("program_id") or program_path.stem)
+        payload = install_research_launch_agent(
+            label=str(args.label or f"com.trademl.research.{program_id}"),
+            python_executable=str(args.python_executable or sys.executable),
+            repo_root=repo_root,
+            program_path=program_path,
+            data_root=data_root,
+            local_state=local_state,
+            env_path=env_path,
+            poll_seconds=int(args.poll_seconds or spec.get("poll_seconds") or 60),
+            plist_path=Path(args.plist_path).expanduser() if args.plist_path else None,
+            load=bool(args.load),
         )
         print(json.dumps(payload, indent=2, default=str))
         return 0

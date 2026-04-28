@@ -358,6 +358,7 @@ def test_research_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli, "latest_research_program_summary", lambda local_state: {"frontier": {"latest": True}})
     monkeypatch.setattr(cli, "write_research_review_packet", lambda program_id, **kwargs: {"action": "review", "program_id": program_id})
     monkeypatch.setattr(cli, "steer_research_program", lambda local_state, program_id, **kwargs: {"action": "steer", "program_id": program_id, "steering": kwargs})
+    monkeypatch.setattr(cli, "install_research_launch_agent", lambda **kwargs: {"action": "install-launchd", "label": kwargs["label"], "load": kwargs["load"]})
 
     assert cli.main(["research", "start", "--program", str(program_path), "--detach"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "start"
@@ -369,6 +370,11 @@ def test_research_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     assert json.loads(capsys.readouterr().out)["action"] == "resume"
     assert cli.main(["research", "stop", "--program-id", "perpetual"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "stop"
+    assert cli.main(["research", "install-launchd", "--program", str(program_path), "--load"]) == 0
+    launchd_payload = json.loads(capsys.readouterr().out)
+    assert launchd_payload["action"] == "install-launchd"
+    assert launchd_payload["label"] == "com.trademl.research.perpetual"
+    assert launchd_payload["load"] is True
     assert cli.main(["research", "frontier", "--program-id", "perpetual"]) == 0
     assert json.loads(capsys.readouterr().out)["x"] == 1
     assert cli.main(["research", "review-packet", "--program-id", "perpetual"]) == 0

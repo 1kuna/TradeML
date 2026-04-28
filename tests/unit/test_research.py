@@ -1143,6 +1143,41 @@ def test_spawn_program_supervisor_process_writes_bootstrap_state_before_launch(t
     assert payload["status"] == "RUNNING"
 
 
+def test_start_research_program_returns_duplicate_when_lock_is_held(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    program_path = _program_spec(tmp_path)
+    state = {"program_id": "perpetual-macmini", "status": "RUNNING", "pid": 1234}
+    research._write_program_state(local_state=local_state, program_id="perpetual-macmini", payload=state)  # noqa: SLF001
+    lock_path = research._program_lock_path(local_state=local_state, program_id="perpetual-macmini")  # noqa: SLF001
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("1234", encoding="utf-8")
+    monkeypatch.setattr(research, "_is_local_process_running", lambda pid: pid == 1234)
+    monkeypatch.setattr(
+        research,
+        "supervise_research_program",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("duplicate start should not supervise")),
+    )
+
+    payload = research.start_research_program(
+        program_path=program_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        targets_config_path=repo_root / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+        detach=False,
+    )
+
+    assert payload["duplicate"] is True
+    assert payload["pid"] == 1234
+
+
 def test_spawn_program_supervisor_process_preserves_existing_frontier(tmp_path: Path, monkeypatch) -> None:
     local_state = tmp_path / "local"
     repo_root = tmp_path / "repo"

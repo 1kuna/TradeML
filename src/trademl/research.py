@@ -16,7 +16,7 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import pandas as pd
 import yaml
@@ -133,16 +133,26 @@ def start_research_program(
             python_executable=python_executable,
             poll_seconds=int(poll_seconds or spec.get("poll_seconds") or 30),
         )
-    return supervise_research_program(
-        program_path=program_path,
-        repo_root=repo_root,
-        data_root=data_root,
-        local_state=local_state,
-        env_path=env_path,
-        targets_config_path=targets_config_path,
-        python_executable=python_executable,
-        poll_seconds=poll_seconds,
-    )
+    with _research_program_lock(local_state=local_state, program_id=program_id) as acquired:
+        if not acquired:
+            state = read_research_program_state(local_state=local_state, program_id=program_id)
+            return {
+                "program_id": program_id,
+                "status": state.get("status") or "RUNNING",
+                "duplicate": True,
+                "reason": "research program lock is already held",
+                "pid": state.get("pid"),
+            }
+        return supervise_research_program(
+            program_path=program_path,
+            repo_root=repo_root,
+            data_root=data_root,
+            local_state=local_state,
+            env_path=env_path,
+            targets_config_path=targets_config_path,
+            python_executable=python_executable,
+            poll_seconds=poll_seconds,
+        )
 
 
 def supervise_research_program(
@@ -2646,6 +2656,45 @@ def _program_state_path(*, local_state: Path, program_id: str) -> Path:
 
 def _program_log_path(*, local_state: Path, program_id: str) -> Path:
     return _program_root(local_state=local_state, program_id=program_id) / "logs" / "program.log"
+
+
+def _program_lock_path(*, local_state: Path, program_id: str) -> Path:
+    return _program_root(local_state=local_state, program_id=program_id) / "program.lock"
+
+
+@contextlib.contextmanager
+def _research_program_lock(*, local_state: Path, program_id: str) -> Iterator[bool]:
+    """Hold a best-effort filesystem lock for one foreground research supervisor."""
+    path = _program_lock_path(local_state=local_state, program_id=program_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("utf-8"))
+            os.close(fd)
+            acquired = True
+            break
+        except FileExistsError:
+            pid = _read_lock_pid(path)
+            if pid is not None and not _is_local_process_running(pid):
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                continue
+            acquired = False
+            break
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+
+def _read_lock_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
 
 
 def _write_program_state(*, local_state: Path, program_id: str, payload: dict[str, Any]) -> None:
