@@ -127,6 +127,61 @@ def load_launch_agent(plist_path: Path) -> dict[str, Any]:
     }
 
 
+def unload_launch_agent(label: str) -> dict[str, Any]:
+    """Unload a LaunchAgent by label for the current GUI user."""
+    if os.uname().sysname != "Darwin":
+        return {"ok": False, "label": label, "reason": "launchd is only supported on macOS"}
+    target = f"gui/{os.getuid()}/{label}"
+    result = subprocess.run(["launchctl", "bootout", target], capture_output=True, text=True, check=False)
+    return {
+        "ok": result.returncode == 0,
+        "label": label,
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def launch_agent_status(label: str) -> dict[str, Any]:
+    """Return launchd status for one LaunchAgent label."""
+    if os.uname().sysname != "Darwin":
+        return {"ok": False, "label": label, "loaded": False, "reason": "launchd is only supported on macOS"}
+    target = f"gui/{os.getuid()}/{label}"
+    result = subprocess.run(["launchctl", "print", target], capture_output=True, text=True, check=False)
+    payload: dict[str, Any] = {
+        "ok": result.returncode == 0,
+        "label": label,
+        "loaded": result.returncode == 0,
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+    if result.returncode == 0:
+        payload.update(_parse_launchctl_print(result.stdout))
+    return payload
+
+
+def _parse_launchctl_print(output: str) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("state = "):
+            parsed["state"] = line.partition(" = ")[2]
+        elif line.startswith("pid = "):
+            try:
+                parsed["pid"] = int(line.partition(" = ")[2])
+            except ValueError:
+                continue
+        elif line.startswith("runs = "):
+            try:
+                parsed["runs"] = int(line.partition(" = ")[2])
+            except ValueError:
+                continue
+        elif line.startswith("path = "):
+            parsed["plist_path"] = line.partition(" = ")[2]
+    return parsed
+
+
 def _label_from_plist(plist_path: Path) -> str:
     payload = plistlib.loads(plist_path.read_bytes())
     return str(payload["Label"])

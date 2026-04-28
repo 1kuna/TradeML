@@ -3,6 +3,7 @@ from __future__ import annotations
 import plistlib
 from pathlib import Path
 
+from trademl.fleet import launchd
 from trademl.fleet.launchd import install_research_launch_agent, render_research_launch_agent
 
 
@@ -52,3 +53,47 @@ def test_install_research_launch_agent_writes_plist_without_loading(tmp_path: Pa
     assert payload["plist_path"] == str(plist_path)
     assert plist_path.exists()
     assert Path(payload["stdout_path"]).parent == tmp_path / "control" / "research_programs" / "perpetual-macmini" / "logs"
+
+
+def test_launch_agent_status_parses_launchctl_print(monkeypatch) -> None:
+    monkeypatch.setattr(launchd.os, "uname", lambda: type("Uname", (), {"sysname": "Darwin"})())
+    monkeypatch.setattr(launchd.os, "getuid", lambda: 501)
+
+    def fake_run(command, **kwargs):
+        assert command == ["launchctl", "print", "gui/501/com.trademl.research.perpetual"]
+        return type(
+            "Completed",
+            (),
+            {
+                "returncode": 0,
+                "stdout": "path = /tmp/agent.plist\nstate = running\nruns = 3\npid = 123\n",
+                "stderr": "",
+            },
+        )()
+
+    monkeypatch.setattr(launchd.subprocess, "run", fake_run)
+
+    payload = launchd.launch_agent_status("com.trademl.research.perpetual")
+
+    assert payload["loaded"] is True
+    assert payload["state"] == "running"
+    assert payload["runs"] == 3
+    assert payload["pid"] == 123
+    assert payload["plist_path"] == "/tmp/agent.plist"
+
+
+def test_unload_launch_agent_bootouts_current_gui_label(monkeypatch) -> None:
+    monkeypatch.setattr(launchd.os, "uname", lambda: type("Uname", (), {"sysname": "Darwin"})())
+    monkeypatch.setattr(launchd.os, "getuid", lambda: 501)
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(launchd.subprocess, "run", fake_run)
+
+    payload = launchd.unload_launch_agent("com.trademl.research.perpetual")
+
+    assert payload["ok"] is True
+    assert calls == [["launchctl", "bootout", "gui/501/com.trademl.research.perpetual"]]

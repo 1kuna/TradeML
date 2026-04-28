@@ -56,7 +56,7 @@ from trademl.experiments import (
     stop_experiment_supervisor,
     supervise_experiment,
 )
-from trademl.fleet.launchd import install_research_launch_agent
+from trademl.fleet.launchd import install_research_launch_agent, launch_agent_status, unload_launch_agent
 from trademl.research import (
     list_research_alerts,
     latest_research_program_summary,
@@ -208,6 +208,12 @@ def main(argv: list[str] | None = None) -> int:
     research_launchd.add_argument("--plist-path", default=None)
     research_launchd.add_argument("--python-executable", default=None)
     research_launchd.add_argument("--load", action="store_true")
+    research_launchd_status = research_subparsers.add_parser("launchd-status", help="Show macOS LaunchAgent status for a research program.")
+    research_launchd_status.add_argument("--program", default=None)
+    research_launchd_status.add_argument("--label", default=None)
+    research_launchd_unload = research_subparsers.add_parser("unload-launchd", help="Unload a macOS LaunchAgent for a research program.")
+    research_launchd_unload.add_argument("--program", default=None)
+    research_launchd_unload.add_argument("--label", default=None)
     research_status = research_subparsers.add_parser("status", help="Show research program state.")
     research_status.add_argument("--program-id", required=True)
     research_pause = research_subparsers.add_parser("pause", help="Pause a research program.")
@@ -597,6 +603,11 @@ def _dispatch_research(args: argparse.Namespace) -> int:
         )
         print(json.dumps(payload, indent=2, default=str))
         return 0
+    if args.research_command in {"launchd-status", "unload-launchd"}:
+        label = _research_launchd_label(program_path=args.program, label=args.label)
+        payload = launch_agent_status(label) if args.research_command == "launchd-status" else unload_launch_agent(label)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
     if args.research_command == "status":
         payload = read_research_program_state(local_state=local_state, program_id=args.program_id)
         print(json.dumps(payload, indent=2, default=str))
@@ -681,6 +692,18 @@ def _dispatch_research(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported research command: {args.research_command}")
+
+
+def _research_launchd_label(*, program_path: str | None, label: str | None) -> str:
+    """Resolve the launchd label for a research program."""
+    if label:
+        return str(label)
+    if not program_path:
+        raise SystemExit("--program or --label is required")
+    resolved_program_path = Path(program_path).expanduser()
+    spec = yaml.safe_load(resolved_program_path.read_text(encoding="utf-8")) or {}
+    program_id = str(spec.get("program_id") or resolved_program_path.stem)
+    return f"com.trademl.research.{program_id}"
 
 
 if __name__ == "__main__":
