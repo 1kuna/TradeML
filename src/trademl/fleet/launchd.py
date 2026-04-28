@@ -165,19 +165,19 @@ def _parse_launchctl_print(output: str) -> dict[str, Any]:
     parsed: dict[str, Any] = {}
     for raw_line in output.splitlines():
         line = raw_line.strip()
-        if line.startswith("state = "):
+        if line.startswith("state = ") and "state" not in parsed:
             parsed["state"] = line.partition(" = ")[2]
-        elif line.startswith("pid = "):
+        elif line.startswith("pid = ") and "pid" not in parsed:
             try:
                 parsed["pid"] = int(line.partition(" = ")[2])
             except ValueError:
                 continue
-        elif line.startswith("runs = "):
+        elif line.startswith("runs = ") and "runs" not in parsed:
             try:
                 parsed["runs"] = int(line.partition(" = ")[2])
             except ValueError:
                 continue
-        elif line.startswith("path = "):
+        elif line.startswith("path = ") and "plist_path" not in parsed:
             parsed["plist_path"] = line.partition(" = ")[2]
     return parsed
 

@@ -837,7 +837,10 @@ def list_research_alerts(*, local_state: Path, program_id: str, limit: int = 20)
 
 def _research_launchd_status(program_id: str) -> dict[str, Any]:
     """Return launchd status for the conventional research LaunchAgent label."""
-    return launch_agent_status(f"com.trademl.research.{program_id}")
+    status = dict(launch_agent_status(f"com.trademl.research.{program_id}"))
+    status.pop("stdout", None)
+    status.pop("stderr", None)
+    return status
 
 
 def pause_research_program(*, local_state: Path, program_id: str) -> dict[str, Any]:
