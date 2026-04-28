@@ -53,6 +53,7 @@ class TrainingTarget:
     env_path: Path | None
     identity_file: Path | None
     local_runtime_root: Path
+    password_env: str | None = None
 
     @property
     def label(self) -> str:
@@ -179,6 +180,7 @@ def resolve_training_targets(
             env_path=None,
             identity_file=None,
             local_runtime_root=local_state,
+            password_env=None,
         )
     }
     for name, payload in configured_targets.items():
@@ -198,6 +200,7 @@ def resolve_training_targets(
             env_path=Path(str(payload["env_path"])).expanduser() if payload.get("env_path") else None,
             identity_file=Path(str(payload["identity_file"])).expanduser() if payload.get("identity_file") else None,
             local_runtime_root=Path(str(payload.get("local_runtime_root") or local_state)).expanduser(),
+            password_env=str(payload["password_env"]).strip() if payload.get("password_env") else None,
         )
     preferred_name = str(training_settings.get("default_target") or ("workstation-remote" if "workstation-remote" in targets else "local"))
     if preferred_name not in targets:
@@ -901,7 +904,7 @@ def stop_training_process(
     pid = runtime.get("pid")
     if not isinstance(pid, int):
         return {"stopped": False, "reason": "no active pid", **snapshot}
-    resolved_target = TrainingTarget(**snapshot["target"])
+    resolved_target = TrainingTarget(**{**snapshot["target"], "password_env": snapshot["target"].get("password_env")})
     if resolved_target.kind == "local":
         os.kill(pid, signal.SIGTERM)
     else:
@@ -1274,7 +1277,8 @@ def _remote_python_here_doc(target: TrainingTarget, body: str) -> str:
 
 def _run_ssh_command(target: TrainingTarget, command: str, *, check: bool = False) -> subprocess.CompletedProcess[str]:
     """Run one remote shell command against an SSH training target."""
-    ssh_command = ["ssh", *_ssh_base_options(target), "-p", str(target.port)]
+    password = _target_password(target)
+    ssh_command = _ssh_command_prefix(password) + ["ssh", *_ssh_base_options(target, has_password=password is not None), "-p", str(target.port)]
     ssh_command.append(f"{target.user}@{target.host}")
     ssh_command.append(command)
     try:
@@ -1284,6 +1288,7 @@ def _run_ssh_command(target: TrainingTarget, command: str, *, check: bool = Fals
             text=True,
             check=False,
             timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
+            env=_ssh_subprocess_env(password),
         )
     except subprocess.TimeoutExpired as exc:
         message = f"ssh command timed out for target={target.name}"
@@ -1298,7 +1303,8 @@ def _run_ssh_command(target: TrainingTarget, command: str, *, check: bool = Fals
 def _copy_file_to_remote(*, target: TrainingTarget, local_path: Path, remote_path: Path) -> None:
     """Copy one local file onto the remote SSH target."""
     _run_ssh_command(target, f"mkdir -p {shlex.quote(str(remote_path.parent))}", check=True)
-    scp_command = ["scp", *_ssh_base_options(target), "-P", str(target.port)]
+    password = _target_password(target)
+    scp_command = _ssh_command_prefix(password) + ["scp", *_ssh_base_options(target, has_password=password is not None), "-P", str(target.port)]
     scp_command.extend([str(local_path), f"{target.user}@{target.host}:{remote_path}"])
     try:
         result = subprocess.run(  # noqa: S603
@@ -1307,6 +1313,7 @@ def _copy_file_to_remote(*, target: TrainingTarget, local_path: Path, remote_pat
             text=True,
             check=False,
             timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
+            env=_ssh_subprocess_env(password),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"scp timed out for target={target.name}") from exc
@@ -1314,11 +1321,11 @@ def _copy_file_to_remote(*, target: TrainingTarget, local_path: Path, remote_pat
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"scp failed for target={target.name}")
 
 
-def _ssh_base_options(target: TrainingTarget) -> list[str]:
+def _ssh_base_options(target: TrainingTarget, *, has_password: bool = False) -> list[str]:
     """Return noninteractive bounded SSH options for control-plane probes."""
     options = [
         "-o",
-        "BatchMode=yes",
+        f"BatchMode={'no' if has_password else 'yes'}",
         "-o",
         f"ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}",
         "-o",
@@ -1329,6 +1336,23 @@ def _ssh_base_options(target: TrainingTarget) -> list[str]:
     if target.identity_file is not None:
         options.extend(["-i", str(target.identity_file)])
     return options
+
+
+def _target_password(target: TrainingTarget) -> str | None:
+    if not target.password_env:
+        return None
+    password = os.environ.get(target.password_env)
+    return password if password else None
+
+
+def _ssh_command_prefix(password: str | None) -> list[str]:
+    return ["sshpass", "-e"] if password else []
+
+
+def _ssh_subprocess_env(password: str | None) -> dict[str, str] | None:
+    if not password:
+        return None
+    return {**os.environ, "SSHPASS": password}
 
 
 def _remote_process_running(*, target: TrainingTarget, pid: int) -> bool:

@@ -20,3 +20,4 @@ def test_shipped_workstation_remote_uses_current_tailscale_target_without_baked_
 
     assert target["host"] == "100.102.98.14"
     assert "identity_file" not in target
+    assert target["password_env"] == "TRADEML_WORKSTATION_REMOTE_PASSWORD"
