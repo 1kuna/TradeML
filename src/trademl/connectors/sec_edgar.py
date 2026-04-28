@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import contextlib
 from datetime import date as date_type
+import gzip
+import os
+from pathlib import Path
+import time
+import uuid
 
 import pandas as pd
+import requests
 
-from trademl.connectors.base import HTTPConnector
+from trademl.connectors.base import (
+    HTTPConnector,
+    PermanentConnectorError,
+    TemporaryConnectorError,
+)
 
 
 class SecEdgarConnector(HTTPConnector):
@@ -20,6 +31,108 @@ class SecEdgarConnector(HTTPConnector):
 
     def _headers(self) -> dict[str, str]:
         return {"User-Agent": self.user_agent, "Accept-Encoding": "gzip, deflate"}
+
+    def stream_companyfacts_to_gzip(self, *, cik: str, output: Path) -> dict[str, object]:
+        """Stream a SEC companyfacts payload to gzip without building a JSON object."""
+        normalized_cik = str(cik).zfill(10)
+        endpoint = f"/api/xbrl/companyfacts/CIK{normalized_cik}.json"
+        telemetry_key = "companyfacts"
+        for attempt in range(1, self.retry_config.max_attempts + 1):
+            if not self.budget_manager.can_spend(
+                self.vendor_name, task_kind="OTHER", units=1
+            ):
+                self.budget_manager.record_local_budget_block(
+                    self.vendor_name, endpoint=telemetry_key
+                )
+                raise TemporaryConnectorError(
+                    f"budget exhausted for vendor={self.vendor_name}"
+                )
+            start = time.perf_counter()
+            try:
+                response = self.session.request(
+                    method="GET",
+                    url=f"{self.base_url}{endpoint}",
+                    params=self._auth_params(),
+                    headers=self._headers(),
+                    timeout=30,
+                    stream=True,
+                )
+            except requests.RequestException as exc:
+                self.budget_manager.record_spend(
+                    self.vendor_name,
+                    task_kind="OTHER",
+                    units=1,
+                    endpoint=telemetry_key,
+                    logical_units=1,
+                )
+                if attempt < self.retry_config.max_attempts:
+                    self.sleep_fn(self._sleep_duration(attempt))
+                    continue
+                raise TemporaryConnectorError(
+                    f"{self.vendor_name} request failed: {exc}"
+                ) from exc
+            self.budget_manager.record_spend(
+                self.vendor_name,
+                task_kind="OTHER",
+                units=1,
+                endpoint=telemetry_key,
+                logical_units=1,
+            )
+            if response.status_code < 400:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = output.with_suffix(output.suffix + f".{uuid.uuid4().hex}.tmp")
+                raw_bytes = 0
+                try:
+                    with gzip.open(tmp_path, "wb") as handle:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            raw_bytes += len(chunk)
+                            handle.write(chunk)
+                    os.replace(tmp_path, output)
+                finally:
+                    with contextlib.suppress(Exception):
+                        response.close()
+                self._log_request(
+                    endpoint=endpoint,
+                    symbols=[normalized_cik],
+                    rows=1,
+                    elapsed_ms=(time.perf_counter() - start) * 1000,
+                )
+                return {
+                    "cik": normalized_cik,
+                    "facts_path": str(output),
+                    "raw_bytes": raw_bytes,
+                }
+            response_text = response.text[:512] if response.text else ""
+            if response.status_code == 429:
+                self.budget_manager.record_remote_rate_limit(
+                    self.vendor_name, endpoint=telemetry_key
+                )
+                if attempt < self.retry_config.max_attempts:
+                    self.sleep_fn(
+                        self._retry_after_seconds(response, telemetry_key)
+                        or self._sleep_duration(attempt)
+                    )
+                    continue
+                raise self._rate_limit_error()
+            if response.status_code in self._retryable_statuses(telemetry_key):
+                if attempt < self.retry_config.max_attempts:
+                    self.sleep_fn(
+                        self._retry_after_seconds(response, telemetry_key)
+                        or self._sleep_duration(attempt)
+                    )
+                    continue
+                raise TemporaryConnectorError(
+                    f"{self.vendor_name} request failed: {response.status_code} {response_text}"
+                )
+            self.budget_manager.record_permanent_failure(
+                self.vendor_name, endpoint=telemetry_key
+            )
+            raise PermanentConnectorError(
+                f"{self.vendor_name} request failed: {response.status_code} {response_text}"
+            )
+        raise TemporaryConnectorError(f"{self.vendor_name} request failed after retries")
 
     def fetch(
         self,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+import gzip
+import json
 from pathlib import Path
 import threading
 import time
@@ -131,6 +133,29 @@ class _PartialReferenceConnector:
                 }
             ]
         )
+
+
+class _SecCompanyfactsConnector:
+    vendor_name = "sec_edgar"
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def stream_companyfacts_to_gzip(self, *, cik: str, output: Path) -> dict[str, object]:
+        self.calls.append([cik])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "cik": str(cik).zfill(10),
+            "facts": {"us-gaap": {"Revenue": {"units": {"USD": []}}}},
+        }
+        with gzip.open(output, "wt", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        return {"cik": str(cik).zfill(10), "facts_path": str(output), "raw_bytes": 42}
+
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        raise AssertionError("companyfacts should stream without dataframe fetch")
 
 
 class _ListingConnector:
@@ -5013,6 +5038,99 @@ def test_process_auxiliary_planner_task_marks_reference_success_and_deferred_con
     assert db.get_planner_task("aux::MSFT").status == "PARTIAL"
     stored = pd.read_parquet(tmp_path / "data" / "reference" / "corp_actions.parquet")
     assert stored["symbol"].tolist() == ["AAPL"]
+
+
+def test_process_companyfacts_planner_task_streams_per_cik(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    connector = _SecCompanyfactsConnector()
+    service = DataNodeService(
+        db=db,
+        connectors={"sec_edgar": connector},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    db.upsert_planner_task(
+        task_key="reference::companyfacts::000",
+        task_family="events_filings",
+        planner_group="reference_events_backlog",
+        dataset="companyfacts",
+        tier="B",
+        priority=270,
+        start_date="2021-04-04",
+        end_date="2026-04-04",
+        symbols=["320193", "789019", "1018724"],
+        eligible_vendors=["sec_edgar"],
+        output_name="sec_companyfacts",
+        payload={"capability_id": "sec_edgar.companyfacts.reference"},
+    )
+    task = db.lease_planner_task_by_key(
+        task_key="reference::companyfacts::000", lease_owner=service.worker_id
+    )
+
+    assert task is not None
+    service._auxiliary_runtime._process_auxiliary_planner_task(task, "sec_edgar")
+
+    assert connector.calls == [["320193"], ["789019"], ["1018724"]]
+    assert db.get_planner_task("reference::companyfacts::000").status == "SUCCESS"
+    index = pd.read_parquet(
+        tmp_path / "data" / "reference" / "sec_companyfacts.parquet"
+    )
+    assert set(index["cik"]) == {"0000320193", "0000789019", "0001018724"}
+    raw_path = (
+        tmp_path
+        / "data"
+        / "reference"
+        / "sec_companyfacts"
+        / "cik=0000320193"
+        / "companyfacts.json.gz"
+    )
+    with gzip.open(raw_path, "rt", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    assert payload["facts"]["us-gaap"]["Revenue"]["units"]["USD"] == []
+
+
+def test_aux_lane_width_caps_sec_edgar_while_companyfacts_pending(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"sec_edgar": _SecCompanyfactsConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    db.upsert_planner_task(
+        task_key="reference::companyfacts::000",
+        task_family="events_filings",
+        planner_group="reference_events_backlog",
+        dataset="companyfacts",
+        tier="B",
+        priority=270,
+        start_date="2021-04-04",
+        end_date="2026-04-04",
+        symbols=["320193"],
+        eligible_vendors=["sec_edgar"],
+        output_name="sec_companyfacts",
+        payload={"capability_id": "sec_edgar.companyfacts.reference"},
+    )
+
+    widths = service._auxiliary_runtime._aux_lane_widths(
+        task_kinds={"REFERENCE", "EVENT"}
+    )
+
+    assert widths["sec_edgar"] == 1
 
 
 def test_process_backfill_queue_prefers_tiingo_for_equities_history(

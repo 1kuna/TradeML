@@ -485,6 +485,10 @@ class AuxiliaryRuntime:
                 continue
             width = int(job.lane_width or 1)
             widths[job.vendor] = max(widths.get(job.vendor, 0), width)
+        if self.db.has_pending_planner_tasks(
+            task_families=("events_filings",), datasets=("companyfacts",)
+        ):
+            widths["sec_edgar"] = min(max(1, widths.get("sec_edgar", 1)), 1)
         return widths
 
     def _vendor_has_canonical_pressure(self, vendor: str) -> bool:
@@ -577,6 +581,10 @@ class AuxiliaryRuntime:
             )
         if str(job["dataset"]) in {"macros_treasury", "vintagedates"}:
             return self._execute_macro_auxiliary_job(
+                job, task_key=effective_task_key, vendor=vendor
+            )
+        if vendor == "sec_edgar" and str(job["dataset"]) == "companyfacts":
+            return self._execute_sec_companyfacts_job(
                 job, task_key=effective_task_key, vendor=vendor
             )
         try:
@@ -709,6 +717,105 @@ class AuxiliaryRuntime:
             rows_returned=row_count,
             state={"dataset": job["dataset"], "outputs": output_paths},
         )
+
+    def _execute_sec_companyfacts_job(
+        self,
+        job: dict[str, object],
+        *,
+        task_key: str,
+        vendor: str,
+    ) -> AuxiliaryExecutionResult:
+        """Stream SEC companyfacts one CIK at a time to avoid Pi OOM kills."""
+        connector = self.connectors[vendor]
+        output_paths: list[Path] = []
+        index_rows: list[dict[str, object]] = []
+        rows_returned = 0
+        for cik in [str(symbol) for symbol in job.get("symbols", [])]:
+            normalized_cik = cik.zfill(10)
+            output = (
+                self.paths.reference_root
+                / "sec_companyfacts"
+                / f"cik={normalized_cik}"
+                / "companyfacts.json.gz"
+            )
+            try:
+                stream_fn = getattr(connector, "stream_companyfacts_to_gzip")
+                metadata = stream_fn(cik=cik, output=output)
+            except PermanentConnectorError as exc:
+                self.db.mark_vendor_attempt_failed(
+                    task_key=task_key,
+                    vendor=vendor,
+                    error=str(exc),
+                    backoff_minutes=0,
+                    permanent=True,
+                )
+                return AuxiliaryExecutionResult(
+                    outputs=[str(path) for path in output_paths],
+                    failures=[f"{vendor}:{job['dataset']}:{cik}:{exc}"],
+                    deferred=0,
+                    rows_returned=rows_returned,
+                    state={"outputs": [str(path) for path in output_paths]},
+                )
+            except ConnectorError as exc:
+                message = str(exc)
+                self.db.mark_vendor_attempt_failed(
+                    task_key=task_key,
+                    vendor=vendor,
+                    error=message,
+                    backoff_minutes=30 if "budget exhausted" in message else 15,
+                )
+                return AuxiliaryExecutionResult(
+                    outputs=[str(path) for path in output_paths],
+                    failures=[] if "budget exhausted" in message else [f"{vendor}:{job['dataset']}:{cik}:{message}"],
+                    deferred=1 if "budget exhausted" in message else 0,
+                    rows_returned=rows_returned,
+                    state={"outputs": [str(path) for path in output_paths]},
+                )
+            output_paths.append(output)
+            index_rows.append(
+                {
+                    "cik": normalized_cik,
+                    "facts_path": str(output),
+                    "raw_bytes": int(metadata.get("raw_bytes", 0) or 0),
+                    "captured_at": datetime.now().isoformat(),
+                    "source": "sec_edgar",
+                }
+            )
+            rows_returned += 1
+        if index_rows:
+            index_path = self.paths.reference_root / "sec_companyfacts.parquet"
+            self._append_sec_companyfacts_index(index_path, pd.DataFrame(index_rows))
+            output_paths.append(index_path)
+        self.db.mark_vendor_attempt_success(
+            task_key=task_key, vendor=vendor, rows_returned=rows_returned
+        )
+        return AuxiliaryExecutionResult(
+            outputs=[str(path) for path in output_paths],
+            failures=[],
+            deferred=0,
+            rows_returned=rows_returned,
+            state={
+                "dataset": job["dataset"],
+                "outputs": [str(path) for path in output_paths],
+            },
+        )
+
+    def _append_sec_companyfacts_index(self, output: Path, frame: pd.DataFrame) -> None:
+        """Append compact SEC companyfacts index rows without loading raw facts."""
+        lock_path = output.with_suffix(".lock")
+        self._acquire_file_lock(lock_path)
+        try:
+            if output.exists():
+                existing = pd.read_parquet(output)
+                frame = pd.concat([existing, frame], ignore_index=True)
+            frame = frame.drop_duplicates(subset=["cik"], keep="last")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = output.with_suffix(output.suffix + f".{uuid.uuid4().hex}.tmp")
+            frame.sort_values(["cik"]).to_parquet(tmp_path, index=False)
+            os.replace(tmp_path, output)
+        finally:
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
 
     def _append_reference_frame(self, output: Path, frame: pd.DataFrame) -> None:
         lock_path = output.with_suffix(".lock")

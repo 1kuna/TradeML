@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import requests
@@ -50,6 +51,14 @@ class FakeResponse:
             return json.dumps(self.payload)
         return str(self.payload)
 
+    def iter_content(self, chunk_size: int):
+        raw = self.text.encode("utf-8")
+        for offset in range(0, len(raw), chunk_size):
+            yield raw[offset : offset + chunk_size]
+
+    def close(self) -> None:
+        return None
+
 
 class FakeSession:
     def __init__(self, responses: list[FakeResponse]) -> None:
@@ -63,6 +72,7 @@ class FakeSession:
         params: dict | None,
         headers: dict | None,
         timeout: int,
+        **kwargs: object,
     ) -> FakeResponse:
         self.calls.append((method, url, params, headers))
         if not self.responses:
@@ -82,6 +92,7 @@ class ErrorSession:
         params: dict | None,
         headers: dict | None,
         timeout: int,
+        **kwargs: object,
     ) -> FakeResponse:
         self.calls.append((method, url, params, headers))
         raise self.error
@@ -865,6 +876,38 @@ def test_fmp_and_sec_edgar_connectors() -> None:
     assert filings.iloc[0]["form"] == "8-K"
     assert sec_session.calls[0][3]["User-Agent"] == "TradeML/0.1 test@example.com"
     assert "Host" not in sec_session.calls[0][3]
+
+
+def test_sec_edgar_streams_companyfacts_without_json_materialization(
+    tmp_path: Path,
+) -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "cik": 320193,
+                    "entityName": "Apple Inc.",
+                    "facts": {"us-gaap": {"Revenue": {"units": {"USD": []}}}},
+                },
+            )
+        ]
+    )
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+    output = tmp_path / "companyfacts.json.gz"
+
+    metadata = sec.stream_companyfacts_to_gzip(cik="320193", output=output)
+
+    assert output.exists()
+    assert metadata["cik"] == "0000320193"
+    assert metadata["raw_bytes"] > 0
+    assert session.calls[0][1].endswith("/api/xbrl/companyfacts/CIK0000320193.json")
+    assert session.calls[0][3]["User-Agent"] == "TradeML/0.1 test@example.com"
 
 
 def test_fmp_delistings_follow_documented_page_limit_pagination() -> None:
