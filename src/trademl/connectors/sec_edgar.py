@@ -20,6 +20,14 @@ from trademl.connectors.base import (
 )
 
 
+class MissingCompanyfactsError(PermanentConnectorError):
+    """SEC has no companyfacts object for this CIK."""
+
+    def __init__(self, *, cik: str, message: str) -> None:
+        super().__init__(message)
+        self.cik = cik
+
+
 class SecEdgarConnector(HTTPConnector):
     """Fetch filing history from SEC EDGAR submissions API."""
 
@@ -125,6 +133,11 @@ class SecEdgarConnector(HTTPConnector):
                     continue
                 raise TemporaryConnectorError(
                     f"{self.vendor_name} request failed: {response.status_code} {response_text}"
+                )
+            if response.status_code == 404 and "NoSuchKey" in response_text:
+                raise MissingCompanyfactsError(
+                    cik=normalized_cik,
+                    message=f"SEC companyfacts missing for CIK{normalized_cik}",
                 )
             self.budget_manager.record_permanent_failure(
                 self.vendor_name, endpoint=telemetry_key

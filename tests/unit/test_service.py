@@ -16,6 +16,7 @@ import sqlite3
 import trademl.data_node.auxiliary_runtime as auxiliary_runtime_module
 from trademl.calendars.exchange import ExchangeCalendarStore
 from trademl.connectors.base import PermanentConnectorError, TemporaryConnectorError
+from trademl.connectors.sec_edgar import MissingCompanyfactsError
 from trademl.data_node.auxiliary_runtime import AuxiliaryRuntime
 from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.budgets import BudgetManager
@@ -138,19 +139,26 @@ class _PartialReferenceConnector:
 class _SecCompanyfactsConnector:
     vendor_name = "sec_edgar"
 
-    def __init__(self) -> None:
+    def __init__(self, *, missing_ciks: set[str] | None = None) -> None:
         self.calls: list[list[str]] = []
+        self.missing_ciks = {str(cik).zfill(10) for cik in missing_ciks or set()}
 
     def stream_companyfacts_to_gzip(self, *, cik: str, output: Path) -> dict[str, object]:
+        normalized_cik = str(cik).zfill(10)
         self.calls.append([cik])
+        if normalized_cik in self.missing_ciks:
+            raise MissingCompanyfactsError(
+                cik=normalized_cik,
+                message=f"SEC companyfacts missing for CIK{normalized_cik}",
+            )
         output.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "cik": str(cik).zfill(10),
+            "cik": normalized_cik,
             "facts": {"us-gaap": {"Revenue": {"units": {"USD": []}}}},
         }
         with gzip.open(output, "wt", encoding="utf-8") as handle:
             json.dump(payload, handle)
-        return {"cik": str(cik).zfill(10), "facts_path": str(output), "raw_bytes": 42}
+        return {"cik": normalized_cik, "facts_path": str(output), "raw_bytes": 42}
 
     def fetch(
         self, dataset: str, symbols: list[str], start_date: str, end_date: str
@@ -5093,6 +5101,62 @@ def test_process_companyfacts_planner_task_streams_per_cik(tmp_path: Path) -> No
     with gzip.open(raw_path, "rt", encoding="utf-8") as handle:
         payload = json.load(handle)
     assert payload["facts"]["us-gaap"]["Revenue"]["units"]["USD"] == []
+
+
+def test_process_companyfacts_planner_task_records_missing_cik_and_continues(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    connector = _SecCompanyfactsConnector(missing_ciks={"1103838"})
+    service = DataNodeService(
+        db=db,
+        connectors={"sec_edgar": connector},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    db.upsert_planner_task(
+        task_key="reference::companyfacts::009",
+        task_family="events_filings",
+        planner_group="reference_events_backlog",
+        dataset="companyfacts",
+        tier="B",
+        priority=270,
+        start_date="2021-04-04",
+        end_date="2026-04-04",
+        symbols=["320193", "1103838", "1018724"],
+        eligible_vendors=["sec_edgar"],
+        output_name="sec_companyfacts",
+        payload={"capability_id": "sec_edgar.companyfacts.reference"},
+    )
+    task = db.lease_planner_task_by_key(
+        task_key="reference::companyfacts::009", lease_owner=service.worker_id
+    )
+
+    assert task is not None
+    service._auxiliary_runtime._process_auxiliary_planner_task(task, "sec_edgar")
+
+    assert connector.calls == [["320193"], ["1103838"], ["1018724"]]
+    assert db.get_planner_task("reference::companyfacts::009").status == "SUCCESS"
+    index = pd.read_parquet(
+        tmp_path / "data" / "reference" / "sec_companyfacts.parquet"
+    )
+    assert set(index["cik"]) == {"0000320193", "0001018724"}
+    missing = pd.read_parquet(
+        tmp_path / "data" / "reference" / "sec_companyfacts_missing.parquet"
+    )
+    assert missing[["cik", "reason", "source"]].to_dict("records") == [
+        {
+            "cik": "0001103838",
+            "reason": "sec_companyfacts_404",
+            "source": "sec_edgar",
+        }
+    ]
 
 
 def test_aux_lane_width_caps_sec_edgar_while_companyfacts_pending(

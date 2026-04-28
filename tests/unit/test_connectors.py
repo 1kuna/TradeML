@@ -20,6 +20,7 @@ from trademl.connectors.fmp import FMPConnector
 from trademl.connectors.fred import FredConnector
 from trademl.connectors.massive import MassiveConnector
 from trademl.connectors.sec_edgar import SecEdgarConnector
+from trademl.connectors.sec_edgar import MissingCompanyfactsError
 from trademl.connectors.tiingo import TiingoConnector
 from trademl.connectors.twelve_data import TwelveDataConnector
 from trademl.data_node.budgets import BudgetManager
@@ -908,6 +909,38 @@ def test_sec_edgar_streams_companyfacts_without_json_materialization(
     assert metadata["raw_bytes"] > 0
     assert session.calls[0][1].endswith("/api/xbrl/companyfacts/CIK0000320193.json")
     assert session.calls[0][3]["User-Agent"] == "TradeML/0.1 test@example.com"
+
+
+def test_sec_edgar_companyfacts_404_is_typed_missing_payload(
+    tmp_path: Path,
+) -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                404,
+                {},
+                text=(
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message>"
+                    "<Key>api/xbrl/companyfacts/CIK0001103838.json</Key></Error>"
+                ),
+            )
+        ]
+    )
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    with pytest.raises(MissingCompanyfactsError) as exc_info:
+        sec.stream_companyfacts_to_gzip(
+            cik="1103838", output=tmp_path / "companyfacts.json.gz"
+        )
+
+    assert exc_info.value.cik == "0001103838"
+    assert not (tmp_path / "companyfacts.json.gz").exists()
 
 
 def test_fmp_delistings_follow_documented_page_limit_pagination() -> None:

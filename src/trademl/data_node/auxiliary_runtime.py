@@ -22,6 +22,7 @@ from trademl.connectors.base import (
     ConnectorError,
     PermanentConnectorError,
 )
+from trademl.connectors.sec_edgar import MissingCompanyfactsError
 from trademl.data_node.capabilities import (
     auxiliary_capabilities,
     canonical_qc_capabilities,
@@ -729,7 +730,9 @@ class AuxiliaryRuntime:
         connector = self.connectors[vendor]
         output_paths: list[Path] = []
         index_rows: list[dict[str, object]] = []
+        missing_rows: list[dict[str, object]] = []
         rows_returned = 0
+        captured_at = datetime.now().isoformat()
         for cik in [str(symbol) for symbol in job.get("symbols", [])]:
             normalized_cik = cik.zfill(10)
             output = (
@@ -741,6 +744,16 @@ class AuxiliaryRuntime:
             try:
                 stream_fn = getattr(connector, "stream_companyfacts_to_gzip")
                 metadata = stream_fn(cik=cik, output=output)
+            except MissingCompanyfactsError:
+                missing_rows.append(
+                    {
+                        "cik": normalized_cik,
+                        "reason": "sec_companyfacts_404",
+                        "captured_at": captured_at,
+                        "source": "sec_edgar",
+                    }
+                )
+                continue
             except PermanentConnectorError as exc:
                 self.db.mark_vendor_attempt_failed(
                     task_key=task_key,
@@ -777,7 +790,7 @@ class AuxiliaryRuntime:
                     "cik": normalized_cik,
                     "facts_path": str(output),
                     "raw_bytes": int(metadata.get("raw_bytes", 0) or 0),
-                    "captured_at": datetime.now().isoformat(),
+                    "captured_at": captured_at,
                     "source": "sec_edgar",
                 }
             )
@@ -786,6 +799,14 @@ class AuxiliaryRuntime:
             index_path = self.paths.reference_root / "sec_companyfacts.parquet"
             self._append_sec_companyfacts_index(index_path, pd.DataFrame(index_rows))
             output_paths.append(index_path)
+        if missing_rows:
+            missing_path = (
+                self.paths.reference_root / "sec_companyfacts_missing.parquet"
+            )
+            self._append_sec_companyfacts_missing(
+                missing_path, pd.DataFrame(missing_rows)
+            )
+            output_paths.append(missing_path)
         self.db.mark_vendor_attempt_success(
             task_key=task_key, vendor=vendor, rows_returned=rows_returned
         )
@@ -812,6 +833,25 @@ class AuxiliaryRuntime:
             output.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = output.with_suffix(output.suffix + f".{uuid.uuid4().hex}.tmp")
             frame.sort_values(["cik"]).to_parquet(tmp_path, index=False)
+            os.replace(tmp_path, output)
+        finally:
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
+
+    def _append_sec_companyfacts_missing(
+        self, output: Path, frame: pd.DataFrame
+    ) -> None:
+        """Append SEC companyfacts missing-CIK records."""
+        lock_path = output.with_suffix(".lock")
+        self._acquire_file_lock(lock_path)
+        try:
+            if output.exists():
+                existing = pd.read_parquet(output)
+                frame = pd.concat([existing, frame], ignore_index=True)
+            frame = frame.drop_duplicates(subset=["cik", "reason"], keep="last")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = output.with_suffix(output.suffix + f".{uuid.uuid4().hex}.tmp")
+            frame.sort_values(["cik", "reason"]).to_parquet(tmp_path, index=False)
             os.replace(tmp_path, output)
         finally:
             with contextlib.suppress(OSError):
