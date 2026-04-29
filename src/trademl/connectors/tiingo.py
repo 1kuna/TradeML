@@ -137,7 +137,7 @@ class TiingoConnector(HTTPConnector):
                 "date": published.dt.date,
                 "published_at": published,
                 "crawled_at": crawled,
-                "news_id": pd.to_numeric(frame.get("id"), errors="coerce"),
+                "news_id": frame.get("id", pd.Series(dtype="string")).astype("string"),
                 "headline": frame.get("title", pd.Series(dtype="string")),
                 "summary": frame.get("description", pd.Series(dtype="string")),
                 "url": frame.get("url", pd.Series(dtype="string")),

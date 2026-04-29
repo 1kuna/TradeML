@@ -2202,6 +2202,40 @@ class DataNodeDB:
             )
         return int(cursor.rowcount)
 
+    def release_expired_planner_leases(
+        self,
+        *,
+        now: datetime | None = None,
+        task_families: tuple[str, ...] | None = None,
+    ) -> int:
+        """Release planner leases whose TTL has expired."""
+        reference_time = (now or utc_now()).isoformat()
+        clauses = [
+            "status = 'LEASED'",
+            "COALESCE(lease_expires_at, '1970-01-01T00:00:00+00:00') <= ?",
+        ]
+        params: list[object] = [reference_time]
+        if task_families:
+            placeholders = ",".join("?" for _ in task_families)
+            clauses.append(f"task_family IN ({placeholders})")
+            params.extend(task_families)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE planner_tasks
+                SET status = CASE WHEN attempts > 0 THEN 'PARTIAL' ELSE 'PENDING' END,
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    lease_expires_at = NULL,
+                    next_eligible_at = NULL,
+                    last_error = COALESCE(last_error, 'expired planner lease reclaimed'),
+                    updated_at = ?
+                WHERE {' AND '.join(clauses)}
+                """,
+                [reference_time, *params],
+            )
+        return int(cursor.rowcount)
+
     def release_vendor_attempt_leases_for_owner(
         self,
         *,
@@ -2230,6 +2264,41 @@ class DataNodeDB:
                 WHERE {' AND '.join(clauses)}
                 """,
                 [reason, utc_now().isoformat(), *params],
+            )
+        return int(cursor.rowcount)
+
+    def release_expired_vendor_attempt_leases(
+        self,
+        *,
+        now: datetime | None = None,
+        task_families: tuple[str, ...] | None = None,
+        reason: str,
+    ) -> int:
+        """Release vendor attempt leases whose TTL has expired."""
+        reference_time = (now or utc_now()).isoformat()
+        clauses = [
+            "status = 'LEASED'",
+            "COALESCE(lease_expires_at, '1970-01-01T00:00:00+00:00') <= ?",
+        ]
+        params: list[object] = [reference_time]
+        if task_families:
+            placeholders = ",".join("?" for _ in task_families)
+            clauses.append(f"task_family IN ({placeholders})")
+            params.extend(task_families)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE vendor_attempts
+                SET status = 'FAILED',
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    lease_expires_at = NULL,
+                    next_eligible_at = NULL,
+                    last_error = COALESCE(last_error, ?),
+                    updated_at = ?
+                WHERE {' AND '.join(clauses)}
+                """,
+                [reason, reference_time, *params],
             )
         return int(cursor.rowcount)
 

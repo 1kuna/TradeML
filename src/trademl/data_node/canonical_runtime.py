@@ -222,11 +222,8 @@ class CanonicalRuntime:
                 permanent=fetch_result.permanent,
             )
             if fetch_result.permanent and not self._canonical_task_has_remaining_vendors(task, failed_vendor=vendor):
-                self.db.mark_planner_task_failed(
-                    task.task_key,
-                    error=f"{vendor}: {fetch_result.error}",
-                    backoff_minutes=15,
-                    permanent=True,
+                self._mark_terminal_canonical_failure(
+                    task, vendor=vendor, error=fetch_result.error
                 )
                 continue
             self.db.mark_planner_task_partial(
@@ -246,6 +243,30 @@ class CanonicalRuntime:
         dataset = batch[0].dataset
         start_date = batch[0].start_date
         end_date = batch[0].end_date
+        preflight_progress = self._canonical_batch_progress(tasks=batch, exchange=exchange)
+        runnable_batch: list[PlannerTask] = []
+        for task in batch:
+            progress_payload = preflight_progress[task.task_key]
+            if int(progress_payload.get("remaining_units", 0) or 0) <= 0:
+                self.db.update_planner_task_progress(
+                    task_key=task.task_key,
+                    expected_units=progress_payload["expected_units"],
+                    completed_units=progress_payload["completed_units"],
+                    remaining_units=progress_payload["remaining_units"],
+                    completed_symbols=progress_payload["completed_symbols"],
+                    remaining_symbols=progress_payload["remaining_symbols"],
+                    state={
+                        "trading_days": progress_payload["trading_days"],
+                        "scope_kind": task.payload.get("scope_kind", "symbol_range"),
+                        "pre_fetch_pruned": True,
+                    },
+                )
+                self.db.mark_planner_task_success(task.task_key)
+                continue
+            runnable_batch.append(task)
+        if not runnable_batch:
+            return []
+        batch = runnable_batch
         prior_progress = {task.task_key: self.db.fetch_planner_task_progress(task.task_key) for task in batch}
         leased_tasks: list[PlannerTask] = []
         symbols: list[str] = []
@@ -321,11 +342,8 @@ class CanonicalRuntime:
                             backoff_minutes=self._canonical_next_task_backoff_minutes(task, excluded_vendor=vendor, default_minutes=5),
                         )
                         continue
-                    self.db.mark_planner_task_failed(
-                        task.task_key,
-                        error=f"{vendor}: no incremental canonical coverage",
-                        backoff_minutes=15,
-                        permanent=True,
+                    self._mark_terminal_canonical_failure(
+                        task, vendor=vendor, error="no incremental canonical coverage"
                     )
                     continue
             else:
@@ -344,11 +362,8 @@ class CanonicalRuntime:
                         backoff_minutes=self._canonical_next_task_backoff_minutes(task, excluded_vendor=vendor),
                     )
                     continue
-                self.db.mark_planner_task_failed(
-                    task.task_key,
-                    error=f"{vendor}: {empty_error}",
-                    backoff_minutes=15,
-                    permanent=True,
+                self._mark_terminal_canonical_failure(
+                    task, vendor=vendor, error=empty_error
                 )
                 continue
             if progress_payload["remaining_units"] == 0:
@@ -360,6 +375,20 @@ class CanonicalRuntime:
                     backoff_minutes=self._canonical_next_task_backoff_minutes(task, excluded_vendor=vendor, default_minutes=5),
                 )
         return changed_dates
+
+    def _mark_terminal_canonical_failure(
+        self, task: PlannerTask, *, vendor: str, error: str
+    ) -> None:
+        """Mark a canonical task permanently terminal with repair-specific context."""
+        message = f"{vendor}: {error}"
+        if task.task_family == "canonical_repair" or task.planner_group == "canonical_repair":
+            message = f"canonical repair uncollectable: {message}"
+        self.db.mark_planner_task_failed(
+            task.task_key,
+            error=message,
+            backoff_minutes=15,
+            permanent=True,
+        )
 
     def _canonical_task_progress(self, *, task: PlannerTask, exchange: str) -> dict[str, object]:
         """Compute symbol-date coverage for a canonical planner task from raw partitions."""
@@ -501,17 +530,33 @@ class CanonicalRuntime:
                 return False
         if len(task.symbols) != 1:
             return True
-        if vendor == "tiingo" and not self._tiingo_supported_ticker_allows(task.symbols[0], start_date=str(task.start_date), end_date=str(task.end_date)):
+        if vendor == "tiingo" and not self._tiingo_supported_ticker_allows(
+            task.symbols[0],
+            start_date=str(task.start_date),
+            end_date=str(task.end_date),
+            require_known=task.task_family == "canonical_repair"
+            or task.planner_group == "canonical_repair",
+        ):
             return False
         floor = self._vendor_symbol_floor(vendor=vendor, symbol=task.symbols[0])
         if not floor:
             return True
         return str(task.end_date) >= floor
 
-    def _tiingo_supported_ticker_allows(self, symbol: str, *, start_date: str, end_date: str) -> bool:
+    def _tiingo_supported_ticker_allows(
+        self,
+        symbol: str,
+        *,
+        start_date: str,
+        end_date: str,
+        require_known: bool = False,
+    ) -> bool:
         """Return whether Tiingo metadata says a symbol can cover the requested window."""
-        metadata = self._tiingo_supported_tickers().get(str(symbol).upper())
+        metadata_map = self._tiingo_supported_tickers()
+        metadata = metadata_map.get(str(symbol).upper())
         if metadata is None:
+            if require_known and (self.paths.reference_root / "tiingo_supported_tickers.parquet").exists():
+                return False
             return True
         start_floor, end_ceiling = metadata
         if start_floor and pd.Timestamp(end_date) < pd.Timestamp(start_floor):

@@ -111,8 +111,10 @@ def write_codex_issue_bucket(*, data_root: Path, issues: list[dict[str, Any]], n
         )
         return {"issue_root": str(root), "written": [], "issues": [failure], "summary": summarize_issues([failure])}
     written: list[str] = []
+    current_ids: set[str] = set()
     for issue in issues:
         normalized = _normalize_issue(issue, now=now)
+        current_ids.add(str(normalized["id"]))
         path = root / f"{normalized['id']}.json"
         if path.exists():
             try:
@@ -123,6 +125,20 @@ def write_codex_issue_bucket(*, data_root: Path, issues: list[dict[str, Any]], n
             normalized["count"] = int(previous.get("count") or 0) + 1
         path.write_text(json.dumps(normalized, indent=2, sort_keys=True), encoding="utf-8")
         written.append(str(path))
+    for path in root.glob("*.json"):
+        if path.stem in current_ids:
+            continue
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if str(previous.get("status") or "open") != "open":
+            continue
+        previous["status"] = "resolved"
+        previous["resolved_at"] = now.isoformat()
+        previous["last_seen"] = previous.get("last_seen") or now.isoformat()
+        previous["updated_at"] = now.isoformat()
+        path.write_text(json.dumps(previous, indent=2, sort_keys=True), encoding="utf-8")
     latest = read_codex_issue_bucket(data_root=data_root)
     return {"issue_root": str(root), "written": written, "issues": latest["issues"], "summary": summarize_issues(latest["issues"])}
 
@@ -219,10 +235,18 @@ def _mac_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
     blocked = str(program.get("status") or "").upper() in {"INFRA_BLOCKED", "WAITING_FOR_DATA"}
     launchd_ok = not launchd or bool(launchd.get("loaded"))
     status = "online" if running and launchd_ok else "blocked" if blocked else "degraded" if program else "unknown"
+    incumbent = dict(program.get("incumbent") or {})
+    best = dict(program.get("best_candidate_summary") or {})
+    headline = "Research running" if running else str(program.get("status") or "Unknown")
+    if running and not incumbent and best:
+        headline = "Research running, no incumbent yet"
+    detail = str(program.get("current_experiment_id") or experiment.get("experiment_id") or "-")
+    if running and not incumbent and best.get("best_decision_reason"):
+        detail = str(best.get("best_decision_reason"))
     return {
         "status": status,
-        "headline": "Research running" if running else str(program.get("status") or "Unknown"),
-        "detail": str(program.get("current_experiment_id") or experiment.get("experiment_id") or "-"),
+        "headline": headline,
+        "detail": detail,
         "launchd": launchd,
     }
 
@@ -238,14 +262,19 @@ def _architecture_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
     elif int(experiment.get("shortlist_count") or 0) > 0:
         state = "Candidate found"
         status = "degraded"
+    elif str(program.get("status") or "").upper() == "RUNNING" and best:
+        state = "Research running, no promotable candidate yet"
+        status = "degraded"
     else:
         state = "No incumbent"
         status = "degraded"
+    best_advanced = dict(best.get("best_advanced") or {})
     return {
         "status": status,
         "state": state,
         "best_candidate": best.get("best_candidate") or experiment.get("best_candidate"),
         "primary_score": best.get("best_primary_score") or experiment.get("best_primary_score"),
+        "best_advanced_score": best_advanced.get("best_primary_score"),
         "decision": best.get("best_decision") or experiment.get("best_decision") or "No GO yet",
         "reason": best.get("best_decision_reason") or experiment.get("best_decision_reason") or "-",
     }

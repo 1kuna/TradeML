@@ -103,6 +103,11 @@ class DataNodeService:
         self._verification_history: set[str] = set()
         self._ledger_bootstrap_complete = False
         self._startup_leases_reclaimed = False
+        self._last_runtime_lease_reclaim = 0.0
+        self._last_runtime_lease_reclaim_counts = {
+            "planner_tasks": 0,
+            "vendor_attempts": 0,
+        }
         self._auxiliary_runtime = AuxiliaryRuntime(
             db=self.db,
             connectors=self.connectors,
@@ -424,6 +429,7 @@ class DataNodeService:
             self._ensure_planner_backlog_seeded(
                 trading_date=trading_date or datetime.now(tz=UTC).date().isoformat()
             )
+        self._reclaim_expired_runtime_leases()
         changed_dates: list[str] = []
         futures: dict[object, str] = {}
         canonical_lane_widths = self._canonical_runtime._backfill_lane_widths()
@@ -442,18 +448,41 @@ class DataNodeService:
         )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             aux_active: dict[str, int] = defaultdict(int)
+            canonical_active: dict[str, int] = defaultdict(int)
+            aux_submitted: dict[str, int] = defaultdict(int)
+            canonical_submitted: dict[str, int] = defaultdict(int)
+            aux_submit_cap = {
+                vendor: max(1, int(width)) * 32
+                for vendor, width in aux_lane_widths.items()
+            }
+            canonical_submit_cap = {
+                vendor: max(1, int(width)) * 16
+                for vendor, width in canonical_lane_widths.items()
+            }
 
             def submit_auxiliary_lane(vendor: str) -> None:
                 futures[executor.submit(self._drain_auxiliary_lane, vendor)] = (
                     f"auxiliary:{vendor}"
                 )
                 aux_active[vendor] += 1
+                aux_submitted[vendor] += 1
+
+            def submit_canonical_lane(vendor: str) -> None:
+                futures[
+                    executor.submit(self._drain_canonical_lane, vendor, exchange)
+                ] = f"canonical:{vendor}"
+                canonical_active[vendor] += 1
+                canonical_submitted[vendor] += 1
+
+            def can_submit_auxiliary(vendor: str) -> bool:
+                return aux_submitted[vendor] < aux_submit_cap.get(vendor, 32)
+
+            def can_submit_canonical(vendor: str) -> bool:
+                return canonical_submitted[vendor] < canonical_submit_cap.get(vendor, 16)
 
             for vendor, width in canonical_lane_widths.items():
                 for _ in range(max(1, width)):
-                    futures[
-                        executor.submit(self._drain_canonical_lane, vendor, exchange)
-                    ] = f"canonical:{vendor}"
+                    submit_canonical_lane(vendor)
             for vendor, width in aux_lane_widths.items():
                 for _ in range(max(1, width)):
                     submit_auxiliary_lane(vendor)
@@ -478,6 +507,7 @@ class DataNodeService:
                             )
                         last_heartbeat = now
                     if (now - last_pending_log) >= max(5.0, heartbeat_interval_seconds):
+                        self._reclaim_expired_runtime_leases()
                         lane_counts: dict[str, int] = {}
                         for lane in futures.values():
                             lane_counts[lane] = lane_counts.get(lane, 0) + 1
@@ -493,6 +523,8 @@ class DataNodeService:
                     lane_kind, _, vendor = task_type.partition(":")
                     if lane_kind == "auxiliary":
                         aux_active[vendor] = max(0, aux_active[vendor] - 1)
+                    elif lane_kind == "canonical":
+                        canonical_active[vendor] = max(0, canonical_active[vendor] - 1)
                     try:
                         result = future.result()
                     except Exception:
@@ -501,12 +533,31 @@ class DataNodeService:
                             task_type,
                             self.worker_id,
                         )
+                        if (
+                            lane_kind == "auxiliary"
+                            and not self._stop_event.is_set()
+                            and can_submit_auxiliary(vendor)
+                            and aux_active[vendor] < max(1, int(aux_lane_widths.get(vendor, 1)))
+                            and self._auxiliary_vendor_has_eligible_work(vendor)
+                        ):
+                            submit_auxiliary_lane(vendor)
                         continue
                     if lane_kind == "canonical":
                         changed_dates.extend(result)
-                    elif lane_kind == "auxiliary" and result:
+                        if (
+                            result
+                            and not self._stop_event.is_set()
+                            and can_submit_canonical(vendor)
+                            and canonical_active[vendor]
+                            < max(1, int(canonical_lane_widths.get(vendor, 1)))
+                            and self._canonical_vendor_has_eligible_work(vendor)
+                        ):
+                            submit_canonical_lane(vendor)
+                    elif lane_kind == "auxiliary":
                         if not self._stop_event.is_set() and aux_active[vendor] < max(
                             1, int(aux_lane_widths.get(vendor, 1))
+                        ) and can_submit_auxiliary(vendor) and (
+                            result or self._auxiliary_vendor_has_eligible_work(vendor)
                         ):
                             submit_auxiliary_lane(vendor)
         return sorted(set(changed_dates))
@@ -1207,7 +1258,8 @@ class DataNodeService:
     def _drain_canonical_lane(self, vendor: str, exchange: str) -> list[str]:
         """Drain canonical planner tasks for a single vendor lane."""
         changed_dates: list[str] = []
-        while not self._stop_event.is_set():
+        batches_processed = 0
+        while not self._stop_event.is_set() and batches_processed < 1:
             batch = self._canonical_runtime._lease_canonical_batch(vendor)
             if not batch:
                 break
@@ -1216,6 +1268,7 @@ class DataNodeService:
                     batch=batch, vendor=vendor, exchange=exchange
                 )
             )
+            batches_processed += 1
         return changed_dates
 
     def _drain_auxiliary_lane(self, vendor: str) -> list[str]:
@@ -1225,7 +1278,44 @@ class DataNodeService:
         task = self._lease_next_auxiliary_task_for_vendor(vendor)
         if task is None:
             return []
-        self._auxiliary_runtime._process_auxiliary_planner_task(task, vendor)
+        try:
+            self._auxiliary_runtime._process_auxiliary_planner_task(task, vendor)
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            LOGGER.exception(
+                "auxiliary_task_failed vendor=%s dataset=%s task_key=%s worker_id=%s",
+                vendor,
+                task.dataset,
+                task.task_key,
+                self.worker_id,
+            )
+            permanent = _looks_like_entitlement_failure(message)
+            if permanent:
+                self._mark_entitlement_blocked_lane(
+                    vendor=vendor,
+                    dataset=task.dataset,
+                    reason=message,
+                )
+            else:
+                self.db.mark_vendor_attempt_failed(
+                    task_key=task.task_key,
+                    vendor=vendor,
+                    error=message,
+                    backoff_minutes=5,
+                )
+                self.db.upsert_vendor_lane_health(
+                    vendor=vendor,
+                    dataset=task.dataset,
+                    state="DEGRADED",
+                    recent_permanent_failures=0,
+                )
+                self.db.mark_planner_task_failed(
+                    task.task_key,
+                    error=message,
+                    backoff_minutes=5,
+                    permanent=False,
+                )
+            return [task.task_key]
         refreshed = self.db.get_planner_task(task.task_key)
         if (
             refreshed is not None
@@ -1237,7 +1327,71 @@ class DataNodeService:
                 dataset=refreshed.dataset,
                 reason=str(refreshed.last_error or "entitlement blocked"),
             )
-        return [task.task_key]
+        if refreshed is not None and refreshed.status in {"SUCCESS", "FAILED"}:
+            return [task.task_key]
+        return []
+
+    def _canonical_vendor_has_eligible_work(self, vendor: str) -> bool:
+        """Return whether a canonical vendor has non-blocked planner work."""
+        now_iso = datetime.now(tz=UTC).isoformat()
+        for page in range(8):
+            tasks = self.db.fetch_planner_tasks(
+                task_families=("canonical_bars", "canonical_repair"),
+                statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+                limit=256,
+                offset=page * 256,
+            )
+            if not tasks:
+                return False
+            if any(
+                self._canonical_runtime._planner_task_vendor_eligible(
+                    task, vendor=vendor, now_iso=now_iso
+                )
+                for task in tasks
+            ):
+                return True
+        return False
+
+    def _auxiliary_vendor_has_eligible_work(self, vendor: str) -> bool:
+        """Return whether an auxiliary vendor has affordable non-blocked work."""
+        now_iso = datetime.now(tz=UTC).isoformat()
+        task_families = (
+            "security_master",
+            "corp_actions",
+            "events_filings",
+            "macro",
+            "supplemental_research",
+        )
+        for page in range(8):
+            tasks = self.db.fetch_planner_tasks(
+                task_families=task_families,
+                statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+                vendor=vendor,
+                limit=256,
+                offset=page * 256,
+            )
+            if not tasks:
+                return False
+            for candidate in tasks:
+                if candidate.next_eligible_at and candidate.next_eligible_at > now_iso:
+                    continue
+                if _looks_like_entitlement_failure(str(candidate.last_error or "")):
+                    continue
+                lane = self.db.get_vendor_lane_health(
+                    vendor=vendor, dataset=candidate.dataset
+                )
+                if lane is not None and lane.state == "ENTITLEMENT_BLOCKED":
+                    continue
+                if (
+                    self.db.get_active_vendor_lane_cooldown(
+                        vendor=vendor, dataset=candidate.dataset
+                    )
+                    is not None
+                ):
+                    continue
+                if self._auxiliary_vendor_can_afford_task(vendor, candidate):
+                    return True
+        return False
 
     def _lease_next_auxiliary_task_for_vendor(self, vendor: str):
         """Lease the highest-priority affordable auxiliary task for one vendor."""
@@ -1926,6 +2080,7 @@ class DataNodeService:
                         current_local=current_local,
                         trading_date=trading_date,
                     )
+                self._reclaim_expired_runtime_leases(now=current)
 
                 self._ensure_planner_backlog_seeded(
                     trading_date=trading_date, skip_when_backlog_exists=True
@@ -2025,6 +2180,10 @@ class DataNodeService:
             payload["lane_throughput"] = self.db.summarize_lane_throughput(
                 minutes=15, limit=16
             )
+        if any(self._last_runtime_lease_reclaim_counts.values()):
+            payload["runtime_lease_reclaims"] = dict(
+                self._last_runtime_lease_reclaim_counts
+            )
         return payload
 
     def _reclaim_startup_leases(self) -> None:
@@ -2046,6 +2205,38 @@ class DataNodeService:
                 released_tasks,
                 released_attempts,
             )
+
+    def _reclaim_expired_runtime_leases(
+        self, *, now: datetime | None = None, min_interval_seconds: float = 30.0
+    ) -> dict[str, int]:
+        """Release expired planner and vendor-attempt leases during long-lived runs."""
+        monotonic_now = monotonic()
+        if (
+            now is None
+            and self._last_runtime_lease_reclaim
+            and (monotonic_now - self._last_runtime_lease_reclaim)
+            < min_interval_seconds
+        ):
+            return dict(self._last_runtime_lease_reclaim_counts)
+        reference_time = now or datetime.now(tz=UTC)
+        released_tasks = self.db.release_expired_planner_leases(now=reference_time)
+        released_attempts = self.db.release_expired_vendor_attempt_leases(
+            now=reference_time,
+            reason="expired runtime vendor attempt lease reclaimed",
+        )
+        self._last_runtime_lease_reclaim = monotonic_now
+        self._last_runtime_lease_reclaim_counts = {
+            "planner_tasks": int(released_tasks),
+            "vendor_attempts": int(released_attempts),
+        }
+        if released_tasks or released_attempts:
+            LOGGER.warning(
+                "reclaimed_expired_runtime_leases worker_id=%s planner_tasks=%s vendor_attempts=%s",
+                self.worker_id,
+                released_tasks,
+                released_attempts,
+            )
+        return dict(self._last_runtime_lease_reclaim_counts)
 
     def _should_run_collection(
         self,

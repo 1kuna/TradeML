@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import UTC, datetime
 import gzip
 import json
 from pathlib import Path
@@ -1614,6 +1614,53 @@ def test_auxiliary_lane_skips_blocked_news_and_runs_alpaca_minute_with_repair_pr
     assert processed == ["alpaca:minute::alpaca::AAPL"]
 
 
+def test_auxiliary_lane_exception_marks_task_failed_and_releases_lease(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        worker_id="rpi-01",
+    )
+    db.upsert_planner_task(
+        task_key="news::alpaca::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="news",
+        tier="B",
+        priority=220,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="ticker_news",
+        payload={"scope_kind": "symbol_range"},
+    )
+
+    def process_task(task, vendor):  # noqa: ANN001
+        raise RuntimeError("parquet schema mismatch")
+
+    service._auxiliary_runtime._process_auxiliary_planner_task = process_task  # type: ignore[method-assign]
+
+    result = service._drain_auxiliary_lane("alpaca")
+
+    assert result == ["news::alpaca::AAPL"]
+    refreshed = db.get_planner_task("news::alpaca::AAPL")
+    assert refreshed is not None
+    assert refreshed.status == "FAILED"
+    assert refreshed.lease_owner is None
+    assert "parquet schema mismatch" in str(refreshed.last_error)
+
+
 def test_idle_budget_warning_records_affordable_unleased_work(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     service = DataNodeService(
@@ -2476,6 +2523,140 @@ def test_reclaim_startup_leases_releases_same_owner_rolling_tasks_for_repair(
 
     assert batch
     assert batch[0].task_key == "canonical_repair::2026-04-10::000"
+
+
+def test_reclaim_expired_runtime_leases_releases_stale_leased_tasks(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _MultiSymbolBackfillConnector("alpaca")},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        worker_id="rpi-01",
+    )
+    db.upsert_planner_task(
+        task_key="news::alpaca::stale",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="news",
+        tier="B",
+        priority=220,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="ticker_news",
+        payload={"scope_kind": "symbol_range"},
+    )
+    leased_task = db.lease_planner_task_by_key(
+        task_key="news::alpaca::stale",
+        lease_owner="dead-worker",
+        now=datetime(2026, 4, 28, 10, tzinfo=UTC),
+        lease_ttl_seconds=1,
+    )
+    assert leased_task is not None
+    attempt = db.lease_vendor_attempt(
+        task_key="news::alpaca::stale",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        vendor="alpaca",
+        lease_owner="dead-worker",
+        payload={"symbols": ["AAPL"], "start_date": "2026-04-01", "end_date": "2026-04-01"},
+        lease_ttl_seconds=1,
+        now=datetime(2026, 4, 28, 10, tzinfo=UTC),
+    )
+    assert attempt is not None
+
+    released = service._reclaim_expired_runtime_leases(
+        now=datetime(2026, 4, 28, 10, 1, tzinfo=UTC)
+    )
+
+    assert released == {"planner_tasks": 1, "vendor_attempts": 1}
+    refreshed = db.get_planner_task("news::alpaca::stale")
+    assert refreshed is not None
+    assert refreshed.status == "PENDING"
+    assert refreshed.lease_owner is None
+    attempt = db.vendor_attempts_for_task("news::alpaca::stale")[0]
+    assert attempt.status == "FAILED"
+    assert attempt.lease_owner is None
+
+
+def test_canonical_batch_marks_already_covered_task_success_without_vendor_call(
+    tmp_path: Path,
+) -> None:
+    class _ExplodingConnector:
+        vendor_name = "alpaca"
+
+        def fetch(
+            self, dataset: str, symbols: list[str], start_date: str, end_date: str
+        ) -> pd.DataFrame:
+            raise AssertionError("fetch should not run for already-covered task")
+
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _ExplodingConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        worker_id="rpi-01",
+    )
+    db.upsert_planner_task(
+        task_key="canonical::covered",
+        task_family="canonical_bars",
+        planner_group="rolling_canonical",
+        dataset="equities_eod",
+        tier="A",
+        priority=10,
+        start_date="2026-04-10",
+        end_date="2026-04-10",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_bars",
+        payload={"scope_kind": "symbol_range", "trading_days": ["2026-04-10"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical::covered",
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=["AAPL"],
+        state={"trading_days": ["2026-04-10"]},
+    )
+    task = db.lease_planner_task_by_key(
+        task_key="canonical::covered", lease_owner="rpi-01"
+    )
+    assert task is not None
+    db.replace_canonical_units_for_date(
+        dataset="equities_eod",
+        trading_date="2026-04-10",
+        symbols=["AAPL"],
+        partition_revision=1,
+        source_names={"AAPL": "alpaca"},
+    )
+
+    changed = service._canonical_runtime._process_canonical_planner_batch(
+        batch=[task], vendor="alpaca", exchange="XNYS"
+    )
+
+    assert changed == []
+    refreshed = db.get_planner_task("canonical::covered")
+    assert refreshed is not None
+    assert refreshed.status == "SUCCESS"
+    assert db.vendor_attempts_for_task("canonical::covered") == []
 
 
 def test_permanent_vendor_failure_does_not_terminally_poison_task_when_alternatives_remain(
@@ -4856,6 +5037,61 @@ def test_execute_auxiliary_job_writes_news_to_partitioned_archive(
     assert len(stored) == 1
     assert stored.iloc[0]["symbol"] == "AAPL"
     assert stored.iloc[0]["headline"] == "Alpha"
+
+
+def test_partitioned_news_archive_aligns_mixed_news_id_schema(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NewsConnector("alpaca")},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    output = (
+        tmp_path / "data" / "raw" / "ticker_news" / "date=2026-04-10" / "data.parquet"
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "date": "2026-04-10",
+                "published_at": pd.Timestamp("2026-04-10T13:30:00Z"),
+                "news_id": 1,
+                "symbol": "AAPL",
+                "headline": "Existing",
+                "source_name": "tiingo",
+            }
+        ]
+    ).to_parquet(output, index=False)
+
+    service._auxiliary_runtime._append_partitioned_archive_frame(
+        output_name="ticker_news",
+        frame=pd.DataFrame(
+            [
+                {
+                    "date": "2026-04-10",
+                    "published_at": pd.Timestamp("2026-04-10T14:30:00Z"),
+                    "news_id": "45185058",
+                    "symbol": "AAPL",
+                    "headline": "New",
+                    "source_name": "alpaca",
+                    "url": "https://example.test/news",
+                }
+            ]
+        ),
+    )
+
+    stored = pd.read_parquet(output)
+    assert stored["news_id"].astype("string").tolist() == ["1", "45185058"]
+    assert stored["source_name"].astype("string").tolist() == ["tiingo", "alpaca"]
 
 
 def test_execute_auxiliary_job_pauses_raw_archive_when_storage_watermark_is_high(

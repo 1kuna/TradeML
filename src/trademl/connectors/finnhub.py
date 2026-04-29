@@ -64,7 +64,7 @@ class FinnhubConnector(HTTPConnector):
                         "date": published.dt.date,
                         "published_at": published,
                         "crawled_at": pd.NaT,
-                        "news_id": pd.to_numeric(frame.get("id"), errors="coerce"),
+                        "news_id": frame.get("id", pd.Series(dtype="string")).astype("string"),
                         "headline": frame.get("headline", pd.Series(dtype="string")),
                         "summary": frame.get("summary", pd.Series(dtype="string")),
                         "url": frame.get("url", pd.Series(dtype="string")),

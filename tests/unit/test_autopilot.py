@@ -33,7 +33,7 @@ def test_current_state_summary_rolls_up_system_architecture_profit_and_codex() -
     assert payload["verdict"] == "DEGRADED"
     assert payload["pi"]["status"] == "online"
     assert payload["mac"]["status"] == "online"
-    assert payload["architecture"]["state"] == "No incumbent"
+    assert payload["architecture"]["state"] == "Research running, no promotable candidate yet"
     assert payload["profit"]["headline"] == "Shadow paper ready"
 
 
@@ -51,6 +51,35 @@ def test_codex_issue_bucket_deduplicates_and_counts(tmp_path: Path) -> None:
     assert len(bucket["issues"]) == 1
     assert bucket["issues"][0]["count"] == 2
     assert bucket["summary"]["open_count"] == 1
+
+
+def test_codex_issue_bucket_resolves_absent_current_issues(tmp_path: Path) -> None:
+    data_root = tmp_path / "nas"
+    data_root.mkdir()
+    issue = {
+        "source": "pi",
+        "severity": "critical",
+        "kind": "pi_remote_unhealthy",
+        "message": "permission denied",
+        "suggested_codex_action": "inspect",
+    }
+
+    write_codex_issue_bucket(
+        data_root=data_root,
+        issues=[issue],
+        now=datetime(2026, 4, 28, 10, tzinfo=UTC),
+    )
+    payload = write_codex_issue_bucket(
+        data_root=data_root,
+        issues=[],
+        now=datetime(2026, 4, 28, 11, tzinfo=UTC),
+    )
+    bucket = read_codex_issue_bucket(data_root=data_root)
+
+    assert payload["summary"]["open_count"] == 0
+    assert payload["summary"]["critical_count"] == 0
+    assert bucket["issues"][0]["status"] == "resolved"
+    assert bucket["issues"][0]["resolved_at"] == "2026-04-28T11:00:00+00:00"
 
 
 def test_codex_issue_bucket_reports_missing_data_root_without_creating_it(tmp_path: Path) -> None:
@@ -118,3 +147,33 @@ def test_fleet_health_uses_remote_mac_status_when_local_program_state_is_absent(
     assert payload["current_state"]["mac"]["status"] == "online"
     assert payload["current_state"]["mac"]["headline"] == "Research running"
     assert payload["current_state"]["mac"]["detail"] == "exp-remote"
+
+
+def test_current_state_distinguishes_running_research_without_promotable_candidate() -> None:
+    snapshot = {
+        "runtime": {"running": True},
+        "collection_status": {"repair_remaining_units": 0},
+        "health": {
+            "research_program_summary": {
+                "status": "RUNNING",
+                "current_experiment_id": "exp-a",
+                "launchd": {"loaded": True},
+                "best_candidate_summary": {
+                    "best_candidate": "advanced",
+                    "best_primary_score": 0.024,
+                    "best_decision": "NO_GO",
+                    "best_decision_reason": "ic_ok=False; years_positive=False",
+                    "best_advanced": {"best_primary_score": 0.024},
+                },
+                "frontier_architecture": {"enabled": True, "active": True},
+            }
+        },
+        "experiment_summary": {"shortlist_count": 0},
+    }
+
+    payload = build_current_state_summary(snapshot, issues=[])
+
+    assert payload["mac"]["headline"] == "Research running, no incumbent yet"
+    assert payload["architecture"]["state"] == "Research running, no promotable candidate yet"
+    assert payload["architecture"]["best_advanced_score"] == 0.024
+    assert payload["architecture"]["reason"] == "ic_ok=False; years_positive=False"
