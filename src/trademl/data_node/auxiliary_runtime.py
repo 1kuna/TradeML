@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from time import sleep
+from time import perf_counter, sleep
 from typing import Any, Callable
 
 import numpy as np
@@ -26,7 +26,7 @@ from trademl.connectors.base import (
 )
 from trademl.data_node.budgets import BudgetDecision
 from trademl.connectors.sec_edgar import MissingCompanyfactsError
-from trademl.data_node.archive_schema import normalize_archive_frame
+from trademl.data_node.archive_schema import ARCHIVE_SCHEMAS, normalize_archive_frame
 from trademl.data_node.capabilities import (
     auxiliary_capabilities,
     canonical_qc_capabilities,
@@ -1147,9 +1147,12 @@ class AuxiliaryRuntime:
         for day_value, day_frame in frame.groupby("date", dropna=True):
             if pd.isna(day_value):
                 continue
+            started = perf_counter()
+            day_key = pd.Timestamp(day_value).strftime("%Y-%m-%d")
+            rows_in = int(len(day_frame))
             output = (
                 archive_root
-                / f"date={pd.Timestamp(day_value).strftime('%Y-%m-%d')}"
+                / f"date={day_key}"
                 / "data.parquet"
             )
             lock_path = output.with_suffix(".lock")
@@ -1166,18 +1169,53 @@ class AuxiliaryRuntime:
                     )
                 else:
                     combined = normalize_archive_frame(output_name, day_frame)
+                before_dedupe = int(len(combined))
                 combined = self._deduplicate_reference_frame(combined)
+                duplicates_dropped = max(0, before_dedupe - int(len(combined)))
                 output.parent.mkdir(parents=True, exist_ok=True)
                 tmp_path = output.with_suffix(
                     output.suffix + f".{uuid.uuid4().hex}.tmp"
                 )
                 combined.to_parquet(tmp_path, index=False)
                 os.replace(tmp_path, output)
+                self.db.record_archive_write_telemetry(
+                    output_name=output_name,
+                    partition_date=day_key,
+                    status="success",
+                    rows_in=rows_in,
+                    rows_written=int(len(combined)),
+                    duplicates_dropped=duplicates_dropped,
+                    coerced_columns=self._archive_coerced_columns(output_name, combined),
+                    schema_mismatch=False,
+                    duration_ms=round((perf_counter() - started) * 1000.0, 3),
+                )
                 written.append(output)
+            except Exception as exc:
+                self.db.record_archive_write_telemetry(
+                    output_name=output_name,
+                    partition_date=day_key,
+                    status="failed",
+                    rows_in=rows_in,
+                    rows_written=0,
+                    duplicates_dropped=0,
+                    coerced_columns=self._archive_coerced_columns(output_name, day_frame),
+                    schema_mismatch=True,
+                    error=str(exc),
+                    duration_ms=round((perf_counter() - started) * 1000.0, 3),
+                )
+                raise
             finally:
                 with contextlib.suppress(OSError):
                     lock_path.unlink()
         return written
+
+    @staticmethod
+    def _archive_coerced_columns(output_name: str, frame: pd.DataFrame) -> list[str]:
+        schema = ARCHIVE_SCHEMAS.get(output_name)
+        if schema is None:
+            return []
+        expected = set(schema.string_columns) | set(schema.timestamp_columns) | {schema.date_column}
+        return sorted(column for column in frame.columns if column in expected)
 
     @staticmethod
     def _acquire_file_lock(path: Path, *, stale_after_seconds: int = 15) -> None:

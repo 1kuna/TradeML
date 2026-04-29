@@ -99,6 +99,160 @@ class RuntimeStore(_Store):
             )
         return int(cursor.rowcount)
 
+    def record_scheduler_decision(
+        self,
+        *,
+        vendor: str,
+        decision: str,
+        dataset: str | None = None,
+        task_key: str | None = None,
+        reason: str | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        """Persist one scheduler claim decision for observability rollups."""
+        timestamp = created_at or self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO scheduler_decisions (
+                  vendor, dataset, decision, task_key, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(vendor),
+                    str(dataset) if dataset is not None else None,
+                    str(decision),
+                    str(task_key) if task_key is not None else None,
+                    str(reason) if reason is not None else None,
+                    timestamp,
+                ),
+            )
+
+    def summarize_scheduler_decisions(
+        self, *, minutes: int = 15, limit: int | None = None
+    ) -> dict[str, Any]:
+        """Return recent scheduler decisions grouped by vendor/dataset/decision."""
+        window_minutes = max(1, int(minutes))
+        since = (self._now() - timedelta(minutes=window_minutes)).isoformat()
+        params: list[object] = [since]
+        query = """
+            SELECT vendor,
+                   COALESCE(dataset, '') AS dataset,
+                   decision,
+                   COUNT(*) AS count,
+                   MAX(created_at) AS latest_at,
+                   MAX(reason) AS latest_reason
+            FROM scheduler_decisions
+            WHERE created_at >= ?
+            GROUP BY vendor, COALESCE(dataset, ''), decision
+            ORDER BY count DESC, vendor ASC, dataset ASC, decision ASC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return {
+            "window_minutes": window_minutes,
+            "checked_at": self._now().isoformat(),
+            "rows": [dict(row) for row in rows],
+        }
+
+    def prune_scheduler_decisions(self, *, retention_hours: int = 24) -> int:
+        """Delete old scheduler decision telemetry."""
+        cutoff = (self._now() - timedelta(hours=max(1, int(retention_hours)))).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM scheduler_decisions WHERE created_at < ?",
+                (cutoff,),
+            )
+        return int(cursor.rowcount)
+
+    def record_archive_write_telemetry(
+        self,
+        *,
+        output_name: str,
+        status: str,
+        partition_date: str | None = None,
+        rows_in: int = 0,
+        rows_written: int = 0,
+        duplicates_dropped: int = 0,
+        coerced_columns: list[str] | tuple[str, ...] | None = None,
+        schema_mismatch: bool = False,
+        error: str | None = None,
+        duration_ms: float | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        """Persist one raw/archive parquet write telemetry event."""
+        timestamp = created_at or self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO archive_write_telemetry (
+                  output_name, partition_date, status, rows_in, rows_written,
+                  duplicates_dropped, coerced_columns_json, schema_mismatch,
+                  error, duration_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(output_name),
+                    str(partition_date) if partition_date is not None else None,
+                    str(status),
+                    int(rows_in),
+                    int(rows_written),
+                    int(duplicates_dropped),
+                    json.dumps(sorted({str(value) for value in (coerced_columns or [])})),
+                    1 if schema_mismatch else 0,
+                    str(error) if error is not None else None,
+                    float(duration_ms) if duration_ms is not None else None,
+                    timestamp,
+                ),
+            )
+
+    def summarize_archive_write_telemetry(
+        self, *, minutes: int = 60, limit: int | None = None
+    ) -> dict[str, Any]:
+        """Return recent archive write health grouped by output dataset."""
+        window_minutes = max(1, int(minutes))
+        since = (self._now() - timedelta(minutes=window_minutes)).isoformat()
+        params: list[object] = [since]
+        query = """
+            SELECT output_name,
+                   COUNT(*) AS writes,
+                   SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
+                   SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) AS failures,
+                   SUM(rows_in) AS rows_in,
+                   SUM(rows_written) AS rows_written,
+                   SUM(duplicates_dropped) AS duplicates_dropped,
+                   SUM(schema_mismatch) AS schema_mismatches,
+                   MAX(created_at) AS latest_at,
+                   MAX(error) AS latest_error
+            FROM archive_write_telemetry
+            WHERE created_at >= ?
+            GROUP BY output_name
+            ORDER BY failures DESC, writes DESC, output_name ASC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return {
+            "window_minutes": window_minutes,
+            "checked_at": self._now().isoformat(),
+            "rows": [dict(row) for row in rows],
+        }
+
+    def prune_archive_write_telemetry(self, *, retention_hours: int = 24) -> int:
+        """Delete old archive write telemetry."""
+        cutoff = (self._now() - timedelta(hours=max(1, int(retention_hours)))).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM archive_write_telemetry WHERE created_at < ?",
+                (cutoff,),
+            )
+        return int(cursor.rowcount)
+
 
 
 

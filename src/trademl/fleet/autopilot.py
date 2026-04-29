@@ -9,7 +9,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from trademl.fleet.remote import run_password_ssh
+from trademl.fleet.observability import (
+    build_fleet_observability,
+    collect_observability_issues,
+    write_fleet_observability,
+)
+from trademl.fleet.remote import run_password_ssh as _run_password_ssh
 
 SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 
@@ -21,11 +26,19 @@ def build_current_state_summary(snapshot: dict[str, Any], *, issues: list[dict[s
     mac = _mac_summary(snapshot)
     architecture = _architecture_summary(snapshot)
     profit = _profit_summary(snapshot)
+    observability = dict(snapshot.get("observability") or {})
+    data = _data_summary(snapshot, observability=observability)
+    research = _research_summary(snapshot, observability=observability)
+    paper = _paper_summary(snapshot, observability=observability)
     issue_summary = summarize_issues(issues)
     verdict = _rollup_verdict([pi["status"], mac["status"]], issue_summary)
     return {
         "verdict": verdict,
         "action": _action_from_verdict(verdict, issue_summary),
+        "systems": {"pi": pi, "mac": mac},
+        "data": data,
+        "research": research,
+        "paper": paper,
         "pi": pi,
         "mac": mac,
         "architecture": architecture,
@@ -71,6 +84,8 @@ def collect_current_state_issues(snapshot: dict[str, Any]) -> list[dict[str, Any
                 "Inspect research alerts and latest review packet.",
             )
         )
+    if snapshot.get("observability"):
+        issues.extend(collect_observability_issues(dict(snapshot.get("observability") or {})))
     return issues
 
 
@@ -186,15 +201,23 @@ def collect_fleet_health(
         remote["pi"] = _ssh_service_health(pi, service_command="systemctl --user", service_name="trademl-node.service", heal=heal)
     if mac:
         remote["mac"] = _ssh_mac_health(mac, heal=heal)
-    issues = collect_current_state_issues(local_snapshot)
+    summary_snapshot = {**local_snapshot, "fleet_remote": remote}
+    observability = build_fleet_observability(
+        snapshot=summary_snapshot,
+        data_root=data_root,
+        remote=remote,
+    )
+    if data_root.exists():
+        write_fleet_observability(data_root=data_root, payload=observability)
+    summary_snapshot["observability"] = observability
+    issues = collect_current_state_issues(summary_snapshot)
     for name, payload in remote.items():
         if payload.get("status") != "online":
             issues.append(_issue(name, "critical", f"{name}_remote_unhealthy", str(payload.get("reason") or f"{name} remote check failed"), f"Inspect {name} remote service."))
     bucket = write_codex_issue_bucket(data_root=data_root, issues=issues)
     bucket_issues = list(bucket.get("issues") or read_codex_issue_bucket(data_root=data_root)["issues"])
-    summary_snapshot = {**local_snapshot, "fleet_remote": remote}
     current_state = build_current_state_summary(summary_snapshot, issues=bucket_issues)
-    return {"verdict": current_state["verdict"], "current_state": current_state, "remote": remote, "issue_bucket": bucket}
+    return {"verdict": current_state["verdict"], "current_state": current_state, "remote": remote, "issue_bucket": bucket, "observability": observability}
 
 
 def _pi_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -295,6 +318,55 @@ def _profit_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _data_summary(snapshot: dict[str, Any], *, observability: dict[str, Any]) -> dict[str, Any]:
+    vendors = dict(observability.get("vendors") or {})
+    freshness = dict(observability.get("freshness") or {})
+    underutilized = int(vendors.get("underutilized_count") or 0)
+    stale_count = int(freshness.get("stale_count") or 0)
+    status = "degraded" if underutilized or stale_count else "online"
+    return {
+        "status": status,
+        "headline": "Collecting" if status == "online" else "Collection needs inspection",
+        "detail": f"{underutilized} underutilized vendors; {stale_count} stale datasets",
+        "underutilized_vendors": underutilized,
+        "stale_datasets": stale_count,
+    }
+
+
+def _research_summary(snapshot: dict[str, Any], *, observability: dict[str, Any]) -> dict[str, Any]:
+    research = dict(observability.get("research") or {})
+    status = str(research.get("status") or "").upper()
+    blocked = status in {"INFRA_BLOCKED", "WAITING_FOR_DATA"}
+    running = status == "RUNNING"
+    return {
+        "status": "blocked" if blocked else "online" if running else "pending",
+        "headline": "Research running" if running else status or "Research pending",
+        "detail": research.get("best_decision_reason") or research.get("reason") or research.get("current_experiment_id") or "-",
+        "completed_runs_24h": int(research.get("completed_runs_24h") or 0),
+        "failed_runs_24h": int(research.get("failed_runs_24h") or 0),
+    }
+
+
+def _paper_summary(snapshot: dict[str, Any], *, observability: dict[str, Any]) -> dict[str, Any]:
+    paper = dict(observability.get("paper_pnl") or {})
+    status = str(paper.get("status") or "pending")
+    headline = {
+        "available": "Paper PnL available",
+        "pending_labels": "Paper labels pending",
+        "pending": "No validated paper PnL yet",
+        "error": "Paper PnL needs inspection",
+    }.get(status, status)
+    return {
+        "status": "degraded" if status == "error" else "pending" if status.startswith("pending") else "online",
+        "headline": headline,
+        "detail": paper.get("path") or paper.get("reason") or "-",
+        "net_return": paper.get("net_return"),
+        "turnover": paper.get("turnover"),
+        "cost_drag": paper.get("cost_drag"),
+        "no_live_orders": bool(paper.get("no_live_orders", True)),
+    }
+
+
 def _rollup_verdict(statuses: list[str], issue_summary: dict[str, Any]) -> str:
     if issue_summary.get("critical_count") or "blocked" in statuses or "offline" in statuses:
         return "BLOCKED"
@@ -338,13 +410,13 @@ def _normalize_issue(issue: dict[str, Any], *, now: datetime) -> dict[str, Any]:
 
 def _ssh_service_health(target: dict[str, str], *, service_command: str, service_name: str, heal: bool) -> dict[str, Any]:
     command = f"{service_command} is-active {service_name}"
-    result = run_password_ssh(target, command).to_dict()
+    result = _ssh_result_dict(_run_password_ssh(target, command))
     active = result.get("returncode") == 0 and str(result.get("stdout") or "").strip() == "active"
     healed = False
     if heal and not active:
-        restart = run_password_ssh(target, f"{service_command} restart {service_name}").to_dict()
+        restart = _ssh_result_dict(_run_password_ssh(target, f"{service_command} restart {service_name}"))
         healed = restart.get("returncode") == 0
-        result = run_password_ssh(target, command).to_dict()
+        result = _ssh_result_dict(_run_password_ssh(target, command))
         active = result.get("returncode") == 0 and str(result.get("stdout") or "").strip() == "active"
     return {"status": "online" if active else "offline", "healed": healed, "raw": result, "reason": None if active else result.get("stderr") or result.get("stdout")}
 
@@ -353,13 +425,13 @@ def _ssh_mac_health(target: dict[str, str], *, heal: bool) -> dict[str, Any]:
     label = target.get("label") or "com.trademl.research.perpetual-macmini"
     service = f"gui/$(id -u)/{label}"
     command = f"launchctl print {service} >/dev/null && echo active"
-    result = run_password_ssh(target, command).to_dict()
+    result = _ssh_result_dict(_run_password_ssh(target, command))
     active = result.get("returncode") == 0 and "active" in str(result.get("stdout") or "")
     healed = False
     if heal and not active:
-        restart = run_password_ssh(target, f"launchctl kickstart -k {service}").to_dict()
+        restart = _ssh_result_dict(_run_password_ssh(target, f"launchctl kickstart -k {service}"))
         healed = restart.get("returncode") == 0
-        result = run_password_ssh(target, command).to_dict()
+        result = _ssh_result_dict(_run_password_ssh(target, command))
         active = result.get("returncode") == 0 and "active" in str(result.get("stdout") or "")
     research = _ssh_mac_research_status(target) if active else {}
     return {
@@ -382,7 +454,7 @@ def _ssh_mac_research_status(target: dict[str, str]) -> dict[str, Any]:
         f"--data-root {data_root} --local-state {local_state} --env-file {env_file} "
         f"status --program-id {program_id}"
     )
-    result = run_password_ssh(target, command).to_dict()
+    result = _ssh_result_dict(_run_password_ssh(target, command))
     if result.get("returncode") != 0:
         return {"status": "unknown", "error": result.get("stderr") or result.get("stdout")}
     try:
@@ -395,3 +467,10 @@ def _ssh_mac_research_status(target: dict[str, str]) -> dict[str, Any]:
         "current_experiment_id": payload.get("current_experiment_id"),
         "wait_reason": payload.get("wait_reason"),
     }
+
+
+def _ssh_result_dict(result: Any) -> dict[str, Any]:
+    """Return a dict for shared remote runner results or test doubles."""
+    if isinstance(result, dict):
+        return result
+    return result.to_dict()

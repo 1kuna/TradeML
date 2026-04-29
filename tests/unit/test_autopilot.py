@@ -9,6 +9,7 @@ from trademl.fleet.autopilot import (
     read_codex_issue_bucket,
     write_codex_issue_bucket,
 )
+from trademl.fleet.observability import build_fleet_observability
 
 
 def test_current_state_summary_rolls_up_system_architecture_profit_and_codex() -> None:
@@ -205,3 +206,97 @@ def test_current_state_treats_no_incumbent_and_no_pnl_as_pending_not_degraded() 
     assert payload["architecture"]["status"] == "pending"
     assert payload["profit"]["headline"] == "No validated paper PnL yet"
     assert payload["profit"]["status"] == "pending"
+
+
+def test_observability_snapshot_reports_vendor_underutilization_and_pending_pnl(tmp_path: Path) -> None:
+    data_root = tmp_path / "nas"
+    data_root.mkdir()
+    snapshot = {
+        "runtime": {"running": True, "pid": 42, "heartbeat_at": "2026-04-29T12:00:00+00:00"},
+        "latest_raw_date": "2026-04-29",
+        "latest_curated_date": "2026-04-29",
+        "planner_summary": {"progress": {"supplemental_research": {"remaining_units": 10}}},
+        "budget_summary": {
+            "rows": [
+                {
+                    "vendor": "alpaca",
+                    "state": "available",
+                    "rpm_limit": 200,
+                    "rpm_used": 0,
+                    "day_remaining": 1000,
+                    "minute_available": True,
+                    "day_available": True,
+                    "outbound_requests_60s": 0,
+                }
+            ]
+        },
+        "vendor_throughput": {"rows": [{"vendor": "alpaca", "state": "available", "rows_per_min": 0.0}]},
+        "scheduler_decisions": {
+            "window_minutes": 15,
+            "rows": [{"vendor": "alpaca", "dataset": "equities_minute", "decision": "no_task", "count": 2}],
+        },
+        "archive_write_telemetry": {
+            "rows": [{"output_name": "ticker_news", "failures": 0, "schema_mismatches": 0}]
+        },
+        "health": {
+            "research_program_summary": {
+                "status": "RUNNING",
+                "current_experiment_id": "exp-a",
+                "latest_shadow_paper_outputs": {
+                    "status": "written",
+                    "date": "2026-04-29",
+                    "shadow_orders_path": "/tmp/shadow_orders.parquet",
+                    "non_incumbent": True,
+                },
+            }
+        },
+    }
+
+    payload = build_fleet_observability(
+        snapshot=snapshot,
+        data_root=data_root,
+        now=datetime(2026, 4, 29, 12, 1, tzinfo=UTC),
+    )
+
+    assert payload["vendors"]["underutilized_count"] == 1
+    assert payload["scheduler"]["totals"]["no_task"] == 2
+    assert payload["research"]["status"] == "RUNNING"
+    assert payload["paper_pnl"]["status"] == "pending_labels"
+    assert payload["verdict"] == "DEGRADED"
+    assert payload["issues"][0]["kind"] == "vendor_underutilized"
+
+
+def test_current_state_uses_observability_top_cards_without_degrading_for_pending_pnl(tmp_path: Path) -> None:
+    data_root = tmp_path / "nas"
+    data_root.mkdir()
+    observability = build_fleet_observability(
+        snapshot={
+            "runtime": {"running": True},
+            "latest_raw_date": "2026-04-29",
+            "latest_curated_date": "2026-04-29",
+            "health": {
+                "research_program_summary": {
+                    "status": "RUNNING",
+                    "latest_shadow_paper_outputs": {"status": "written", "non_incumbent": True},
+                }
+            },
+        },
+        data_root=data_root,
+        now=datetime(2026, 4, 29, 12, tzinfo=UTC),
+    )
+
+    payload = build_current_state_summary(
+        {
+            "runtime": {"running": True},
+            "collection_status": {"repair_remaining_units": 0},
+            "health": {"research_program_summary": {"status": "RUNNING"}},
+            "observability": observability,
+        },
+        issues=[],
+    )
+
+    assert payload["systems"]["pi"]["status"] == "online"
+    assert payload["data"]["headline"] == "Collecting"
+    assert payload["research"]["headline"] == "Research running"
+    assert payload["paper"]["headline"] == "Paper labels pending"
+    assert payload["verdict"] == "OK"

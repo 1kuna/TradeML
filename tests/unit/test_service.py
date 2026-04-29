@@ -5305,6 +5305,9 @@ def test_execute_auxiliary_job_writes_news_to_partitioned_archive(
     assert len(stored) == 1
     assert stored.iloc[0]["symbol"] == "AAPL"
     assert stored.iloc[0]["headline"] == "Alpha"
+    archive = db.summarize_archive_write_telemetry(minutes=60)
+    assert archive["rows"][0]["output_name"] == "ticker_news"
+    assert archive["rows"][0]["successes"] == 1
 
 
 def test_partitioned_news_archive_aligns_mixed_news_id_schema(
@@ -5360,6 +5363,9 @@ def test_partitioned_news_archive_aligns_mixed_news_id_schema(
     stored = pd.read_parquet(output)
     assert stored["news_id"].astype("string").tolist() == ["1", "45185058"]
     assert stored["source_name"].astype("string").tolist() == ["tiingo", "alpaca"]
+    archive = db.summarize_archive_write_telemetry(minutes=60)
+    assert archive["rows"][0]["rows_in"] == 1
+    assert archive["rows"][0]["rows_written"] == 2
 
 
 def test_execute_auxiliary_job_pauses_raw_archive_when_storage_watermark_is_high(

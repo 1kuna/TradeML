@@ -43,6 +43,7 @@ from trademl.dashboard.controller import (
     verify_recent_canonical_dates,
 )
 from trademl.fleet.autopilot import collect_fleet_health
+from trademl.fleet.observability import build_fleet_observability, write_fleet_observability
 from trademl.experiments import (
     backtest_experiment_survivors,
     compare_experiment,
@@ -258,6 +259,15 @@ def main(argv: list[str] | None = None) -> int:
     fleet_health.add_argument("--mac-user", default="openclaw")
     fleet_health.add_argument("--mac-password-env", default="TRADEML_MAC_PASSWORD")
     fleet_health.add_argument("--heal", action="store_true")
+    fleet_observability = fleet_subparsers.add_parser("observability", help="Write and print the fleet observability snapshot.")
+    fleet_observability.add_argument("--data-root", default=None)
+    fleet_observability.add_argument("--pi-host", default=None)
+    fleet_observability.add_argument("--pi-user", default="zach")
+    fleet_observability.add_argument("--pi-password-env", default="TRADEML_PI_PASSWORD")
+    fleet_observability.add_argument("--mac-host", default=None)
+    fleet_observability.add_argument("--mac-user", default="openclaw")
+    fleet_observability.add_argument("--mac-password-env", default="TRADEML_MAC_PASSWORD")
+    fleet_observability.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
     if args.command == "dashboard":
@@ -402,6 +412,39 @@ def _dispatch_fleet(args: argparse.Namespace) -> int:
             else None
         )
         payload = collect_fleet_health(local_snapshot=snapshot, data_root=settings.nas_mount, pi=pi, mac=mac, heal=bool(args.heal))
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.fleet_command == "observability":
+        snapshot = collect_dashboard_status_snapshot(settings)
+        data_root = Path(args.data_root).expanduser() if args.data_root else settings.nas_mount
+        pi = (
+            {"host": args.pi_host, "user": args.pi_user, "password_env": args.pi_password_env}
+            if args.pi_host
+            else None
+        )
+        mac = (
+            {"host": args.mac_host, "user": args.mac_user, "password_env": args.mac_password_env}
+            if args.mac_host
+            else None
+        )
+        if pi or mac:
+            payload = collect_fleet_health(
+                local_snapshot=snapshot,
+                data_root=data_root,
+                pi=pi,
+                mac=mac,
+                heal=False,
+            )["observability"]
+            print(json.dumps(payload, indent=2, default=str))
+            return 0
+        remote = {}
+        payload = build_fleet_observability(
+            snapshot={**snapshot, "fleet_remote": remote},
+            data_root=data_root,
+            remote=remote,
+            config=yaml.safe_load(settings.config_path.read_text(encoding="utf-8")) or {},
+        )
+        write_fleet_observability(data_root=data_root, payload=payload)
         print(json.dumps(payload, indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported fleet command: {args.fleet_command}")

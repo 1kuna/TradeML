@@ -54,6 +54,8 @@ class DataNodeDB:
             "canonical_units",
             "raw_partition_manifest",
             "vendor_lane_health",
+            "scheduler_decisions",
+            "archive_write_telemetry",
         }
     )
 
@@ -275,6 +277,49 @@ class DataNodeDB:
                   updated_at               TIMESTAMP NOT NULL,
                   PRIMARY KEY (vendor, dataset)
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scheduler_decisions (
+                  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                  vendor         TEXT NOT NULL,
+                  dataset        TEXT,
+                  decision       TEXT NOT NULL,
+                  task_key       TEXT,
+                  reason         TEXT,
+                  created_at     TIMESTAMP NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_scheduler_decisions_created
+                ON scheduler_decisions(created_at, vendor, dataset, decision)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS archive_write_telemetry (
+                  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                  output_name         TEXT NOT NULL,
+                  partition_date      DATE,
+                  status              TEXT NOT NULL,
+                  rows_in             INTEGER NOT NULL DEFAULT 0,
+                  rows_written        INTEGER NOT NULL DEFAULT 0,
+                  duplicates_dropped  INTEGER NOT NULL DEFAULT 0,
+                  coerced_columns_json TEXT,
+                  schema_mismatch     INTEGER NOT NULL DEFAULT 0,
+                  error               TEXT,
+                  duration_ms         REAL,
+                  created_at          TIMESTAMP NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_archive_write_telemetry_created
+                ON archive_write_telemetry(created_at, output_name, partition_date, status)
                 """
             )
         self._validate_schema()

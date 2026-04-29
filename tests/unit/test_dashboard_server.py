@@ -128,8 +128,9 @@ def test_dashboard_server_serves_hud_and_game_snapshot(tmp_path: Path, monkeypat
     assert "The Collector" in html
     assert "The Brain" in html
     assert "<title>TradeML Operator Dashboard</title>" in operator_html
-    assert 'id="metric-architecture"' in operator_html
-    assert 'id="metric-profit"' in operator_html
+    assert 'id="metric-data"' in operator_html
+    assert 'id="metric-research"' in operator_html
+    assert 'id="metric-paper"' in operator_html
     assert 'id="metric-codex"' in operator_html
     assert 'id="metric-coverage"' not in operator_html
     assert 'id="metric-canonical"' not in operator_html

@@ -34,6 +34,13 @@ collection:
   saturation:
     enabled: true
     target_utilization: 0.98
+  observability:
+    enabled: true
+    vendor_underutilized_after_minutes: 10
+    dataset_stale_after_minutes: 1440
+    scheduler_decision_retention_hours: 24
+    resource_warn_thresholds:
+      disk_percent: 90
   universe_policy: tiered_expansion
   retention_policy: watermarked_indefinite
   storage_watermark:

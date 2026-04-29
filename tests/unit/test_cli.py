@@ -102,6 +102,59 @@ def test_fleet_health_cli_prints_current_state(tmp_path: Path, monkeypatch, caps
     assert json.loads(capsys.readouterr().out)["verdict"] == "OK"
 
 
+def test_fleet_observability_cli_writes_snapshot(tmp_path: Path, monkeypatch, capsys) -> None:
+    workspace = tmp_path / "workspace"
+    data_root = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    data_root.mkdir()
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(data_root),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                },
+                "collection": {"saturation": {"target_utilization": 0.98}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cli,
+        "collect_dashboard_status_snapshot",
+        lambda settings: {
+            "runtime": {"running": True},
+            "collection_status": {},
+            "latest_raw_date": "2026-04-29",
+            "latest_curated_date": "2026-04-29",
+            "health": {"research_program_summary": {"status": "RUNNING"}},
+        },
+    )
+
+    rc = cli.main(
+        [
+            "fleet",
+            "--workspace-root",
+            str(workspace),
+            "--config",
+            str(config_path),
+            "observability",
+            "--data-root",
+            str(data_root),
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["research"]["status"] == "RUNNING"
+    assert (data_root / "control" / "cluster" / "state" / "autopilot" / "observability" / "latest.json").exists()
+
+
 def test_join_cluster_cli_bootstraps_manifest(tmp_path: Path, capsys) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)

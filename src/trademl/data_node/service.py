@@ -1188,7 +1188,20 @@ class DataNodeService:
                 ),
             )
             if claim.task is not None:
+                self.db.record_scheduler_decision(
+                    vendor=vendor,
+                    dataset=claim.task.dataset,
+                    decision="claimed",
+                    task_key=claim.task.task_key,
+                )
                 return claim.task
+            if claim.skip_reason:
+                self.db.record_scheduler_decision(
+                    vendor=vendor,
+                    dataset=claim.dataset,
+                    decision=self._scheduler_decision_label(claim.skip_reason),
+                    reason=claim.skip_reason,
+                )
             if (
                 claim.skip_reason
                 and claim.skip_reason.startswith("budget:")
@@ -1203,6 +1216,23 @@ class DataNodeService:
                 )
         self._record_idle_budget_warning_for_vendor(vendor)
         return None
+
+    @staticmethod
+    def _scheduler_decision_label(skip_reason: str) -> str:
+        """Return a compact scheduler decision label for telemetry."""
+        if skip_reason.startswith("budget:"):
+            return "budget_blocked"
+        if skip_reason.startswith("lane_cooldown"):
+            return "cooldown"
+        if skip_reason == "entitlement_blocked":
+            return "entitlement_blocked"
+        if skip_reason in {"vendor_attempt_backoff", "planner_task_backoff"}:
+            return "attempt_backoff" if skip_reason.startswith("vendor") else "planner_backoff"
+        if skip_reason in {"vendor_attempt_leased", "planner_task_leased", "planner_claim_race"}:
+            return "lease_race"
+        if skip_reason == "no_eligible_task":
+            return "no_task"
+        return "skipped"
 
     def _lease_auxiliary_candidate_if_available(self, candidate, vendor: str):
         """Lease an auxiliary candidate after lane-state and budget checks."""

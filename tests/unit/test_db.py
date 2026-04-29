@@ -1067,3 +1067,40 @@ def test_fetch_recent_raw_partition_dates_returns_newest_dates_first(tmp_path: P
     )
 
     assert recent == ["2025-01-04", "2025-01-03"]
+
+
+def test_scheduler_decision_and_archive_telemetry_summaries(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+
+    database.record_scheduler_decision(
+        vendor="alpaca",
+        dataset="equities_minute",
+        decision="claimed",
+        task_key="minute:aapl",
+    )
+    database.record_scheduler_decision(
+        vendor="alpaca",
+        dataset="equities_minute",
+        decision="budget_blocked",
+        reason="budget:minute",
+    )
+    database.record_archive_write_telemetry(
+        output_name="ticker_news",
+        partition_date="2026-04-29",
+        status="success",
+        rows_in=3,
+        rows_written=2,
+        duplicates_dropped=1,
+        coerced_columns=["news_id", "published_at"],
+    )
+
+    scheduler = database.summarize_scheduler_decisions(minutes=15)
+    archive = database.summarize_archive_write_telemetry(minutes=60)
+
+    assert {row["decision"] for row in scheduler["rows"]} == {
+        "claimed",
+        "budget_blocked",
+    }
+    assert archive["rows"][0]["output_name"] == "ticker_news"
+    assert archive["rows"][0]["rows_in"] == 3
+    assert archive["rows"][0]["duplicates_dropped"] == 1

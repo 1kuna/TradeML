@@ -90,6 +90,7 @@ from trademl.fleet.autopilot import (
     read_codex_issue_bucket,
     write_codex_issue_bucket,
 )
+from trademl.fleet.observability import build_fleet_observability, write_fleet_observability
 from trademl.reference.universe import build_stage1_universe, build_time_varying_universe
 
 LOGGER = logging.getLogger(__name__)
@@ -1374,6 +1375,8 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
     vendor_attempt_summary = _read_vendor_attempt_summary(settings.db_path)
     budget_summary = _read_budget_summary(settings)
     vendor_throughput = _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
+    scheduler_decisions = _read_scheduler_decisions(settings.db_path)
+    archive_write_telemetry = _read_archive_write_telemetry(settings.db_path)
     planner_eta = _summarize_planner_eta(settings.db_path, planner_summary=planner_summary, vendor_throughput=vendor_throughput)
     stage = _read_yaml(settings.stage_path)
     stage_symbols = stage.get("symbols", [])
@@ -1486,6 +1489,8 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "queue_counts": queue_counts,
         "vendor_attempt_summary": vendor_attempt_summary,
         "vendor_throughput": vendor_throughput,
+        "scheduler_decisions": scheduler_decisions,
+        "archive_write_telemetry": archive_write_telemetry,
         "planner_summary": planner_summary,
         "planner_eta": planner_eta,
         "budget_summary": budget_summary,
@@ -1533,6 +1538,14 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "audit": audit,
         "coverage_plan": coverage_plan,
     }
+    observability = build_fleet_observability(
+        snapshot=snapshot,
+        data_root=settings.nas_mount,
+        config=_read_yaml(settings.config_path),
+    )
+    if settings.nas_mount.exists():
+        write_fleet_observability(data_root=settings.nas_mount, payload=observability)
+    snapshot["observability"] = observability
     issues = collect_current_state_issues(snapshot)
     bucket = write_codex_issue_bucket(data_root=settings.nas_mount, issues=issues)
     bucket_state = read_codex_issue_bucket(data_root=settings.nas_mount)
@@ -2406,6 +2419,24 @@ def _read_planner_summary(db_path: Path) -> dict[str, Any]:
         return DataNodeDB(db_path).planner_summary()
     except sqlite3.OperationalError:
         return {"counts": {}, "progress": {}}
+
+
+def _read_scheduler_decisions(db_path: Path) -> dict[str, Any]:
+    if not db_path.exists():
+        return {"rows": [], "checked_at": None, "window_minutes": 15}
+    try:
+        return DataNodeDB(db_path).summarize_scheduler_decisions(minutes=15)
+    except sqlite3.OperationalError:
+        return {"rows": [], "checked_at": None, "window_minutes": 15}
+
+
+def _read_archive_write_telemetry(db_path: Path) -> dict[str, Any]:
+    if not db_path.exists():
+        return {"rows": [], "checked_at": None, "window_minutes": 60}
+    try:
+        return DataNodeDB(db_path).summarize_archive_write_telemetry(minutes=60)
+    except sqlite3.OperationalError:
+        return {"rows": [], "checked_at": None, "window_minutes": 60}
 
 
 def _summarize_vendor_throughput(db_path: Path, *, budget_summary: dict[str, Any], window_minutes: int = 15) -> dict[str, Any]:

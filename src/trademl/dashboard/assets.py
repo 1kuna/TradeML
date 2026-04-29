@@ -435,8 +435,9 @@ OPERATOR_HTML_PAGE = """<!doctype html>
 
     <div class="summary-grid">
       <div class="card"><div class="label">Systems</div><div class="value" id="metric-node-status">-</div><div class="delta mono" id="metric-node-detail">-</div></div>
-      <div class="card"><div class="label">Architecture</div><div class="value" id="metric-architecture">-</div><div class="delta" id="metric-architecture-detail">-</div></div>
-      <div class="card"><div class="label">Profit</div><div class="value" id="metric-profit">-</div><div class="delta" id="metric-profit-detail">-</div></div>
+      <div class="card"><div class="label">Data</div><div class="value" id="metric-data">-</div><div class="delta" id="metric-data-detail">-</div></div>
+      <div class="card"><div class="label">Research</div><div class="value" id="metric-research">-</div><div class="delta" id="metric-research-detail">-</div></div>
+      <div class="card"><div class="label">Paper</div><div class="value" id="metric-paper">-</div><div class="delta" id="metric-paper-detail">-</div></div>
       <div class="card"><div class="label">Codex</div><div class="value" id="metric-codex">-</div><div class="delta" id="metric-codex-detail">-</div></div>
     </div>
 
@@ -731,19 +732,22 @@ OPERATOR_HTML_PAGE = """<!doctype html>
       const state = currentStatusSnapshot?.current_state || {};
       const pi = state.pi || {};
       const mac = state.mac || {};
-      const architecture = state.architecture || {};
-      const profit = state.profit || {};
+      const data = state.data || {};
+      const research = state.research || {};
+      const paper = state.paper || {};
       const codex = state.codex || {};
       document.getElementById('metric-node-status').textContent = state.verdict || (runtime.running ? 'Running' : 'Stopped');
       document.getElementById('metric-node-detail').textContent = `Pi ${pi.status || '-'} · Mac ${mac.status || '-'}`;
-      document.getElementById('metric-architecture').textContent = architecture.state || 'No incumbent';
-      document.getElementById('metric-architecture-detail').textContent = architecture.decision || architecture.reason || '-';
+      document.getElementById('metric-data').textContent = data.headline || 'Collecting';
+      document.getElementById('metric-data-detail').textContent = data.detail || '-';
+      document.getElementById('metric-research').textContent = research.headline || 'Research pending';
+      document.getElementById('metric-research-detail').textContent = research.detail || '-';
       const pinnedRemaining = collection.phase1_pinned_remaining_units;
       const rollingRemaining = collection.rolling_remaining_units ?? 0;
       const repairRemaining = collection.repair_remaining_units ?? 0;
       const totalRemaining = collection.canonical_remaining_units ?? (rollingRemaining + repairRemaining);
-      document.getElementById('metric-profit').textContent = profit.headline || 'No validated PnL';
-      document.getElementById('metric-profit-detail').textContent = profit.detail || '-';
+      document.getElementById('metric-paper').textContent = paper.headline || 'No validated PnL';
+      document.getElementById('metric-paper-detail').textContent = paper.detail || '-';
       document.getElementById('metric-codex').textContent = state.action || 'OK';
       document.getElementById('metric-codex-detail').textContent = codex.open_count
         ? `${formatNumber(codex.open_count)} issue(s): ${(codex.latest || {}).message || 'inspect bucket'}`
@@ -2540,5 +2544,4 @@ HTML_PAGE = """<!doctype html>
 </body>
 </html>
 """
-
 
