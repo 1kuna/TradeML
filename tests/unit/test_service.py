@@ -1104,6 +1104,7 @@ def test_process_planner_queue_heartbeats_while_waiting_on_pending_lane(
     slow_lane_started = threading.Event()
     heartbeat_calls: list[float] = []
     lane_invocations = {"count": 0}
+    service._canonical_vendor_has_eligible_work = lambda vendor: lane_invocations["count"] < 2  # type: ignore[method-assign]
 
     def drain_canonical_lane(vendor: str, exchange: str) -> list[str]:
         lane_invocations["count"] += 1
@@ -1152,6 +1153,7 @@ def test_process_planner_queue_waits_for_stalled_lane_instead_of_overlapping_wor
     release_lane = threading.Event()
     lane_started = threading.Event()
     invocations = {"count": 0}
+    service._auxiliary_vendor_has_eligible_work = lambda vendor: invocations["count"] < 1  # type: ignore[method-assign]
 
     def drain_auxiliary_lane(vendor: str) -> list[str]:
         invocations["count"] += 1
@@ -1199,12 +1201,12 @@ def test_process_planner_queue_refills_idle_vendor_while_other_lane_is_stalled(
 
     def aux_lane_widths(**kwargs):  # noqa: ANN001
         width_calls["count"] += 1
-        if width_calls["count"] == 1:
+        if width_calls["count"] <= 2:
             return {"fred": 1}
         return {"fred": 1, "alpaca": 1}
 
     service._aux_lane_widths = aux_lane_widths  # type: ignore[method-assign]
-    service._auxiliary_vendor_has_eligible_work = lambda vendor: vendor == "alpaca"  # type: ignore[method-assign]
+    service._auxiliary_vendor_has_eligible_work = lambda vendor: vendor in {"alpaca", "fred"}  # type: ignore[method-assign]
     release_fred = threading.Event()
     alpaca_ran = threading.Event()
     calls: list[str] = []
@@ -1229,6 +1231,44 @@ def test_process_planner_queue_refills_idle_vendor_while_other_lane_is_stalled(
     assert "fred" in calls
     assert "alpaca" in calls
     assert changed == []
+
+
+def test_process_planner_queue_does_not_submit_auxiliary_lane_without_eligible_work(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"fred": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        worker_id="rpi-01",
+    )
+    service._ensure_planner_backlog_seeded = lambda trading_date=None: None  # type: ignore[method-assign]
+    service._canonical_runtime._backfill_lane_widths = lambda: {}  # type: ignore[method-assign]
+    service._aux_lane_widths = lambda **kwargs: {"fred": 1}  # type: ignore[method-assign]
+    service._auxiliary_vendor_has_eligible_work = lambda vendor: False  # type: ignore[method-assign]
+    calls: list[str] = []
+
+    def drain_auxiliary_lane(vendor: str) -> list[str]:
+        calls.append(vendor)
+        return []
+
+    service._drain_auxiliary_lane = drain_auxiliary_lane  # type: ignore[method-assign]
+
+    changed = service.process_planner_queue(
+        lane_stall_seconds=0.01,
+        heartbeat_interval_seconds=60.0,
+    )
+
+    assert changed == []
+    assert calls == []
 
 
 def test_archive_file_lock_retries_when_lock_disappears_between_open_and_stat(
@@ -4644,17 +4684,24 @@ def test_process_planner_queue_runs_unrelated_auxiliary_lanes_while_canonical_ba
     service.default_symbols = ["AAPL"]
     calls: list[str] = []
     aux_task_kind_calls: list[set[str]] = []
+    aux_calls = {"count": 0}
 
     service._ensure_planner_backlog_seeded = lambda **kwargs: None  # type: ignore[method-assign]
     service._canonical_runtime._backfill_lane_widths = lambda: {"alpaca": 1}  # type: ignore[method-assign]
     service._aux_lane_widths = lambda **kwargs: aux_task_kind_calls.append(set(kwargs.get("task_kinds") or ())) or {"alpha_vantage": 1}  # type: ignore[method-assign]
+    service._canonical_vendor_has_eligible_work = lambda vendor: True  # type: ignore[method-assign]
+    service._auxiliary_vendor_has_eligible_work = lambda vendor: aux_calls["count"] < 1  # type: ignore[method-assign]
     service._drain_canonical_lane = lambda vendor, exchange: calls.append(f"canonical:{vendor}") or []  # type: ignore[method-assign]
-    service._drain_auxiliary_lane = lambda vendor: calls.append(f"aux:{vendor}") or []  # type: ignore[method-assign]
+    service._drain_auxiliary_lane = lambda vendor: aux_calls.__setitem__("count", aux_calls["count"] + 1) or calls.append(f"aux:{vendor}") or []  # type: ignore[method-assign]
 
     service.process_planner_queue(exchange="XNYS")
 
     assert calls == ["canonical:alpaca", "aux:alpha_vantage"]
-    assert aux_task_kind_calls == [{"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"}]
+    assert aux_task_kind_calls
+    assert all(
+        call == {"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"}
+        for call in aux_task_kind_calls
+    )
 
 
 def test_process_planner_queue_runs_full_auxiliary_width_during_canonical_tail(
@@ -4747,22 +4794,25 @@ def test_process_planner_queue_runs_full_auxiliary_width_during_canonical_tail(
     service.default_symbols = ["HOLX", "AL"]
     calls: list[str] = []
     aux_task_kind_calls: list[set[str]] = []
+    aux_calls = {"count": 0}
 
     service._ensure_planner_backlog_seeded = lambda **kwargs: None  # type: ignore[method-assign]
     service._canonical_runtime._backfill_lane_widths = lambda: {"alpaca": 1}  # type: ignore[method-assign]
     service._aux_lane_widths = lambda **kwargs: aux_task_kind_calls.append(set(kwargs.get("task_kinds") or ())) or {"alpha_vantage": 3}  # type: ignore[method-assign]
+    service._canonical_vendor_has_eligible_work = lambda vendor: True  # type: ignore[method-assign]
+    service._auxiliary_vendor_has_eligible_work = lambda vendor: aux_calls["count"] < 3  # type: ignore[method-assign]
     service._drain_canonical_lane = lambda vendor, exchange: calls.append(f"canonical:{vendor}") or []  # type: ignore[method-assign]
-    service._drain_auxiliary_lane = lambda vendor: calls.append(f"aux:{vendor}") or []  # type: ignore[method-assign]
+    service._drain_auxiliary_lane = lambda vendor: aux_calls.__setitem__("count", aux_calls["count"] + 1) or calls.append(f"aux:{vendor}") or []  # type: ignore[method-assign]
 
     service.process_planner_queue(exchange="XNYS")
 
-    assert calls == [
-        "canonical:alpaca",
-        "aux:alpha_vantage",
-        "aux:alpha_vantage",
-        "aux:alpha_vantage",
-    ]
-    assert aux_task_kind_calls == [{"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"}]
+    assert calls[0] == "canonical:alpaca"
+    assert calls.count("aux:alpha_vantage") >= 3
+    assert aux_task_kind_calls
+    assert all(
+        call == {"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"}
+        for call in aux_task_kind_calls
+    )
 
 
 def test_process_planner_queue_refills_auxiliary_vendor_lanes_without_waiting_for_next_cycle(
@@ -4788,6 +4838,7 @@ def test_process_planner_queue_refills_auxiliary_vendor_lanes_without_waiting_fo
     service._ensure_planner_backlog_seeded = lambda **kwargs: None  # type: ignore[method-assign]
     service._canonical_runtime._backfill_lane_widths = lambda: {}  # type: ignore[method-assign]
     service._aux_lane_widths = lambda **kwargs: {"alpaca": 1, "finnhub": 1}  # type: ignore[method-assign]
+    service._auxiliary_vendor_has_eligible_work = lambda vendor: remaining[vendor] > 0  # type: ignore[method-assign]
 
     def drain_auxiliary_lane(vendor: str) -> list[str]:
         calls.append(vendor)

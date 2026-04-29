@@ -129,12 +129,7 @@ class PlannerLaneScheduler:
                     ):
                         submit_auxiliary_lane(vendor)
 
-            for vendor, width in canonical_lane_widths.items():
-                for _ in range(max(1, width)):
-                    submit_canonical_lane(vendor)
-            for vendor, width in aux_lane_widths.items():
-                for _ in range(max(1, width)):
-                    submit_auxiliary_lane(vendor)
+            refill_ready_lanes()
             last_heartbeat = monotonic()
             last_pending_log = monotonic()
             queue_started = monotonic()
