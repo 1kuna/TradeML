@@ -1815,6 +1815,34 @@ def test_write_paper_outputs_uses_latest_rebalance_date(tmp_path: Path) -> None:
     assert targets["date"].dt.strftime("%Y-%m-%d").unique().tolist() == ["2026-02-27"]
 
 
+def test_write_paper_outputs_uses_latest_date_when_no_rebalance_day_exists(tmp_path: Path) -> None:
+    predictions_path = tmp_path / "predictions.parquet"
+    pd.DataFrame(
+        {
+            "date": ["2026-03-02", "2026-03-02", "2026-03-02"],
+            "symbol": ["A", "B", "C"],
+            "prediction": [0.4, 0.1, 0.3],
+        }
+    ).to_parquet(predictions_path, index=False)
+    incumbent = {
+        "program_id": "perpetual-macmini",
+        "run_id": "strong",
+        "artifacts": {"primary_predictions_path": str(predictions_path)},
+    }
+
+    result = research.write_paper_outputs_for_incumbent(
+        incumbent=incumbent,
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        policy={"enabled": True, "rebalance_day": "FRI", "no_live_orders": True},
+    )
+
+    targets = pd.read_parquet(result["target_weights_path"])
+    assert result["date"] == "2026-03-02"
+    assert not targets.empty
+    assert targets["target_weight"].sum() == pytest.approx(1.0)
+
+
 def test_write_shadow_paper_outputs_for_candidate_is_non_tradable(tmp_path: Path) -> None:
     predictions_path = tmp_path / "predictions.parquet"
     pd.DataFrame(

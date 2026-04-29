@@ -698,7 +698,10 @@ def _write_paper_outputs(
     latest["rank"] = range(1, len(latest) + 1)
     latest["source_run_id"] = source.get("run_id")
     signals = latest[["date", "symbol", "score", "rank", "source_run_id"]].copy()
-    targets = build_portfolio(signals[["date", "symbol", "score"]], {"rebalance_day": merged_policy.get("rebalance_day", "FRI")})
+    targets = build_portfolio(
+        signals[["date", "symbol", "score"]],
+        {"rebalance_day": _rebalance_day_for_signal_date(latest_date)},
+    )
     previous = _latest_prior_paper_targets(data_root=data_root, local_state=local_state, current_date=latest_date.date().isoformat())
     orders = _paper_order_deltas(targets=targets, previous=previous)
     root = _shared_research_root(data_root=data_root) / shared_family / latest_date.date().isoformat()
@@ -759,6 +762,12 @@ def _latest_paper_signal_date(*, predictions: pd.DataFrame, rebalance_day: str) 
     if not eligible.empty:
         return pd.Timestamp(eligible.iloc[-1])
     return pd.Timestamp(normalized.iloc[-1])
+
+
+def _rebalance_day_for_signal_date(signal_date: pd.Timestamp) -> str:
+    """Return a rebalance-day token that preserves the selected signal date."""
+    codes = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+    return codes[int(pd.Timestamp(signal_date).weekday())]
 
 
 def write_alpaca_paper_order_payloads(
