@@ -30,6 +30,19 @@ class VendorBudget:
     daily_cap: int
 
 
+@dataclass(slots=True, frozen=True)
+class BudgetDecision:
+    """Reasoned permit decision for one prospective vendor request."""
+
+    allowed: bool
+    blocked_dimension: str | None
+    next_eligible_at: datetime | None
+    remaining_minute: int
+    remaining_daily: int
+    remaining_non_forward: int
+    requested_units: int
+
+
 class BudgetManager:
     """Track per-vendor RPM and daily caps with FORWARD-task reserve support."""
 
@@ -193,6 +206,114 @@ class BudgetManager:
             return reserved_units
         return max(0, int(reserved_units * (seconds_to_reset / burn_window_seconds)))
 
+    @staticmethod
+    def _next_reset(now: datetime) -> datetime:
+        """Return the next UTC daily reset boundary."""
+        return datetime.combine(
+            now.date() + timedelta(days=1), datetime.min.time(), tzinfo=UTC
+        )
+
+    def _next_reserve_release(
+        self,
+        *,
+        limits: VendorBudget,
+        spend_other: int,
+        requested_units: int,
+        now: datetime,
+    ) -> datetime:
+        """Return when non-forward reserve burn-down can permit the request."""
+        next_reset = self._next_reset(now)
+        burn_start = next_reset - timedelta(hours=1)
+        if now < burn_start:
+            return burn_start
+        for step in range(1, 61):
+            candidate = min(next_reset, now + timedelta(minutes=step))
+            non_forward_ceiling = max(
+                0, limits.daily_cap - self._effective_reserved_units(limits, candidate)
+            )
+            if spend_other + requested_units <= non_forward_ceiling:
+                return candidate
+        return next_reset
+
+    def budget_decision(
+        self,
+        vendor: str,
+        task_kind: str = "OTHER",
+        *,
+        units: int = 1,
+        now: datetime | None = None,
+    ) -> BudgetDecision:
+        """Return a reasoned budget permit decision for a prospective request."""
+        with self._lock:
+            current = self._normalize(now)
+            self._trim_window(vendor, current)
+            limits = self.vendor_limits[vendor]
+            spend = self.daily_spend[vendor]
+            requested_units = max(1, int(units))
+            total_spend = spend["FORWARD"] + spend["OTHER"]
+            reserved_units = self._effective_reserved_units(limits, current)
+            non_forward_ceiling = max(0, limits.daily_cap - reserved_units)
+            remaining_minute = max(0, limits.rpm - len(self.request_windows[vendor]))
+            remaining_daily = max(0, limits.daily_cap - total_spend)
+            remaining_non_forward = max(0, non_forward_ceiling - spend["OTHER"])
+
+            if remaining_minute <= 0:
+                window = self.request_windows[vendor]
+                next_eligible = (
+                    window[0] + timedelta(seconds=60)
+                    if window
+                    else current + timedelta(seconds=60)
+                )
+                return BudgetDecision(
+                    allowed=False,
+                    blocked_dimension="minute",
+                    next_eligible_at=next_eligible,
+                    remaining_minute=remaining_minute,
+                    remaining_daily=remaining_daily,
+                    remaining_non_forward=remaining_non_forward,
+                    requested_units=requested_units,
+                )
+
+            if total_spend + requested_units > limits.daily_cap:
+                return BudgetDecision(
+                    allowed=False,
+                    blocked_dimension="daily",
+                    next_eligible_at=self._next_reset(current),
+                    remaining_minute=remaining_minute,
+                    remaining_daily=remaining_daily,
+                    remaining_non_forward=remaining_non_forward,
+                    requested_units=requested_units,
+                )
+
+            if (
+                task_kind != "FORWARD"
+                and spend["OTHER"] + requested_units > non_forward_ceiling
+            ):
+                return BudgetDecision(
+                    allowed=False,
+                    blocked_dimension="reserve",
+                    next_eligible_at=self._next_reserve_release(
+                        limits=limits,
+                        spend_other=spend["OTHER"],
+                        requested_units=requested_units,
+                        now=current,
+                    ),
+                    remaining_minute=remaining_minute,
+                    remaining_daily=remaining_daily,
+                    remaining_non_forward=remaining_non_forward,
+                    requested_units=requested_units,
+                )
+
+            return BudgetDecision(
+                allowed=True,
+                blocked_dimension=None,
+                next_eligible_at=None,
+                remaining_minute=remaining_minute,
+                remaining_daily=remaining_daily,
+                remaining_non_forward=remaining_non_forward,
+                requested_units=requested_units,
+            )
+
     def can_spend(
         self,
         vendor: str,
@@ -202,26 +323,9 @@ class BudgetManager:
         now: datetime | None = None,
     ) -> bool:
         """Return whether a request can be issued for the vendor now."""
-        with self._lock:
-            current = self._normalize(now)
-            self._trim_window(vendor, current)
-            limits = self.vendor_limits[vendor]
-            spend = self.daily_spend[vendor]
-            requested_units = max(1, int(units))
-
-            if len(self.request_windows[vendor]) >= limits.rpm:
-                return False
-
-            total_spend = spend["FORWARD"] + spend["OTHER"]
-            reserved_units = self._effective_reserved_units(limits, current)
-            non_forward_ceiling = max(0, limits.daily_cap - reserved_units)
-
-            if task_kind == "FORWARD":
-                return total_spend + requested_units <= limits.daily_cap
-            return (
-                spend["OTHER"] + requested_units <= non_forward_ceiling
-                and total_spend + requested_units <= limits.daily_cap
-            )
+        return self.budget_decision(
+            vendor, task_kind=task_kind, units=units, now=now
+        ).allowed
 
     def _record_telemetry_event(
         self,

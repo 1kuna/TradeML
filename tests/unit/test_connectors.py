@@ -11,7 +11,9 @@ from trademl.connectors.alpaca import AlpacaConnector
 from trademl.connectors.alpha_vantage import AlphaVantageConnector
 from trademl.connectors.base import (
     BaseConnector,
+    BudgetBlockedConnectorError,
     PermanentConnectorError,
+    RemoteRateLimitConnectorError,
     RetryConfig,
     TemporaryConnectorError,
 )
@@ -1574,7 +1576,23 @@ def test_http_connector_normalizes_exhausted_429_as_budget_error() -> None:
         sleep_fn=lambda _: None,
     )
 
-    with pytest.raises(
-        TemporaryConnectorError, match="budget exhausted for vendor=massive"
-    ):
+    with pytest.raises(RemoteRateLimitConnectorError) as exc_info:
         connector.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-02")
+
+    assert exc_info.value.vendor == "massive"
+
+
+def test_http_connector_raises_typed_local_budget_block() -> None:
+    budget_manager = BudgetManager({"massive": {"rpm": 1, "daily_cap": 10}})
+    budget_manager.record_spend("massive")
+    connector = MassiveConnector(
+        base_url="https://api.polygon.io",
+        api_key="key",
+        budget_manager=budget_manager,
+        session=FakeSession([]),
+    )
+
+    with pytest.raises(BudgetBlockedConnectorError) as exc_info:
+        connector.fetch("equities_eod", ["MSFT"], "2024-01-02", "2024-01-02")
+
+    assert exc_info.value.decision.blocked_dimension == "minute"

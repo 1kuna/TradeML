@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from trademl.data_node import db as db_module
+from trademl.data_node.budgets import BudgetManager
 from trademl.data_node.db import DataNodeDB
 
 
@@ -780,6 +781,263 @@ def test_raw_partition_manifest_and_vendor_lane_health_round_trip(tmp_path: Path
     assert lane is not None
     assert lane.state == "COOLDOWN"
     assert lane.recent_remote_429s == 4
+
+
+def test_clear_expired_vendor_lane_cooldowns_resolves_current_state(
+    tmp_path: Path,
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    now = datetime.now(tz=UTC).replace(microsecond=0)
+    database.upsert_vendor_lane_health(
+        vendor="twelve_data",
+        dataset="equities_minute",
+        state="BUDGET_BLOCKED",
+        cooldown_until=(now - timedelta(seconds=1)).isoformat(),
+    )
+
+    cleared = database.clear_expired_vendor_lane_cooldowns(now=now)
+    lane = database.get_vendor_lane_health(
+        vendor="twelve_data", dataset="equities_minute"
+    )
+
+    assert cleared == 1
+    assert lane is not None
+    assert lane.state == "HEALTHY"
+    assert lane.cooldown_until is None
+
+
+def test_clear_stale_idle_vendor_lanes_resolves_old_idle_marker(
+    tmp_path: Path,
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    now = datetime(2026, 4, 29, 12, tzinfo=UTC)
+    database.upsert_vendor_lane_health(
+        vendor="alpaca",
+        dataset="news",
+        state="IDLE_BUDGET",
+    )
+
+    cleared = database.clear_stale_idle_vendor_lanes(
+        older_than=now + timedelta(days=1)
+    )
+    lane = database.get_vendor_lane_health(vendor="alpaca", dataset="news")
+
+    assert cleared == 1
+    assert lane is not None
+    assert lane.state == "HEALTHY"
+
+
+def test_claim_next_vendor_task_leases_task_and_attempt_atomically(
+    tmp_path: Path,
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    database.upsert_planner_task(
+        task_key="minute::alpaca::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="equities_minute",
+        tier="B",
+        priority=205,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_minute",
+        payload={"request_units": 1},
+    )
+    budget = BudgetManager({"alpaca": {"rpm": 200, "daily_cap": 1000}})
+
+    claim = database.claim_next_vendor_task(
+        vendor="alpaca",
+        lease_owner="worker-1",
+        task_families=("supplemental_research",),
+        budget_decision_provider=lambda _task: budget.budget_decision("alpaca"),
+    )
+
+    assert claim.task is not None
+    assert claim.task.task_key == "minute::alpaca::AAPL"
+    attempt = database.vendor_attempts_for_task("minute::alpaca::AAPL")[0]
+    assert attempt.status == "LEASED"
+    assert attempt.lease_owner == "worker-1"
+
+
+def test_claim_next_vendor_task_returns_explicit_budget_skip_reason(
+    tmp_path: Path,
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    database.upsert_planner_task(
+        task_key="minute::twelve::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="equities_minute",
+        tier="B",
+        priority=205,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["twelve_data"],
+        output_name="equities_minute",
+        payload={"request_units": 1},
+    )
+    budget = BudgetManager({"twelve_data": {"rpm": 1, "daily_cap": 100}})
+    now = datetime.now(tz=UTC).replace(microsecond=0)
+    budget.record_spend("twelve_data", now=now)
+
+    claim = database.claim_next_vendor_task(
+        vendor="twelve_data",
+        lease_owner="worker-1",
+        task_families=("supplemental_research",),
+        budget_decision_provider=lambda _task: budget.budget_decision(
+            "twelve_data", now=now + timedelta(seconds=1)
+        ),
+        now=now + timedelta(seconds=1),
+    )
+
+    assert claim.task is None
+    assert claim.skip_reason == "budget:minute"
+    assert claim.dataset == "equities_minute"
+    assert claim.budget_decision.next_eligible_at == now + timedelta(seconds=60)
+    assert database.vendor_attempts_for_task("minute::twelve::AAPL") == []
+
+
+def test_claim_next_vendor_task_clears_stale_budget_cooldown_when_affordable(
+    tmp_path: Path,
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    now = datetime(2026, 4, 29, 12, tzinfo=UTC)
+    database.upsert_vendor_lane_health(
+        vendor="finnhub",
+        dataset="company_news",
+        state="BUDGET_BLOCKED",
+        cooldown_until=(now + timedelta(minutes=20)).isoformat(),
+        recent_local_budget_blocks=3,
+    )
+    database.upsert_planner_task(
+        task_key="news::finnhub::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="company_news",
+        tier="B",
+        priority=220,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["finnhub"],
+        output_name="ticker_news",
+        payload={"request_units": 1},
+    )
+    budget = BudgetManager({"finnhub": {"rpm": 57, "daily_cap": 82080}})
+
+    claim = database.claim_next_vendor_task(
+        vendor="finnhub",
+        lease_owner="worker-1",
+        task_families=("supplemental_research",),
+        budget_decision_provider=lambda _task: budget.budget_decision(
+            "finnhub", now=now
+        ),
+        now=now,
+    )
+
+    lane = database.get_vendor_lane_health(vendor="finnhub", dataset="company_news")
+    assert claim.task is not None
+    assert lane is not None
+    assert lane.state == "HEALTHY"
+    assert lane.cooldown_until is None
+
+
+def test_claim_next_vendor_task_clears_stale_budget_task_backoff_when_affordable(
+    tmp_path: Path,
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    now = datetime(2026, 4, 29, 12, tzinfo=UTC)
+    database.upsert_planner_task(
+        task_key="news::finnhub::MSFT",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="company_news",
+        tier="B",
+        priority=220,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["MSFT"],
+        eligible_vendors=["finnhub"],
+        output_name="ticker_news",
+        payload={"request_units": 1},
+    )
+    database.mark_planner_task_failed(
+        "news::finnhub::MSFT",
+        error="finnhub:company_news: budget exhausted",
+        backoff_minutes=30,
+    )
+    budget = BudgetManager({"finnhub": {"rpm": 57, "daily_cap": 82080}})
+
+    claim = database.claim_next_vendor_task(
+        vendor="finnhub",
+        lease_owner="worker-1",
+        task_families=("supplemental_research",),
+        budget_decision_provider=lambda _task: budget.budget_decision(
+            "finnhub", now=now
+        ),
+        now=now,
+    )
+
+    assert claim.task is not None
+    assert claim.task.task_key == "news::finnhub::MSFT"
+
+
+def test_claim_next_vendor_task_retries_empty_success_when_task_still_partial(
+    tmp_path: Path,
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    database.upsert_planner_task(
+        task_key="minute::alpaca::today",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="equities_minute",
+        tier="B",
+        priority=205,
+        start_date="2026-04-29",
+        end_date="2026-04-29",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_minute",
+        payload={"request_units": 1},
+    )
+    database.mark_planner_task_partial(
+        "minute::alpaca::today", error="empty result", backoff_minutes=0
+    )
+    claim_now = datetime.now(tz=UTC) + timedelta(seconds=1)
+    assert (
+        database.lease_vendor_attempt(
+            task_key="minute::alpaca::today",
+            task_family="supplemental_research",
+            planner_group="supplemental_research_backlog",
+            vendor="alpaca",
+            lease_owner="worker-1",
+            payload={},
+            now=claim_now - timedelta(minutes=1),
+        )
+        is not None
+    )
+    database.mark_vendor_attempt_success(
+        task_key="minute::alpaca::today", vendor="alpaca", rows_returned=0
+    )
+    budget = BudgetManager({"alpaca": {"rpm": 200, "daily_cap": 288000}})
+
+    claim = database.claim_next_vendor_task(
+        vendor="alpaca",
+        lease_owner="worker-1",
+        task_families=("supplemental_research",),
+        budget_decision_provider=lambda _task: budget.budget_decision(
+            "alpaca", now=claim_now
+        ),
+        now=claim_now,
+    )
+
+    assert claim.task is not None
+    attempt = database.vendor_attempts_for_task("minute::alpaca::today")[0]
+    assert attempt.status == "LEASED"
+    assert attempt.rows_returned == 0
 
 
 def test_fetch_recent_raw_partition_dates_returns_newest_dates_first(tmp_path: Path) -> None:

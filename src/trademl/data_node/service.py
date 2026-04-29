@@ -24,6 +24,7 @@ from trademl.data_node.auxiliary_runtime import (
     ReferenceCollectionResult,
     _looks_like_entitlement_failure,
 )
+from trademl.data_node.budgets import BudgetDecision
 from trademl.data_node.capabilities import auxiliary_capabilities, forward_capabilities
 from trademl.data_node.canonical_runtime import CanonicalRuntime
 from trademl.data_node.curator import Curator, CuratorResult
@@ -1120,6 +1121,7 @@ class DataNodeService:
 
     def _auxiliary_vendor_has_eligible_work(self, vendor: str) -> bool:
         """Return whether an auxiliary vendor has affordable non-blocked work."""
+        self.db.clear_expired_vendor_lane_cooldowns()
         now_iso = datetime.now(tz=UTC).isoformat()
         task_families = (
             "security_master",
@@ -1155,7 +1157,7 @@ class DataNodeService:
                     is not None
                 ):
                     continue
-                if self._auxiliary_vendor_can_afford_task(vendor, candidate):
+                if self._auxiliary_vendor_budget_decision(vendor, candidate).allowed:
                     return True
         return False
 
@@ -1176,25 +1178,29 @@ class DataNodeService:
             dataset_passes.append(preferred_datasets)
         dataset_passes.append(None)
         for datasets_filter in dataset_passes:
-            page = 0
-            while not self._stop_event.is_set():
-                tasks = self.db.fetch_planner_tasks(
-                    task_families=task_families,
-                    statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+            claim = self.db.claim_next_vendor_task(
+                vendor=vendor,
+                lease_owner=self.worker_id,
+                task_families=task_families,
+                allowed_datasets=datasets_filter,
+                budget_decision_provider=lambda task: self._auxiliary_vendor_budget_decision(
+                    vendor, task
+                ),
+            )
+            if claim.task is not None:
+                return claim.task
+            if (
+                claim.skip_reason
+                and claim.skip_reason.startswith("budget:")
+                and claim.dataset
+                and claim.budget_decision is not None
+            ):
+                self._auxiliary_runtime._mark_budget_blocked_lane(
                     vendor=vendor,
-                    datasets=datasets_filter,
-                    limit=256,
-                    offset=page * 256,
+                    dataset=claim.dataset,
+                    reason=f"budget exhausted ({claim.skip_reason})",
+                    decision=claim.budget_decision,
                 )
-                if not tasks:
-                    break
-                for candidate in tasks:
-                    leased = self._lease_auxiliary_candidate_if_available(
-                        candidate, vendor
-                    )
-                    if leased is not None:
-                        return leased
-                page += 1
         self._record_idle_budget_warning_for_vendor(vendor)
         return None
 
@@ -1215,11 +1221,13 @@ class DataNodeService:
         )
         if cooldown is not None:
             return None
-        if not self._auxiliary_vendor_can_afford_task(vendor, candidate):
+        decision = self._auxiliary_vendor_budget_decision(vendor, candidate)
+        if not decision.allowed:
             self._auxiliary_runtime._mark_budget_blocked_lane(
                 vendor=vendor,
                 dataset=candidate.dataset,
                 reason="budget exhausted",
+                decision=decision,
             )
             return None
         return self.db.lease_planner_task_by_key(
@@ -1229,16 +1237,71 @@ class DataNodeService:
 
     def _auxiliary_vendor_can_afford_task(self, vendor: str, task) -> bool:
         """Return whether a vendor has local budget for an auxiliary task."""
+        return self._auxiliary_vendor_budget_decision(vendor, task).allowed
+
+    def _auxiliary_vendor_budget_decision(
+        self, vendor: str, task
+    ) -> BudgetDecision:
+        """Return the reasoned local-budget decision for an auxiliary task."""
         connector = self.connectors.get(vendor)
         budget_manager = getattr(connector, "budget_manager", None)
         if budget_manager is None:
-            return True
+            return BudgetDecision(
+                allowed=True,
+                blocked_dimension=None,
+                next_eligible_at=None,
+                remaining_minute=1,
+                remaining_daily=1,
+                remaining_non_forward=1,
+                requested_units=1,
+            )
         job = {
             "credit_cost": task.payload.get("credit_cost"),
             "request_units": task.payload.get("request_units", 1),
         }
         units = self._auxiliary_runtime._job_credit_cost(job)
-        return bool(budget_manager.can_spend(vendor, task_kind="OTHER", units=units))
+        return budget_manager.budget_decision(
+            vendor, task_kind="OTHER", units=units
+        )
+
+    def _reconcile_budget_blocked_auxiliary_lanes(self) -> int:
+        """Clear stale budget-blocked lane/task state when current budget is affordable."""
+        task_families = (
+            "security_master",
+            "corp_actions",
+            "events_filings",
+            "macro",
+            "supplemental_research",
+        )
+        reconciled = 0
+        for lane in self.db.fetch_vendor_lane_health(states=("BUDGET_BLOCKED",)):
+            connector = self.connectors.get(lane.vendor)
+            budget_manager = getattr(connector, "budget_manager", None)
+            if budget_manager is None:
+                continue
+            decision = budget_manager.budget_decision(
+                lane.vendor, task_kind="OTHER", units=1
+            )
+            if not decision.allowed:
+                continue
+            self.db.upsert_vendor_lane_health(
+                vendor=lane.vendor,
+                dataset=lane.dataset,
+                state="HEALTHY",
+                recent_outbound_requests=lane.recent_outbound_requests,
+                recent_success_units=lane.recent_success_units,
+                recent_remote_429s=lane.recent_remote_429s,
+                recent_local_budget_blocks=lane.recent_local_budget_blocks,
+                recent_empty_valid=lane.recent_empty_valid,
+                recent_permanent_failures=lane.recent_permanent_failures,
+            )
+            reconciled += self.db.clear_budget_backoff_for_vendor_dataset(
+                vendor=lane.vendor,
+                dataset=lane.dataset,
+                task_families=task_families,
+                reason="cleared stale budget backoff after current budget recovered",
+            )
+        return reconciled
 
     def _mark_entitlement_blocked_lane(
         self, *, vendor: str, dataset: str, reason: str
@@ -1287,6 +1350,23 @@ class DataNodeService:
                 continue
             if candidate.next_eligible_at and candidate.next_eligible_at > now_iso:
                 continue
+            attempts = [
+                attempt
+                for attempt in self.db.vendor_attempts_for_task(candidate.task_key)
+                if attempt.vendor == vendor
+            ]
+            if attempts:
+                attempt = attempts[0]
+                if attempt.status in {"SUCCESS", "PERMANENT_FAILED"}:
+                    continue
+                if (
+                    attempt.status == "LEASED"
+                    and attempt.lease_expires_at
+                    and attempt.lease_expires_at > now_iso
+                ):
+                    continue
+                if attempt.next_eligible_at and attempt.next_eligible_at > now_iso:
+                    continue
             lane = self.db.get_vendor_lane_health(
                 vendor=vendor, dataset=candidate.dataset
             )

@@ -22,6 +22,23 @@ def test_rpm_limiting() -> None:
     assert manager.can_spend("alpaca", now=now + timedelta(seconds=61))
 
 
+def test_budget_decision_reports_minute_block_timing() -> None:
+    manager = BudgetManager({"alpaca": {"rpm": 2, "daily_cap": 10}})
+    now = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+
+    manager.record_spend("alpaca", now=now)
+    manager.record_spend("alpaca", now=now + timedelta(seconds=1))
+
+    decision = manager.budget_decision("alpaca", now=now + timedelta(seconds=2))
+
+    assert not decision.allowed
+    assert decision.blocked_dimension == "minute"
+    assert decision.next_eligible_at == now + timedelta(seconds=60)
+    assert decision.remaining_minute == 0
+    assert decision.remaining_daily == 8
+    assert decision.requested_units == 1
+
+
 def test_daily_cap_enforcement() -> None:
     manager = BudgetManager({"fmp": {"rpm": 10, "daily_cap": 5}})
     now = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
@@ -33,6 +50,22 @@ def test_daily_cap_enforcement() -> None:
     assert not manager.can_spend("fmp", now=now + timedelta(minutes=5))
     manager.reset_daily(now=now + timedelta(days=1))
     assert manager.can_spend("fmp", now=now + timedelta(days=1))
+
+
+def test_budget_decision_reports_daily_block_reset() -> None:
+    manager = BudgetManager({"fmp": {"rpm": 10, "daily_cap": 5}})
+    now = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+
+    manager.record_spend("fmp", task_kind="FORWARD", units=5, now=now)
+
+    decision = manager.budget_decision(
+        "fmp", task_kind="FORWARD", units=1, now=now + timedelta(minutes=1)
+    )
+
+    assert not decision.allowed
+    assert decision.blocked_dimension == "daily"
+    assert decision.next_eligible_at == datetime(2026, 1, 3, tzinfo=UTC)
+    assert decision.remaining_daily == 0
 
 
 def test_daily_cap_enforcement_uses_weighted_units() -> None:
@@ -83,6 +116,32 @@ def test_forward_reserve_burns_down_near_daily_reset() -> None:
         "alpaca", task_kind="OTHER", now=early + timedelta(minutes=10)
     )
     assert manager.can_spend("alpaca", task_kind="OTHER", now=late)
+
+
+def test_budget_decision_reports_reserve_release_timing() -> None:
+    manager = BudgetManager(
+        {"alpaca": {"rpm": 100, "daily_cap": 10}}, reserve_fraction=0.20
+    )
+    early = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+    late = datetime(2026, 1, 2, 23, 30, tzinfo=UTC)
+
+    for offset in range(8):
+        manager.record_spend(
+            "alpaca", task_kind="OTHER", now=early + timedelta(minutes=offset)
+        )
+
+    early_decision = manager.budget_decision(
+        "alpaca", task_kind="OTHER", now=early + timedelta(minutes=10)
+    )
+    late_decision = manager.budget_decision(
+        "alpaca", task_kind="OTHER", now=late
+    )
+
+    assert not early_decision.allowed
+    assert early_decision.blocked_dimension == "reserve"
+    assert early_decision.next_eligible_at == datetime(2026, 1, 2, 23, 0, tzinfo=UTC)
+    assert late_decision.allowed
+    assert late_decision.remaining_non_forward >= 1
 
 
 def test_budget_manager_persists_snapshot(tmp_path) -> None:

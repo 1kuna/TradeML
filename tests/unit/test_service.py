@@ -149,6 +149,19 @@ class _BudgetBlockedAuxiliaryConnector:
         raise TemporaryConnectorError("budget exhausted for vendor=finnhub")
 
 
+class _BudgetedAuxiliaryConnector:
+    def __init__(self, vendor_name: str, budget_manager: BudgetManager) -> None:
+        self.vendor_name = vendor_name
+        self.budget_manager = budget_manager
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        self.calls.append((dataset, tuple(symbols)))
+        return pd.DataFrame()
+
+
 class _EntitlementBlockedAuxiliaryConnector:
     vendor_name = "tiingo"
 
@@ -1379,6 +1392,106 @@ def test_budget_blocked_auxiliary_lane_defers_peer_tasks_without_retry_storm(
     assert "budget exhausted" in str(second.last_error)
 
 
+def test_local_budget_block_uses_budget_decision_retry_timing(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    budget = BudgetManager({"finnhub": {"rpm": 1, "daily_cap": 100}})
+    now = datetime.now(tz=UTC)
+    budget.record_spend("finnhub", now=now)
+    connector = _BudgetedAuxiliaryConnector("finnhub", budget)
+    service = DataNodeService(
+        db=db,
+        connectors={"finnhub": connector},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    db.upsert_planner_task(
+        task_key="news::budget::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="company_news",
+        tier="B",
+        priority=220,
+        start_date="2026-04-01",
+        end_date="2026-04-28",
+        symbols=["AAPL"],
+        eligible_vendors=["finnhub"],
+        output_name="ticker_news",
+        payload={"scope_kind": "symbol_range"},
+    )
+
+    service._drain_auxiliary_lane("finnhub")
+
+    lane = db.get_vendor_lane_health(vendor="finnhub", dataset="company_news")
+    assert lane is not None
+    assert lane.state == "BUDGET_BLOCKED"
+    assert lane.cooldown_until is not None
+    cooldown = datetime.fromisoformat(lane.cooldown_until)
+    assert cooldown <= now + pd.Timedelta(seconds=65)
+    assert connector.calls == []
+
+
+def test_reconcile_budget_blocked_auxiliary_lanes_clears_recovered_budget(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    budget = BudgetManager({"finnhub": {"rpm": 57, "daily_cap": 82080}})
+    service = DataNodeService(
+        db=db,
+        connectors={"finnhub": _BudgetedAuxiliaryConnector("finnhub", budget)},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    db.upsert_vendor_lane_health(
+        vendor="finnhub",
+        dataset="company_news",
+        state="BUDGET_BLOCKED",
+        cooldown_until=(datetime.now(tz=UTC) + pd.Timedelta(minutes=20)).isoformat(),
+        recent_local_budget_blocks=5,
+    )
+    db.upsert_planner_task(
+        task_key="news::reconcile::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="company_news",
+        tier="B",
+        priority=220,
+        start_date="2026-04-01",
+        end_date="2026-04-28",
+        symbols=["AAPL"],
+        eligible_vendors=["finnhub"],
+        output_name="ticker_news",
+        payload={"scope_kind": "symbol_range"},
+    )
+    db.mark_planner_task_failed(
+        "news::reconcile::AAPL",
+        error="finnhub:company_news: budget exhausted",
+        backoff_minutes=30,
+    )
+
+    cleared = service._reconcile_budget_blocked_auxiliary_lanes()
+
+    lane = db.get_vendor_lane_health(vendor="finnhub", dataset="company_news")
+    task = db.get_planner_task("news::reconcile::AAPL")
+    assert cleared == 1
+    assert lane is not None
+    assert lane.state == "HEALTHY"
+    assert lane.cooldown_until is None
+    assert task is not None
+    assert task.next_eligible_at is None
+
+
 def test_entitlement_blocked_auxiliary_lane_permanently_blocks_peer_tasks(
     tmp_path: Path,
 ) -> None:
@@ -1582,6 +1695,50 @@ def test_idle_budget_warning_records_affordable_unleased_work(tmp_path: Path) ->
     lane = db.get_vendor_lane_health(vendor="alpaca", dataset="equities_minute")
     assert lane is not None
     assert lane.state == "IDLE_BUDGET"
+
+
+def test_idle_budget_warning_ignores_vendor_attempt_backoff(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    db.upsert_planner_task(
+        task_key="minute::idle-backoff::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="equities_minute",
+        tier="B",
+        priority=205,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_minute",
+        payload={"scope_kind": "symbol_range"},
+    )
+    assert (
+        db.lease_vendor_attempt(
+            task_key="minute::idle-backoff::AAPL",
+            task_family="supplemental_research",
+            planner_group="supplemental_research_backlog",
+            vendor="alpaca",
+            lease_owner="other-worker",
+            payload={},
+        )
+        is not None
+    )
+
+    assert service._record_idle_budget_warning_for_vendor("alpaca") is False
+    assert db.get_vendor_lane_health(vendor="alpaca", dataset="equities_minute") is None
 
 
 def test_run_cluster_forever_backfill_renews_runtime_heartbeat(tmp_path: Path) -> None:
@@ -4956,6 +5113,35 @@ def test_aux_lane_widths_keep_research_vendors_hot_under_canonical_pressure(
     widths = service._aux_lane_widths(task_kinds={"RESEARCH_ONLY"})
 
     assert widths["alpaca"] == 1
+    assert widths["finnhub"] == 1
+
+
+def test_aux_lane_widths_scale_high_capacity_budgeted_vendors(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    alpaca_budget = BudgetManager({"alpaca": {"rpm": 200, "daily_cap": 288000}})
+    twelve_budget = BudgetManager({"twelve_data": {"rpm": 8, "daily_cap": 800}})
+    finnhub_budget = BudgetManager({"finnhub": {"rpm": 57, "daily_cap": 82080}})
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _BudgetedAuxiliaryConnector("alpaca", alpaca_budget),
+            "twelve_data": _BudgetedAuxiliaryConnector("twelve_data", twelve_budget),
+            "finnhub": _BudgetedAuxiliaryConnector("finnhub", finnhub_budget),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+
+    widths = service._aux_lane_widths(task_kinds={"RESEARCH_ONLY"})
+
+    assert widths["alpaca"] > 1
+    assert widths["twelve_data"] == 1
     assert widths["finnhub"] == 1
 
 

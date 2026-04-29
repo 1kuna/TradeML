@@ -17,6 +17,7 @@ from trademl.data_node.db_models import (
     RawPartitionManifest,
     VendorAttempt,
     VendorLaneHealth,
+    VendorTaskClaimResult,
     utc_now,
 )
 from trademl.data_node.db_stores import (
@@ -35,6 +36,7 @@ __all__ = [
     "RawPartitionManifest",
     "VendorAttempt",
     "VendorLaneHealth",
+    "VendorTaskClaimResult",
     "utc_now",
 ]
 

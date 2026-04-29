@@ -33,6 +33,9 @@ class PlannerLaneScheduler:
             service._ensure_planner_backlog_seeded(  # noqa: SLF001
                 trading_date=trading_date or datetime.now(tz=UTC).date().isoformat()
             )
+        service.db.clear_expired_vendor_lane_cooldowns()
+        service.db.clear_stale_idle_vendor_lanes()
+        service._reconcile_budget_blocked_auxiliary_lanes()  # noqa: SLF001
         service._reclaim_expired_runtime_leases()  # noqa: SLF001
         service._terminalize_unservable_canonical_repairs()  # noqa: SLF001
         changed_dates: list[str] = []

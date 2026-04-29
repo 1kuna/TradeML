@@ -6,7 +6,7 @@ import json
 import sqlite3
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
-from typing import Callable
+from typing import Any, Callable
 
 from trademl.data_node.db_models import (
     CanonicalUnit,
@@ -15,6 +15,7 @@ from trademl.data_node.db_models import (
     RawPartitionManifest,
     VendorAttempt,
     VendorLaneHealth,
+    VendorTaskClaimResult,
 )
 
 
@@ -491,6 +492,46 @@ class VendorAttemptStore(_Store):
             return None
         return lane
 
+    def clear_expired_vendor_lane_cooldowns(
+        self, *, now: datetime | None = None
+    ) -> int:
+        """Mark expired budget/rate cooldown lanes healthy for current-state views."""
+        reference_time = (now or self._now()).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE vendor_lane_health
+                SET state = 'HEALTHY',
+                    cooldown_until = NULL,
+                    updated_at = ?
+                WHERE state IN ('BUDGET_BLOCKED', 'COOLDOWN')
+                  AND cooldown_until IS NOT NULL
+                  AND cooldown_until <= ?
+                """,
+                (reference_time, reference_time),
+            )
+        return int(cursor.rowcount)
+
+    def clear_stale_idle_vendor_lanes(
+        self, *, older_than: datetime | None = None
+    ) -> int:
+        """Clear old idle-budget markers so they do not masquerade as current state."""
+        cutoff = (older_than or (self._now() - timedelta(minutes=15))).isoformat()
+        timestamp = self._now().isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE vendor_lane_health
+                SET state = 'HEALTHY',
+                    cooldown_until = NULL,
+                    updated_at = ?
+                WHERE state = 'IDLE_BUDGET'
+                  AND updated_at < ?
+                """,
+                (timestamp, cutoff),
+            )
+        return int(cursor.rowcount)
+
     def vendor_lane_health_map(self, *, dataset: str) -> dict[str, VendorLaneHealth]:
         """Return lane-health rows keyed by vendor."""
         with self._connect() as connection:
@@ -499,6 +540,21 @@ class VendorAttemptStore(_Store):
                 (dataset,),
             ).fetchall()
         return {str(row["vendor"]): VendorLaneHealth(**dict(row)) for row in rows}
+
+    def fetch_vendor_lane_health(
+        self, *, states: tuple[str, ...] | None = None
+    ) -> list[VendorLaneHealth]:
+        """Return lane-health rows, optionally filtered by state."""
+        query = "SELECT * FROM vendor_lane_health"
+        params: list[object] = []
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            query += f" WHERE state IN ({placeholders})"
+            params.extend(states)
+        query += " ORDER BY updated_at DESC, vendor, dataset"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [VendorLaneHealth(**dict(row)) for row in rows]
 
     def lease_vendor_attempt(
         self,
@@ -1371,6 +1427,272 @@ class PlannerTaskStore(_Store):
                         return PlannerTask(**dict(row))
         return None
 
+    def claim_next_vendor_task(
+        self,
+        *,
+        vendor: str,
+        lease_owner: str,
+        task_families: tuple[str, ...],
+        allowed_datasets: tuple[str, ...] | None = None,
+        budget_decision_provider: Callable[[PlannerTask], Any] | None = None,
+        now: datetime | None = None,
+        lease_ttl_seconds: int = 300,
+        limit: int = 256,
+        scan_pages: int = 16,
+    ) -> VendorTaskClaimResult:
+        """Atomically claim a planner task and its vendor-attempt lease."""
+        lease_time = now or self._now()
+        lease_time_iso = lease_time.isoformat()
+        expires_at = (lease_time + timedelta(seconds=lease_ttl_seconds)).isoformat()
+        first_skip: VendorTaskClaimResult | None = None
+        for page in range(max(1, scan_pages)):
+            candidates = self.fetch_planner_tasks(
+                task_families=task_families,
+                statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+                vendor=vendor,
+                datasets=allowed_datasets,
+                limit=limit,
+                offset=page * limit,
+            )
+            if not candidates:
+                break
+            for candidate in candidates:
+                if candidate.status == "LEASED" and candidate.lease_expires_at and candidate.lease_expires_at > lease_time_iso:
+                    first_skip = first_skip or VendorTaskClaimResult(
+                        task=None,
+                        skip_reason="planner_task_leased",
+                        dataset=candidate.dataset,
+                    )
+                    continue
+                decision = (
+                    budget_decision_provider(candidate)
+                    if budget_decision_provider is not None
+                    else None
+                )
+                stale_budget_backoff = False
+                if candidate.next_eligible_at and candidate.next_eligible_at > lease_time_iso:
+                    stale_budget_backoff = (
+                        "budget" in str(candidate.last_error or "").lower()
+                        and decision is not None
+                        and bool(getattr(decision, "allowed", False))
+                    )
+                    if not stale_budget_backoff:
+                        first_skip = first_skip or VendorTaskClaimResult(
+                            task=None,
+                            skip_reason="planner_task_backoff",
+                            dataset=candidate.dataset,
+                        )
+                        continue
+                if decision is not None and not bool(getattr(decision, "allowed", True)):
+                    first_skip = first_skip or VendorTaskClaimResult(
+                        task=None,
+                        skip_reason=f"budget:{getattr(decision, 'blocked_dimension', 'unknown')}",
+                        dataset=candidate.dataset,
+                        budget_decision=decision,
+                    )
+                    continue
+                with self._connect() as connection:
+                    lane = connection.execute(
+                        """
+                        SELECT state, cooldown_until
+                        FROM vendor_lane_health
+                        WHERE vendor = ? AND dataset = ?
+                        """,
+                        (vendor, candidate.dataset),
+                    ).fetchone()
+                    if lane is not None and str(lane["state"]) == "ENTITLEMENT_BLOCKED":
+                        first_skip = first_skip or VendorTaskClaimResult(
+                            task=None,
+                            skip_reason="entitlement_blocked",
+                            dataset=candidate.dataset,
+                        )
+                        continue
+                    active_lane_cooldown = (
+                        lane is not None
+                        and lane["cooldown_until"]
+                        and str(lane["cooldown_until"]) > lease_time_iso
+                    )
+                    stale_budget_cooldown = (
+                        active_lane_cooldown
+                        and str(lane["state"]) == "BUDGET_BLOCKED"
+                        and decision is not None
+                        and bool(getattr(decision, "allowed", False))
+                    )
+                    if stale_budget_cooldown:
+                        connection.execute(
+                            """
+                            UPDATE vendor_lane_health
+                            SET state = 'HEALTHY',
+                                cooldown_until = NULL,
+                                updated_at = ?
+                            WHERE vendor = ? AND dataset = ?
+                            """,
+                            (lease_time_iso, vendor, candidate.dataset),
+                        )
+                    elif active_lane_cooldown:
+                        first_skip = first_skip or VendorTaskClaimResult(
+                            task=None,
+                            skip_reason=f"lane_cooldown:{lane['state']}",
+                            dataset=candidate.dataset,
+                        )
+                        continue
+                    if stale_budget_backoff:
+                        connection.execute(
+                            """
+                            UPDATE planner_tasks
+                            SET next_eligible_at = NULL,
+                                updated_at = ?
+                            WHERE task_key = ?
+                            """,
+                            (lease_time_iso, candidate.task_key),
+                        )
+                    attempt = connection.execute(
+                        """
+                        SELECT *
+                        FROM vendor_attempts
+                        WHERE task_key = ? AND vendor = ?
+                        """,
+                        (candidate.task_key, vendor),
+                    ).fetchone()
+                    if attempt is not None:
+                        status = str(attempt["status"])
+                        if status == "SUCCESS":
+                            retry_empty_success = (
+                                candidate.status in {"PARTIAL", "FAILED"}
+                                and int(attempt["rows_returned"] or 0) == 0
+                                and "empty result"
+                                in str(candidate.last_error or "").lower()
+                            )
+                            if not retry_empty_success:
+                                first_skip = first_skip or VendorTaskClaimResult(
+                                    task=None,
+                                    skip_reason="vendor_attempt_success",
+                                    dataset=candidate.dataset,
+                                )
+                                continue
+                        if status == "PERMANENT_FAILED":
+                            first_skip = first_skip or VendorTaskClaimResult(
+                                task=None,
+                                skip_reason="vendor_attempt_permanent_failed",
+                                dataset=candidate.dataset,
+                            )
+                            continue
+                        if (
+                            status == "LEASED"
+                            and attempt["lease_expires_at"]
+                            and str(attempt["lease_expires_at"]) > lease_time_iso
+                            and str(attempt["lease_owner"]) != lease_owner
+                        ):
+                            first_skip = first_skip or VendorTaskClaimResult(
+                                task=None,
+                                skip_reason="vendor_attempt_leased",
+                                dataset=candidate.dataset,
+                            )
+                            continue
+                        if attempt["next_eligible_at"] and str(attempt["next_eligible_at"]) > lease_time_iso:
+                            stale_attempt_budget_backoff = (
+                                "budget" in str(attempt["last_error"] or "").lower()
+                                and decision is not None
+                                and bool(getattr(decision, "allowed", False))
+                            )
+                            if not stale_attempt_budget_backoff:
+                                first_skip = first_skip or VendorTaskClaimResult(
+                                    task=None,
+                                    skip_reason="vendor_attempt_backoff",
+                                    dataset=candidate.dataset,
+                                )
+                                continue
+                    updated = connection.execute(
+                        """
+                        UPDATE planner_tasks
+                        SET status = 'LEASED',
+                            lease_owner = ?,
+                            leased_at = ?,
+                            lease_expires_at = ?,
+                            updated_at = ?
+                        WHERE task_key = ?
+                          AND (
+                            status IN ('PENDING', 'PARTIAL', 'FAILED')
+                            OR (status = 'LEASED' AND COALESCE(lease_expires_at, '1970-01-01T00:00:00+00:00') <= ?)
+                          )
+                          AND COALESCE(next_eligible_at, '1970-01-01T00:00:00+00:00') <= ?
+                        """,
+                        (
+                            lease_owner,
+                            lease_time_iso,
+                            expires_at,
+                            lease_time_iso,
+                            candidate.task_key,
+                            lease_time_iso,
+                            lease_time_iso,
+                        ),
+                    ).rowcount
+                    if not updated:
+                        first_skip = first_skip or VendorTaskClaimResult(
+                            task=None,
+                            skip_reason="planner_claim_race",
+                            dataset=candidate.dataset,
+                        )
+                        continue
+                    payload_json = json.dumps(candidate.payload, sort_keys=True)
+                    if attempt is None:
+                        connection.execute(
+                            """
+                            INSERT INTO vendor_attempts (
+                              task_key, task_family, planner_group, vendor, lease_owner,
+                              status, attempts, leased_at, lease_expires_at, payload_json, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, 'LEASED', 0, ?, ?, ?, ?)
+                            """,
+                            (
+                                candidate.task_key,
+                                candidate.task_family,
+                                candidate.planner_group,
+                                vendor,
+                                lease_owner,
+                                lease_time_iso,
+                                expires_at,
+                                payload_json,
+                                lease_time_iso,
+                            ),
+                        )
+                    else:
+                        connection.execute(
+                            """
+                            UPDATE vendor_attempts
+                            SET task_family = ?,
+                                planner_group = ?,
+                                lease_owner = ?,
+                                status = 'LEASED',
+                                leased_at = ?,
+                                lease_expires_at = ?,
+                                next_eligible_at = NULL,
+                                last_error = NULL,
+                                payload_json = ?,
+                                updated_at = ?
+                            WHERE task_key = ? AND vendor = ?
+                            """,
+                            (
+                                candidate.task_family,
+                                candidate.planner_group,
+                                lease_owner,
+                                lease_time_iso,
+                                expires_at,
+                                payload_json,
+                                lease_time_iso,
+                                candidate.task_key,
+                                vendor,
+                            ),
+                        )
+                    row = connection.execute(
+                        "SELECT * FROM planner_tasks WHERE task_key = ?",
+                        (candidate.task_key,),
+                    ).fetchone()
+                    if row is not None:
+                        return VendorTaskClaimResult(task=PlannerTask(**dict(row)))
+        return first_skip or VendorTaskClaimResult(
+            task=None, skip_reason="no_eligible_task"
+        )
+
     def lease_planner_task_by_key(
         self,
         *,
@@ -1619,6 +1941,45 @@ class PlannerTaskStore(_Store):
                 )
                 updated += int(cursor.rowcount)
         return updated
+
+    def clear_budget_backoff_for_vendor_dataset(
+        self,
+        *,
+        vendor: str,
+        dataset: str,
+        task_families: tuple[str, ...],
+        reason: str,
+    ) -> int:
+        """Clear stale budget-created planner backoff for one affordable vendor lane."""
+        timestamp = self._now().isoformat()
+        placeholders = ",".join("?" for _ in task_families)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE planner_tasks
+                SET status = CASE WHEN status = 'FAILED' THEN 'PARTIAL' ELSE status END,
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    lease_expires_at = NULL,
+                    next_eligible_at = NULL,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE dataset = ?
+                  AND eligible_vendors_json LIKE ?
+                  AND task_family IN ({placeholders})
+                  AND status IN ('PENDING', 'PARTIAL', 'FAILED', 'LEASED')
+                  AND next_eligible_at IS NOT NULL
+                  AND lower(COALESCE(last_error, '')) LIKE '%budget%'
+                """,
+                [
+                    reason,
+                    timestamp,
+                    dataset,
+                    f'%"{vendor}"%',
+                    *task_families,
+                ],
+            )
+        return int(cursor.rowcount)
 
     def release_planner_leases_for_owner(
         self,

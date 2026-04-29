@@ -19,9 +19,12 @@ import pandas as pd
 
 from trademl.connectors.base import (
     BaseConnector,
+    BudgetBlockedConnectorError,
     ConnectorError,
     PermanentConnectorError,
+    RemoteRateLimitConnectorError,
 )
+from trademl.data_node.budgets import BudgetDecision
 from trademl.connectors.sec_edgar import MissingCompanyfactsError
 from trademl.data_node.archive_schema import normalize_archive_frame
 from trademl.data_node.capabilities import (
@@ -487,13 +490,47 @@ class AuxiliaryRuntime:
         ):
             if job.task_kind not in task_kinds:
                 continue
-            width = int(job.lane_width or 1)
+            width = self._adaptive_vendor_lane_width(
+                vendor=job.vendor, base_width=int(job.lane_width or 1)
+            )
             widths[job.vendor] = max(widths.get(job.vendor, 0), width)
         if self.db.has_pending_planner_tasks(
             task_families=("events_filings",), datasets=("companyfacts",)
         ):
             widths["sec_edgar"] = min(max(1, widths.get("sec_edgar", 1)), 1)
         return widths
+
+    def _adaptive_vendor_lane_width(self, *, vendor: str, base_width: int) -> int:
+        """Scale vendor concurrency from current RPM/headroom instead of static metadata."""
+        connector = self.connectors.get(vendor)
+        budget_manager = getattr(connector, "budget_manager", None)
+        if budget_manager is None:
+            return max(1, int(base_width))
+        snapshot = budget_manager.snapshot()
+        vendor_payload = (snapshot.get("vendors") or {}).get(vendor, {})
+        if not isinstance(vendor_payload, dict):
+            return max(1, int(base_width))
+        telemetry = vendor_payload.get("telemetry") or {}
+        window_counts = (
+            telemetry.get("window_counts") if isinstance(telemetry, dict) else {}
+        ) or {}
+        if int(window_counts.get("remote_rate_limits", 0) or 0):
+            return 1
+        remaining_window = int(vendor_payload.get("remaining_window_requests", 0) or 0)
+        remaining_daily = int(vendor_payload.get("remaining_daily_units", 0) or 0)
+        rpm = int(vendor_payload.get("rpm", 0) or 0)
+        daily_cap = int(vendor_payload.get("daily_cap", 0) or 0)
+        if remaining_window <= 0 or remaining_daily <= 0:
+            return 1
+        if daily_cap and daily_cap <= 1000:
+            return max(1, int(base_width))
+        target_utilization = float(
+            os.getenv("TRADEML_COLLECTION_TARGET_UTILIZATION", "0.98")
+        )
+        target_requests = max(1, int(rpm * min(1.0, max(0.1, target_utilization))))
+        adaptive = max(1, target_requests // 25)
+        cap = 8 if vendor == "alpaca" else 4 if vendor == "tiingo" else 1
+        return max(1, min(cap, remaining_window, max(int(base_width), adaptive)))
 
     def _vendor_has_canonical_pressure(self, vendor: str) -> bool:
         """Return whether a vendor is currently needed by canonical work."""
@@ -560,16 +597,25 @@ class AuxiliaryRuntime:
             )
         budget_manager = getattr(connector, "budget_manager", None)
         request_units = self._job_credit_cost(job)
-        if budget_manager is not None and not budget_manager.can_spend(
-            vendor, task_kind="OTHER", units=request_units
-        ):
-            self._mark_budget_blocked_lane(vendor=vendor, dataset=str(job["dataset"]))
+        if budget_manager is not None:
+            decision = budget_manager.budget_decision(
+                vendor, task_kind="OTHER", units=request_units
+            )
+        else:
+            decision = None
+        if decision is not None and not decision.allowed:
+            self._mark_budget_blocked_lane(
+                vendor=vendor, dataset=str(job["dataset"]), decision=decision
+            )
             return AuxiliaryExecutionResult(
                 outputs=[],
                 failures=[],
                 deferred=1,
                 rows_returned=0,
-                state={"blocked_reason": "budget_exhausted"},
+                state={
+                    "blocked_reason": "budget_exhausted",
+                    "blocked_dimension": decision.blocked_dimension,
+                },
             )
         effective_task_key = task_key or self._aux_task_key(job)
         leased = self.db.lease_vendor_attempt(
@@ -624,17 +670,76 @@ class AuxiliaryRuntime:
                 rows_returned=0,
                 state={"permanent_failure": True, "blocked_reason": blocked_reason},
             )
+        except BudgetBlockedConnectorError as exc:
+            self._mark_budget_blocked_lane(
+                vendor=vendor,
+                dataset=str(job["dataset"]),
+                reason=str(exc),
+                decision=exc.decision,
+            )
+            backoff_minutes = self._budget_backoff_minutes(exc.decision)
+            self.db.mark_vendor_attempt_failed(
+                task_key=effective_task_key,
+                vendor=vendor,
+                error=str(exc),
+                backoff_minutes=backoff_minutes,
+            )
+            return AuxiliaryExecutionResult(
+                outputs=[],
+                failures=[],
+                deferred=1,
+                rows_returned=0,
+                state={
+                    "blocked_reason": "budget_exhausted",
+                    "blocked_dimension": exc.decision.blocked_dimension,
+                },
+            )
+        except RemoteRateLimitConnectorError as exc:
+            retry_at = datetime.now(tz=UTC) + timedelta(
+                seconds=max(1.0, float(exc.retry_after_seconds or 60.0))
+            )
+            self._mark_remote_rate_limited_lane(
+                vendor=vendor,
+                dataset=str(job["dataset"]),
+                retry_at=retry_at,
+                reason=str(exc),
+            )
+            self.db.mark_vendor_attempt_failed(
+                task_key=effective_task_key,
+                vendor=vendor,
+                error=str(exc),
+                backoff_minutes=max(1, int((retry_at - datetime.now(tz=UTC)).total_seconds() // 60)),
+            )
+            return AuxiliaryExecutionResult(
+                outputs=[],
+                failures=[],
+                deferred=1,
+                rows_returned=0,
+                state={"blocked_reason": "remote_rate_limit"},
+            )
         except ConnectorError as exc:
             message = str(exc)
             if "budget exhausted" in message:
+                decision = None
+                if budget_manager is not None:
+                    decision = budget_manager.budget_decision(
+                        vendor, task_kind="OTHER", units=request_units
+                    )
                 self._mark_budget_blocked_lane(
-                    vendor=vendor, dataset=str(job["dataset"]), reason=message
+                    vendor=vendor,
+                    dataset=str(job["dataset"]),
+                    reason=message,
+                    decision=decision,
                 )
                 self.db.mark_vendor_attempt_failed(
                     task_key=effective_task_key,
                     vendor=vendor,
                     error=message,
-                    backoff_minutes=30,
+                    backoff_minutes=(
+                        self._budget_backoff_minutes(decision)
+                        if decision is not None
+                        else 1
+                    ),
                 )
                 return AuxiliaryExecutionResult(
                     outputs=[],
@@ -691,12 +796,16 @@ class AuxiliaryRuntime:
         vendor: str,
         dataset: str,
         reason: str = "budget exhausted",
-        cooldown_minutes: int = 30,
+        decision: BudgetDecision | None = None,
+        cooldown_minutes: int = 1,
     ) -> str:
         """Cool down one auxiliary vendor/dataset lane after budget exhaustion."""
-        cooldown_until = (
-            datetime.now(tz=UTC) + timedelta(minutes=cooldown_minutes)
-        ).isoformat()
+        cooldown_dt = (
+            decision.next_eligible_at
+            if decision is not None and decision.next_eligible_at is not None
+            else datetime.now(tz=UTC) + timedelta(minutes=cooldown_minutes)
+        )
+        cooldown_until = cooldown_dt.isoformat()
         existing = self.db.get_vendor_lane_health(vendor=vendor, dataset=dataset)
         self.db.upsert_vendor_lane_health(
             vendor=vendor,
@@ -714,6 +823,46 @@ class AuxiliaryRuntime:
             dataset=dataset,
             next_eligible_at=cooldown_until,
             error=f"{vendor}:{dataset}: {reason}",
+            task_families=(
+                "security_master",
+                "corp_actions",
+                "events_filings",
+                "macro",
+                "supplemental_research",
+            ),
+        )
+        return cooldown_until
+
+    @staticmethod
+    def _budget_backoff_minutes(decision: BudgetDecision | None) -> int:
+        """Return a bounded planner backoff from a budget decision."""
+        if decision is None or decision.next_eligible_at is None:
+            return 1
+        seconds = max(
+            1.0, (decision.next_eligible_at - datetime.now(tz=UTC)).total_seconds()
+        )
+        return max(1, int((seconds + 59) // 60))
+
+    def _mark_remote_rate_limited_lane(
+        self, *, vendor: str, dataset: str, retry_at: datetime, reason: str
+    ) -> str:
+        """Cool down a lane after an observed remote throttle."""
+        cooldown_until = retry_at.isoformat()
+        existing = self.db.get_vendor_lane_health(vendor=vendor, dataset=dataset)
+        self.db.upsert_vendor_lane_health(
+            vendor=vendor,
+            dataset=dataset,
+            state="COOLDOWN",
+            cooldown_until=cooldown_until,
+            recent_remote_429s=(
+                1 if existing is None else int(existing.recent_remote_429s or 0) + 1
+            ),
+        )
+        self.db.defer_planner_tasks_for_vendor_dataset(
+            vendor=vendor,
+            dataset=dataset,
+            next_eligible_at=cooldown_until,
+            error=f"{vendor}:{dataset}: remote rate limit: {reason}",
             task_families=(
                 "security_master",
                 "corp_actions",

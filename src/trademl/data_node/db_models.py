@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 UTC = timezone.utc
 
@@ -203,3 +204,12 @@ class VendorLaneHealth:
     recent_permanent_failures: int
     updated_at: str
 
+
+@dataclass(slots=True)
+class VendorTaskClaimResult:
+    """Outcome of a vendor-specific auxiliary task claim attempt."""
+
+    task: PlannerTask | None
+    skip_reason: str | None = None
+    dataset: str | None = None
+    budget_decision: Any | None = None

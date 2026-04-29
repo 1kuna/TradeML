@@ -15,7 +15,7 @@ from typing import Any, Protocol, runtime_checkable
 import pandas as pd
 import requests
 
-from trademl.data_node.budgets import BudgetManager
+from trademl.data_node.budgets import BudgetDecision, BudgetManager
 from trademl.data_node.provider_contracts import dataset_contract, provider_contract
 
 
@@ -33,6 +33,31 @@ class PermanentConnectorError(ConnectorError):
 
 class TemporaryConnectorError(ConnectorError):
     """Retryable connector error."""
+
+
+class BudgetBlockedConnectorError(TemporaryConnectorError):
+    """Local budget controller blocked a request before it left the process."""
+
+    def __init__(self, vendor: str, decision: BudgetDecision) -> None:
+        self.vendor = vendor
+        self.decision = decision
+        super().__init__(f"budget exhausted for vendor={vendor}")
+
+
+class RemoteRateLimitConnectorError(TemporaryConnectorError):
+    """Remote vendor rate limit response after retries were exhausted."""
+
+    def __init__(
+        self,
+        vendor: str,
+        *,
+        retry_after_seconds: float | None = None,
+        status_code: int = 429,
+    ) -> None:
+        self.vendor = vendor
+        self.retry_after_seconds = retry_after_seconds
+        self.status_code = status_code
+        super().__init__(f"remote rate limit for vendor={vendor}")
 
 
 @runtime_checkable
@@ -111,9 +136,13 @@ class HTTPConnector:
         )
         return delay + self.rng.uniform(0, delay / 4 if delay else 0.01)
 
-    def _rate_limit_error(self) -> TemporaryConnectorError:
+    def _rate_limit_error(
+        self, *, retry_after_seconds: float | None = None
+    ) -> TemporaryConnectorError:
         """Return the normalized retryable error for vendor budget/rate exhaustion."""
-        return TemporaryConnectorError(f"budget exhausted for vendor={self.vendor_name}")
+        return RemoteRateLimitConnectorError(
+            self.vendor_name, retry_after_seconds=retry_after_seconds
+        )
 
     def _entitlement_failure_markers(self, endpoint_key: str | None = None) -> tuple[str, ...]:
         """Return known entitlement or unsupported-plan markers for an endpoint."""
@@ -190,9 +219,12 @@ class HTTPConnector:
         entitlement_markers = tuple(marker.lower() for marker in self._entitlement_failure_markers(endpoint_key))
 
         for attempt in range(1, self.retry_config.max_attempts + 1):
-            if not self.budget_manager.can_spend(self.vendor_name, task_kind=task_kind, units=normalized_units):
+            decision = self.budget_manager.budget_decision(
+                self.vendor_name, task_kind=task_kind, units=normalized_units
+            )
+            if not decision.allowed:
                 self.budget_manager.record_local_budget_block(self.vendor_name, endpoint=telemetry_key)
-                raise TemporaryConnectorError(f"budget exhausted for vendor={self.vendor_name}")
+                raise BudgetBlockedConnectorError(self.vendor_name, decision)
 
             start = time.perf_counter()
             try:
@@ -235,10 +267,11 @@ class HTTPConnector:
 
             if response.status_code == 429:
                 self.budget_manager.record_remote_rate_limit(self.vendor_name, endpoint=telemetry_key)
+                retry_after_seconds = self._retry_after_seconds(response, endpoint_key)
                 if attempt < self.retry_config.max_attempts:
-                    self.sleep_fn(self._retry_after_seconds(response, endpoint_key) or self._sleep_duration(attempt))
+                    self.sleep_fn(retry_after_seconds or self._sleep_duration(attempt))
                     continue
-                raise self._rate_limit_error()
+                raise self._rate_limit_error(retry_after_seconds=retry_after_seconds)
             if response.status_code in retryable_statuses and attempt < self.retry_config.max_attempts:
                 self.sleep_fn(self._retry_after_seconds(response, endpoint_key) or self._sleep_duration(attempt))
                 continue
