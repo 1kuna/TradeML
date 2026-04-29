@@ -1358,6 +1358,8 @@ class DataNodeService:
 
     def _record_idle_budget_warning_for_vendor(self, vendor: str) -> bool:
         """Record when a vendor has affordable eligible work but no leased task."""
+        if self._vendor_has_recent_outbound_spend(vendor):
+            return False
         now_iso = datetime.now(tz=UTC).isoformat()
         tasks = self.db.fetch_planner_tasks(
             task_families=(
@@ -1421,6 +1423,18 @@ class DataNodeService:
             )
             return True
         return False
+
+    def _vendor_has_recent_outbound_spend(self, vendor: str) -> bool:
+        """Return whether the vendor has spent any request in the current budget window."""
+        connector = self.connectors.get(vendor)
+        budget_manager = getattr(connector, "budget_manager", None)
+        if budget_manager is None:
+            return False
+        snapshot = budget_manager.snapshot()
+        vendor_payload = (snapshot.get("vendors") or {}).get(vendor, {})
+        telemetry = vendor_payload.get("telemetry") if isinstance(vendor_payload, dict) else {}
+        window_counts = (telemetry or {}).get("window_counts") or {}
+        return int(window_counts.get("outbound_requests", 0) or 0) > 0
 
     def _should_prioritize_minute_lane(self, vendor: str) -> bool:
         """Return whether this vendor should pull minute archive work before fillers."""

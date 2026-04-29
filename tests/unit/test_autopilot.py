@@ -108,6 +108,22 @@ def test_current_state_issues_accept_remote_pi_online_when_local_pid_missing() -
     assert [issue["kind"] for issue in issues] == []
 
 
+def test_current_state_issues_flag_pi_schema_drift() -> None:
+    issues = collect_current_state_issues(
+        {
+            "runtime": {"running": True},
+            "collection_status": {"repair_remaining_units": 0},
+            "deployed_version": {"commit": "abc123"},
+            "db_schema": {
+                "status": "missing_tables",
+                "missing_tables": ["scheduler_decisions"],
+            },
+        }
+    )
+
+    assert [issue["kind"] for issue in issues] == ["pi_sqlite_schema_drift"]
+
+
 def test_observability_uses_remote_mac_research_when_local_summary_missing(tmp_path: Path) -> None:
     data_root = tmp_path / "nas"
     data_root.mkdir()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -1104,3 +1105,47 @@ def test_scheduler_decision_and_archive_telemetry_summaries(tmp_path: Path) -> N
     assert archive["rows"][0]["output_name"] == "ticker_news"
     assert archive["rows"][0]["rows_in"] == 3
     assert archive["rows"][0]["duplicates_dropped"] == 1
+
+
+def test_existing_pi_db_initialization_adds_scheduler_decisions_table(tmp_path: Path) -> None:
+    db_path = tmp_path / "node.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE planner_tasks (
+              task_key TEXT PRIMARY KEY,
+              task_family TEXT NOT NULL,
+              planner_group TEXT NOT NULL,
+              dataset TEXT NOT NULL,
+              tier TEXT NOT NULL,
+              priority INTEGER NOT NULL,
+              start_date DATE NOT NULL,
+              end_date DATE NOT NULL,
+              symbols_json TEXT NOT NULL,
+              eligible_vendors_json TEXT NOT NULL,
+              output_name TEXT,
+              payload_json TEXT,
+              status TEXT NOT NULL,
+              lease_owner TEXT,
+              leased_at TIMESTAMP,
+              lease_expires_at TIMESTAMP,
+              next_eligible_at TIMESTAMP,
+              attempts INTEGER DEFAULT 0,
+              last_error TEXT,
+              created_at TIMESTAMP NOT NULL,
+              updated_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+
+    database = DataNodeDB(db_path)
+    database.record_scheduler_decision(vendor="alpaca", decision="claimed")
+
+    with sqlite3.connect(db_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert "scheduler_decisions" in tables

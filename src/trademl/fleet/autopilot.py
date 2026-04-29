@@ -70,6 +70,28 @@ def collect_current_state_issues(snapshot: dict[str, Any]) -> list[dict[str, Any
     budget = dict(snapshot.get("budget_summary") or {})
     if bool(budget.get("stale")):
         issues.append(_issue("pi", "warning", "budget_snapshot_stale", "Budget snapshot is stale", "Inspect the data-node budget snapshot and node heartbeat."))
+    schema = dict(snapshot.get("db_schema") or {})
+    if schema and schema.get("status") != "ok":
+        missing = ", ".join(str(item) for item in list(schema.get("missing_tables") or []))
+        issues.append(
+            _issue(
+                "pi",
+                "critical",
+                "pi_sqlite_schema_drift",
+                f"Pi SQLite schema is {schema.get('status')}; missing={missing or '-'}",
+                "Run node status/update on the Pi and verify DataNodeDB migrations.",
+            )
+        )
+    if bool((snapshot.get("runtime") or {}).get("running")) and not snapshot.get("deployed_version"):
+        issues.append(
+            _issue(
+                "pi",
+                "warning",
+                "pi_deploy_provenance_missing",
+                "Pi deployed_version.json is missing",
+                "Write deploy provenance after the next Pi sync/restart.",
+            )
+        )
     program = dict((snapshot.get("health") or {}).get("research_program_summary") or {})
     launchd = dict(program.get("launchd") or {})
     if program and str(program.get("status") or "").upper() in {"INFRA_BLOCKED", "WAITING_FOR_DATA"}:
@@ -216,6 +238,33 @@ def collect_fleet_health(
     for name, payload in remote.items():
         if payload.get("status") != "online":
             issues.append(_issue(name, "critical", f"{name}_remote_unhealthy", str(payload.get("reason") or f"{name} remote check failed"), f"Inspect {name} remote service."))
+    pi_state = dict((remote.get("pi") or {}).get("node_state") or {})
+    pi_schema = dict(pi_state.get("db_schema") or {})
+    if pi_schema and pi_schema.get("status") != "ok":
+        missing = ", ".join(str(item) for item in list(pi_schema.get("missing_tables") or []))
+        issues.append(
+            _issue(
+                "pi",
+                "critical",
+                "pi_sqlite_schema_drift",
+                f"Pi SQLite schema is {pi_schema.get('status')}; missing={missing or '-'}",
+                "Deploy current code to the Pi and restart trademl-node.service.",
+            )
+        )
+    if (
+        pi_state
+        and remote.get("pi", {}).get("status") == "online"
+        and not pi_state.get("deployed_version")
+    ):
+        issues.append(
+            _issue(
+                "pi",
+                "warning",
+                "pi_deploy_provenance_missing",
+                "Pi deployed_version.json is missing",
+                "Write deploy provenance after the next Pi sync/restart.",
+            )
+        )
     bucket = write_codex_issue_bucket(data_root=data_root, issues=issues)
     bucket_issues = list(bucket.get("issues") or read_codex_issue_bucket(data_root=data_root)["issues"])
     current_state = build_current_state_summary(summary_snapshot, issues=bucket_issues)
@@ -434,7 +483,52 @@ def _ssh_service_health(target: dict[str, str], *, service_command: str, service
         healed = restart.get("returncode") == 0
         result = _ssh_result_dict(_run_password_ssh(target, command))
         active = result.get("returncode") == 0 and str(result.get("stdout") or "").strip() == "active"
-    return {"status": "online" if active else "offline", "healed": healed, "raw": result, "reason": None if active else result.get("stderr") or result.get("stdout")}
+    node_state = _ssh_pi_node_state(target) if active and service_name == "trademl-node.service" else {}
+    return {
+        "status": "online" if active else "offline",
+        "healed": healed,
+        "raw": result,
+        "node_state": node_state,
+        "reason": None if active else result.get("stderr") or result.get("stdout"),
+    }
+
+
+def _ssh_pi_node_state(target: dict[str, str]) -> dict[str, Any]:
+    user = target.get("user") or "zach"
+    node_root = shlex.quote(target.get("node_root") or f"/home/{user}/trademl-node")
+    command = (
+        f"TRADEML_NODE_ROOT={node_root} python3 - <<'PY'\n"
+        "import json, os, pathlib, sqlite3\n"
+        "root = pathlib.Path(os.environ['TRADEML_NODE_ROOT'])\n"
+        "version_path = root / 'control' / 'deployed_version.json'\n"
+        "db_path = root / 'control' / 'node.sqlite'\n"
+        "required = {'scheduler_decisions', 'archive_write_telemetry', 'planner_tasks', 'vendor_attempts'}\n"
+        "version = {}\n"
+        "if version_path.exists():\n"
+        "    try:\n"
+        "        version = json.loads(version_path.read_text())\n"
+        "    except Exception as exc:\n"
+        "        version = {'error': str(exc)}\n"
+        "schema = {'status': 'missing', 'missing_tables': sorted(required)}\n"
+        "if db_path.exists():\n"
+        "    try:\n"
+        "        with sqlite3.connect(db_path) as conn:\n"
+        "            rows = conn.execute(\"SELECT name FROM sqlite_master WHERE type = 'table'\").fetchall()\n"
+        "        existing = {row[0] for row in rows}\n"
+        "        missing = sorted(required - existing)\n"
+        "        schema = {'status': 'ok' if not missing else 'missing_tables', 'missing_tables': missing}\n"
+        "    except Exception as exc:\n"
+        "        schema = {'status': 'invalid', 'missing_tables': sorted(required), 'error': str(exc)}\n"
+        "print(json.dumps({'deployed_version': version, 'db_schema': schema}))\n"
+        "PY"
+    )
+    result = _ssh_result_dict(_run_password_ssh(target, command))
+    if result.get("returncode") != 0:
+        return {"status": "unknown", "error": result.get("stderr") or result.get("stdout")}
+    try:
+        return json.loads(str(result.get("stdout") or "{}"))
+    except json.JSONDecodeError as exc:
+        return {"status": "unknown", "error": str(exc)}
 
 
 def _ssh_mac_health(target: dict[str, str], *, heal: bool) -> dict[str, Any]:

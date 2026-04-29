@@ -41,6 +41,7 @@ from trademl.dashboard.controller import (
     update_worker,
     update_cluster_secrets,
     verify_recent_canonical_dates,
+    write_deployed_version,
 )
 from trademl.env import load_dotenv
 from trademl.fleet.autopilot import collect_fleet_health
@@ -145,6 +146,9 @@ def main(argv: list[str] | None = None) -> int:
     reset_parser = node_subparsers.add_parser("reset", help="Wipe local disposable worker state and rebuild from NAS.")
     reset_parser.add_argument("--passphrase", default=None)
     node_subparsers.add_parser("update", help="Update the local worker installation.")
+    deployed_parser = node_subparsers.add_parser("write-deployed-version", help="Write deploy provenance for this worker.")
+    deployed_parser.add_argument("--commit", default=None)
+    deployed_parser.add_argument("--test-evidence", default=None)
     node_subparsers.add_parser("uninstall", help="Remove local worker artifacts from this machine.")
     node_subparsers.add_parser("run-audit", help="Run live vendor capability canaries and persist the report.")
     node_subparsers.add_parser("replan-coverage", help="Materialize the current auxiliary coverage plan.")
@@ -357,6 +361,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.node_command == "update":
         print(json.dumps(update_worker(settings), indent=2, default=str))
+        return 0
+    if args.node_command == "write-deployed-version":
+        evidence: dict[str, object] = {}
+        if args.test_evidence:
+            try:
+                evidence = json.loads(args.test_evidence)
+            except json.JSONDecodeError:
+                evidence = {"summary": args.test_evidence}
+        print(
+            json.dumps(
+                write_deployed_version(
+                    settings,
+                    commit=args.commit,
+                    test_evidence=evidence,
+                ),
+                indent=2,
+                default=str,
+            )
+        )
         return 0
     if args.node_command == "uninstall":
         print(json.dumps(uninstall_worker(settings), indent=2, default=str))

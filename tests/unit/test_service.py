@@ -1175,6 +1175,62 @@ def test_process_planner_queue_waits_for_stalled_lane_instead_of_overlapping_wor
     assert invocations["count"] == 1
 
 
+def test_process_planner_queue_refills_idle_vendor_while_other_lane_is_stalled(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector(), "fred": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        worker_id="rpi-01",
+    )
+    service.default_symbols = ["AAPL"]
+    service._ensure_planner_backlog_seeded = lambda trading_date=None: None  # type: ignore[method-assign]
+    service._canonical_runtime._backfill_lane_widths = lambda: {}  # type: ignore[method-assign]
+    width_calls = {"count": 0}
+
+    def aux_lane_widths(**kwargs):  # noqa: ANN001
+        width_calls["count"] += 1
+        if width_calls["count"] == 1:
+            return {"fred": 1}
+        return {"fred": 1, "alpaca": 1}
+
+    service._aux_lane_widths = aux_lane_widths  # type: ignore[method-assign]
+    service._auxiliary_vendor_has_eligible_work = lambda vendor: vendor == "alpaca"  # type: ignore[method-assign]
+    release_fred = threading.Event()
+    alpaca_ran = threading.Event()
+    calls: list[str] = []
+
+    def drain_auxiliary_lane(vendor: str) -> list[str]:
+        calls.append(vendor)
+        if vendor == "fred":
+            release_fred.wait(timeout=2.0)
+            return []
+        alpaca_ran.set()
+        release_fred.set()
+        return ["alpaca:minute"]
+
+    service._drain_auxiliary_lane = drain_auxiliary_lane  # type: ignore[method-assign]
+
+    changed = service.process_planner_queue(
+        lane_stall_seconds=0.01,
+        heartbeat_interval_seconds=60.0,
+    )
+
+    assert alpaca_ran.is_set()
+    assert "fred" in calls
+    assert "alpaca" in calls
+    assert changed == []
+
+
 def test_archive_file_lock_retries_when_lock_disappears_between_open_and_stat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4746,6 +4802,50 @@ def test_process_planner_queue_refills_auxiliary_vendor_lanes_without_waiting_fo
 
     assert calls.count("alpaca") == 3
     assert calls.count("finnhub") == 2
+
+
+def test_idle_budget_warning_skips_vendor_with_recent_outbound_spend(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    budget = BudgetManager({"alpaca": {"rpm": 200, "daily_cap": 288000}})
+    connector = _BudgetedAuxiliaryConnector("alpaca", budget)
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": connector},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    db.upsert_planner_task(
+        task_key="minute::alpaca::2026-04-28::000",
+        task_family="supplemental_research",
+        planner_group="minute",
+        dataset="equities_minute",
+        tier="A",
+        priority=10,
+        start_date="2026-04-28",
+        end_date="2026-04-28",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        payload={"credit_cost": 1},
+    )
+    budget.record_spend(
+        "alpaca",
+        task_kind="OTHER",
+        endpoint="equities_minute",
+        logical_units=100,
+    )
+
+    recorded = service._record_idle_budget_warning_for_vendor("alpaca")  # noqa: SLF001
+
+    assert recorded is False
+    assert db.get_vendor_lane_health(vendor="alpaca", dataset="equities_minute") is None
 
 
 def test_auxiliary_lane_widths_do_not_suppress_vendors_with_canonical_pressure(

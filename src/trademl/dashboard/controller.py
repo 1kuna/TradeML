@@ -137,6 +137,10 @@ class NodeSettings:
         return self.local_state / "node.sqlite"
 
     @property
+    def deployed_version_path(self) -> Path:
+        return self.local_state / "deployed_version.json"
+
+    @property
     def qc_path(self) -> Path:
         return self.nas_mount / "data" / "qc" / "partition_status.parquet"
 
@@ -687,12 +691,52 @@ def update_worker(settings: NodeSettings) -> dict[str, Any]:
     if was_running:
         start_node(settings)
     append_cluster_event(settings.cluster_paths, "worker_updated", {"worker_id": settings.worker_id, "wrapper_path": str(wrapper_path)})
+    version = write_deployed_version(
+        settings,
+        test_evidence={"source": "node update", "status": "completed"},
+    )
     return {
         "venv_path": str(venv_path),
         "wrapper_path": str(wrapper_path),
         "service": service_result,
         "restarted": was_running,
+        "deployed_version": version,
     }
+
+
+def write_deployed_version(
+    settings: NodeSettings,
+    *,
+    commit: str | None = None,
+    test_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write the node deploy provenance artifact used by fleet health."""
+    resolved_commit = commit
+    if not resolved_commit:
+        with contextlib.suppress(Exception):
+            result = subprocess.run(
+                ["git", "-C", str(settings.repo_root), "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                resolved_commit = result.stdout.strip()
+    payload = {
+        "commit": resolved_commit or "unknown",
+        "written_at": datetime.now(tz=UTC).isoformat(),
+        "source_host": socket.gethostname(),
+        "repo_root": str(settings.repo_root),
+        "worker_id": settings.worker_id,
+        "test_evidence": test_evidence or {},
+    }
+    settings.deployed_version_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.deployed_version_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    return payload
 
 
 def reset_worker(settings: NodeSettings, *, passphrase: str | None = None) -> dict[str, Any]:
@@ -1377,6 +1421,8 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
     vendor_throughput = _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
     scheduler_decisions = _read_scheduler_decisions(settings.db_path)
     archive_write_telemetry = _read_archive_write_telemetry(settings.db_path)
+    db_schema = _read_db_schema_status(settings.db_path)
+    deployed_version = _read_deployed_version(settings.deployed_version_path)
     planner_eta = _summarize_planner_eta(settings.db_path, planner_summary=planner_summary, vendor_throughput=vendor_throughput)
     stage = _read_yaml(settings.stage_path)
     stage_symbols = stage.get("symbols", [])
@@ -1491,6 +1537,8 @@ def collect_dashboard_status_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "vendor_throughput": vendor_throughput,
         "scheduler_decisions": scheduler_decisions,
         "archive_write_telemetry": archive_write_telemetry,
+        "db_schema": db_schema,
+        "deployed_version": deployed_version,
         "planner_summary": planner_summary,
         "planner_eta": planner_eta,
         "budget_summary": budget_summary,
@@ -1567,6 +1615,8 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
     raw_datapoints = _raw_datapoints_from_qc(partition_summary)
     budget_summary = _read_budget_summary(settings)
     vendor_throughput = _summarize_vendor_throughput(settings.db_path, budget_summary=budget_summary)
+    scheduler_decisions = _read_scheduler_decisions(settings.db_path)
+    db_schema = _read_db_schema_status(settings.db_path)
     planner_eta = _summarize_planner_eta(settings.db_path, planner_summary=planner_summary, vendor_throughput=vendor_throughput)
     stage = _read_yaml(settings.stage_path)
     stage_symbols = stage.get("symbols", [])
@@ -1623,6 +1673,9 @@ def collect_dashboard_live_snapshot(settings: NodeSettings) -> dict[str, Any]:
         "planner_eta": planner_eta,
         "budget_summary": budget_summary,
         "vendor_throughput": vendor_throughput,
+        "scheduler_decisions": scheduler_decisions,
+        "db_schema": db_schema,
+        "deployed_version": _read_deployed_version(settings.deployed_version_path),
     }
 
 
@@ -2428,6 +2481,42 @@ def _read_scheduler_decisions(db_path: Path) -> dict[str, Any]:
         return DataNodeDB(db_path).summarize_scheduler_decisions(minutes=15)
     except sqlite3.OperationalError:
         return {"rows": [], "checked_at": None, "window_minutes": 15}
+
+
+def _read_deployed_version(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"status": "unreadable", "path": str(path)}
+    return payload if isinstance(payload, dict) else {"status": "invalid", "path": str(path)}
+
+
+def _read_db_schema_status(db_path: Path) -> dict[str, Any]:
+    required = sorted(DataNodeDB.REQUIRED_TABLES)
+    if not db_path.exists():
+        return {"status": "missing", "required_tables": required, "missing_tables": required}
+    try:
+        DataNodeDB(db_path)
+        with sqlite3.connect(db_path) as connection:
+            rows = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+    except sqlite3.OperationalError as exc:
+        return {
+            "status": "invalid",
+            "required_tables": required,
+            "missing_tables": required,
+            "error": str(exc),
+        }
+    existing = {str(row[0]) for row in rows}
+    missing = sorted(DataNodeDB.REQUIRED_TABLES.difference(existing))
+    return {
+        "status": "ok" if not missing else "missing_tables",
+        "required_tables": required,
+        "missing_tables": missing,
+    }
 
 
 def _read_archive_write_telemetry(db_path: Path) -> dict[str, Any]:

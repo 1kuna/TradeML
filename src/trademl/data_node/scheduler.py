@@ -48,8 +48,12 @@ class PlannerLaneScheduler:
             task_kinds={"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"},
             canonical_pressure=canonical_backlog_active,
         )
+        configured_lanes = len(canonical_lane_widths) + len(aux_lane_widths)
         max_workers = max(
-            1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values())
+            1,
+            sum(canonical_lane_widths.values())
+            + sum(aux_lane_widths.values())
+            + configured_lanes,
         )
         executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
@@ -88,6 +92,43 @@ class PlannerLaneScheduler:
                     vendor, 16
                 )
 
+            def refresh_lane_widths() -> None:
+                canonical_lane_widths.update(
+                    service._canonical_runtime._backfill_lane_widths()  # noqa: SLF001
+                )
+                canonical_active_backlog = service.db.has_pending_planner_tasks(
+                    task_families=("canonical_bars", "canonical_repair")
+                )
+                aux_lane_widths.update(
+                    service._aux_lane_widths(  # noqa: SLF001
+                        task_kinds={"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"},
+                        canonical_pressure=canonical_active_backlog,
+                    )
+                )
+                for vendor, width in aux_lane_widths.items():
+                    aux_submit_cap.setdefault(vendor, max(1, int(width)) * 32)
+                for vendor, width in canonical_lane_widths.items():
+                    canonical_submit_cap.setdefault(vendor, max(1, int(width)) * 16)
+
+            def refill_ready_lanes() -> None:
+                if service._stop_event.is_set():  # noqa: SLF001
+                    return
+                refresh_lane_widths()
+                for vendor, width in canonical_lane_widths.items():
+                    while (
+                        canonical_active[vendor] < max(1, int(width))
+                        and can_submit_canonical(vendor)
+                        and service._canonical_vendor_has_eligible_work(vendor)  # noqa: SLF001
+                    ):
+                        submit_canonical_lane(vendor)
+                for vendor, width in aux_lane_widths.items():
+                    while (
+                        aux_active[vendor] < max(1, int(width))
+                        and can_submit_auxiliary(vendor)
+                        and service._auxiliary_vendor_has_eligible_work(vendor)  # noqa: SLF001
+                    ):
+                        submit_auxiliary_lane(vendor)
+
             for vendor, width in canonical_lane_widths.items():
                 for _ in range(max(1, width)):
                     submit_canonical_lane(vendor)
@@ -103,7 +144,7 @@ class PlannerLaneScheduler:
                 )
                 if not done:
                     now = monotonic()
-                    if (now - queue_started) >= max(5.0, float(lane_stall_seconds)):
+                    if (now - queue_started) >= max(0.01, float(lane_stall_seconds)):
                         lane_counts: dict[str, int] = {}
                         for lane in futures.values():
                             lane_counts[lane] = lane_counts.get(lane, 0) + 1
@@ -114,6 +155,8 @@ class PlannerLaneScheduler:
                             lane_counts,
                         )
                         service._reclaim_expired_runtime_leases()  # noqa: SLF001
+                        service._terminalize_unservable_canonical_repairs()  # noqa: SLF001
+                        refill_ready_lanes()
                         queue_started = now
                     if (
                         heartbeat_fn is not None
