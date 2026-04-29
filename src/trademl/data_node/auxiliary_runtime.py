@@ -23,6 +23,7 @@ from trademl.connectors.base import (
     PermanentConnectorError,
 )
 from trademl.connectors.sec_edgar import MissingCompanyfactsError
+from trademl.data_node.archive_schema import normalize_archive_frame
 from trademl.data_node.capabilities import (
     auxiliary_capabilities,
     canonical_qc_capabilities,
@@ -991,7 +992,7 @@ class AuxiliaryRuntime:
     ) -> list[Path]:
         if frame.empty:
             return []
-        frame = self._align_partitioned_archive_schema(output_name, frame)
+        frame = normalize_archive_frame(output_name, frame)
         archive_root = self.paths.root / "data" / "raw" / output_name
         written: list[Path] = []
         for day_value, day_frame in frame.groupby("date", dropna=True):
@@ -1009,19 +1010,13 @@ class AuxiliaryRuntime:
                     existing = pd.read_parquet(output)
                     combined = pd.concat(
                         [
-                            self._align_partitioned_archive_schema(
-                                output_name, existing
-                            ),
-                            self._align_partitioned_archive_schema(
-                                output_name, day_frame
-                            ),
+                            normalize_archive_frame(output_name, existing),
+                            normalize_archive_frame(output_name, day_frame),
                         ],
                         ignore_index=True,
                     )
                 else:
-                    combined = self._align_partitioned_archive_schema(
-                        output_name, day_frame
-                    )
+                    combined = normalize_archive_frame(output_name, day_frame)
                 combined = self._deduplicate_reference_frame(combined)
                 output.parent.mkdir(parents=True, exist_ok=True)
                 tmp_path = output.with_suffix(
@@ -1034,53 +1029,6 @@ class AuxiliaryRuntime:
                 with contextlib.suppress(OSError):
                     lock_path.unlink()
         return written
-
-    @staticmethod
-    def _align_partitioned_archive_schema(
-        output_name: str, frame: pd.DataFrame
-    ) -> pd.DataFrame:
-        """Coerce raw archive partitions to stable append-safe dtypes."""
-        if frame.empty:
-            return frame.copy()
-        normalized = frame.copy()
-        if "date" in normalized.columns:
-            normalized["date"] = pd.to_datetime(
-                normalized["date"], errors="coerce"
-            ).dt.strftime("%Y-%m-%d")
-        string_columns = {
-            "equities_minute": (
-                "source_name",
-                "symbol",
-                "vendor_ts",
-                "currency",
-            ),
-            "ticker_news": (
-                "source_name",
-                "symbol",
-                "symbols",
-                "news_id",
-                "id",
-                "url",
-                "headline",
-                "summary",
-                "source",
-                "author",
-                "image_url",
-            ),
-        }.get(output_name, ())
-        for column in string_columns:
-            if column in normalized.columns:
-                normalized[column] = normalized[column].astype("string")
-        timestamp_columns = {
-            "equities_minute": ("timestamp", "vendor_ts", "ingested_at"),
-            "ticker_news": ("published_at", "crawled_at", "ingested_at"),
-        }.get(output_name, ())
-        for column in timestamp_columns:
-            if column in normalized.columns and column != "vendor_ts":
-                normalized[column] = pd.to_datetime(
-                    normalized[column], errors="coerce", utc=True
-                )
-        return normalized
 
     @staticmethod
     def _acquire_file_lock(path: Path, *, stale_after_seconds: int = 15) -> None:
