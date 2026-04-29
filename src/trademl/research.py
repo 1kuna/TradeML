@@ -687,7 +687,11 @@ def _write_paper_outputs(
         raise ValueError(f"predictions parquet missing required columns: {sorted(missing)}")
     frame = predictions.copy()
     frame["date"] = pd.to_datetime(frame["date"])
-    latest_date = frame["date"].max()
+    latest_available_date = frame["date"].max()
+    latest_date = _latest_paper_signal_date(
+        predictions=frame,
+        rebalance_day=str(merged_policy.get("rebalance_day", "FRI")),
+    )
     latest = frame.loc[frame["date"] == latest_date, ["date", "symbol", "prediction"]].copy()
     latest = latest.sort_values(["prediction", "symbol"], ascending=[False, True]).reset_index(drop=True)
     latest["score"] = latest["prediction"].astype(float)
@@ -720,6 +724,7 @@ def _write_paper_outputs(
     payload = {
         "status": "written",
         "date": latest_date.date().isoformat(),
+        "latest_prediction_date": latest_available_date.date().isoformat(),
         "signals_path": str(signals_path),
         "target_weights_path": str(targets_path),
         "paper_orders_path": str(orders_path),
@@ -740,6 +745,20 @@ def _write_paper_outputs(
             }
         )
     return payload
+
+
+def _latest_paper_signal_date(*, predictions: pd.DataFrame, rebalance_day: str) -> pd.Timestamp:
+    """Return the latest prediction date eligible for the paper rebalance policy."""
+    dates = pd.to_datetime(predictions["date"].dropna().unique())
+    if len(dates) == 0:
+        raise ValueError("predictions parquet has no usable dates")
+    normalized = pd.Series(dates).dt.normalize().sort_values()
+    weekday_lookup = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4}
+    weekday = weekday_lookup.get(str(rebalance_day).upper()[:3], 4)
+    eligible = normalized.loc[normalized.dt.weekday == weekday]
+    if not eligible.empty:
+        return pd.Timestamp(eligible.iloc[-1])
+    return pd.Timestamp(normalized.iloc[-1])
 
 
 def write_alpaca_paper_order_payloads(
