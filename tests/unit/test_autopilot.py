@@ -30,11 +30,13 @@ def test_current_state_summary_rolls_up_system_architecture_profit_and_codex() -
 
     payload = build_current_state_summary(snapshot, issues=[])
 
-    assert payload["verdict"] == "DEGRADED"
+    assert payload["verdict"] == "OK"
     assert payload["pi"]["status"] == "online"
     assert payload["mac"]["status"] == "online"
     assert payload["architecture"]["state"] == "Research running, no promotable candidate yet"
+    assert payload["architecture"]["status"] == "pending"
     assert payload["profit"]["headline"] == "Shadow paper ready"
+    assert payload["profit"]["status"] == "pending"
 
 
 def test_codex_issue_bucket_deduplicates_and_counts(tmp_path: Path) -> None:
@@ -174,6 +176,32 @@ def test_current_state_distinguishes_running_research_without_promotable_candida
     payload = build_current_state_summary(snapshot, issues=[])
 
     assert payload["mac"]["headline"] == "Research running, no incumbent yet"
+    assert payload["verdict"] == "OK"
     assert payload["architecture"]["state"] == "Research running, no promotable candidate yet"
+    assert payload["architecture"]["status"] == "pending"
     assert payload["architecture"]["best_advanced_score"] == 0.024
     assert payload["architecture"]["reason"] == "ic_ok=False; years_positive=False"
+
+
+def test_current_state_treats_no_incumbent_and_no_pnl_as_pending_not_degraded() -> None:
+    snapshot = {
+        "runtime": {"running": True, "pid": 42},
+        "collection_status": {"repair_remaining_units": 0},
+        "health": {
+            "research_program_summary": {
+                "status": "RUNNING",
+                "current_experiment_id": "exp-a",
+                "launchd": {"loaded": True},
+            }
+        },
+        "experiment_summary": {"shortlist_count": 0},
+    }
+
+    payload = build_current_state_summary(snapshot, issues=[])
+
+    assert payload["verdict"] == "OK"
+    assert payload["action"] == "OK"
+    assert payload["architecture"]["state"] == "No incumbent"
+    assert payload["architecture"]["status"] == "pending"
+    assert payload["profit"]["headline"] == "No validated paper PnL yet"
+    assert payload["profit"]["status"] == "pending"

@@ -23,7 +23,7 @@ def build_current_state_summary(snapshot: dict[str, Any], *, issues: list[dict[s
     architecture = _architecture_summary(snapshot)
     profit = _profit_summary(snapshot)
     issue_summary = summarize_issues(issues)
-    verdict = _rollup_verdict([pi["status"], mac["status"], architecture["status"], profit["status"]], issue_summary)
+    verdict = _rollup_verdict([pi["status"], mac["status"]], issue_summary)
     return {
         "verdict": verdict,
         "action": _action_from_verdict(verdict, issue_summary),
@@ -261,13 +261,13 @@ def _architecture_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
         status = "online"
     elif int(experiment.get("shortlist_count") or 0) > 0:
         state = "Candidate found"
-        status = "degraded"
+        status = "pending"
     elif str(program.get("status") or "").upper() == "RUNNING" and best:
         state = "Research running, no promotable candidate yet"
-        status = "degraded"
+        status = "pending"
     else:
         state = "No incumbent"
-        status = "degraded"
+        status = "pending"
     best_advanced = dict(best.get("best_advanced") or {})
     return {
         "status": status,
@@ -286,9 +286,9 @@ def _profit_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
     shadow = dict(program.get("latest_shadow_paper_outputs") or {})
     source = paper if paper.get("status") == "written" else shadow
     if not source:
-        return {"status": "degraded", "headline": "No validated paper PnL yet", "detail": "-"}
+        return {"status": "pending", "headline": "No validated paper PnL yet", "detail": "-"}
     return {
-        "status": "online" if not source.get("non_incumbent") else "degraded",
+        "status": "online" if not source.get("non_incumbent") else "pending",
         "headline": "Shadow paper ready" if source.get("non_incumbent") else "Paper ready",
         "detail": source.get("paper_orders_path") or source.get("shadow_orders_path") or "-",
         "date": source.get("date"),
