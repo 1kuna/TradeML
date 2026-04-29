@@ -7,8 +7,6 @@ import logging
 import signal
 import threading
 import uuid
-from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +29,7 @@ from trademl.data_node.canonical_runtime import CanonicalRuntime
 from trademl.data_node.curator import Curator, CuratorResult
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.planner import plan_coverage_tasks
+from trademl.data_node.scheduler import PlannerLaneScheduler
 from trademl.data_node.training_control import recommended_training_cutoff
 from trademl.fleet.cluster import ClusterCoordinator, ShardSpec
 
@@ -141,6 +140,7 @@ class DataNodeService:
                 frame, source_name=source_name, verify_repairs=False
             ),
         )
+        self._planner_scheduler = PlannerLaneScheduler(self)
 
     def stop(self) -> None:
         """Request a graceful shutdown."""
@@ -288,154 +288,13 @@ class DataNodeService:
         lane_stall_seconds: float = 45.0,
     ) -> list[str]:
         """Process planner-native canonical and auxiliary work."""
-        if not self.db.has_pending_planner_tasks():
-            self._ensure_planner_backlog_seeded(
-                trading_date=trading_date or datetime.now(tz=UTC).date().isoformat()
-            )
-        self._reclaim_expired_runtime_leases()
-        self._terminalize_unservable_canonical_repairs()
-        changed_dates: list[str] = []
-        futures: dict[object, str] = {}
-        canonical_lane_widths = self._canonical_runtime._backfill_lane_widths()
-        canonical_backlog_active = (
-            self.db.has_pending_planner_tasks(
-                task_families=("canonical_bars", "canonical_repair")
-            )
+        return self._planner_scheduler.process_planner_queue(
+            trading_date=trading_date,
+            exchange=exchange,
+            heartbeat_fn=heartbeat_fn,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            lane_stall_seconds=lane_stall_seconds,
         )
-        aux_task_kinds = {"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"}
-        aux_lane_widths = self._aux_lane_widths(
-            task_kinds=aux_task_kinds, canonical_pressure=canonical_backlog_active
-        )
-        max_workers = max(
-            1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values())
-        )
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        abandon_pending = False
-        try:
-            aux_active: dict[str, int] = defaultdict(int)
-            canonical_active: dict[str, int] = defaultdict(int)
-            aux_submitted: dict[str, int] = defaultdict(int)
-            canonical_submitted: dict[str, int] = defaultdict(int)
-            aux_submit_cap = {vendor: max(1, int(width)) * 32 for vendor, width in aux_lane_widths.items()}
-            canonical_submit_cap = {vendor: max(1, int(width)) * 16 for vendor, width in canonical_lane_widths.items()}
-
-            def submit_auxiliary_lane(vendor: str) -> None:
-                futures[executor.submit(self._drain_auxiliary_lane, vendor)] = (
-                    f"auxiliary:{vendor}"
-                )
-                aux_active[vendor] += 1
-                aux_submitted[vendor] += 1
-
-            def submit_canonical_lane(vendor: str) -> None:
-                futures[
-                    executor.submit(self._drain_canonical_lane, vendor, exchange)
-                ] = f"canonical:{vendor}"
-                canonical_active[vendor] += 1
-                canonical_submitted[vendor] += 1
-
-            def can_submit_auxiliary(vendor: str) -> bool:
-                return aux_submitted[vendor] < aux_submit_cap.get(vendor, 32)
-
-            def can_submit_canonical(vendor: str) -> bool:
-                return canonical_submitted[vendor] < canonical_submit_cap.get(vendor, 16)
-
-            for vendor, width in canonical_lane_widths.items():
-                for _ in range(max(1, width)):
-                    submit_canonical_lane(vendor)
-            for vendor, width in aux_lane_widths.items():
-                for _ in range(max(1, width)):
-                    submit_auxiliary_lane(vendor)
-            last_heartbeat = monotonic()
-            last_pending_log = monotonic()
-            queue_started = monotonic()
-            while futures:
-                done, _pending = wait(
-                    list(futures), return_when=FIRST_COMPLETED, timeout=0.5
-                )
-                if not done:
-                    now = monotonic()
-                    if (now - queue_started) >= max(5.0, float(lane_stall_seconds)):
-                        lane_counts: dict[str, int] = {}
-                        for lane in futures.values():
-                            lane_counts[lane] = lane_counts.get(lane, 0) + 1
-                        LOGGER.warning(
-                            "planner_queue_stalled worker_id=%s elapsed_seconds=%.1f pending=%s",
-                            self.worker_id,
-                            now - queue_started,
-                            lane_counts,
-                        )
-                        self._reclaim_expired_runtime_leases()
-                        abandon_pending = True
-                        break
-                    if (
-                        heartbeat_fn is not None
-                        and (now - last_heartbeat) >= heartbeat_interval_seconds
-                    ):
-                        try:
-                            heartbeat_fn()
-                        except Exception:
-                            LOGGER.exception(
-                                "planner_queue_heartbeat_failed worker_id=%s",
-                                self.worker_id,
-                            )
-                        last_heartbeat = now
-                    if (now - last_pending_log) >= max(5.0, heartbeat_interval_seconds):
-                        self._reclaim_expired_runtime_leases()
-                        lane_counts: dict[str, int] = {}
-                        for lane in futures.values():
-                            lane_counts[lane] = lane_counts.get(lane, 0) + 1
-                        LOGGER.warning(
-                            "planner_queue_waiting worker_id=%s pending=%s",
-                            self.worker_id,
-                            lane_counts,
-                        )
-                        last_pending_log = now
-                    continue
-                for future in done:
-                    task_type = futures.pop(future)
-                    lane_kind, _, vendor = task_type.partition(":")
-                    if lane_kind == "auxiliary":
-                        aux_active[vendor] = max(0, aux_active[vendor] - 1)
-                    elif lane_kind == "canonical":
-                        canonical_active[vendor] = max(0, canonical_active[vendor] - 1)
-                    try:
-                        result = future.result()
-                    except Exception:
-                        LOGGER.exception(
-                            "planner_lane_failed lane=%s worker_id=%s",
-                            task_type,
-                            self.worker_id,
-                        )
-                        if (
-                            lane_kind == "auxiliary"
-                            and not self._stop_event.is_set()
-                            and can_submit_auxiliary(vendor)
-                            and aux_active[vendor] < max(1, int(aux_lane_widths.get(vendor, 1)))
-                            and self._auxiliary_vendor_has_eligible_work(vendor)
-                        ):
-                            submit_auxiliary_lane(vendor)
-                        continue
-                    if lane_kind == "canonical":
-                        changed_dates.extend(result)
-                        if (
-                            result
-                            and not self._stop_event.is_set()
-                            and can_submit_canonical(vendor)
-                            and canonical_active[vendor]
-                            < max(1, int(canonical_lane_widths.get(vendor, 1)))
-                            and self._canonical_vendor_has_eligible_work(vendor)
-                        ):
-                            submit_canonical_lane(vendor)
-                    elif lane_kind == "auxiliary":
-                        if not self._stop_event.is_set() and aux_active[vendor] < max(
-                            1, int(aux_lane_widths.get(vendor, 1))
-                        ) and can_submit_auxiliary(vendor) and (
-                            result or self._auxiliary_vendor_has_eligible_work(vendor)
-                        ):
-                            submit_auxiliary_lane(vendor)
-        finally:
-            executor.shutdown(wait=not abandon_pending, cancel_futures=abandon_pending)
-        return sorted(set(changed_dates))
 
     def _allow_auxiliary_during_canonical_tail(self) -> bool:
         """Allow limited auxiliary work when only a tiny rolling-canonical tail remains."""
