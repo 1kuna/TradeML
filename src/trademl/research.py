@@ -205,6 +205,11 @@ def supervise_research_program(
         program_id=program_id,
         payload=_initial_program_state(spec=spec, program_path=program_path, poll_seconds=resolved_poll),
     )
+    state = _sync_family_budget_with_existing_experiments(
+        local_state=local_state,
+        program_id=program_id,
+        state=state,
+    )
     state = _bootstrap_research_state_from_training_history(
         local_state=local_state,
         state=state,
@@ -1076,6 +1081,11 @@ def run_research_canary(
         local_state=local_state,
         program_id=program_id,
         payload=_initial_program_state(spec=spec, program_path=program_path, poll_seconds=resolved_poll),
+    )
+    state = _sync_family_budget_with_existing_experiments(
+        local_state=local_state,
+        program_id=program_id,
+        state=state,
     )
     phase_policy = _phase_policy(spec=spec, phase=_current_ssot_phase(state=state, spec=spec))
     if phase_policy is None:
@@ -3149,6 +3159,8 @@ def _recover_stalled_active_experiment(
     status = str((experiment_supervisor or {}).get("status") or "").upper()
     if status != "STOPPED":
         return None
+    if bool((experiment_supervisor or {}).get("stop_requested")):
+        return None
     if not _experiment_has_remaining_work(experiment_summary):
         return None
     spec_path_value = (
@@ -3168,6 +3180,35 @@ def _recover_stalled_active_experiment(
         poll_seconds=poll_seconds,
         detach=True,
     )
+
+
+def _sync_family_budget_with_existing_experiments(
+    *,
+    local_state: Path,
+    program_id: str,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep generated family ids ahead of existing specs and summaries."""
+    max_sequence = 0
+    roots = [
+        _program_root(local_state=local_state, program_id=program_id) / "specs",
+        local_state / "experiments",
+    ]
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.iterdir():
+            name = path.stem if path.is_file() else path.name
+            if not name.startswith(f"{program_id}-"):
+                continue
+            max_sequence = max(max_sequence, _family_sequence(name) or 0)
+    if max_sequence <= 0:
+        return state
+    updated = deepcopy(state)
+    budgets = dict(updated.get("budgets") or {})
+    budgets["families_started"] = max(int(budgets.get("families_started", 0) or 0), max_sequence)
+    updated["budgets"] = budgets
+    return updated
 
 
 def _experiment_has_remaining_work(summary: dict[str, Any]) -> bool:

@@ -895,6 +895,44 @@ def test_recover_stalled_active_experiment_relaunches_same_family_when_work_rema
     assert observed["spec_path"] == Path(state["current_experiment_spec_path"])
 
 
+def test_recover_stalled_active_experiment_respects_operator_stop(tmp_path: Path, monkeypatch) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["current_experiment_id"] = "perpetual-macmini-p1-f032"
+    state["current_experiment_spec_path"] = str(tmp_path / "specs" / "perpetual-macmini-p1-f032.yml")
+    experiment_supervisor = {
+        "status": "STOPPED",
+        "stop_requested": True,
+        "experiment_id": "perpetual-macmini-p1-f032",
+        "spec_path": state["current_experiment_spec_path"],
+    }
+    experiment_summary = {
+        "experiment_id": "perpetual-macmini-p1-f032",
+        "counts": {"COMPLETED": 68, "FAILED": 1},
+        "runs": [{"run_id": "retry-me", "status": "FAILED", "failure_kind": "infra", "retry_count": 1}],
+    }
+
+    def unexpected_supervise(**kwargs):  # noqa: ANN001
+        raise AssertionError("operator-stopped experiment should not be relaunched")
+
+    monkeypatch.setattr(research, "supervise_experiment", unexpected_supervise)
+
+    relaunched = research._recover_stalled_active_experiment(  # noqa: SLF001
+        state=state,
+        experiment_supervisor=experiment_supervisor,
+        experiment_summary=experiment_summary,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=30,
+    )
+
+    assert relaunched is None
+
+
 def test_recover_stalled_active_experiment_skips_relaunch_when_family_is_idle(tmp_path: Path, monkeypatch) -> None:
     spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
     state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
@@ -936,6 +974,28 @@ def test_recover_stalled_active_experiment_skips_relaunch_when_family_is_idle(tm
     )
 
     assert relaunched is None
+
+
+def test_sync_family_budget_avoids_reusing_existing_family_ids_after_canary(tmp_path: Path) -> None:
+    program_id = "perpetual-macmini"
+    state = {"budgets": {"families_started": 190}}
+    specs_root = tmp_path / "research_programs" / program_id / "specs"
+    specs_root.mkdir(parents=True)
+    (specs_root / f"{program_id}-p1-f191.yml").write_text("experiment_id: old\n", encoding="utf-8")
+    (tmp_path / "experiments" / f"{program_id}-p1-f192").mkdir(parents=True)
+
+    synced = research._sync_family_budget_with_existing_experiments(  # noqa: SLF001
+        local_state=tmp_path,
+        program_id=program_id,
+        state=state,
+    )
+
+    assert synced["budgets"]["families_started"] == 192
+    assert research._next_experiment_id(  # noqa: SLF001
+        program_state=synced,
+        spec={"program_id": program_id},
+        phase=1,
+    ) == f"{program_id}-p1-f193"
 
 
 def test_ensure_program_state_refreshes_budget_caps_from_latest_spec(tmp_path: Path) -> None:
