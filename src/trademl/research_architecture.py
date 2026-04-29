@@ -19,6 +19,8 @@ class ArchitectureEntry:
     allowed_phases: tuple[int, ...]
     promotable: bool
     implemented: bool
+    canary_eligible: bool
+    pivot_role: str
     deferred_reason: str | None = None
     config_overrides: dict[str, Any] | None = None
 
@@ -42,6 +44,8 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureEntry] = {
         allowed_phases=(1, 2),
         promotable=True,
         implemented=True,
+        canary_eligible=True,
+        pivot_role="sentinel",
         config_overrides={},
     ),
     "tree_challenger": ArchitectureEntry(
@@ -53,6 +57,8 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureEntry] = {
         allowed_phases=(1, 2),
         promotable=True,
         implemented=True,
+        canary_eligible=True,
+        pivot_role="workhorse_sentinel",
         config_overrides={},
     ),
     "advanced_challenger": ArchitectureEntry(
@@ -64,6 +70,8 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureEntry] = {
         allowed_phases=(1, 2),
         promotable=True,
         implemented=True,
+        canary_eligible=True,
+        pivot_role="advanced_primary",
         config_overrides={},
     ),
     "ensemble_meta": ArchitectureEntry(
@@ -75,6 +83,8 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureEntry] = {
         allowed_phases=(1, 2),
         promotable=True,
         implemented=True,
+        canary_eligible=True,
+        pivot_role="advanced_failure_pivot",
         config_overrides={},
     ),
     "tabular_deep_challenger": ArchitectureEntry(
@@ -86,6 +96,8 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureEntry] = {
         allowed_phases=(2,),
         promotable=True,
         implemented=False,
+        canary_eligible=False,
+        pivot_role="disabled_future",
         deferred_reason="requires a dedicated tabular deep training suite",
         config_overrides={},
     ),

@@ -306,6 +306,8 @@ def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     experiment = dict(snapshot.get("experiment_summary") or {})
     remote_research = dict(((snapshot.get("fleet_remote") or {}).get("mac") or {}).get("research") or {})
     best = dict(program.get("best_candidate_summary") or {})
+    progression = dict(program.get("autonomous_progression") or program.get("progression") or {})
+    paper_smoke = dict(program.get("latest_paper_account_smoke") or program.get("paper_account_smoke") or {})
     return {
         "status": str(program.get("status") or remote_research.get("status") or "UNKNOWN"),
         "current_experiment_id": program.get("current_experiment_id") or experiment.get("experiment_id") or remote_research.get("current_experiment_id"),
@@ -319,6 +321,15 @@ def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
         "best_primary_score": best.get("best_primary_score") or experiment.get("best_primary_score"),
         "best_decision_reason": best.get("best_decision_reason") or experiment.get("best_decision_reason"),
         "frontier_lane": program.get("frontier_architecture") or program.get("frontier") or {},
+        "architecture_lane": program.get("architecture_lane") or progression.get("current_lane"),
+        "complexity_tier": program.get("complexity_tier"),
+        "objective_verdict": program.get("objective_verdict") or {},
+        "progression": progression,
+        "pivot_reason": program.get("pivot_reason") or progression.get("pivot_reason"),
+        "next_lane": program.get("next_lane") or progression.get("next_lane"),
+        "exhausted_lanes": progression.get("exhausted_lanes") or [],
+        "last_canary": program.get("last_canary") or {},
+        "paper_account_smoke": paper_smoke,
         "data_revision": program.get("data_revision") or experiment.get("data_revision"),
         "reason": program.get("wait_reason") or remote_research.get("wait_reason") or best.get("best_decision_reason"),
     }
@@ -329,17 +340,23 @@ def _paper_pnl_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     paper = dict(program.get("latest_paper_outputs") or program.get("paper_outputs") or {})
     shadow = dict(program.get("latest_shadow_paper_outputs") or {})
     pnl = dict(program.get("latest_paper_pnl") or program.get("paper_pnl") or {})
+    paper_smoke = dict(program.get("latest_paper_account_smoke") or program.get("paper_account_smoke") or {})
+    paper_submission = dict(program.get("latest_paper_submission") or program.get("paper_submission") or {})
     source = paper if paper.get("status") == "written" else shadow
     if pnl:
         return {
             "status": str(pnl.get("status") or "available"),
             "date": pnl.get("date") or source.get("date"),
+            "path": pnl.get("path"),
             "net_return": pnl.get("net_return"),
             "turnover": pnl.get("turnover"),
             "cost_drag": pnl.get("cost_drag"),
             "max_drawdown": pnl.get("max_drawdown"),
             "benchmark_spy_return": pnl.get("benchmark_spy_return"),
             "source": "paper" if paper.get("status") == "written" else "shadow",
+            "paper_order_payloads_path": source.get("paper_order_payloads_path") or source.get("shadow_order_payloads_path"),
+            "paper_account_smoke_status": paper_smoke.get("status"),
+            "paper_submission_status": paper_submission.get("status"),
             "no_live_orders": True,
         }
     if source:
@@ -348,10 +365,19 @@ def _paper_pnl_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
             "date": source.get("date"),
             "path": source.get("paper_orders_path") or source.get("shadow_orders_path"),
             "source": "shadow" if source.get("non_incumbent") else "paper",
+            "paper_order_payloads_path": source.get("paper_order_payloads_path") or source.get("shadow_order_payloads_path"),
+            "paper_account_smoke_status": paper_smoke.get("status"),
+            "paper_submission_status": paper_submission.get("status"),
             "no_live_orders": True,
             "non_incumbent": bool(source.get("non_incumbent")),
         }
-    return {"status": "pending", "reason": "No paper/shadow outputs yet", "no_live_orders": True}
+    return {
+        "status": "pending",
+        "reason": "No paper/shadow outputs yet",
+        "paper_account_smoke_status": paper_smoke.get("status"),
+        "paper_submission_status": paper_submission.get("status"),
+        "no_live_orders": True,
+    }
 
 
 def _freshness_row(dataset: str, latest_date: Any, *, stale_after: int, now: datetime) -> dict[str, Any]:

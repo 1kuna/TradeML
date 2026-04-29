@@ -52,6 +52,11 @@ from trademl.research_alerts import (
     send_research_alert_email as send_research_alert_email,
     write_research_alerts,
 )
+from trademl.broker.alpaca_paper import (
+    build_alpaca_order_payloads_from_deltas,
+    paper_account_smoke_check,
+    submit_alpaca_paper_payloads,
+)
 
 DEFAULT_RESEARCH_REVIEW_HOURS = 12
 DEFAULT_BUDGET_POLICY = {
@@ -100,6 +105,14 @@ DEFAULT_PAPER_POLICY = {
     "rebalance_day": "FRI",
     "no_live_orders": True,
     "pnl_horizon_trading_days": 5,
+    "portfolio_notional": 100_000.0,
+    "broker": {
+        "provider": "alpaca_paper",
+        "base_url": "https://paper-api.alpaca.markets/v2",
+        "submit_orders_enabled": False,
+        "api_key_env": "ALPACA_API_KEY",
+        "api_secret_env": "ALPACA_API_SECRET",
+    },
 }
 DEFAULT_FRONTIER_ARCHITECTURE_POLICY = {
     "enabled": False,
@@ -658,7 +671,7 @@ def _write_paper_outputs(
     non_incumbent: bool,
 ) -> dict[str, Any]:
     """Write deterministic paper-style signals, weights, and order deltas."""
-    merged_policy = {**DEFAULT_PAPER_POLICY, **dict(policy or {})}
+    merged_policy = _paper_policy(policy)
     if not bool(merged_policy.get("enabled", True)):
         return {"status": "skipped", "reason": "paper policy disabled"}
     if not bool(merged_policy.get("no_live_orders", True)):
@@ -697,6 +710,13 @@ def _write_paper_outputs(
     signals.to_parquet(local_root / f"{path_prefix}signals.parquet", index=False)
     targets.to_parquet(local_root / f"{path_prefix}target_weights.parquet", index=False)
     orders.to_parquet(local_root / f"{path_prefix}paper_orders.parquet", index=False)
+    payloads = write_alpaca_paper_order_payloads(
+        paper_orders_path=orders_path,
+        output_dir=root,
+        policy=merged_policy,
+        prefix=path_prefix,
+        source_run_id=str(source.get("run_id") or "unknown"),
+    )
     payload = {
         "status": "written",
         "date": latest_date.date().isoformat(),
@@ -705,6 +725,8 @@ def _write_paper_outputs(
         "paper_orders_path": str(orders_path),
         "local_root": str(local_root),
         "no_live_orders": True,
+        "paper_order_payloads_path": payloads.get("payloads_path"),
+        "paper_broker": payloads.get("broker"),
     }
     if non_incumbent:
         payload.update(
@@ -714,9 +736,86 @@ def _write_paper_outputs(
                 "shadow_signals_path": str(signals_path),
                 "shadow_target_weights_path": str(targets_path),
                 "shadow_orders_path": str(orders_path),
+                "shadow_order_payloads_path": payloads.get("payloads_path"),
             }
         )
     return payload
+
+
+def write_alpaca_paper_order_payloads(
+    *,
+    paper_orders_path: Path,
+    output_dir: Path,
+    policy: dict[str, Any] | None = None,
+    prefix: str = "",
+    source_run_id: str = "unknown",
+) -> dict[str, Any]:
+    """Write Alpaca-compatible paper order payloads without submitting them."""
+    merged_policy = _paper_policy(policy)
+    if not bool(merged_policy.get("no_live_orders", True)):
+        raise ValueError("paper payload generation requires no_live_orders=true")
+    broker = dict(merged_policy.get("broker") or {})
+    if str(broker.get("provider") or "alpaca_paper") != "alpaca_paper":
+        return {"status": "skipped", "reason": "unsupported paper broker", "broker": broker.get("provider")}
+    client_prefix = f"trademl-{Path(str(paper_orders_path)).parent.name}-{source_run_id}".replace("_", "-")[:40]
+    payloads = build_alpaca_order_payloads_from_deltas(
+        orders_path=paper_orders_path,
+        portfolio_notional=float(merged_policy.get("portfolio_notional") or 100_000.0),
+        client_order_prefix=client_prefix,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payloads_path = output_dir / f"{prefix}paper_order_payloads.json"
+    result = {
+        "status": "written",
+        "broker": "alpaca_paper",
+        "payloads_path": str(payloads_path),
+        "payload_count": len(payloads),
+        "submit_orders_enabled": bool(broker.get("submit_orders_enabled", False)),
+        "no_live_orders": True,
+        "payloads": payloads,
+    }
+    _atomic_write_json(payloads_path, result)
+    return {key: value for key, value in result.items() if key != "payloads"}
+
+
+def paper_account_smoke(
+    *,
+    policy: dict[str, Any] | None = None,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Run a read-only Alpaca paper smoke check when credentials are configured."""
+    merged_policy = _paper_policy(policy)
+    return paper_account_smoke_check(policy=merged_policy, environ=environ)
+
+
+def submit_paper_orders(
+    *,
+    payloads_path: Path,
+    policy: dict[str, Any] | None = None,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Submit previously generated Alpaca paper order payloads with explicit guards."""
+    merged_policy = _paper_policy(policy)
+    payload = json.loads(payloads_path.read_text(encoding="utf-8"))
+    if not bool(payload.get("no_live_orders", True)):
+        raise ValueError("paper payload file must declare no_live_orders=true")
+    if str(payload.get("broker") or "") != "alpaca_paper":
+        raise ValueError("only alpaca_paper payload files are supported")
+    submissions = submit_alpaca_paper_payloads(
+        payloads=list(payload.get("payloads") or []),
+        policy=merged_policy,
+        environ=environ,
+    )
+    result = {
+        **submissions,
+        "payloads_path": str(payloads_path),
+        "no_live_orders": True,
+        "submitted_at": datetime.now(tz=UTC).isoformat(),
+    }
+    submissions_path = payloads_path.with_name(payloads_path.stem.replace("payloads", "submissions") + ".json")
+    _atomic_write_json(submissions_path, result)
+    result["submissions_path"] = str(submissions_path)
+    return result
 
 
 def evaluate_paper_pnl(
@@ -726,7 +825,7 @@ def evaluate_paper_pnl(
     policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate mature paper/shadow portfolio PnL from curated PIT-safe prices."""
-    merged_policy = {**DEFAULT_PAPER_POLICY, **dict(policy or {})}
+    merged_policy = _paper_policy(policy)
     if not paper_outputs or paper_outputs.get("status") != "written":
         return {"status": "pending", "reason": "no paper outputs written", "no_live_orders": True}
     targets_path = Path(
@@ -790,6 +889,15 @@ def evaluate_paper_pnl(
     _atomic_write_json(pnl_path, payload)
     payload["path"] = str(pnl_path)
     return payload
+
+
+def _paper_policy(policy: dict[str, Any] | None) -> dict[str, Any]:
+    merged = deepcopy(DEFAULT_PAPER_POLICY)
+    incoming = dict(policy or {})
+    broker = {**dict(merged.get("broker") or {}), **dict(incoming.get("broker") or {})}
+    merged.update(incoming)
+    merged["broker"] = broker
+    return merged
 
 
 def evaluate_research_drift(
@@ -899,6 +1007,12 @@ def research_health(
         "incumbent": incumbent,
         "alerts": alerts,
         "paper": state.get("latest_paper_outputs", {}),
+        "latest_paper_outputs": state.get("latest_paper_outputs", {}),
+        "latest_shadow_paper_outputs": state.get("latest_shadow_paper_outputs", {}),
+        "latest_paper_pnl": state.get("latest_paper_pnl", {}),
+        "latest_paper_account_smoke": state.get("latest_paper_account_smoke", {}),
+        "latest_paper_submission": state.get("latest_paper_submission", {}),
+        "last_canary": state.get("last_canary", {}),
         "infra_blocker": state.get("last_infra_preflight", {}),
         "launchd": _research_launchd_status(program_id),
         "frontier_architecture": _frontier_architecture_status(spec=spec, state=state, frontier=dict(state.get("frontier") or {}), experiment_summary=latest_summary) if spec else {},
@@ -911,6 +1025,81 @@ def research_health(
         "autonomous_progression": state.get("autonomous_progression", {}),
         "dependency_preflight": (state.get("last_infra_preflight") or {}).get("dependencies", {}),
         "paths": _research_path_summary(local_state=local_state, data_root=data_root),
+    }
+
+
+def run_research_canary(
+    *,
+    program_path: Path,
+    repo_root: Path,
+    data_root: Path,
+    local_state: Path,
+    env_path: Path,
+    targets_config_path: Path,
+    python_executable: str,
+    poll_seconds: int | None = None,
+    detach: bool = False,
+) -> dict[str, Any]:
+    """Run one bounded architecture canary family for the research autopilot."""
+    spec = _load_research_program_spec(program_path)
+    program_id = str(spec["program_id"])
+    resolved_poll = int(poll_seconds or spec.get("poll_seconds") or 30)
+    state = _ensure_program_state(
+        local_state=local_state,
+        program_id=program_id,
+        payload=_initial_program_state(spec=spec, program_path=program_path, poll_seconds=resolved_poll),
+    )
+    phase_policy = _phase_policy(spec=spec, phase=_current_ssot_phase(state=state, spec=spec))
+    if phase_policy is None:
+        payload = {"status": "INFRA_BLOCKED", "reason": "missing phase policy for canary", "program_id": program_id}
+        state.update(payload)
+        _write_program_state(local_state=local_state, program_id=program_id, payload=state)
+        return payload
+    next_spec = _canary_experiment_spec(spec=spec, state=state, phase_policy=phase_policy)
+    launched = _launch_program_family(
+        program_id=program_id,
+        program_state=state,
+        next_spec=next_spec,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        targets_config_path=targets_config_path,
+        python_executable=python_executable,
+        poll_seconds=resolved_poll,
+        detach=detach,
+    )
+    state.update(launched)
+    state["last_canary"] = {
+        "experiment_id": next_spec["experiment_id"],
+        "status": launched.get("status") or launched.get("active_experiment_supervisor", {}).get("status"),
+        "ran_at": datetime.now(tz=UTC).isoformat(),
+        "architecture_families": list(next_spec["matrix"].get("architecture_family") or []),
+    }
+    if launched.get("status") == "INFRA_BLOCKED":
+        _write_program_state(local_state=local_state, program_id=program_id, payload=state)
+        return {**launched, "program_id": program_id, "canary_spec": next_spec}
+    paper_smoke = paper_account_smoke(policy=dict(spec.get("paper_policy") or {}))
+    review_packet = {}
+    if not detach:
+        review_packet = write_research_review_packet(
+            program_id=program_id,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=python_executable,
+        )
+        state["latest_review_packet"] = review_packet
+        state["last_review_packet_at"] = datetime.now(tz=UTC).isoformat()
+    state["latest_paper_account_smoke"] = paper_smoke
+    _write_program_state(local_state=local_state, program_id=program_id, payload=state)
+    return {
+        **launched,
+        "program_id": program_id,
+        "canary_spec": next_spec,
+        "paper_account_smoke": paper_smoke,
+        "review_packet": review_packet,
     }
 
 
@@ -2060,16 +2249,8 @@ def _frontier_architecture_spec(
         default=allowed_data_families[0],
         epoch=epoch,
     )
-    sentinel_count = max(0, int(policy.get("sentinel_baseline_runs") or 0))
-    architectures = ["advanced_challenger"]
-    if epoch > 0:
-        architectures.append("ensemble_meta")
-    if sentinel_count >= 1:
-        architectures.append("tree_challenger")
-    if sentinel_count >= 2:
-        architectures.append("linear_baseline")
-    if not bool(policy.get("advanced_first", True)):
-        architectures = list(reversed(architectures))
+    progression = _architecture_progression_plan(policy=policy, frontier=frontier, epoch=epoch)
+    architectures = progression["architectures"]
     next_spec = _make_experiment_spec_from_phase_policy(
         spec=spec,
         program_state=state,
@@ -2087,24 +2268,133 @@ def _frontier_architecture_spec(
         },
         steering=dict(state.get("steering") or {}),
     )
-    if bool(policy.get("advanced_first", True)):
-        order = {
-            family: idx
-            for idx, family in enumerate(["advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"])
-        }
-        next_spec["matrix"]["architecture_family"] = sorted(
-            list(next_spec["matrix"].get("architecture_family") or []),
-            key=lambda value: order.get(str(value), 100),
-        )
+    architecture_values = list(next_spec["matrix"].get("architecture_family") or [])
+    current_lane = str(progression.get("current_lane") or "")
+    if dict(state.get("steering") or {}).get("force_pivot"):
+        next_spec["matrix"]["architecture_family"] = [value for value in architectures if value in architecture_values]
+    elif current_lane in architecture_values:
+        next_spec["matrix"]["architecture_family"] = [current_lane] + [value for value in architecture_values if value != current_lane]
     next_spec["proposal_policy"]["family_size_cap"] = int(policy.get("family_size_cap") or phase_policy.get("family_size_cap") or 6)
     next_spec["frontier_architecture_policy"] = policy
     next_spec["frontier_architecture"] = True
     next_spec["frontier_iteration"] = advanced_count + 1
     next_spec["search_epoch"] = int(state.get("search_epoch", 0) or 0)
+    next_spec["progression"] = progression
     next_spec = _decorate_autonomous_experiment_spec(next_spec=next_spec, spec=spec)
+    next_spec["autonomous_progression"] = {
+        **dict(next_spec.get("autonomous_progression") or {}),
+        **progression,
+    }
+    next_spec["architecture_lane"] = str(progression.get("current_lane") or next_spec.get("architecture_lane"))
+    next_spec["next_lane"] = str(progression.get("next_lane") or next_spec.get("next_lane"))
     if _family_signature(next_spec) in set(frontier.get("tried_family_signatures") or []):
         return None
     return next_spec
+
+
+def _architecture_progression_plan(
+    *,
+    policy: dict[str, Any],
+    frontier: dict[str, Any],
+    epoch: int,
+) -> dict[str, Any]:
+    """Return deterministic architecture lanes for the next frontier epoch."""
+    sentinel_count = max(0, int(policy.get("sentinel_baseline_runs") or 0))
+    max_advanced = int(policy.get("max_advanced_failures_per_epoch") or 0)
+    lane_stats = dict((frontier.get("lane_stats") or {}).get("architecture_family") or {})
+    advanced_exhausted = _prior_epoch_exhausted_architecture(frontier=frontier, family="advanced_challenger") or (
+        int(epoch or 0) > 0
+        and max_advanced > 0
+        and int(lane_stats.get("advanced_challenger") or 0) >= max_advanced
+    )
+    ensemble_exhausted = _prior_epoch_exhausted_architecture(frontier=frontier, family="ensemble_meta")
+    if int(epoch or 0) > 0 and advanced_exhausted and not ensemble_exhausted:
+        primary = "ensemble_meta"
+        pivot_reason = "advanced_non_promotable_pivot_to_ensemble"
+    elif int(epoch or 0) > 1 and advanced_exhausted and ensemble_exhausted:
+        primary = "advanced_challenger"
+        pivot_reason = "ensemble_not_better_pivot_window_profile"
+    else:
+        primary = "advanced_challenger"
+        pivot_reason = "advanced_first"
+    architectures = [primary]
+    for family in ("advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"):
+        if family == primary:
+            continue
+        if family == "ensemble_meta" and int(epoch or 0) <= 0:
+            continue
+        if family == "tree_challenger" and sentinel_count < 1:
+            continue
+        if family == "linear_baseline" and sentinel_count < 2:
+            continue
+        architectures.append(family)
+    if not bool(policy.get("advanced_first", True)) and primary == "advanced_challenger":
+        architectures = list(reversed(architectures))
+    exhausted = [family for family, exhausted in {"advanced_challenger": advanced_exhausted, "ensemble_meta": ensemble_exhausted}.items() if exhausted]
+    return {
+        "current_lane": primary,
+        "architectures": architectures,
+        "exhausted_lanes": exhausted,
+        "pivot_reason": pivot_reason,
+        "next_lane": architectures[0],
+        "epoch": int(epoch or 0),
+        "last_successful_run": _last_successful_frontier_run(frontier),
+    }
+
+
+def _prior_epoch_exhausted_architecture(*, frontier: dict[str, Any], family: str) -> bool:
+    history = [item for item in list(frontier.get("family_history") or []) if isinstance(item, dict)]
+    return any(
+        family in set(item.get("architecture_families") or [])
+        and int(item.get("shortlist_count") or 0) <= 0
+        for item in history
+    )
+
+
+def _last_successful_frontier_run(frontier: dict[str, Any]) -> str | None:
+    history = [item for item in list(frontier.get("family_history") or []) if isinstance(item, dict)]
+    for item in reversed(history):
+        if item.get("best_primary_score") is not None:
+            return str(item.get("experiment_id"))
+    return None
+
+
+def _canary_experiment_spec(*, spec: dict[str, Any], state: dict[str, Any], phase_policy: dict[str, Any]) -> dict[str, Any]:
+    """Build the fixed bounded architecture canary family."""
+    phase = _current_ssot_phase(state=state, spec=spec)
+    canary_state = {**state, "current_generation": int(state.get("current_generation", 0) or 0) + 1}
+    next_spec = _make_experiment_spec_from_phase_policy(
+        spec=spec,
+        program_state=canary_state,
+        phase_policy=phase_policy,
+        experiment_id=f"{spec['program_id']}-canary-{datetime.now(tz=UTC).strftime('%Y%m%d%H%M%S')}",
+        generation=int(canary_state["current_generation"]),
+    )
+    allowed_data = [
+        family
+        for family in list(phase_policy.get("allowed_data_families") or ["price_plus_liquidity", "price_only"])
+        if family in MODELING_READY_DATA_FAMILIES
+    ]
+    data_family = "price_plus_liquidity" if "price_plus_liquidity" in allowed_data else allowed_data[0] if allowed_data else "price_only"
+    next_spec["phase"] = phase
+    next_spec["ssot_phase"] = phase
+    next_spec["max_concurrent"] = 1
+    next_spec["matrix"] = {
+        "architecture_family": ["advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"],
+        "feature_family": ["price_liquidity"],
+        "data_family": [data_family],
+        "data_profile": ["phase1_default"],
+        "validation.initial_train_years": [2],
+    }
+    next_spec["proposal_policy"]["family_size_cap"] = 4
+    next_spec["frontier_architecture"] = True
+    next_spec["canary"] = True
+    next_spec["supervision"] = {
+        **dict(next_spec.get("supervision") or {}),
+        "auto_backtest_survivors": True,
+        "auto_propose_next_family": False,
+    }
+    return _decorate_autonomous_experiment_spec(next_spec=next_spec, spec=spec)
 
 
 def _frontier_advanced_count_for_epoch(*, state: dict[str, Any], frontier: dict[str, Any]) -> int:
@@ -2872,6 +3162,7 @@ def _launch_program_family(
     targets_config_path: Path,
     python_executable: str,
     poll_seconds: int,
+    detach: bool = True,
 ) -> dict[str, Any]:
     preflight = _program_family_preflight(
         next_spec=next_spec,
@@ -2900,7 +3191,7 @@ def _launch_program_family(
         targets_config_path=targets_config_path,
         python_executable=python_executable,
         poll_seconds=poll_seconds,
-        detach=True,
+        detach=detach,
     )
     return {
         "current_experiment_id": next_spec["experiment_id"],
@@ -2993,7 +3284,7 @@ def _most_capable_model_suite(spec: dict[str, Any]) -> str | None:
         if preset is not None:
             suites.append(str(preset["model_suite"]))
     suites.extend(str(item) for item in matrix.get("model_suite") or [])
-    order = {"advanced": 3, "full": 2, "ridge_only": 1}
+    order = {"advanced": 4, "ensemble": 3, "full": 2, "ridge_only": 1}
     return max(suites, key=lambda value: order.get(value, 0), default=None)
 
 

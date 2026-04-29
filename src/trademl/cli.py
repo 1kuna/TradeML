@@ -64,14 +64,17 @@ from trademl.fleet.launchd import install_research_launch_agent, launch_agent_st
 from trademl.research import (
     list_research_alerts,
     latest_research_program_summary,
+    paper_account_smoke,
     pause_research_program,
     read_research_incumbent,
     read_research_program_state,
     research_health,
     resume_research_program,
+    run_research_canary,
     start_research_program,
     steer_research_program,
     stop_research_program,
+    submit_paper_orders,
     write_research_review_packet,
 )
 
@@ -205,6 +208,15 @@ def main(argv: list[str] | None = None) -> int:
     research_start.add_argument("--program", required=True)
     research_start.add_argument("--poll-seconds", type=int, default=None)
     research_start.add_argument("--detach", action="store_true")
+    research_canary = research_subparsers.add_parser("canary", help="Run one bounded autonomous research canary family.")
+    research_canary.add_argument("--program", required=True)
+    research_canary.add_argument("--poll-seconds", type=int, default=None)
+    research_canary.add_argument("--detach", action="store_true")
+    research_paper_smoke = research_subparsers.add_parser("paper-smoke", help="Run a read-only Alpaca paper account smoke check.")
+    research_paper_smoke.add_argument("--program", required=True)
+    research_paper_submit = research_subparsers.add_parser("paper-submit", help="Submit generated Alpaca paper payloads with explicit guards.")
+    research_paper_submit.add_argument("--program", required=True)
+    research_paper_submit.add_argument("--payloads", required=True)
     research_launchd = research_subparsers.add_parser("install-launchd", help="Install a macOS LaunchAgent for a research program.")
     research_launchd.add_argument("--program", required=True)
     research_launchd.add_argument("--poll-seconds", type=int, default=None)
@@ -680,6 +692,28 @@ def _dispatch_research(args: argparse.Namespace) -> int:
             poll_seconds=args.poll_seconds,
             detach=bool(args.detach),
             **common,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "canary":
+        payload = run_research_canary(
+            program_path=Path(args.program).expanduser(),
+            poll_seconds=args.poll_seconds,
+            detach=bool(args.detach),
+            **common,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "paper-smoke":
+        spec = yaml.safe_load(Path(args.program).expanduser().read_text(encoding="utf-8")) or {}
+        payload = paper_account_smoke(policy=dict(spec.get("paper_policy") or {}))
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "paper-submit":
+        spec = yaml.safe_load(Path(args.program).expanduser().read_text(encoding="utf-8")) or {}
+        payload = submit_paper_orders(
+            payloads_path=Path(args.payloads).expanduser(),
+            policy=dict(spec.get("paper_policy") or {}),
         )
         print(json.dumps(payload, indent=2, default=str))
         return 0

@@ -565,8 +565,86 @@ def test_frontier_architecture_brake_pivots_to_new_epoch_instead_of_waiting(tmp_
     assert "pivoting to search epoch 1" in decision["reason"]
     assert decision["next_spec"]["search_epoch"] == 1
     assert decision["next_spec"]["frontier_iteration"] == 1
-    assert decision["next_spec"]["matrix"]["architecture_family"][0] == "advanced_challenger"
+    assert decision["next_spec"]["matrix"]["architecture_family"][0] == "ensemble_meta"
+    assert decision["next_spec"]["progression"]["pivot_reason"] == "advanced_non_promotable_pivot_to_ensemble"
     assert decision["next_spec"]["matrix"]["data_profile"] == ["phase1_short_window"]
+
+
+def test_research_canary_preflight_blocks_without_creating_doomed_manifests(tmp_path: Path, monkeypatch) -> None:
+    program_path = _program_spec(tmp_path)
+    calls = {"supervise": 0}
+
+    monkeypatch.setattr(
+        research,
+        "_program_family_preflight",
+        lambda **kwargs: {"ok": False, "reason": "missing python packages for advanced: catboost"},
+    )
+
+    def unexpected_supervise(**kwargs):  # noqa: ANN001
+        calls["supervise"] += 1
+        raise AssertionError("canary should not supervise when preflight fails")
+
+    monkeypatch.setattr(research, "supervise_experiment", unexpected_supervise)
+
+    payload = research.run_research_canary(
+        program_path=program_path,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        detach=True,
+    )
+
+    assert payload["status"] == "INFRA_BLOCKED"
+    assert "missing python packages" in payload["wait_reason"]
+    assert payload["canary_spec"]["matrix"]["architecture_family"] == [
+        "advanced_challenger",
+        "ensemble_meta",
+        "tree_challenger",
+        "linear_baseline",
+    ]
+    assert calls["supervise"] == 0
+    assert not list((tmp_path / "local" / "experiments").glob("**/*.json"))
+
+
+def test_research_canary_records_review_and_read_only_paper_smoke(tmp_path: Path, monkeypatch) -> None:
+    program_path = _program_spec(tmp_path)
+
+    monkeypatch.setattr(
+        research,
+        "_launch_program_family",
+        lambda **kwargs: {
+            "status": "RUNNING",
+            "current_experiment_id": kwargs["next_spec"]["experiment_id"],
+            "active_experiment_supervisor": {"status": "COMPLETED"},
+        },
+    )
+    monkeypatch.setattr(research, "paper_account_smoke", lambda **kwargs: {"status": "skipped", "read_only": True})
+    monkeypatch.setattr(research, "write_research_review_packet", lambda **kwargs: {"status": "written", "path": "review.md"})
+
+    payload = research.run_research_canary(
+        program_path=program_path,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        detach=False,
+    )
+
+    state = research.read_research_program_state(local_state=tmp_path / "local", program_id="perpetual-macmini")
+    assert payload["review_packet"]["status"] == "written"
+    assert payload["paper_account_smoke"]["read_only"] is True
+    assert state["last_canary"]["architecture_families"] == [
+        "advanced_challenger",
+        "ensemble_meta",
+        "tree_challenger",
+        "linear_baseline",
+    ]
+    assert state["latest_paper_account_smoke"]["status"] == "skipped"
 
 
 def test_frontier_architecture_failure_count_is_epoch_local(tmp_path: Path) -> None:
@@ -1690,10 +1768,15 @@ def test_write_paper_outputs_for_incumbent_is_deterministic(tmp_path: Path) -> N
 
     assert first["date"] == "2026-04-24"
     assert first["paper_orders_path"] == second["paper_orders_path"]
+    assert first["paper_order_payloads_path"] == second["paper_order_payloads_path"]
     signals = pd.read_parquet(first["signals_path"])
     orders = pd.read_parquet(first["paper_orders_path"])
+    payloads = json.loads(Path(first["paper_order_payloads_path"]).read_text(encoding="utf-8"))
     assert signals["symbol"].tolist()[0] == "A"
     assert orders.loc[orders["symbol"] == "A", "order_delta"].iloc[0] == pytest.approx(1.0)
+    assert payloads["broker"] == "alpaca_paper"
+    assert payloads["no_live_orders"] is True
+    assert payloads["submit_orders_enabled"] is False
 
 
 def test_write_shadow_paper_outputs_for_candidate_is_non_tradable(tmp_path: Path) -> None:
@@ -1728,6 +1811,7 @@ def test_write_shadow_paper_outputs_for_candidate_is_non_tradable(tmp_path: Path
     assert first["not_trade_approved"] is True
     assert first["no_live_orders"] is True
     assert first["shadow_orders_path"] == second["shadow_orders_path"]
+    assert Path(first["shadow_order_payloads_path"]).exists()
     assert "/shadow_paper/" in first["shadow_orders_path"]
     assert Path(first["shadow_orders_path"]).exists()
 

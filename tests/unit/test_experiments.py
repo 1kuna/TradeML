@@ -304,6 +304,9 @@ def test_architecture_registry_resolves_current_and_blocks_deferred_lanes() -> N
     assert registry["advanced_challenger"]["primary_metrics"][0] == "catboost_mean_rank_ic"
     assert registry["ensemble_meta"]["implemented"] is True
     assert registry["ensemble_meta"]["model_suite"] == "ensemble"
+    assert registry["ensemble_meta"]["canary_eligible"] is True
+    assert registry["ensemble_meta"]["pivot_role"] == "advanced_failure_pivot"
+    assert registry["tabular_deep_challenger"]["canary_eligible"] is False
     assert objective["research_profitability_v1"]["primary_metric"] == "rank_ic"
 
     with pytest.raises(ValueError, match="deferred"):

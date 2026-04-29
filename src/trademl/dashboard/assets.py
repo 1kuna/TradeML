@@ -849,6 +849,8 @@ OPERATOR_HTML_PAGE = """<!doctype html>
         ['Reason', bestCandidate.best_decision_reason || experiment.best_decision_reason || '-'],
       ]);
       const queueActive = Boolean(program.status || supervisor.status || experiment.experiment_id);
+      const progression = program.autonomous_progression || program.progression || {};
+      const paperSmoke = program.latest_paper_account_smoke || program.paper_account_smoke || {};
       renderKeyValue('research-board', [
         ['Queue status', program.status || (queueActive ? 'Active' : 'Idle')],
         ['Launch agent', launchd.loaded ? `${launchd.state || 'loaded'}${launchd.pid ? ` · pid ${launchd.pid}` : ''}` : (launchd.reason || '-')],
@@ -860,11 +862,15 @@ OPERATOR_HTML_PAGE = """<!doctype html>
         ['Shortlisted', formatNumber(experiment.shortlist_count ?? 0)],
         ['Predictive survivors', formatNumber((experiment.evaluation_counts || {}).SURVIVES_PREDICTIVE ?? 0)],
         ['Paper orders', paperOutputs.paper_orders_path || '-'],
+        ['Paper payloads', paperOutputs.paper_order_payloads_path || '-'],
+        ['Paper API', paperSmoke.status || '-'],
         ['Shadow paper', (program.latest_shadow_paper_outputs || {}).shadow_orders_path || '-'],
         ['Drift alerts', formatNumber(driftAlerts.length || 0)],
         ['Infra blocker', infraBlocker.reason || program.wait_reason || '-'],
-        ['Architecture lane', program.architecture_lane || bestCandidate.architecture_lane || (frontierArchitecture.enabled ? 'Advanced-first' : '-')],
-        ['Next lane', program.next_lane || '-'],
+        ['Architecture lane', program.architecture_lane || progression.current_lane || bestCandidate.architecture_lane || (frontierArchitecture.enabled ? 'Advanced-first' : '-')],
+        ['Next lane', program.next_lane || progression.next_lane || '-'],
+        ['Progression', progression.pivot_reason || program.pivot_reason || '-'],
+        ['Exhausted lanes', (progression.exhausted_lanes || []).join(', ') || '-'],
         ['Complexity tier', program.complexity_tier ?? bestCandidate.complexity_tier ?? '-'],
         ['Pivot reason', program.pivot_reason || '-'],
         ['Sentinel delta', formatDecimal(program.sentinel_delta ?? bestCandidate.sentinel_delta)],
