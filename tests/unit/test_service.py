@@ -2755,6 +2755,70 @@ def test_multisymbol_repair_does_not_wait_on_single_symbol_fallback_vendors(
     assert "canonical repair uncollectable" in str(refreshed.last_error)
 
 
+def test_terminalize_unservable_canonical_repairs_closes_stale_partial_tasks(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _NoopConnector(),
+            "tiingo": _BackfillConnector("tiingo"),
+            "massive": _BackfillConnector("massive"),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        worker_id="rpi-01",
+    )
+    db.upsert_planner_task(
+        task_key="canonical_repair::stale",
+        task_family="canonical_repair",
+        planner_group="canonical_repair",
+        dataset="equities_eod",
+        tier="A",
+        priority=8,
+        start_date="2026-04-20",
+        end_date="2026-04-20",
+        symbols=["AL", "HOLX"],
+        eligible_vendors=["alpaca", "tiingo", "massive"],
+        output_name="equities_bars",
+        payload={"scope_kind": "symbol_range", "trading_days": ["2026-04-20"]},
+    )
+    db.mark_planner_task_partial(
+        "canonical_repair::stale",
+        error="alpaca: valid empty planner canonical result",
+        backoff_minutes=0,
+    )
+    attempt = db.lease_vendor_attempt(
+        task_key="canonical_repair::stale",
+        task_family="canonical_repair",
+        planner_group="canonical_repair",
+        vendor="alpaca",
+        lease_owner="rpi-01",
+        payload={"symbols": ["AL", "HOLX"], "start_date": "2026-04-20", "end_date": "2026-04-20"},
+    )
+    assert attempt is not None
+    db.mark_vendor_attempt_failed(
+        task_key="canonical_repair::stale",
+        vendor="alpaca",
+        error="valid empty planner canonical result",
+        backoff_minutes=0,
+        permanent=True,
+    )
+
+    assert service._terminalize_unservable_canonical_repairs() == 1
+    refreshed = db.get_planner_task("canonical_repair::stale")
+    assert refreshed is not None
+    assert refreshed.status == "PERMANENT_FAILED"
+    assert "no plausible remaining vendor" in str(refreshed.last_error)
+
+
 def test_permanent_vendor_failure_does_not_terminally_poison_task_when_alternatives_remain(
     tmp_path: Path,
 ) -> None:

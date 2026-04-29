@@ -431,6 +431,7 @@ class DataNodeService:
                 trading_date=trading_date or datetime.now(tz=UTC).date().isoformat()
             )
         self._reclaim_expired_runtime_leases()
+        self._terminalize_unservable_canonical_repairs()
         changed_dates: list[str] = []
         futures: dict[object, str] = {}
         canonical_lane_widths = self._canonical_runtime._backfill_lane_widths()
@@ -1268,6 +1269,38 @@ class DataNodeService:
             reason="released budget-blocked canonical task to alternate vendor",
         )
 
+    def _terminalize_unservable_canonical_repairs(self) -> int:
+        """Permanently close repair tasks with no plausible remaining vendor."""
+        terminalized = 0
+        page = 0
+        limit = 256
+        while True:
+            tasks = self.db.fetch_planner_tasks(
+                task_families=("canonical_repair",),
+                statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+                limit=limit,
+                offset=page * limit,
+            )
+            if not tasks:
+                break
+            for task in tasks:
+                if self._canonical_runtime._canonical_task_has_remaining_vendors(
+                    task, failed_vendor=""
+                ):
+                    continue
+                self.db.mark_planner_task_failed(
+                    task.task_key,
+                    error=(
+                        "canonical repair uncollectable: no plausible remaining vendor; "
+                        f"last_error={task.last_error or '-'}"
+                    ),
+                    backoff_minutes=0,
+                    permanent=True,
+                )
+                terminalized += 1
+            page += 1
+        return terminalized
+
     def _drain_canonical_lane(self, vendor: str, exchange: str) -> list[str]:
         """Drain canonical planner tasks for a single vendor lane."""
         changed_dates: list[str] = []
@@ -2104,6 +2137,12 @@ class DataNodeService:
                 if completed:
                     LOGGER.warning(
                         "completed_stale_canonical_progress_tasks count=%s", completed
+                    )
+                terminal_repairs = self._terminalize_unservable_canonical_repairs()
+                if terminal_repairs:
+                    LOGGER.warning(
+                        "terminalized_unservable_canonical_repairs count=%s",
+                        terminal_repairs,
                     )
                 released = self._release_budget_blocked_canonical_tasks()
                 if released:
