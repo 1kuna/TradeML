@@ -1039,11 +1039,11 @@ class AuxiliaryRuntime:
                 os.close(fd)
                 return
             except FileExistsError:
-                if (
-                    path.exists()
-                    and (datetime.now().timestamp() - path.stat().st_mtime)
-                    > stale_after_seconds
-                ):
+                try:
+                    mtime = path.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if (datetime.now(tz=UTC).timestamp() - mtime) > stale_after_seconds:
                     with contextlib.suppress(OSError):
                         path.unlink()
                     continue

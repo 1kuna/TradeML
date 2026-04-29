@@ -1115,7 +1115,7 @@ def test_process_planner_queue_heartbeats_while_waiting_on_pending_lane(
     assert changed == ["2026-01-02", "2026-01-03"]
 
 
-def test_process_planner_queue_abandons_stalled_lane_without_waiting_forever(
+def test_process_planner_queue_waits_for_stalled_lane_instead_of_overlapping_work(
     tmp_path: Path,
 ) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
@@ -1137,20 +1137,63 @@ def test_process_planner_queue_abandons_stalled_lane_without_waiting_forever(
     service._canonical_runtime._backfill_lane_widths = lambda: {}  # type: ignore[method-assign]
     service._aux_lane_widths = lambda task_kinds=None, canonical_pressure=None: {"alpaca": 1}  # type: ignore[method-assign]
     release_lane = threading.Event()
+    lane_started = threading.Event()
+    invocations = {"count": 0}
 
     def drain_auxiliary_lane(vendor: str) -> list[str]:
+        invocations["count"] += 1
+        lane_started.set()
         release_lane.wait(timeout=2.0)
-        return ["late"]
+        return []
+
+    def heartbeat() -> None:
+        if lane_started.is_set():
+            release_lane.set()
 
     service._drain_auxiliary_lane = drain_auxiliary_lane  # type: ignore[method-assign]
 
-    started = time.monotonic()
-    changed = service.process_planner_queue(lane_stall_seconds=0.01)
-    elapsed = time.monotonic() - started
-    release_lane.set()
+    changed = service.process_planner_queue(
+        lane_stall_seconds=0.01,
+        heartbeat_fn=heartbeat,
+        heartbeat_interval_seconds=0.01,
+    )
 
     assert changed == []
-    assert elapsed < 6.0
+    assert invocations["count"] == 1
+
+
+def test_archive_file_lock_retries_when_lock_disappears_between_open_and_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / "date=2026-01-12" / "data.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text("held", encoding="utf-8")
+    original_open = auxiliary_runtime_module.os.open
+    original_stat = Path.stat
+    opened = {"count": 0}
+    stat_calls = {"count": 0}
+
+    def flaky_open(path: str | bytes | Path, flags: int, mode: int = 0o777, *, dir_fd=None):  # noqa: ANN001
+        if Path(path) == lock_path and opened["count"] == 0:
+            opened["count"] += 1
+            raise FileExistsError(str(path))
+        if dir_fd is None:
+            return original_open(path, flags, mode)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    def disappearing_stat(self: Path, *args, **kwargs):  # noqa: ANN002, ANN003
+        if self == lock_path and stat_calls["count"] == 0:
+            stat_calls["count"] += 1
+            lock_path.unlink()
+            raise FileNotFoundError(str(self))
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(auxiliary_runtime_module.os, "open", flaky_open)
+    monkeypatch.setattr(Path, "stat", disappearing_stat)
+
+    AuxiliaryRuntime._acquire_file_lock(lock_path)
+
+    assert lock_path.exists()
 
 
 def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(

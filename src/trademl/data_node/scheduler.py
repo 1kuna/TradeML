@@ -49,7 +49,6 @@ class PlannerLaneScheduler:
             1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values())
         )
         executor = ThreadPoolExecutor(max_workers=max_workers)
-        abandon_pending = False
         try:
             aux_active: dict[str, int] = defaultdict(int)
             canonical_active: dict[str, int] = defaultdict(int)
@@ -112,8 +111,7 @@ class PlannerLaneScheduler:
                             lane_counts,
                         )
                         service._reclaim_expired_runtime_leases()  # noqa: SLF001
-                        abandon_pending = True
-                        break
+                        queue_started = now
                     if (
                         heartbeat_fn is not None
                         and (now - last_heartbeat) >= heartbeat_interval_seconds
@@ -186,5 +184,5 @@ class PlannerLaneScheduler:
                     ):
                         submit_auxiliary_lane(vendor)
         finally:
-            executor.shutdown(wait=not abandon_pending, cancel_futures=abandon_pending)
+            executor.shutdown(wait=True, cancel_futures=False)
         return sorted(set(changed_dates))
