@@ -94,7 +94,7 @@ def test_fleet_health_cli_prints_current_state(tmp_path: Path, monkeypatch, caps
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(cli, "collect_dashboard_status_snapshot", lambda settings: {"runtime": {"running": True}, "collection_status": {}, "health": {}})
+    monkeypatch.setattr(cli, "collect_dashboard_live_snapshot", lambda settings: {"runtime": {"running": True}, "collection_status": {}, "health": {}})
     monkeypatch.setattr(cli, "collect_fleet_health", lambda **kwargs: {"verdict": "OK", "current_state": {"action": "OK"}})
 
     rc = cli.main(["fleet", "--workspace-root", str(workspace), "--config", str(config_path), "health"])
@@ -130,7 +130,7 @@ def test_fleet_cli_loads_env_file_for_password_env(tmp_path: Path, monkeypatch, 
         encoding="utf-8",
     )
     monkeypatch.delenv("TRADEML_PI_PASSWORD", raising=False)
-    monkeypatch.setattr(cli, "collect_dashboard_status_snapshot", lambda settings: {"runtime": {"running": True}, "collection_status": {}, "health": {}})
+    monkeypatch.setattr(cli, "collect_dashboard_live_snapshot", lambda settings: {"runtime": {"running": True}, "collection_status": {}, "health": {}})
 
     def fake_collect_fleet_health(**kwargs):  # noqa: ANN003, ANN202
         assert kwargs["pi"]["host"] == "100.76.4.69"
@@ -182,7 +182,7 @@ def test_fleet_observability_cli_writes_snapshot(tmp_path: Path, monkeypatch, ca
     )
     monkeypatch.setattr(
         cli,
-        "collect_dashboard_status_snapshot",
+        "collect_dashboard_live_snapshot",
         lambda settings: {
             "runtime": {"running": True},
             "collection_status": {},

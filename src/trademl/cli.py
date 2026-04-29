@@ -13,8 +13,8 @@ import yaml
 
 from trademl.dashboard.controller import (
     bootstrap_canonical_ledger,
+    collect_dashboard_live_snapshot,
     collect_dashboard_snapshot,
-    collect_dashboard_status_snapshot,
     force_release_lease,
     install_service,
     join_cluster,
@@ -402,7 +402,7 @@ def _dispatch_fleet(args: argparse.Namespace) -> int:
     )
     load_dotenv(settings.env_path)
     if args.fleet_command == "health":
-        snapshot = collect_dashboard_status_snapshot(settings)
+        snapshot = _collect_fleet_local_snapshot(settings)
         pi_host = args.pi_host or os.getenv("TRADEML_PI_HOST") or os.getenv("TRADEML_PI_TAILSCALE_HOST")
         mac_host = args.mac_host or os.getenv("TRADEML_MAC_HOST") or os.getenv("TRADEML_MAC_TAILSCALE_HOST")
         pi = (
@@ -419,7 +419,7 @@ def _dispatch_fleet(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.fleet_command == "observability":
-        snapshot = collect_dashboard_status_snapshot(settings)
+        snapshot = _collect_fleet_local_snapshot(settings)
         data_root = Path(args.data_root).expanduser() if args.data_root else settings.nas_mount
         pi_host = args.pi_host or os.getenv("TRADEML_PI_HOST") or os.getenv("TRADEML_PI_TAILSCALE_HOST")
         mac_host = args.mac_host or os.getenv("TRADEML_MAC_HOST") or os.getenv("TRADEML_MAC_TAILSCALE_HOST")
@@ -454,6 +454,11 @@ def _dispatch_fleet(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported fleet command: {args.fleet_command}")
+
+
+def _collect_fleet_local_snapshot(settings) -> dict[str, object]:  # noqa: ANN001
+    """Collect fleet command state without triggering remote training probes."""
+    return collect_dashboard_live_snapshot(settings)
 
 
 def _launch_dashboard(args: argparse.Namespace) -> int:
