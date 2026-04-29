@@ -2412,7 +2412,13 @@ class DataNodeDB:
                 SELECT planner_tasks.task_family AS task_family,
                        SUM(planner_task_progress.expected_units) AS expected_units,
                        SUM(planner_task_progress.completed_units) AS completed_units,
-                       SUM(planner_task_progress.remaining_units) AS remaining_units
+                       SUM(
+                         CASE
+                           WHEN planner_tasks.status IN ('PENDING', 'PARTIAL', 'FAILED', 'LEASED')
+                           THEN planner_task_progress.remaining_units
+                           ELSE 0
+                         END
+                       ) AS remaining_units
                 FROM planner_tasks
                 LEFT JOIN planner_task_progress
                   ON planner_tasks.task_key = planner_task_progress.task_key
@@ -2438,7 +2444,13 @@ class DataNodeDB:
                        END AS backlog_class,
                        SUM(planner_task_progress.expected_units) AS expected_units,
                        SUM(planner_task_progress.completed_units) AS completed_units,
-                       SUM(planner_task_progress.remaining_units) AS remaining_units
+                       SUM(
+                         CASE
+                           WHEN planner_tasks.status IN ('PENDING', 'PARTIAL', 'FAILED', 'LEASED')
+                           THEN planner_task_progress.remaining_units
+                           ELSE 0
+                         END
+                       ) AS remaining_units
                 FROM planner_tasks
                 LEFT JOIN planner_task_progress
                   ON planner_tasks.task_key = planner_task_progress.task_key

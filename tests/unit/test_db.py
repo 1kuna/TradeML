@@ -476,6 +476,46 @@ def test_mark_completed_planner_progress_success_clears_stale_active_tasks(
     assert task.last_error is None
 
 
+def test_planner_summary_excludes_terminal_tasks_from_remaining_units(
+    tmp_path: Path,
+) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+    database.upsert_planner_task(
+        task_key="canonical_repair::terminal",
+        task_family="canonical_repair",
+        planner_group="canonical_repair",
+        dataset="equities_eod",
+        tier="A",
+        priority=8,
+        start_date="2026-04-20",
+        end_date="2026-04-20",
+        symbols=["AL", "HOLX"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_bars",
+        payload={"scope_kind": "symbol_range"},
+    )
+    database.update_planner_task_progress(
+        task_key="canonical_repair::terminal",
+        expected_units=2,
+        completed_units=0,
+        remaining_units=2,
+        remaining_symbols=["AL", "HOLX"],
+        state={"trading_days": ["2026-04-20"]},
+    )
+    database.mark_planner_task_failed(
+        "canonical_repair::terminal",
+        error="canonical repair uncollectable",
+        backoff_minutes=0,
+        permanent=True,
+    )
+
+    summary = database.planner_summary()
+
+    assert summary["counts"]["canonical_repair"]["PERMANENT_FAILED"] == 1
+    assert summary["progress"]["canonical_repair"]["remaining_units"] == 0
+    assert summary["backlog_progress"]["repair"]["remaining_units"] == 0
+
+
 def test_planner_task_lifecycle_and_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     database = DataNodeDB(tmp_path / "node.sqlite")
     now = db_module.utc_now()

@@ -310,6 +310,46 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert any(row["vendor"] == "alpaca" for row in snapshot["provider_role_matrix"])
 
 
+def test_repair_summary_keeps_terminal_repairs_visible_but_not_remaining(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "node.sqlite")
+    db.upsert_planner_task(
+        task_key="canonical_repair::terminal",
+        task_family="canonical_repair",
+        planner_group="canonical_repair",
+        dataset="equities_eod",
+        tier="A",
+        priority=8,
+        start_date="2026-04-20",
+        end_date="2026-04-20",
+        symbols=["AL", "HOLX"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_bars",
+        payload={"scope_kind": "symbol_range"},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical_repair::terminal",
+        expected_units=2,
+        completed_units=0,
+        remaining_units=2,
+        remaining_symbols=["AL", "HOLX"],
+        state={"trading_days": ["2026-04-20"]},
+    )
+    db.mark_planner_task_failed(
+        "canonical_repair::terminal",
+        error="canonical repair uncollectable",
+        backoff_minutes=0,
+        permanent=True,
+    )
+
+    summary = dashboard_controller._summarize_repair_tasks(db)  # noqa: SLF001
+
+    assert summary["counts"]["PERMANENT_FAILED"] == 1
+    assert summary["remaining_units"] == 0
+    assert summary["rows"][0]["remaining_units"] == 0
+
+
 def test_run_vendor_audit_and_replan_coverage_persist_outputs(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     nas_mount = tmp_path / "nas"

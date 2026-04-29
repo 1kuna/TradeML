@@ -3004,13 +3004,18 @@ def _summarize_repair_tasks(db: DataNodeDB, *, window_minutes: int = 60) -> dict
     tasks = db.fetch_planner_tasks(task_families=("canonical_repair",))
     counts: dict[str, int] = {}
     rows = []
+    active_statuses = {"PENDING", "PARTIAL", "FAILED", "LEASED"}
     now = datetime.now(tz=UTC)
     cutoff = now - timedelta(minutes=window_minutes)
     completed_recent = 0
     for task in tasks:
         counts[task.status] = counts.get(task.status, 0) + 1
         progress = db.fetch_planner_task_progress(task.task_key)
-        remaining_units = int(progress.remaining_units) if progress is not None else 0
+        remaining_units = (
+            int(progress.remaining_units)
+            if progress is not None and task.status in active_statuses
+            else 0
+        )
         if task.status == "SUCCESS":
             with contextlib.suppress(ValueError):
                 if datetime.fromisoformat(task.updated_at) >= cutoff:
