@@ -2697,6 +2697,64 @@ def test_canonical_batch_marks_already_covered_task_success_without_vendor_call(
     assert db.vendor_attempts_for_task("canonical::covered") == []
 
 
+def test_multisymbol_repair_does_not_wait_on_single_symbol_fallback_vendors(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={
+            "alpaca": _NoopConnector(),
+            "tiingo": _BackfillConnector("tiingo"),
+            "massive": _BackfillConnector("massive"),
+        },
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        worker_id="rpi-01",
+    )
+    db.upsert_planner_task(
+        task_key="canonical_repair::multi",
+        task_family="canonical_repair",
+        planner_group="canonical_repair",
+        dataset="equities_eod",
+        tier="A",
+        priority=8,
+        start_date="2026-04-20",
+        end_date="2026-04-20",
+        symbols=["AL", "HOLX"],
+        eligible_vendors=["alpaca", "tiingo", "massive"],
+        output_name="equities_bars",
+        payload={"scope_kind": "symbol_range", "trading_days": ["2026-04-20"]},
+    )
+    db.update_planner_task_progress(
+        task_key="canonical_repair::multi",
+        expected_units=2,
+        completed_units=0,
+        remaining_units=2,
+        remaining_symbols=["AL", "HOLX"],
+        state={"trading_days": ["2026-04-20"]},
+    )
+    task = db.lease_planner_task_by_key(
+        task_key="canonical_repair::multi", lease_owner="rpi-01"
+    )
+    assert task is not None
+
+    service._canonical_runtime._process_canonical_planner_batch(
+        batch=[task], vendor="alpaca", exchange="XNYS"
+    )
+
+    refreshed = db.get_planner_task("canonical_repair::multi")
+    assert refreshed is not None
+    assert refreshed.status == "PERMANENT_FAILED"
+    assert "canonical repair uncollectable" in str(refreshed.last_error)
+
+
 def test_permanent_vendor_failure_does_not_terminally_poison_task_when_alternatives_remain(
     tmp_path: Path,
 ) -> None:

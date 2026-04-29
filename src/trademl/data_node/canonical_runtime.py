@@ -434,7 +434,10 @@ class CanonicalRuntime:
         for candidate in task.eligible_vendors:
             if candidate == failed_vendor:
                 continue
-            if self._canonical_capability(candidate) is None:
+            capability = self._canonical_capability(candidate)
+            if capability is None:
+                continue
+            if capability.batching_mode == "single_symbol" and len(task.symbols) != 1:
                 continue
             if not self._vendor_can_serve_canonical_task(vendor=candidate, task=task):
                 continue
@@ -455,7 +458,10 @@ class CanonicalRuntime:
         for candidate in task.eligible_vendors:
             if candidate == excluded_vendor:
                 continue
-            if self._canonical_capability(candidate) is None:
+            capability = self._canonical_capability(candidate)
+            if capability is None:
+                continue
+            if capability.batching_mode == "single_symbol" and len(task.symbols) != 1:
                 continue
             if not self._vendor_can_serve_canonical_task(vendor=candidate, task=task):
                 continue
@@ -489,7 +495,10 @@ class CanonicalRuntime:
         for candidate in task.eligible_vendors:
             if candidate == excluded_vendor:
                 continue
-            if self._canonical_capability(candidate) is None:
+            capability = self._canonical_capability(candidate)
+            if capability is None:
+                continue
+            if capability.batching_mode == "single_symbol" and len(task.symbols) != 1:
                 continue
             if not self._vendor_can_serve_canonical_task(vendor=candidate, task=task):
                 continue
