@@ -52,7 +52,9 @@ def collect_current_state_issues(snapshot: dict[str, Any]) -> list[dict[str, Any
     """Collect dashboard-visible issues for the Codex bucket."""
     issues: list[dict[str, Any]] = []
     runtime = dict(snapshot.get("runtime") or {})
-    if not bool(runtime.get("running")):
+    remote_pi = dict((snapshot.get("fleet_remote") or {}).get("pi") or {})
+    remote_pi_online = remote_pi.get("status") == "online"
+    if not bool(runtime.get("running")) and not remote_pi_online:
         issues.append(_issue("pi", "critical", "node_offline", "Pi data node is not running", "Check Pi systemd service and node logs."))
     collection = dict(snapshot.get("collection_status") or {})
     if int(collection.get("repair_remaining_units") or 0) > 0:

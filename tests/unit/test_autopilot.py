@@ -5,6 +5,7 @@ from pathlib import Path
 
 from trademl.fleet.autopilot import (
     build_current_state_summary,
+    collect_current_state_issues,
     collect_fleet_health,
     read_codex_issue_bucket,
     write_codex_issue_bucket,
@@ -93,6 +94,18 @@ def test_codex_issue_bucket_reports_missing_data_root_without_creating_it(tmp_pa
     assert not data_root.exists()
     assert payload["summary"]["critical_count"] == 1
     assert payload["issues"][0]["kind"] == "nas_unavailable"
+
+
+def test_current_state_issues_accept_remote_pi_online_when_local_pid_missing() -> None:
+    issues = collect_current_state_issues(
+        {
+            "runtime": {"running": False},
+            "collection_status": {"repair_remaining_units": 0},
+            "fleet_remote": {"pi": {"status": "online"}},
+        }
+    )
+
+    assert [issue["kind"] for issue in issues] == []
 
 
 def test_fleet_health_records_remote_failures_without_healing_active_services(tmp_path: Path, monkeypatch) -> None:
