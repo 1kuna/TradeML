@@ -40,6 +40,12 @@ paper_policy:
   rebalance_day: FRI
   output_root: control/cluster/state/research/paper
   no_live_orders: true
+  broker:
+    provider: alpaca_paper
+    base_url: https://paper-api.alpaca.markets/v2
+    submit_orders_enabled: false
+    api_key_env: ALPACA_API_KEY
+    api_secret_env: ALPACA_API_SECRET
 architecture_registry_policy:
   enabled: true
 objective_policy:
@@ -160,6 +166,7 @@ ssot_phase_policies:
         - linear_baseline
         - tree_challenger
         - advanced_challenger
+        - ensemble_meta
       feature_family:
         - price_core
         - price_liquidity

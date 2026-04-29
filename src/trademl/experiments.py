@@ -1113,7 +1113,15 @@ def _architecture_entry_for_row(*, row: dict[str, Any]) -> dict[str, Any]:
     family = dict(row.get("matrix_values") or {}).get("architecture_family")
     if family is None:
         model_suite = str(row.get("model_suite") or "")
-        family = "advanced_challenger" if model_suite == "advanced" else "tree_challenger" if model_suite == "full" else "linear_baseline"
+        family = (
+            "ensemble_meta"
+            if model_suite == "ensemble"
+            else "advanced_challenger"
+            if model_suite == "advanced"
+            else "tree_challenger"
+            if model_suite == "full"
+            else "linear_baseline"
+        )
     return resolve_architecture_entry(str(family))
 
 
@@ -1202,7 +1210,13 @@ def _run_priority(*, row: dict[str, Any], spec: dict[str, Any]) -> int:
         entry = _architecture_entry_for_row(row=row)
     except ValueError:
         return 100
-    order = {"advanced_challenger": 0, "tree_challenger": 1, "linear_baseline": 2}
+    matrix_families = set(str(item) for item in (spec.get("matrix") or {}).get("architecture_family") or [])
+    ordered_families = (
+        ["advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"]
+        if "ensemble_meta" in matrix_families
+        else ["advanced_challenger", "tree_challenger", "linear_baseline"]
+    )
+    order = {family: idx for idx, family in enumerate(ordered_families)}
     return order.get(str(entry["family"]), 100)
 
 
@@ -1554,6 +1568,9 @@ def _report_preview_from_report(report: dict[str, Any]) -> dict[str, Any]:
     catboost = report.get("catboost", {})
     if isinstance(catboost, dict) and not catboost.get("skipped"):
         preview["catboost_mean_rank_ic"] = catboost.get("mean_rank_ic")
+    ensemble = report.get("ensemble", {})
+    if isinstance(ensemble, dict) and not ensemble.get("skipped"):
+        preview["ensemble_mean_rank_ic"] = ensemble.get("mean_rank_ic")
     return preview
 
 
@@ -1564,7 +1581,9 @@ def _manifest_needs_report_refresh(manifest: dict[str, Any]) -> bool:
     model_suite = str(manifest.get("model_suite") or "")
     if model_suite == "advanced" and "catboost_mean_rank_ic" not in preview:
         return True
-    if model_suite in {"advanced", "full"} and "lightgbm_mean_rank_ic" not in preview:
+    if model_suite == "ensemble" and "ensemble_mean_rank_ic" not in preview:
+        return True
+    if model_suite in {"advanced", "full", "ensemble"} and "lightgbm_mean_rank_ic" not in preview:
         return True
     return False
 

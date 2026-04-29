@@ -11,6 +11,9 @@ from pathlib import Path
 from train import run_training
 
 
+MODEL_SUITES = {"full", "ridge_only", "advanced", "ensemble"}
+
+
 _TERMINAL_RUNTIME_KEYS = (
     "assessment",
     "error",
@@ -27,7 +30,7 @@ def main() -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--report-date", required=True)
-    parser.add_argument("--model-suite", default="full", choices=["full", "ridge_only", "advanced"])
+    parser.add_argument("--model-suite", default="full", choices=sorted(MODEL_SUITES))
     parser.add_argument("--phase", type=int, required=True)
     parser.add_argument("--local-runtime-path", required=True)
     parser.add_argument("--shared-runtime-path", required=True)

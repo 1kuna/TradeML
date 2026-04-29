@@ -68,14 +68,13 @@ ARCHITECTURE_REGISTRY: dict[str, ArchitectureEntry] = {
     ),
     "ensemble_meta": ArchitectureEntry(
         family="ensemble_meta",
-        model_suite=None,
+        model_suite="ensemble",
         required_packages=("lightgbm", "optuna"),
         complexity_tier=3,
         primary_metrics=("ensemble_mean_rank_ic", "lightgbm_mean_rank_ic", "ridge_mean_rank_ic"),
-        allowed_phases=(2,),
+        allowed_phases=(1, 2),
         promotable=True,
-        implemented=False,
-        deferred_reason="requires out-of-fold prediction and meta-label artifacts",
+        implemented=True,
         config_overrides={},
     ),
     "tabular_deep_challenger": ArchitectureEntry(
@@ -96,6 +95,7 @@ MODEL_SUITE_TO_ARCHITECTURE = {
     "ridge_only": "linear_baseline",
     "full": "tree_challenger",
     "advanced": "advanced_challenger",
+    "ensemble": "ensemble_meta",
 }
 
 OBJECTIVE_REGISTRY: dict[str, dict[str, Any]] = {
@@ -275,6 +275,9 @@ def _metric_from_report(report: dict[str, Any], metric: str) -> float | None:
     elif metric == "catboost_mean_rank_ic":
         catboost = report.get("catboost") or {}
         value = None if not isinstance(catboost, dict) or catboost.get("skipped") else catboost.get("mean_rank_ic")
+    elif metric == "ensemble_mean_rank_ic":
+        ensemble = report.get("ensemble") or {}
+        value = None if not isinstance(ensemble, dict) or ensemble.get("skipped") else ensemble.get("mean_rank_ic")
     else:
         value = report.get(metric)
     if value is None:

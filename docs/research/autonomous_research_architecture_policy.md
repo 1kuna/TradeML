@@ -11,7 +11,7 @@ TradeML optimizes supervised cross-sectional alpha prediction plus cost-aware po
 1. `linear_baseline`: Ridge/rank sentinel. It is the leakage detector and minimum viable incumbent baseline.
 2. `tree_challenger`: LightGBM workhorse. It should remain a cheap sentinel/workhorse in every frontier epoch.
 3. `advanced_challenger`: CatBoost-first challenger with LightGBM/Ridge fallback metrics.
-4. `ensemble_meta`: deferred logical lane until out-of-fold prediction and meta-label artifacts exist.
+4. `ensemble_meta`: implemented rank-averaged Ridge/LightGBM meta lane. It becomes a pivot lane after advanced-first epochs fail to produce a promotable candidate.
 5. `tabular_deep_challenger`: deferred logical lane until a dedicated tabular deep training suite exists.
 
 RL, sequence transformers, GNNs, and foundation forecasters are disabled future lanes. They are not alpha engines for the current autonomous path.

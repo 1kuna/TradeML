@@ -99,6 +99,7 @@ DEFAULT_PAPER_POLICY = {
     "enabled": True,
     "rebalance_day": "FRI",
     "no_live_orders": True,
+    "pnl_horizon_trading_days": 5,
 }
 DEFAULT_FRONTIER_ARCHITECTURE_POLICY = {
     "enabled": False,
@@ -718,6 +719,79 @@ def _write_paper_outputs(
     return payload
 
 
+def evaluate_paper_pnl(
+    *,
+    paper_outputs: dict[str, Any],
+    data_root: Path,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate mature paper/shadow portfolio PnL from curated PIT-safe prices."""
+    merged_policy = {**DEFAULT_PAPER_POLICY, **dict(policy or {})}
+    if not paper_outputs or paper_outputs.get("status") != "written":
+        return {"status": "pending", "reason": "no paper outputs written", "no_live_orders": True}
+    targets_path = Path(
+        str(
+            paper_outputs.get("target_weights_path")
+            or paper_outputs.get("shadow_target_weights_path")
+            or ""
+        )
+    )
+    if not targets_path.exists():
+        return {"status": "pending", "reason": f"missing target weights parquet: {targets_path}", "no_live_orders": True}
+    targets = pd.read_parquet(targets_path)
+    if targets.empty:
+        return {"status": "pending", "reason": "target weights are empty", "no_live_orders": True}
+    signal_date = pd.to_datetime(targets["date"].max()).normalize()
+    horizon = int(merged_policy.get("pnl_horizon_trading_days") or 5)
+    symbols = sorted({str(symbol).upper() for symbol in targets["symbol"].dropna().tolist()})
+    benchmark_symbol = str(merged_policy.get("benchmark_symbol") or "SPY").upper()
+    prices = _load_curated_prices_for_pnl(data_root=data_root, symbols=sorted(set(symbols + [benchmark_symbol])), start_date=signal_date)
+    available_dates = sorted(pd.to_datetime(prices["date"].dropna().unique())) if not prices.empty else []
+    future_dates = [pd.Timestamp(value).normalize() for value in available_dates if pd.Timestamp(value).normalize() > signal_date]
+    if len(future_dates) < horizon:
+        return {
+            "status": "pending_labels",
+            "signal_date": signal_date.date().isoformat(),
+            "available_future_dates": len(future_dates),
+            "required_future_dates": horizon,
+            "no_live_orders": True,
+            "source": "shadow" if paper_outputs.get("non_incumbent") else "paper",
+        }
+    mature_date = future_dates[horizon - 1]
+    returns = _symbol_returns_from_prices(prices=prices, start_date=signal_date, end_date=mature_date)
+    weighted = targets[["symbol", "target_weight"]].copy()
+    weighted["symbol"] = weighted["symbol"].astype(str).str.upper()
+    weighted = weighted.merge(returns.rename("return"), left_on="symbol", right_index=True, how="left")
+    weighted["return"] = pd.to_numeric(weighted["return"], errors="coerce").fillna(0.0)
+    weighted["target_weight"] = pd.to_numeric(weighted["target_weight"], errors="coerce").fillna(0.0)
+    gross_return = float((weighted["target_weight"] * weighted["return"]).sum())
+    turnover = float(pd.to_numeric(targets.get("target_weight", pd.Series(dtype=float)), errors="coerce").abs().sum())
+    cost_bps = float(merged_policy.get("cost_spread_bps", 5.0) or 5.0)
+    cost_drag = turnover * cost_bps / 10_000.0
+    benchmark_return = _safe_float(returns.get(benchmark_symbol))
+    payload = {
+        "status": "available",
+        "source": "shadow" if paper_outputs.get("non_incumbent") else "paper",
+        "signal_date": signal_date.date().isoformat(),
+        "mature_date": mature_date.date().isoformat(),
+        "horizon_trading_days": horizon,
+        "gross_return": gross_return,
+        "cost_drag": cost_drag,
+        "net_return": gross_return - cost_drag,
+        "turnover": turnover,
+        "benchmark_symbol": benchmark_symbol,
+        "benchmark_return": benchmark_return,
+        "excess_return": (gross_return - cost_drag - benchmark_return) if benchmark_return is not None else None,
+        "positions": int(len(weighted)),
+        "no_live_orders": True,
+        "non_incumbent": bool(paper_outputs.get("non_incumbent", False)),
+    }
+    pnl_path = targets_path.parent / ("shadow_paper_pnl.json" if paper_outputs.get("non_incumbent") else "paper_pnl.json")
+    _atomic_write_json(pnl_path, payload)
+    payload["path"] = str(pnl_path)
+    return payload
+
+
 def evaluate_research_drift(
     *,
     program_id: str,
@@ -1062,6 +1136,19 @@ def write_research_review_packet(
                 local_state=local_state,
                 policy=dict(spec.get("paper_policy") or {}),
             )
+    paper_pnl = {}
+    if paper_outputs.get("status") == "written":
+        paper_pnl = evaluate_paper_pnl(
+            paper_outputs=paper_outputs,
+            data_root=data_root,
+            policy=dict(spec.get("paper_policy") or {}),
+        )
+    elif shadow_paper_outputs.get("status") == "written":
+        paper_pnl = evaluate_paper_pnl(
+            paper_outputs=shadow_paper_outputs,
+            data_root=data_root,
+            policy=dict(spec.get("paper_policy") or {}),
+        )
     drift_alerts = evaluate_research_drift(
         program_id=program_id,
         state=state,
@@ -1112,6 +1199,7 @@ def write_research_review_packet(
         "best_rejected_candidate": _best_rejected_candidate(comparison.get("rows") or [], incumbent_update.get("rejections") or []),
         "paper_outputs": paper_outputs,
         "shadow_paper_outputs": shadow_paper_outputs,
+        "paper_pnl": paper_pnl,
         "drift_alerts": drift_alerts,
         "alert_result": alert_result,
         "infra_blocker": state.get("last_infra_preflight", {}),
@@ -1151,6 +1239,7 @@ def write_research_review_packet(
         f"- incumbent_run_id: {(payload['incumbent'] or {}).get('run_id') or '-'}",
         f"- paper_outputs: {(payload['paper_outputs'] or {}).get('paper_orders_path') or '-'}",
         f"- shadow_paper_outputs: {(payload['shadow_paper_outputs'] or {}).get('shadow_orders_path') or '-'}",
+        f"- paper_pnl: {(payload['paper_pnl'] or {}).get('status') or '-'}",
         f"- alert_count: {len(payload['drift_alerts'])}",
         f"- last_transition: {(payload['last_transition'] or {}).get('reason') or '-'}",
         "",
@@ -1170,6 +1259,7 @@ def write_research_review_packet(
     state["incumbent"] = incumbent
     state["latest_paper_outputs"] = paper_outputs
     state["latest_shadow_paper_outputs"] = shadow_paper_outputs
+    state["latest_paper_pnl"] = paper_pnl
     state["latest_drift_alerts"] = drift_alerts
     if alert_result.get("status") == "written":
         state["last_alert_at"] = datetime.now(tz=UTC).isoformat()
@@ -1303,6 +1393,49 @@ def _paper_order_deltas(*, targets: pd.DataFrame, previous: pd.DataFrame) -> pd.
     if not targets.empty and "date" in targets.columns:
         merged["date"] = pd.to_datetime(targets["date"].max())
     return merged.sort_values(["action", "symbol"]).reset_index(drop=True)
+
+
+def _load_curated_prices_for_pnl(*, data_root: Path, symbols: list[str], start_date: pd.Timestamp) -> pd.DataFrame:
+    curated_root = data_root / "data" / "curated" / "equities_ohlcv_adj"
+    if not curated_root.exists():
+        return pd.DataFrame(columns=["date", "symbol", "close"])
+    frames: list[pd.DataFrame] = []
+    symbol_set = set(symbols)
+    for path in sorted(curated_root.glob("date=*/data.parquet")):
+        with contextlib.suppress(ValueError, IndexError):
+            partition_date = pd.Timestamp(path.parent.name.split("=", 1)[1]).normalize()
+            if partition_date < start_date:
+                continue
+        try:
+            frame = pd.read_parquet(path, columns=["date", "symbol", "close"])
+        except Exception:
+            continue
+        if frame.empty:
+            continue
+        frame["symbol"] = frame["symbol"].astype(str).str.upper()
+        frame = frame.loc[frame["symbol"].isin(symbol_set)].copy()
+        if not frame.empty:
+            frames.append(frame)
+    if not frames:
+        return pd.DataFrame(columns=["date", "symbol", "close"])
+    prices = pd.concat(frames, ignore_index=True)
+    prices["date"] = pd.to_datetime(prices["date"]).dt.normalize()
+    prices["close"] = pd.to_numeric(prices["close"], errors="coerce")
+    return prices.dropna(subset=["date", "symbol", "close"]).sort_values(["date", "symbol"]).reset_index(drop=True)
+
+
+def _symbol_returns_from_prices(*, prices: pd.DataFrame, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.Series:
+    if prices.empty:
+        return pd.Series(dtype=float)
+    frame = prices.copy()
+    frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
+    start = frame.loc[frame["date"] == start_date, ["symbol", "close"]].drop_duplicates("symbol", keep="last")
+    end = frame.loc[frame["date"] == end_date, ["symbol", "close"]].drop_duplicates("symbol", keep="last")
+    merged = start.merge(end, on="symbol", suffixes=("_start", "_end"))
+    if merged.empty:
+        return pd.Series(dtype=float)
+    merged["return"] = pd.to_numeric(merged["close_end"], errors="coerce") / pd.to_numeric(merged["close_start"], errors="coerce") - 1.0
+    return merged.set_index("symbol")["return"].dropna()
 
 
 def _latest_summary_coverage(summary: dict[str, Any]) -> float | None:
@@ -1838,7 +1971,15 @@ def _decorate_autonomous_experiment_spec(*, next_spec: dict[str, Any], spec: dic
     matrix = dict(next_spec.get("matrix") or {})
     architectures = [str(item) for item in matrix.get("architecture_family") or []]
     suites = [str(item) for item in matrix.get("model_suite") or []]
-    suite_lane = "advanced_challenger" if "advanced" in suites else "tree_challenger" if "full" in suites else "linear_baseline"
+    suite_lane = (
+        "ensemble_meta"
+        if "ensemble" in suites
+        else "advanced_challenger"
+        if "advanced" in suites
+        else "tree_challenger"
+        if "full" in suites
+        else "linear_baseline"
+    )
     primary_lane = architectures[0] if architectures else suite_lane
     entry = resolve_architecture_entry(primary_lane)
     next_spec["architecture_registry_policy"] = _architecture_registry_policy(spec)
@@ -1921,6 +2062,8 @@ def _frontier_architecture_spec(
     )
     sentinel_count = max(0, int(policy.get("sentinel_baseline_runs") or 0))
     architectures = ["advanced_challenger"]
+    if epoch > 0:
+        architectures.append("ensemble_meta")
     if sentinel_count >= 1:
         architectures.append("tree_challenger")
     if sentinel_count >= 2:
@@ -1945,7 +2088,10 @@ def _frontier_architecture_spec(
         steering=dict(state.get("steering") or {}),
     )
     if bool(policy.get("advanced_first", True)):
-        order = {family: idx for idx, family in enumerate(["advanced_challenger", "tree_challenger", "linear_baseline"])}
+        order = {
+            family: idx
+            for idx, family in enumerate(["advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"])
+        }
         next_spec["matrix"]["architecture_family"] = sorted(
             list(next_spec["matrix"].get("architecture_family") or []),
             key=lambda value: order.get(str(value), 100),
@@ -2083,7 +2229,7 @@ def _expanded_search_spec(
     ]
     feature_values = ["price_core", "price_liquidity", "price_short_horizon"]
     phase_value = int(phase_policy.get("ssot_phase", phase_policy.get("phase", 1)) or 1)
-    architecture_values = ["linear_baseline", "tree_challenger"]
+    architecture_values = ["linear_baseline", "tree_challenger", "ensemble_meta"]
     if phase_value > 1:
         architecture_values.append("advanced_challenger")
     profile_values = list(DEFAULT_EXPANSION_PROFILES)
@@ -2319,6 +2465,7 @@ def _program_best_candidate(*, frontier: dict[str, Any], experiment_summary: dic
         "best_by_data_family": frontier.get("best_by_data_family", {}),
         "best_baseline": best_by_architecture.get("linear_baseline"),
         "best_advanced": best_by_architecture.get("advanced_challenger"),
+        "best_ensemble": best_by_architecture.get("ensemble_meta"),
     }
 
 
@@ -2337,7 +2484,7 @@ def _next_frontier_lane(*, frontier: dict[str, Any]) -> str:
     if any("cost" in str(reason) or "net_return" in str(reason) for reason in recent):
         return "tree_challenger"
     if any("rank_ic" in str(reason) or "assessment" in str(reason) for reason in recent):
-        return "advanced_challenger"
+        return "ensemble_meta"
     return "advanced_challenger"
 
 
@@ -2443,7 +2590,11 @@ def _lane_values(frontier: dict[str, Any], lane: str) -> set[str]:
 
 def _run_primary_score(run: dict[str, Any]) -> float | None:
     preview = dict(run.get("report_preview") or {})
-    if str(run.get("model_suite") or "") == "advanced":
+    if str(run.get("model_suite") or "") == "ensemble":
+        score = preview.get("ensemble_mean_rank_ic")
+        if score is None:
+            score = preview.get("lightgbm_mean_rank_ic")
+    elif str(run.get("model_suite") or "") == "advanced":
         score = preview.get("catboost_mean_rank_ic")
         if score is None:
             score = preview.get("lightgbm_mean_rank_ic")

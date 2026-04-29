@@ -1732,6 +1732,48 @@ def test_write_shadow_paper_outputs_for_candidate_is_non_tradable(tmp_path: Path
     assert Path(first["shadow_orders_path"]).exists()
 
 
+def test_evaluate_paper_pnl_reports_pending_until_future_prices_mature(tmp_path: Path) -> None:
+    outputs = _paper_outputs_for_pnl(tmp_path, date="2026-04-24")
+    _write_price_partition(tmp_path / "nas", "2026-04-24", {"A": 100.0, "SPY": 400.0})
+    _write_price_partition(tmp_path / "nas", "2026-04-27", {"A": 101.0, "SPY": 401.0})
+
+    result = research.evaluate_paper_pnl(
+        paper_outputs=outputs,
+        data_root=tmp_path / "nas",
+        policy={"pnl_horizon_trading_days": 5},
+    )
+
+    assert result["status"] == "pending_labels"
+    assert result["available_future_dates"] == 1
+    assert result["no_live_orders"] is True
+
+
+def test_evaluate_paper_pnl_writes_mature_non_live_summary(tmp_path: Path) -> None:
+    outputs = _paper_outputs_for_pnl(tmp_path, date="2026-04-24")
+    prices = [
+        ("2026-04-24", {"A": 100.0, "SPY": 400.0}),
+        ("2026-04-27", {"A": 101.0, "SPY": 401.0}),
+        ("2026-04-28", {"A": 102.0, "SPY": 402.0}),
+        ("2026-04-29", {"A": 103.0, "SPY": 403.0}),
+        ("2026-04-30", {"A": 104.0, "SPY": 404.0}),
+        ("2026-05-01", {"A": 105.0, "SPY": 405.0}),
+    ]
+    for date_value, closes in prices:
+        _write_price_partition(tmp_path / "nas", date_value, closes)
+
+    result = research.evaluate_paper_pnl(
+        paper_outputs=outputs,
+        data_root=tmp_path / "nas",
+        policy={"pnl_horizon_trading_days": 5, "cost_spread_bps": 5.0},
+    )
+
+    assert result["status"] == "available"
+    assert result["net_return"] == pytest.approx(0.05 - 0.0005)
+    assert result["benchmark_return"] == pytest.approx(0.0125)
+    assert result["no_live_orders"] is True
+    assert Path(result["path"]).exists()
+
+
 def test_research_alerts_write_files_and_skip_email_without_env(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("TRADEML_SMTP_HOST", raising=False)
     monkeypatch.delenv("TRADEML_ALERT_EMAIL_TO", raising=False)
@@ -1821,3 +1863,36 @@ def test_send_research_alert_email_uses_configured_smtp(monkeypatch) -> None:
     assert sent["connect"] == ("smtp.example.test", 2525)
     assert sent["login"] == ("user", "pass")
     assert "coverage" in sent["message"].get_content()
+
+
+def _paper_outputs_for_pnl(tmp_path: Path, *, date: str) -> dict[str, object]:
+    root = tmp_path / "nas" / "control" / "cluster" / "state" / "research" / "paper" / date
+    root.mkdir(parents=True, exist_ok=True)
+    targets_path = root / "target_weights.parquet"
+    pd.DataFrame(
+        {
+            "date": [date],
+            "symbol": ["A"],
+            "score": [1.0],
+            "target_weight": [1.0],
+        }
+    ).to_parquet(targets_path, index=False)
+    return {
+        "status": "written",
+        "date": date,
+        "target_weights_path": str(targets_path),
+        "paper_orders_path": str(root / "paper_orders.parquet"),
+        "no_live_orders": True,
+    }
+
+
+def _write_price_partition(data_root: Path, date: str, closes: dict[str, float]) -> None:
+    root = data_root / "data" / "curated" / "equities_ohlcv_adj" / f"date={date}"
+    root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "date": [date] * len(closes),
+            "symbol": list(closes),
+            "close": list(closes.values()),
+        }
+    ).to_parquet(root / "data.parquet", index=False)

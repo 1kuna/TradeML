@@ -302,7 +302,8 @@ def test_architecture_registry_resolves_current_and_blocks_deferred_lanes() -> N
     assert registry["linear_baseline"]["model_suite"] == "ridge_only"
     assert registry["tree_challenger"]["required_packages"] == ["lightgbm", "optuna"]
     assert registry["advanced_challenger"]["primary_metrics"][0] == "catboost_mean_rank_ic"
-    assert registry["ensemble_meta"]["implemented"] is False
+    assert registry["ensemble_meta"]["implemented"] is True
+    assert registry["ensemble_meta"]["model_suite"] == "ensemble"
     assert objective["research_profitability_v1"]["primary_metric"] == "rank_ic"
 
     with pytest.raises(ValueError, match="deferred"):
@@ -407,6 +408,19 @@ def test_report_preview_preserves_catboost_primary_score() -> None:
     )
 
     assert experiments._preview_primary_score(model_suite="advanced", preview=preview) == 0.05  # noqa: SLF001
+
+
+def test_report_preview_preserves_ensemble_primary_score() -> None:
+    preview = experiments._report_preview_from_report(  # noqa: SLF001
+        {
+            "coverage": 0.99,
+            "ridge": {"mean_rank_ic": 0.01},
+            "lightgbm": {"mean_rank_ic": 0.02},
+            "ensemble": {"mean_rank_ic": 0.04},
+        }
+    )
+
+    assert experiments._preview_primary_score(model_suite="ensemble", preview=preview) == 0.04  # noqa: SLF001
 
 
 def test_completed_advanced_manifest_refreshes_missing_catboost_preview() -> None:

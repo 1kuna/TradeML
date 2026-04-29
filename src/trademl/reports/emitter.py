@@ -22,6 +22,7 @@ def emit_report(*, report: dict, output_root: Path, report_date: str | None = No
 def _render_markdown(report: dict) -> str:
     ridge = report.get("ridge", {})
     lgbm = report.get("lightgbm", {})
+    ensemble = report.get("ensemble", {})
     diagnostics = report.get("diagnostics", {})
     assessment = report.get("assessment", {})
     sign_flip = diagnostics.get("sign_flip_canary", {})
@@ -44,6 +45,7 @@ def _render_markdown(report: dict) -> str:
             f"- Ridge mean rank IC: {ridge.get('mean_rank_ic', 0):.4f}",
             f"- Ridge alpha: {ridge.get('alpha', 'n/a')}",
             f"- LightGBM mean rank IC: {lgbm.get('mean_rank_ic', 0):.4f}",
+            f"- Ensemble mean rank IC: {ensemble.get('mean_rank_ic', 0):.4f}",
             f"- Placebo max abs IC: {max((abs(x) for x in diagnostics.get('placebo', [0])), default=0):.4f}",
             f"- Cost-stress net return: {diagnostics.get('cost_stress', {}).get('net_return', 0):.4f}",
             f"- Sign-flip preferred direction: {sign_flip.get('preferred_direction', 'unknown')}",

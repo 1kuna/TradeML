@@ -22,10 +22,14 @@ from trademl.models.ridge import RidgeModel, tune_ridge_via_walk_forward
 from trademl.portfolio.build import build_portfolio
 from trademl.reports.emitter import emit_report
 from trademl.validation.diagnostics import ic_by_year, placebo_test, portfolio_cost_stress_test, sign_flip_canary
+from trademl.validation.metrics import bucket_metrics, rank_ic
 from trademl.validation.cpcv import combinatorially_purged_cv
 from trademl.validation.dsr import deflated_sharpe_ratio
 from trademl.validation.pbo import probability_of_backtest_overfitting
 from trademl.validation.walk_forward import expanding_walk_forward
+
+
+MODEL_SUITES = {"full", "ridge_only", "advanced", "ensemble"}
 
 
 def _load_catboost_components():
@@ -120,7 +124,7 @@ def run_training(
     model_suite: str = "full",
 ) -> dict:
     """Run the end-to-end training workflow and persist a report."""
-    if model_suite not in {"full", "ridge_only", "advanced"}:
+    if model_suite not in MODEL_SUITES:
         raise ValueError(f"unsupported model suite: {model_suite}")
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -186,7 +190,7 @@ def run_training(
     ridge_folds = expanding_walk_forward(normalized, feature_cols, "label_5d", lambda: RidgeModel(alpha=ridge_alpha), validation_config)
     lgbm_params: dict | None = None
     lgbm_folds = []
-    if model_suite in {"full", "advanced"}:
+    if model_suite in {"full", "advanced", "ensemble"}:
         lgbm_params = tune_lightgbm_via_walk_forward(
             normalized,
             feature_cols,
@@ -227,6 +231,17 @@ def run_training(
     catboost_predictions = (
         pd.concat([fold.predictions for fold in catboost_folds], ignore_index=True) if catboost_folds else pd.DataFrame()
     )
+    ensemble_predictions = (
+        _ensemble_predictions({"ridge": ridge_predictions, "lightgbm": lgbm_predictions}) if model_suite == "ensemble" else pd.DataFrame()
+    )
+    primary_predictions = _primary_predictions_for_suite(
+        model_suite=model_suite,
+        ridge_predictions=ridge_predictions,
+        lgbm_predictions=lgbm_predictions,
+        catboost_predictions=catboost_predictions,
+        ensemble_predictions=ensemble_predictions,
+    )
+    primary_report = _prediction_report(primary_predictions)
     cpcv_results = combinatorially_purged_cv(
         normalized.dropna(subset=["label_5d"]),
         feature_cols,
@@ -236,7 +251,7 @@ def run_training(
         embargo_days=int(config["validation"].get("embargo_days", 10)),
     )
     diagnostics = {
-        "ic_by_year": ic_by_year(ridge_predictions["prediction"], ridge_predictions["label_5d"], ridge_predictions["date"]),
+        "ic_by_year": ic_by_year(primary_predictions["prediction"], primary_predictions["label_5d"], primary_predictions["date"]),
         "placebo": placebo_test(
             normalized.dropna(subset=["label_5d"]),
             feature_cols,
@@ -247,11 +262,11 @@ def run_training(
         ),
         "cost_stress": portfolio_cost_stress_test(
             prices=panel[["date", "symbol", "close"]],
-            prediction_frame=ridge_predictions,
+            prediction_frame=primary_predictions,
             multiplier=float(config["portfolio"]["cost_stress_multiplier"]),
             cost_spread_bps=float(config["portfolio"].get("cost_spread_bps", 5.0)),
         ),
-        "sign_flip_canary": sign_flip_canary(ridge_predictions, label_col="label_5d"),
+        "sign_flip_canary": sign_flip_canary(primary_predictions, label_col="label_5d"),
         "cpcv": {
             "folds": len(cpcv_results),
             "mean_oos_score": float(pd.Series([result.out_of_sample_score for result in cpcv_results]).mean()) if cpcv_results else 0.0,
@@ -265,7 +280,7 @@ def run_training(
     }
 
     assessment = _phase_one_assessment(
-        ridge_mean_ic=_mean_rank_ic(ridge_folds),
+        ridge_mean_ic=float(primary_report["mean_rank_ic"]),
         ic_by_year_result=diagnostics["ic_by_year"],
         cost_stress=diagnostics["cost_stress"],
         placebo=diagnostics["placebo"],
@@ -296,6 +311,11 @@ def run_training(
             if model_suite == "advanced"
             else {"skipped": True, "reason": "advanced_lane_not_selected"}
         ),
+        "ensemble": (
+            primary_report
+            if model_suite == "ensemble"
+            else {"skipped": True, "reason": "ensemble_lane_not_selected"}
+        ),
         "diagnostics": diagnostics,
         "assessment": assessment,
         "model_suite": model_suite,
@@ -309,11 +329,12 @@ def run_training(
             ridge_predictions=ridge_predictions,
             lgbm_predictions=lgbm_predictions,
             catboost_predictions=catboost_predictions,
+            ensemble_predictions=ensemble_predictions,
             model_suite=model_suite,
             ridge_model=RidgeModel(alpha=ridge_alpha).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"]),
             lgbm_model=(
                 LightGBMModel(n_trials=0, best_params=lgbm_params).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"])
-                if model_suite in {"full", "advanced"} and lgbm_params is not None
+                if model_suite in {"full", "advanced", "ensemble"} and lgbm_params is not None
                 else None
             ),
             catboost_model=(
@@ -328,6 +349,7 @@ def run_training(
                 "ridge_mean_rank_ic": _mean_rank_ic(ridge_folds),
                 "lightgbm_mean_rank_ic": _mean_rank_ic(lgbm_folds),
                 "catboost_mean_rank_ic": _mean_rank_ic(catboost_folds),
+                "ensemble_mean_rank_ic": primary_report["mean_rank_ic"] if model_suite == "ensemble" else None,
                 "coverage": coverage,
                 "ridge_alpha": ridge_alpha,
                 "model_suite": model_suite,
@@ -359,6 +381,72 @@ def _fold_report(folds: list[Any]) -> dict[str, object]:
     }
 
 
+def _prediction_report(predictions: pd.DataFrame) -> dict[str, object]:
+    """Return fold-report-shaped metrics for deterministic prediction frames."""
+    if predictions.empty:
+        return {"folds": [], "mean_rank_ic": 0.0, "decile_chart_data": {}}
+    frame = predictions.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    folds: list[dict[str, object]] = []
+    decile_chart_data: dict[str, dict[str, float]] = {}
+    for idx, (date_value, group) in enumerate(frame.groupby("date", sort=True), start=1):
+        decile_spread, hit_rate, bucket_returns = bucket_metrics(group, label_col="label_5d")
+        fold = {
+            "rank_ic": rank_ic(group["prediction"], group["label_5d"]),
+            "decile_spread": decile_spread,
+            "hit_rate": hit_rate,
+            "bucket_returns": bucket_returns,
+        }
+        folds.append(fold)
+        decile_chart_data[f"fold_{idx}_{pd.Timestamp(date_value).date().isoformat()}"] = bucket_returns
+    return {
+        "folds": folds,
+        "mean_rank_ic": float(pd.Series([fold["rank_ic"] for fold in folds], dtype=float).mean()) if folds else 0.0,
+        "decile_chart_data": decile_chart_data,
+    }
+
+
+def _ensemble_predictions(prediction_frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Build a deterministic per-date rank-averaged ensemble prediction frame."""
+    merged: pd.DataFrame | None = None
+    rank_columns: list[str] = []
+    for name, predictions in prediction_frames.items():
+        if predictions.empty:
+            continue
+        frame = predictions[["date", "symbol", "prediction", "label_5d"]].copy()
+        frame["date"] = pd.to_datetime(frame["date"])
+        rank_col = f"{name}_rank_prediction"
+        frame[rank_col] = frame.groupby("date")["prediction"].rank(method="average", pct=True)
+        frame = frame[["date", "symbol", "label_5d", rank_col]]
+        if merged is None:
+            merged = frame
+        else:
+            merged = merged.merge(frame[["date", "symbol", rank_col]], on=["date", "symbol"], how="inner")
+        rank_columns.append(rank_col)
+    if merged is None or not rank_columns:
+        return pd.DataFrame(columns=["date", "symbol", "prediction", "label_5d"])
+    merged["prediction"] = merged[rank_columns].mean(axis=1)
+    return merged[["date", "symbol", "prediction", "label_5d"]].sort_values(["date", "symbol"]).reset_index(drop=True)
+
+
+def _primary_predictions_for_suite(
+    *,
+    model_suite: str,
+    ridge_predictions: pd.DataFrame,
+    lgbm_predictions: pd.DataFrame,
+    catboost_predictions: pd.DataFrame,
+    ensemble_predictions: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return the prediction frame that the selected suite optimizes."""
+    if model_suite == "advanced" and not catboost_predictions.empty:
+        return catboost_predictions
+    if model_suite == "full" and not lgbm_predictions.empty:
+        return lgbm_predictions
+    if model_suite == "ensemble" and not ensemble_predictions.empty:
+        return ensemble_predictions
+    return ridge_predictions
+
+
 def main() -> int:
     """CLI entry point for the training workflow."""
     parser = argparse.ArgumentParser(description="Run the TradeML training workflow.")
@@ -366,7 +454,7 @@ def main() -> int:
     parser.add_argument("--config", default="configs/equities_xs.yml")
     parser.add_argument("--output-root", default=".")
     parser.add_argument("--report-date", default=None)
-    parser.add_argument("--model-suite", default="full", choices=["full", "ridge_only", "advanced"])
+    parser.add_argument("--model-suite", default="full", choices=sorted(MODEL_SUITES))
     args = parser.parse_args()
 
     report = run_training(
@@ -390,6 +478,7 @@ def _persist_run_artifacts(
     ridge_predictions: pd.DataFrame,
     lgbm_predictions: pd.DataFrame,
     catboost_predictions: pd.DataFrame,
+    ensemble_predictions: pd.DataFrame,
     model_suite: str,
     ridge_model: RidgeModel,
     lgbm_model: LightGBMModel | None,
@@ -404,6 +493,7 @@ def _persist_run_artifacts(
             ridge_predictions=ridge_predictions,
             lgbm_predictions=lgbm_predictions,
             catboost_predictions=catboost_predictions,
+            ensemble_predictions=ensemble_predictions,
             model_suite=model_suite,
         )
     )
@@ -442,6 +532,7 @@ def _persist_backtest_inputs(
     ridge_predictions: pd.DataFrame,
     lgbm_predictions: pd.DataFrame,
     catboost_predictions: pd.DataFrame,
+    ensemble_predictions: pd.DataFrame,
     model_suite: str,
 ) -> dict[str, str]:
     inputs_root = output_root / "artifacts" / "backtest_inputs"
@@ -470,6 +561,11 @@ def _persist_backtest_inputs(
         artifacts.update(catboost_payload)
         if model_suite == "advanced":
             primary_prefix = "catboost"
+    if not ensemble_predictions.empty:
+        ensemble_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="ensemble", predictions=ensemble_predictions)
+        artifacts.update(ensemble_payload)
+        if model_suite == "ensemble":
+            primary_prefix = "ensemble"
     artifacts["primary_predictions_path"] = artifacts[f"{primary_prefix}_predictions_path"]
     artifacts["primary_targets_path"] = artifacts[f"{primary_prefix}_targets_path"]
     return artifacts
@@ -504,6 +600,7 @@ def _write_training_log(*, output_root: Path, run_ts: str, report: dict) -> Path
         f"ridge_mean_rank_ic={report['ridge']['mean_rank_ic']:.4f}",
         f"lightgbm_mean_rank_ic={report.get('lightgbm', {}).get('mean_rank_ic', 0.0):.4f}",
         f"catboost_mean_rank_ic={report.get('catboost', {}).get('mean_rank_ic', 0.0):.4f}",
+        f"ensemble_mean_rank_ic={report.get('ensemble', {}).get('mean_rank_ic', 0.0):.4f}",
         f"model_suite={report.get('model_suite', 'full')}",
         f"assessment={report['assessment']['decision']}",
         f"artifact_paths={json.dumps(report['artifacts'])}",
