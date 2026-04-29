@@ -44,3 +44,52 @@ def test_run_password_ssh_reports_timeout(monkeypatch) -> None:
     assert result.returncode == 124
     assert result.timed_out is True
     assert "timed out" in result.stderr
+
+
+def test_copy_file_to_remote_uses_scp_with_redacted_password(monkeypatch, tmp_path) -> None:
+    observed: dict[str, Any] = {}
+    monkeypatch.setenv("TRADEML_TEST_PASSWORD", "secret-value")
+
+    def fake_run(command, **kwargs):  # noqa: ANN001
+        observed["command"] = command
+        observed["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(remote.subprocess, "run", fake_run)
+
+    local_path = tmp_path / "config.yml"
+    local_path.write_text("ok: true\n")
+    result = remote.copy_file_to_remote(
+        host="100.0.0.1",
+        user="zach",
+        local_path=local_path,
+        remote_path="/srv/trademl/control/config.yml",
+        password_env="TRADEML_TEST_PASSWORD",
+    )
+
+    payload = result.to_dict()
+    assert observed["command"][:3] == ["sshpass", "-e", "scp"]
+    assert observed["env"]["SSHPASS"] == "secret-value"
+    assert "secret-value" not in " ".join(payload["command"])
+    assert "-P" in payload["command"]
+    assert payload["returncode"] == 0
+
+
+def test_copy_file_to_remote_reports_timeout(monkeypatch, tmp_path) -> None:
+    def timeout_run(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise subprocess.TimeoutExpired(cmd="scp", timeout=30)
+
+    monkeypatch.setattr(remote.subprocess, "run", timeout_run)
+
+    local_path = tmp_path / "config.yml"
+    local_path.write_text("ok: true\n")
+    result = remote.copy_file_to_remote(
+        host="100.0.0.1",
+        user="zach",
+        local_path=local_path,
+        remote_path="/srv/trademl/control/config.yml",
+    )
+
+    assert result.returncode == 124
+    assert result.timed_out is True
+    assert "timed out" in result.stderr

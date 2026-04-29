@@ -24,6 +24,7 @@ from trademl.data_node.capabilities import default_macro_series
 from trademl.data_node.db import DataNodeDB
 from trademl.data_node.planner import training_readiness
 from trademl.env import read_env_file
+from trademl.fleet import remote as fleet_remote
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1277,82 +1278,49 @@ def _remote_python_here_doc(target: TrainingTarget, body: str) -> str:
 
 def _run_ssh_command(target: TrainingTarget, command: str, *, check: bool = False) -> subprocess.CompletedProcess[str]:
     """Run one remote shell command against an SSH training target."""
-    password = _target_password(target)
-    ssh_command = _ssh_command_prefix(password) + ["ssh", *_ssh_base_options(target, has_password=password is not None), "-p", str(target.port)]
-    ssh_command.append(f"{target.user}@{target.host}")
-    ssh_command.append(command)
-    try:
-        result = subprocess.run(  # noqa: S603
-            ssh_command,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
-            env=_ssh_subprocess_env(password),
+    result = fleet_remote.run_ssh_command(
+        host=str(target.host or ""),
+        user=str(target.user or ""),
+        command=command,
+        port=target.port,
+        identity_file=target.identity_file,
+        password_env=target.password_env,
+        timeout_seconds=REMOTE_COMMAND_TIMEOUT_SECONDS,
+        connect_timeout_seconds=SSH_CONNECT_TIMEOUT_SECONDS,
+        server_alive_interval_seconds=SSH_SERVER_ALIVE_INTERVAL_SECONDS,
+        server_alive_count_max=SSH_SERVER_ALIVE_COUNT_MAX,
+    )
+    completed = subprocess.CompletedProcess(result.command, result.returncode, result.stdout, result.stderr)
+    if check and completed.returncode != 0:
+        message = (
+            f"ssh command timed out for target={target.name}"
+            if result.timed_out
+            else completed.stderr.strip() or completed.stdout.strip() or f"ssh command failed for target={target.name}"
         )
-    except subprocess.TimeoutExpired as exc:
-        message = f"ssh command timed out for target={target.name}"
-        if check:
-            raise RuntimeError(message) from exc
-        return subprocess.CompletedProcess(ssh_command, 124, "", message)
-    if check and result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"ssh command failed for target={target.name}")
-    return result
+        raise RuntimeError(message)
+    return completed
 
 
 def _copy_file_to_remote(*, target: TrainingTarget, local_path: Path, remote_path: Path) -> None:
     """Copy one local file onto the remote SSH target."""
     _run_ssh_command(target, f"mkdir -p {shlex.quote(str(remote_path.parent))}", check=True)
-    password = _target_password(target)
-    scp_command = _ssh_command_prefix(password) + ["scp", *_ssh_base_options(target, has_password=password is not None), "-P", str(target.port)]
-    scp_command.extend([str(local_path), f"{target.user}@{target.host}:{remote_path}"])
-    try:
-        result = subprocess.run(  # noqa: S603
-            scp_command,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
-            env=_ssh_subprocess_env(password),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"scp timed out for target={target.name}") from exc
+    result = fleet_remote.copy_file_to_remote(
+        host=str(target.host or ""),
+        user=str(target.user or ""),
+        local_path=local_path,
+        remote_path=remote_path,
+        port=target.port,
+        identity_file=target.identity_file,
+        password_env=target.password_env,
+        timeout_seconds=REMOTE_COMMAND_TIMEOUT_SECONDS,
+        connect_timeout_seconds=SSH_CONNECT_TIMEOUT_SECONDS,
+        server_alive_interval_seconds=SSH_SERVER_ALIVE_INTERVAL_SECONDS,
+        server_alive_count_max=SSH_SERVER_ALIVE_COUNT_MAX,
+    )
+    if result.timed_out:
+        raise RuntimeError(f"scp timed out for target={target.name}")
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"scp failed for target={target.name}")
-
-
-def _ssh_base_options(target: TrainingTarget, *, has_password: bool = False) -> list[str]:
-    """Return noninteractive bounded SSH options for control-plane probes."""
-    options = [
-        "-o",
-        f"BatchMode={'no' if has_password else 'yes'}",
-        "-o",
-        f"ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}",
-        "-o",
-        f"ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL_SECONDS}",
-        "-o",
-        f"ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}",
-    ]
-    if target.identity_file is not None:
-        options.extend(["-i", str(target.identity_file)])
-    return options
-
-
-def _target_password(target: TrainingTarget) -> str | None:
-    if not target.password_env:
-        return None
-    password = os.environ.get(target.password_env)
-    return password if password else None
-
-
-def _ssh_command_prefix(password: str | None) -> list[str]:
-    return ["sshpass", "-e"] if password else []
-
-
-def _ssh_subprocess_env(password: str | None) -> dict[str, str] | None:
-    if not password:
-        return None
-    return {**os.environ, "SSHPASS": password}
 
 
 def _remote_process_running(*, target: TrainingTarget, pid: int) -> bool:

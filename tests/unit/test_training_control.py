@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 import trademl.data_node.training_control as training_control
+from trademl.fleet import remote as fleet_remote
 from trademl.data_node.training_control import (
     evaluate_training_gates,
     launch_training_process,
@@ -1279,7 +1280,7 @@ def test_run_ssh_command_returns_timeout_completed_process(tmp_path: Path, monke
     def fake_run(*args, **kwargs):  # noqa: ANN001
         raise subprocess.TimeoutExpired(cmd="ssh", timeout=training_control.REMOTE_COMMAND_TIMEOUT_SECONDS)
 
-    monkeypatch.setattr(training_control.subprocess, "run", fake_run)
+    monkeypatch.setattr(fleet_remote.subprocess, "run", fake_run)
 
     result = training_control._run_ssh_command(target, "echo hi")  # noqa: SLF001
 
@@ -1309,7 +1310,7 @@ def test_run_ssh_command_uses_noninteractive_bounded_ssh_options(tmp_path: Path,
         observed["timeout"] = kwargs["timeout"]
         return subprocess.CompletedProcess(command, 0, "ok", "")
 
-    monkeypatch.setattr(training_control.subprocess, "run", fake_run)
+    monkeypatch.setattr(fleet_remote.subprocess, "run", fake_run)
 
     result = training_control._run_ssh_command(target, "echo hi")  # noqa: SLF001
 
@@ -1344,7 +1345,7 @@ def test_run_ssh_command_uses_password_env_without_exposing_secret(tmp_path: Pat
         observed["env"] = kwargs["env"]
         return subprocess.CompletedProcess(command, 0, "ok", "")
 
-    monkeypatch.setattr(training_control.subprocess, "run", fake_run)
+    monkeypatch.setattr(fleet_remote.subprocess, "run", fake_run)
 
     result = training_control._run_ssh_command(target, "echo hi")  # noqa: SLF001
 
