@@ -34,3 +34,27 @@ def test_earnings_flag_excludes_names_from_rebalance() -> None:
     portfolio = build_portfolio(scores, {"rebalance_day": "FRI"})
 
     assert "AAPL" not in set(portfolio["symbol"])
+
+
+def test_cost_aware_long_only_profile_applies_liquidity_and_weight_caps() -> None:
+    scores = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-01-02")] * 10,
+            "symbol": [f"S{idx}" for idx in range(10)],
+            "score": list(reversed(range(10))),
+            "adv_dollar_20d": [1_000_000.0, 2_000_000.0, *([50_000_000.0] * 8)],
+        }
+    )
+
+    portfolio = build_portfolio(
+        scores,
+        {
+            "rebalance_day": "FRI",
+            "portfolio_profile": "cost_aware_long_only_v1",
+            "min_adv_dollar": 10_000_000.0,
+            "max_single_name_weight": 0.05,
+        },
+    )
+
+    assert set(portfolio["symbol"]).isdisjoint({"S0", "S1"})
+    assert portfolio["target_weight"].max() <= 0.05

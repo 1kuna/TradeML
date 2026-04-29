@@ -44,3 +44,14 @@ def test_label_horizon_uses_exchange_sessions_not_calendar_days() -> None:
 
     assert aapl.loc[1, "date"] == pd.Timestamp("2026-07-03")
     assert aapl.loc[1, "raw_forward_return_1d"] == np.log(102.0 / 101.0)
+
+
+def test_multiple_label_horizons_use_distinct_forward_returns() -> None:
+    panel = _label_panel()
+
+    label_1d = build_labels(panel, horizon=1)
+    label_5d = build_labels(panel, horizon=5)
+
+    merged = label_1d.merge(label_5d, on=["date", "symbol"]).dropna()
+    assert not merged["raw_forward_return_1d"].equals(merged["raw_forward_return_5d"])
+    assert {"label_1d", "label_5d"}.issubset(merged.columns)

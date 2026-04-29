@@ -17,6 +17,7 @@ from trademl.data_node.training_control import read_pinned_phase_freeze
 from trademl.features.equities import build_features
 from trademl.features.preprocessing import rank_normalize
 from trademl.labels.returns import build_labels
+from trademl.modeling import DEFAULT_LABEL_VERSION, load_modeling_dataset, modeling_artifact_metadata
 from trademl.models.lgbm import LightGBMModel, tune_lightgbm_via_walk_forward
 from trademl.models.ridge import RidgeModel, tune_ridge_via_walk_forward
 from trademl.portfolio.build import build_portfolio
@@ -163,14 +164,55 @@ def run_training(
         raise FileNotFoundError(f"no curated parquet files found under {curated_root} on or before {effective_end_date.strftime('%Y-%m-%d')}")
     panel, skipped_curated_partitions = _load_curated_panel(curated_files)
 
-    features = build_features(panel, config["features"])
-    labels = build_labels(panel, horizon=5)
-    merged = features.merge(labels, on=["date", "symbol"])
-    merged = merged.dropna(subset=["label_5d"])
+    modeling_config = dict(config.get("modeling") or {})
+    label_horizon = int(modeling_config.get("label_horizon") or modeling_config.get("primary_label_horizon") or 5)
+    label_col = f"label_{label_horizon}d"
+    raw_label_col = f"raw_forward_return_{label_horizon}d"
+    modeling_metadata: dict[str, Any] = {
+        "enabled": bool(modeling_config.get("feature_store", {}).get("enabled", False)),
+        "feature_set": modeling_config.get("feature_set", "legacy_in_memory"),
+        "feature_version": modeling_config.get("feature_version") or "price_liquidity_v1",
+        "label_version": modeling_config.get("label_version", DEFAULT_LABEL_VERSION),
+        "label_horizon": label_horizon,
+        "label_definition": modeling_config.get("label_definition", "universe_relative_forward_return"),
+    }
+    if modeling_metadata["enabled"]:
+        merged, artifact_metadata = load_modeling_dataset(
+            data_root=data_root,
+            feature_version=str(modeling_metadata["feature_version"]),
+            label_version=str(modeling_metadata["label_version"]),
+            label_horizon=label_horizon,
+            report_date=effective_end_date.strftime("%Y-%m-%d"),
+        )
+        modeling_metadata.update(artifact_metadata)
+        panel = panel.loc[pd.to_datetime(panel["date"]) <= effective_end_date].copy()
+    else:
+        features = build_features(panel, config["features"])
+        labels = build_labels(panel, horizon=label_horizon)
+        merged = features.merge(labels, on=["date", "symbol"])
+        modeling_metadata.update(modeling_artifact_metadata(data_root=data_root))
+    merged = merged.dropna(subset=[label_col])
     feature_cols = [
         column
         for column in merged.columns
-        if column not in {"date", "symbol", "raw_forward_return_5d", "label_5d", "earnings_within_5d"}
+        if column
+        not in {
+            "date",
+            "symbol",
+            raw_label_col,
+            label_col,
+            "earnings_within_5d",
+            "feature_available_at",
+            "feature_set",
+            "feature_version",
+            "label_definition",
+            "label_version",
+            "data_revision_x",
+            "data_revision_y",
+            "data_revision",
+            "universe_member",
+        }
+        and not str(column).startswith("target_date_")
     ]
     normalized = rank_normalize(merged, feature_cols, missing_threshold=float(config["preprocessing"]["missing_threshold"]))
 
@@ -183,18 +225,18 @@ def run_training(
     ridge_alpha = tune_ridge_via_walk_forward(
         normalized,
         feature_cols,
-        "label_5d",
+        label_col,
         expanding_walk_forward,
         validation_config,
     )
-    ridge_folds = expanding_walk_forward(normalized, feature_cols, "label_5d", lambda: RidgeModel(alpha=ridge_alpha), validation_config)
+    ridge_folds = expanding_walk_forward(normalized, feature_cols, label_col, lambda: RidgeModel(alpha=ridge_alpha), validation_config)
     lgbm_params: dict | None = None
     lgbm_folds = []
     if model_suite in {"full", "advanced", "ensemble"}:
         lgbm_params = tune_lightgbm_via_walk_forward(
             normalized,
             feature_cols,
-            "label_5d",
+            label_col,
             expanding_walk_forward,
             validation_config,
             n_trials=5,
@@ -202,7 +244,7 @@ def run_training(
         lgbm_folds = expanding_walk_forward(
             normalized,
             feature_cols,
-            "label_5d",
+            label_col,
             lambda: LightGBMModel(n_trials=0, best_params=lgbm_params),
             validation_config,
         )
@@ -213,7 +255,7 @@ def run_training(
         catboost_params = tune_catboost_via_walk_forward(
             normalized,
             feature_cols,
-            "label_5d",
+            label_col,
             expanding_walk_forward,
             validation_config,
             n_trials=5,
@@ -221,7 +263,7 @@ def run_training(
         catboost_folds = expanding_walk_forward(
             normalized,
             feature_cols,
-            "label_5d",
+            label_col,
             lambda: CatBoostModel(n_trials=0, best_params=catboost_params),
             validation_config,
         )
@@ -232,7 +274,7 @@ def run_training(
         pd.concat([fold.predictions for fold in catboost_folds], ignore_index=True) if catboost_folds else pd.DataFrame()
     )
     ensemble_predictions = (
-        _ensemble_predictions({"ridge": ridge_predictions, "lightgbm": lgbm_predictions}) if model_suite == "ensemble" else pd.DataFrame()
+        _ensemble_predictions({"ridge": ridge_predictions, "lightgbm": lgbm_predictions}, label_col=label_col) if model_suite == "ensemble" else pd.DataFrame()
     )
     primary_predictions = _primary_predictions_for_suite(
         model_suite=model_suite,
@@ -241,21 +283,21 @@ def run_training(
         catboost_predictions=catboost_predictions,
         ensemble_predictions=ensemble_predictions,
     )
-    primary_report = _prediction_report(primary_predictions)
+    primary_report = _prediction_report(primary_predictions, label_col=label_col)
     cpcv_results = combinatorially_purged_cv(
-        normalized.dropna(subset=["label_5d"]),
+        normalized.dropna(subset=[label_col]),
         feature_cols,
-        "label_5d",
+        label_col,
         lambda: RidgeModel(alpha=ridge_alpha),
         n_folds=int(config["validation"].get("cpcv_folds", 8)),
         embargo_days=int(config["validation"].get("embargo_days", 10)),
     )
     diagnostics = {
-        "ic_by_year": ic_by_year(primary_predictions["prediction"], primary_predictions["label_5d"], primary_predictions["date"]),
+        "ic_by_year": ic_by_year(primary_predictions["prediction"], primary_predictions[label_col], primary_predictions["date"]),
         "placebo": placebo_test(
-            normalized.dropna(subset=["label_5d"]),
+            normalized.dropna(subset=[label_col]),
             feature_cols,
-            "label_5d",
+            label_col,
             lambda: RidgeModel(alpha=ridge_alpha),
             validation_runner=expanding_walk_forward,
             validation_config=validation_config,
@@ -266,7 +308,7 @@ def run_training(
             multiplier=float(config["portfolio"]["cost_stress_multiplier"]),
             cost_spread_bps=float(config["portfolio"].get("cost_spread_bps", 5.0)),
         ),
-        "sign_flip_canary": sign_flip_canary(primary_predictions, label_col="label_5d"),
+        "sign_flip_canary": sign_flip_canary(primary_predictions, label_col=label_col),
         "cpcv": {
             "folds": len(cpcv_results),
             "mean_oos_score": float(pd.Series([result.out_of_sample_score for result in cpcv_results]).mean()) if cpcv_results else 0.0,
@@ -319,6 +361,7 @@ def run_training(
         "diagnostics": diagnostics,
         "assessment": assessment,
         "model_suite": model_suite,
+        "modeling": modeling_metadata,
         "artifacts": _persist_run_artifacts(
             output_root=output_root,
             run_ts=run_ts,
@@ -331,16 +374,17 @@ def run_training(
             catboost_predictions=catboost_predictions,
             ensemble_predictions=ensemble_predictions,
             model_suite=model_suite,
-            ridge_model=RidgeModel(alpha=ridge_alpha).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"]),
+            label_col=label_col,
+            ridge_model=RidgeModel(alpha=ridge_alpha).fit(normalized[feature_cols].fillna(0.0), normalized[label_col]),
             lgbm_model=(
-                LightGBMModel(n_trials=0, best_params=lgbm_params).fit(normalized[feature_cols].fillna(0.0), normalized["label_5d"])
+                LightGBMModel(n_trials=0, best_params=lgbm_params).fit(normalized[feature_cols].fillna(0.0), normalized[label_col])
                 if model_suite in {"full", "advanced", "ensemble"} and lgbm_params is not None
                 else None
             ),
             catboost_model=(
                 _load_catboost_components()[0](n_trials=0, best_params=catboost_params).fit(
                     normalized[feature_cols].fillna(0.0),
-                    normalized["label_5d"],
+                    normalized[label_col],
                 )
                 if model_suite == "advanced" and catboost_params is not None
                 else None
@@ -353,6 +397,9 @@ def run_training(
                 "coverage": coverage,
                 "ridge_alpha": ridge_alpha,
                 "model_suite": model_suite,
+                "label_horizon": label_horizon,
+                "label_col": label_col,
+                "feature_version": modeling_metadata.get("feature_version"),
             },
         ),
     }
@@ -381,7 +428,7 @@ def _fold_report(folds: list[Any]) -> dict[str, object]:
     }
 
 
-def _prediction_report(predictions: pd.DataFrame) -> dict[str, object]:
+def _prediction_report(predictions: pd.DataFrame, *, label_col: str = "label_5d") -> dict[str, object]:
     """Return fold-report-shaped metrics for deterministic prediction frames."""
     if predictions.empty:
         return {"folds": [], "mean_rank_ic": 0.0, "decile_chart_data": {}}
@@ -390,9 +437,9 @@ def _prediction_report(predictions: pd.DataFrame) -> dict[str, object]:
     folds: list[dict[str, object]] = []
     decile_chart_data: dict[str, dict[str, float]] = {}
     for idx, (date_value, group) in enumerate(frame.groupby("date", sort=True), start=1):
-        decile_spread, hit_rate, bucket_returns = bucket_metrics(group, label_col="label_5d")
+        decile_spread, hit_rate, bucket_returns = bucket_metrics(group, label_col=label_col)
         fold = {
-            "rank_ic": rank_ic(group["prediction"], group["label_5d"]),
+            "rank_ic": rank_ic(group["prediction"], group[label_col]),
             "decile_spread": decile_spread,
             "hit_rate": hit_rate,
             "bucket_returns": bucket_returns,
@@ -406,27 +453,27 @@ def _prediction_report(predictions: pd.DataFrame) -> dict[str, object]:
     }
 
 
-def _ensemble_predictions(prediction_frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def _ensemble_predictions(prediction_frames: dict[str, pd.DataFrame], *, label_col: str = "label_5d") -> pd.DataFrame:
     """Build a deterministic per-date rank-averaged ensemble prediction frame."""
     merged: pd.DataFrame | None = None
     rank_columns: list[str] = []
     for name, predictions in prediction_frames.items():
         if predictions.empty:
             continue
-        frame = predictions[["date", "symbol", "prediction", "label_5d"]].copy()
+        frame = predictions[["date", "symbol", "prediction", label_col]].copy()
         frame["date"] = pd.to_datetime(frame["date"])
         rank_col = f"{name}_rank_prediction"
         frame[rank_col] = frame.groupby("date")["prediction"].rank(method="average", pct=True)
-        frame = frame[["date", "symbol", "label_5d", rank_col]]
+        frame = frame[["date", "symbol", label_col, rank_col]]
         if merged is None:
             merged = frame
         else:
             merged = merged.merge(frame[["date", "symbol", rank_col]], on=["date", "symbol"], how="inner")
         rank_columns.append(rank_col)
     if merged is None or not rank_columns:
-        return pd.DataFrame(columns=["date", "symbol", "prediction", "label_5d"])
+        return pd.DataFrame(columns=["date", "symbol", "prediction", label_col])
     merged["prediction"] = merged[rank_columns].mean(axis=1)
-    return merged[["date", "symbol", "prediction", "label_5d"]].sort_values(["date", "symbol"]).reset_index(drop=True)
+    return merged[["date", "symbol", "prediction", label_col]].sort_values(["date", "symbol"]).reset_index(drop=True)
 
 
 def _primary_predictions_for_suite(
@@ -480,6 +527,7 @@ def _persist_run_artifacts(
     catboost_predictions: pd.DataFrame,
     ensemble_predictions: pd.DataFrame,
     model_suite: str,
+    label_col: str,
     ridge_model: RidgeModel,
     lgbm_model: LightGBMModel | None,
     catboost_model: Any | None,
@@ -495,6 +543,8 @@ def _persist_run_artifacts(
             catboost_predictions=catboost_predictions,
             ensemble_predictions=ensemble_predictions,
             model_suite=model_suite,
+            label_col=label_col,
+            portfolio_config=dict(config.get("portfolio") or {}),
         )
     )
     models = {"ridge": ridge_model}
@@ -534,6 +584,8 @@ def _persist_backtest_inputs(
     catboost_predictions: pd.DataFrame,
     ensemble_predictions: pd.DataFrame,
     model_suite: str,
+    label_col: str,
+    portfolio_config: dict[str, Any],
 ) -> dict[str, str]:
     inputs_root = output_root / "artifacts" / "backtest_inputs"
     inputs_root.mkdir(parents=True, exist_ok=True)
@@ -548,21 +600,21 @@ def _persist_backtest_inputs(
     prices.to_parquet(prices_path, index=False)
 
     artifacts: dict[str, str] = {"prices_path": str(prices_path)}
-    ridge_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="ridge", predictions=ridge_predictions)
+    ridge_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="ridge", predictions=ridge_predictions, label_col=label_col, portfolio_config=portfolio_config)
     artifacts.update(ridge_payload)
     primary_prefix = "ridge"
     if not lgbm_predictions.empty:
-        lgbm_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="lightgbm", predictions=lgbm_predictions)
+        lgbm_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="lightgbm", predictions=lgbm_predictions, label_col=label_col, portfolio_config=portfolio_config)
         artifacts.update(lgbm_payload)
         if model_suite == "full":
             primary_prefix = "lightgbm"
     if not catboost_predictions.empty:
-        catboost_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="catboost", predictions=catboost_predictions)
+        catboost_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="catboost", predictions=catboost_predictions, label_col=label_col, portfolio_config=portfolio_config)
         artifacts.update(catboost_payload)
         if model_suite == "advanced":
             primary_prefix = "catboost"
     if not ensemble_predictions.empty:
-        ensemble_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="ensemble", predictions=ensemble_predictions)
+        ensemble_payload = _write_prediction_artifacts(inputs_root=inputs_root, prefix="ensemble", predictions=ensemble_predictions, label_col=label_col, portfolio_config=portfolio_config)
         artifacts.update(ensemble_payload)
         if model_suite == "ensemble":
             primary_prefix = "ensemble"
@@ -571,16 +623,18 @@ def _persist_backtest_inputs(
     return artifacts
 
 
-def _write_prediction_artifacts(*, inputs_root: Path, prefix: str, predictions: pd.DataFrame) -> dict[str, str]:
+def _write_prediction_artifacts(*, inputs_root: Path, prefix: str, predictions: pd.DataFrame, label_col: str, portfolio_config: dict[str, Any]) -> dict[str, str]:
     if predictions.empty:
         return {}
     prediction_frame = predictions.copy()
+    if label_col in prediction_frame.columns and "label" not in prediction_frame.columns:
+        prediction_frame["label"] = prediction_frame[label_col]
     prediction_frame = prediction_frame.sort_values(["date", "symbol"]).reset_index(drop=True)
     prediction_path = inputs_root / f"{prefix}_predictions.parquet"
     prediction_frame.to_parquet(prediction_path, index=False)
 
     targets_input = prediction_frame.rename(columns={"prediction": "score"})
-    targets = build_portfolio(targets_input, {})
+    targets = build_portfolio(targets_input, portfolio_config)
     target_path = inputs_root / f"{prefix}_targets.parquet"
     targets.to_parquet(target_path, index=False)
     return {

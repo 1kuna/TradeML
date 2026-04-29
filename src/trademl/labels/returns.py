@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 
-def build_labels(panel: pd.DataFrame, horizon: int = 5, *, exchange: str = "XNYS") -> pd.DataFrame:
+def build_labels(panel: pd.DataFrame, horizon: int = 5, *, exchange: str = "XNYS", include_target_date: bool = False) -> pd.DataFrame:
     """Build raw and universe-relative forward returns using trading-calendar horizons."""
     frame = panel.copy()
     frame["date"] = pd.to_datetime(frame["date"])
@@ -43,4 +43,7 @@ def build_labels(panel: pd.DataFrame, horizon: int = 5, *, exchange: str = "XNYS
     frame[f"raw_forward_return_{horizon}d"] = np.log(frame["target_close"] / frame["close"])
     universe_mean = frame.groupby("date")[f"raw_forward_return_{horizon}d"].transform("mean")
     frame[f"label_{horizon}d"] = frame[f"raw_forward_return_{horizon}d"] - universe_mean
-    return frame[["date", "symbol", f"raw_forward_return_{horizon}d", f"label_{horizon}d"]]
+    columns = ["date", "symbol", f"raw_forward_return_{horizon}d", f"label_{horizon}d"]
+    if include_target_date:
+        columns.append("target_date")
+    return frame[columns]

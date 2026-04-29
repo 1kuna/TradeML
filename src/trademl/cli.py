@@ -62,6 +62,7 @@ from trademl.experiments import (
 )
 from trademl.fleet.launchd import install_research_launch_agent, launch_agent_status, unload_launch_agent
 from trademl.research import (
+    build_research_features,
     list_research_alerts,
     latest_research_program_summary,
     paper_account_smoke,
@@ -212,6 +213,12 @@ def main(argv: list[str] | None = None) -> int:
     research_canary.add_argument("--program", required=True)
     research_canary.add_argument("--poll-seconds", type=int, default=None)
     research_canary.add_argument("--detach", action="store_true")
+    research_canary.add_argument("--feature-version", default=None)
+    research_canary.add_argument("--label-horizon", type=int, default=None)
+    research_build_features = research_subparsers.add_parser("build-features", help="Build PIT modeling feature and label artifacts.")
+    research_build_features.add_argument("--program", default="configs/research/perpetual_macmini.yml")
+    research_build_features.add_argument("--feature-version", default=None)
+    research_build_features.add_argument("--report-date", default=None)
     research_paper_smoke = research_subparsers.add_parser("paper-smoke", help="Run a read-only Alpaca paper account smoke check.")
     research_paper_smoke.add_argument("--program", required=True)
     research_paper_submit = research_subparsers.add_parser("paper-submit", help="Submit generated Alpaca paper payloads with explicit guards.")
@@ -700,7 +707,18 @@ def _dispatch_research(args: argparse.Namespace) -> int:
             program_path=Path(args.program).expanduser(),
             poll_seconds=args.poll_seconds,
             detach=bool(args.detach),
+            feature_version=args.feature_version,
+            label_horizon=args.label_horizon,
             **common,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "build-features":
+        payload = build_research_features(
+            program_path=Path(args.program).expanduser(),
+            data_root=data_root,
+            feature_version=args.feature_version,
+            report_date=args.report_date,
         )
         print(json.dumps(payload, indent=2, default=str))
         return 0

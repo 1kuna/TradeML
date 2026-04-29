@@ -29,6 +29,7 @@ from trademl.data_node.training_control import (
     stop_training_process,
     training_status_snapshot,
 )
+from trademl.modeling import DEFAULT_LABEL_VERSION, modeling_artifact_metadata
 from trademl.research_architecture import (
     build_objective_verdict,
     gate_failures_by_objective,
@@ -38,7 +39,16 @@ from trademl.research_architecture import (
     resolve_architecture_entry,
 )
 
-SPECIAL_MATRIX_DIMENSIONS = {"model_suite", "architecture_family", "feature_family", "data_profile", "data_family"}
+SPECIAL_MATRIX_DIMENSIONS = {
+    "model_suite",
+    "architecture_family",
+    "feature_family",
+    "data_profile",
+    "data_family",
+    "feature_version",
+    "label_horizon",
+    "portfolio_profile",
+}
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
@@ -174,6 +184,7 @@ def plan_experiment(
         run_id = _run_id(row)
         runtime_name = f"experiment_{experiment_id}__{run_id}"
         run_config = _apply_overrides(base_config, row.get("config_overrides", {}))
+        modeling = _run_modeling_metadata(data_root=target.data_root, run_config=run_config)
         config_path = configs_dir / f"{run_id}.yml"
         config_path.write_text(yaml.safe_dump(run_config, sort_keys=False), encoding="utf-8")
         output_root = target.data_root / "experiments" / experiment_id / "runs" / run_id
@@ -195,6 +206,13 @@ def plan_experiment(
             "architecture_lane": architecture_entry["family"],
             "objective_policy": objective_policy,
             "complexity_tier": int(architecture_entry["complexity_tier"]),
+            "feature_set": modeling["feature_set"],
+            "feature_version": modeling["feature_version"],
+            "label_version": modeling["label_version"],
+            "label_horizon": modeling["label_horizon"],
+            "label_definition": modeling["label_definition"],
+            "data_revision": modeling.get("data_revision"),
+            "portfolio_profile": modeling["portfolio_profile"],
             "config_overrides": row.get("config_overrides", {}),
             "config_path": str(config_path),
             "config_hash": hashlib.sha1(config_path.read_bytes()).hexdigest(),
@@ -550,6 +568,21 @@ def backtest_experiment_survivors(
         manifest["evaluation_stage"] = "SHORTLISTED" if outcome["shortlisted"] else "REJECTED_BACKTEST"
         manifest["shortlisted"] = bool(outcome["shortlisted"])
         manifest["gate_failures"] = outcome["gate_failures"]
+        objective_verdict = dict(manifest.get("objective_verdict") or {})
+        objective_verdict["backtest"] = {
+            "net_return": summary_payload.get("net_return"),
+            "gross_return": summary_payload.get("gross_return"),
+            "turnover": summary_payload.get("turnover"),
+            "cost_total": summary_payload.get("cost_total"),
+            "gate_failures": outcome["gate_failures"],
+            "passed": bool(outcome["shortlisted"]),
+        }
+        objective_verdict["passed"] = bool(objective_verdict.get("passed", False) and outcome["shortlisted"])
+        objective_verdict["gate_failures_by_objective"] = {
+            **dict(objective_verdict.get("gate_failures_by_objective") or {}),
+            **gate_failures_by_objective(outcome["gate_failures"]),
+        }
+        manifest["objective_verdict"] = objective_verdict
         _write_run_manifest(local_state=local_state, experiment_id=experiment_id, manifest=manifest)
         completed.append({"run_id": manifest["run_id"], "evaluation_stage": manifest["evaluation_stage"]})
     refreshed = experiment_status(
@@ -912,6 +945,13 @@ def compare_experiment(
                 "architecture_registry_entry": manifest.get("architecture_registry_entry", {}),
                 "objective_policy": manifest.get("objective_policy", {}),
                 "complexity_tier": manifest.get("complexity_tier"),
+                "feature_set": manifest.get("feature_set") or (report.get("modeling") or {}).get("feature_set"),
+                "feature_version": manifest.get("feature_version") or (report.get("modeling") or {}).get("feature_version"),
+                "label_version": manifest.get("label_version") or (report.get("modeling") or {}).get("label_version"),
+                "label_horizon": manifest.get("label_horizon") or (report.get("modeling") or {}).get("label_horizon"),
+                "label_definition": manifest.get("label_definition") or (report.get("modeling") or {}).get("label_definition"),
+                "data_revision": manifest.get("data_revision") or (report.get("modeling") or {}).get("data_revision"),
+                "portfolio_profile": manifest.get("portfolio_profile"),
                 "coverage": report.get("coverage"),
                 "ridge_mean_rank_ic": report.get("ridge", {}).get("mean_rank_ic"),
                 "lightgbm_mean_rank_ic": report.get("lightgbm", {}).get("mean_rank_ic"),
@@ -1101,6 +1141,15 @@ def _materialize_matrix_row(matrix_values: dict[str, Any]) -> dict[str, Any]:
         if preset is None:
             raise ValueError(f"unsupported data_family: {data_family}")
         config_overrides.update(dict(preset.get("config_overrides") or {}))
+    if matrix_values.get("feature_version") is not None:
+        config_overrides["modeling.feature_version"] = str(matrix_values["feature_version"])
+    if matrix_values.get("label_horizon") is not None:
+        config_overrides["modeling.label_horizon"] = int(matrix_values["label_horizon"])
+    if matrix_values.get("portfolio_profile") is not None:
+        profile = str(matrix_values["portfolio_profile"])
+        config_overrides["portfolio.portfolio_profile"] = profile
+        config_overrides["portfolio.method"] = profile
+        config_overrides["validation.portfolio_profile"] = profile
     config_overrides.update({key: value for key, value in matrix_values.items() if key not in SPECIAL_MATRIX_DIMENSIONS})
     return {
         "matrix_values": matrix_values,
@@ -1137,6 +1186,21 @@ def _objective_policy(spec: dict[str, Any]) -> dict[str, Any]:
     policy.setdefault("primary", "research_profitability_v1")
     policy.setdefault("complexity_penalty", {"enabled": True, "penalty_per_tier": 0.0005, "min_complexity_adjusted_improvement": 0.0})
     return policy
+
+
+def _run_modeling_metadata(*, data_root: Path, run_config: dict[str, Any]) -> dict[str, Any]:
+    modeling = dict(run_config.get("modeling") or {})
+    portfolio = dict(run_config.get("portfolio") or {})
+    registry = modeling_artifact_metadata(data_root=data_root)
+    return {
+        "feature_set": str(modeling.get("feature_set") or registry.get("feature_set") or "daily_price_liquidity_v1"),
+        "feature_version": str(modeling.get("feature_version") or registry.get("feature_version") or "price_liquidity_v1"),
+        "label_version": str(modeling.get("label_version") or registry.get("label_version") or DEFAULT_LABEL_VERSION),
+        "label_horizon": int(modeling.get("label_horizon") or modeling.get("primary_label_horizon") or 5),
+        "label_definition": str(modeling.get("label_definition") or registry.get("label_definition") or "universe_relative_forward_return"),
+        "data_revision": registry.get("data_revision"),
+        "portfolio_profile": str(portfolio.get("portfolio_profile") or portfolio.get("method") or "equal_weight_top_quintile"),
+    }
 
 
 def _apply_overrides(base_config: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -1290,6 +1354,13 @@ def _summary_run_row(manifest: dict[str, Any]) -> dict[str, Any]:
         "matrix_values": manifest["matrix_values"],
         "architecture_lane": manifest.get("architecture_lane"),
         "complexity_tier": manifest.get("complexity_tier"),
+        "feature_set": manifest.get("feature_set"),
+        "feature_version": manifest.get("feature_version"),
+        "label_version": manifest.get("label_version"),
+        "label_horizon": manifest.get("label_horizon"),
+        "label_definition": manifest.get("label_definition"),
+        "data_revision": manifest.get("data_revision"),
+        "portfolio_profile": manifest.get("portfolio_profile"),
         "objective_verdict": manifest.get("objective_verdict", {}),
         "config_overrides": manifest.get("config_overrides", {}),
         "config_path": manifest.get("config_path"),
@@ -1415,6 +1486,9 @@ def _refresh_experiment_summary(
     best_objective_verdict = {}
     best_architecture_lane = None
     best_complexity_tier = None
+    best_label_horizon = None
+    best_feature_version = None
+    best_portfolio_profile = None
     best_score = float("-inf")
     for run in runs:
         stage = str(run.get("evaluation_stage") or "PLANNED")
@@ -1442,6 +1516,9 @@ def _refresh_experiment_summary(
             best_objective_verdict = dict(run.get("objective_verdict") or {})
             best_architecture_lane = run.get("architecture_lane")
             best_complexity_tier = run.get("complexity_tier")
+            best_label_horizon = run.get("label_horizon")
+            best_feature_version = run.get("feature_version")
+            best_portfolio_profile = run.get("portfolio_profile")
     supervisor = read_experiment_supervisor_state(local_state=local_state, experiment_id=experiment_id)
     proposal_path = _local_experiment_root(local_state, experiment_id) / "next_family_proposal.json"
     proposal_summary = json.loads(proposal_path.read_text(encoding="utf-8")) if proposal_path.exists() else {}
@@ -1463,6 +1540,9 @@ def _refresh_experiment_summary(
         "objective_verdict": best_objective_verdict,
         "architecture_lane": best_architecture_lane,
         "complexity_tier": best_complexity_tier,
+        "label_horizon": best_label_horizon,
+        "feature_version": best_feature_version,
+        "portfolio_profile": best_portfolio_profile,
         "top_gate_failures": sorted(gate_failures.items(), key=lambda item: (-item[1], item[0]))[:5],
         "supervisor": supervisor,
         "proposal_summary": summary.get("proposal_summary") or proposal_summary,

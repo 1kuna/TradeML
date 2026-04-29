@@ -47,6 +47,15 @@ paper_policy:
     submit_orders_enabled: false
     api_key_env: ALPACA_API_KEY
     api_secret_env: ALPACA_API_SECRET
+modeling:
+  feature_store:
+    enabled: true
+  feature_set: daily_price_liquidity_v1
+  feature_version: price_liquidity_v1
+  label_version: universe_relative_forward_return_v1
+  label_horizons: [1, 5, 20]
+  primary_label_horizon: 5
+  label_definition: universe_relative_forward_return
 architecture_registry_policy:
   enabled: true
 objective_policy:
@@ -89,6 +98,7 @@ search_policy:
     - architecture_family
     - feature_family
     - data_family
+    - label_horizon
     - validation.initial_train_years
     - data_profile
 ssot_phase_policies:
@@ -100,6 +110,7 @@ ssot_phase_policies:
       - architecture_family
       - feature_family
       - data_family
+      - label_horizon
       - validation.initial_train_years
       - data_profile
     allowed_data_families:
@@ -123,6 +134,8 @@ ssot_phase_policies:
       data_family:
         - price_only
         - price_plus_liquidity
+      label_horizon:
+        - 5
       validation.initial_train_years:
         - 2
       data_profile:
@@ -147,6 +160,7 @@ ssot_phase_policies:
       - architecture_family
       - feature_family
       - data_family
+      - label_horizon
       - validation.initial_train_years
       - data_profile
     allowed_data_families:
@@ -175,6 +189,8 @@ ssot_phase_policies:
       data_family:
         - price_only
         - price_plus_liquidity
+      label_horizon:
+        - 5
       validation.initial_train_years:
         - 2
         - 3

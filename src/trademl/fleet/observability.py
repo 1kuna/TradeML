@@ -308,6 +308,7 @@ def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     best = dict(program.get("best_candidate_summary") or {})
     progression = dict(program.get("autonomous_progression") or program.get("progression") or {})
     paper_smoke = dict(program.get("latest_paper_account_smoke") or program.get("paper_account_smoke") or {})
+    modeling = dict(program.get("modeling") or {})
     return {
         "status": str(program.get("status") or remote_research.get("status") or "UNKNOWN"),
         "current_experiment_id": program.get("current_experiment_id") or experiment.get("experiment_id") or remote_research.get("current_experiment_id"),
@@ -330,7 +331,11 @@ def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
         "exhausted_lanes": progression.get("exhausted_lanes") or [],
         "last_canary": program.get("last_canary") or {},
         "paper_account_smoke": paper_smoke,
-        "data_revision": program.get("data_revision") or experiment.get("data_revision"),
+        "modeling": modeling,
+        "feature_version": modeling.get("feature_version") or experiment.get("feature_version"),
+        "label_horizon": modeling.get("current_label_horizon") or experiment.get("label_horizon"),
+        "portfolio_profile": modeling.get("current_portfolio_profile") or experiment.get("portfolio_profile"),
+        "data_revision": modeling.get("data_revision") or program.get("data_revision") or experiment.get("data_revision"),
         "reason": program.get("wait_reason") or remote_research.get("wait_reason") or best.get("best_decision_reason"),
     }
 

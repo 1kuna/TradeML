@@ -3,6 +3,17 @@ challenger: lightgbm
 
 target: universe_relative_5d
 
+modeling:
+  feature_store:
+    enabled: true
+  feature_set: daily_price_liquidity_v1
+  feature_version: price_liquidity_v1
+  label_version: universe_relative_forward_return_v1
+  label_horizons: [1, 5, 20]
+  primary_label_horizon: 5
+  label_horizon: 5
+  label_definition: universe_relative_forward_return
+
 data:
   dependencies: [equities_ohlcv_adj]
   green_threshold: 0.98
@@ -37,11 +48,14 @@ validation:
   cpcv_folds: 8
   embargo_days: 10
   additional: [ic_by_year, ic_by_sector, placebo, cost_stress]
+  portfolio_profiles: [equal_weight_top_quintile, cost_aware_long_only_v1]
 
 portfolio:
   method: equal_weight_top_quintile
+  portfolio_profile: equal_weight_top_quintile
   rebalance: weekly
   hedge: none
   cost_spread_bps: 5
   cost_stress_multiplier: 2.0
-
+  max_single_name_weight: 0.02
+  min_adv_dollar: 0.0

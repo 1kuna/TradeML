@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from trademl.features.equities import build_features
+from trademl.modeling import build_modeling_artifacts, feature_label_preflight, load_modeling_dataset
 
 
 def _panel() -> pd.DataFrame:
@@ -105,3 +106,47 @@ def test_reversal_features_are_negative_of_recent_returns_not_momentum_duplicate
         check_names=False,
     )
     assert not aligned["reversal_1d"].equals(aligned["momentum_5d"])
+
+
+def test_modeling_feature_label_factory_writes_pit_versioned_artifacts(tmp_path) -> None:
+    data_root = tmp_path / "nas"
+    panel = _panel().loc[lambda frame: frame["date"] <= pd.Timestamp("2020-10-30")].copy()
+    for date_value, day_frame in panel.groupby(panel["date"].dt.strftime("%Y-%m-%d")):
+        partition = data_root / "data" / "curated" / "equities_ohlcv_adj" / f"date={date_value}"
+        partition.mkdir(parents=True)
+        day_frame.to_parquet(partition / "data.parquet", index=False)
+
+    payload = build_modeling_artifacts(
+        data_root=data_root,
+        feature_config=_feature_config(),
+        feature_version="price_liquidity_test_v1",
+        label_horizons=[1, 5, 20],
+    )
+    frame, metadata = load_modeling_dataset(
+        data_root=data_root,
+        feature_version="price_liquidity_test_v1",
+        label_version="universe_relative_forward_return_v1",
+        label_horizon=5,
+    )
+    preflight = feature_label_preflight(
+        data_root=data_root,
+        feature_version="price_liquidity_test_v1",
+        label_version="universe_relative_forward_return_v1",
+        label_horizon=5,
+    )
+
+    assert payload["feature_version"] == "price_liquidity_test_v1"
+    assert {"feature_available_at", "feature_version", "data_revision", "label_5d"}.issubset(frame.columns)
+    assert (pd.to_datetime(frame["feature_available_at"], utc=True).dt.tz_convert(None) <= pd.to_datetime(frame["date"])).all()
+    assert metadata["label_horizon"] == 5
+    assert preflight["ok"] is True
+
+    cutoff_frame, _ = load_modeling_dataset(
+        data_root=data_root,
+        feature_version="price_liquidity_test_v1",
+        label_version="universe_relative_forward_return_v1",
+        label_horizon=5,
+        report_date="2020-10-23",
+    )
+    immature = pd.to_datetime(cutoff_frame["target_date_5d"]) > pd.Timestamp("2020-10-23")
+    assert cutoff_frame.loc[immature, "label_5d"].isna().all()

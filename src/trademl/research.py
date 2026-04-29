@@ -40,6 +40,13 @@ from trademl.data_node.training_control import (
     training_preflight,
     training_status_snapshot,
 )
+from trademl.modeling import (
+    DEFAULT_FEATURE_VERSION,
+    DEFAULT_LABEL_VERSION,
+    build_modeling_artifacts,
+    feature_label_preflight,
+    modeling_artifact_metadata,
+)
 from trademl.portfolio.build import build_portfolio
 from trademl.research_architecture import (
     architecture_registry_payload,
@@ -1025,6 +1032,7 @@ def research_health(
         python_executable=python_executable,
     )
     latest_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=current_experiment_id) if current_experiment_id else {}
+    modeling_metadata = modeling_artifact_metadata(data_root=data_root)
     alerts = evaluate_research_drift(
         program_id=program_id,
         state=state,
@@ -1058,8 +1066,42 @@ def research_health(
         "sentinel_delta": state.get("sentinel_delta") or (state.get("frontier") or {}).get("sentinel_delta"),
         "autonomous_progression": state.get("autonomous_progression", {}),
         "dependency_preflight": (state.get("last_infra_preflight") or {}).get("dependencies", {}),
+        "feature_label_readiness": (state.get("last_infra_preflight") or {}).get("feature_label", {}),
+        "modeling": {
+            "feature_version": modeling_metadata.get("feature_version"),
+            "feature_set": modeling_metadata.get("feature_set"),
+            "label_version": modeling_metadata.get("label_version"),
+            "label_horizons": modeling_metadata.get("label_horizons"),
+            "data_revision": modeling_metadata.get("data_revision"),
+            "current_label_horizon": latest_summary.get("label_horizon"),
+            "current_portfolio_profile": latest_summary.get("portfolio_profile"),
+        },
         "paths": _research_path_summary(local_state=local_state, data_root=data_root),
     }
+
+
+def build_research_features(
+    *,
+    program_path: Path,
+    data_root: Path,
+    feature_version: str | None = None,
+    report_date: str | None = None,
+) -> dict[str, Any]:
+    """Build modeling-ready feature and label artifacts for a research program."""
+    spec = _load_research_program_spec(program_path)
+    modeling = dict(spec.get("modeling") or {})
+    config_path = Path(__file__).resolve().parents[2] / "configs" / "equities_xs.yml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    return build_modeling_artifacts(
+        data_root=data_root,
+        feature_config=dict(config.get("features") or {}),
+        feature_set=str(modeling.get("feature_set") or "daily_price_liquidity_v1"),
+        feature_version=str(feature_version or modeling.get("feature_version") or DEFAULT_FEATURE_VERSION),
+        label_definition=str(modeling.get("label_definition") or "universe_relative_forward_return"),
+        label_version=str(modeling.get("label_version") or DEFAULT_LABEL_VERSION),
+        label_horizons=[int(item) for item in list(modeling.get("label_horizons") or [1, 5, 20])],
+        report_date=report_date,
+    )
 
 
 def run_research_canary(
@@ -1073,6 +1115,8 @@ def run_research_canary(
     python_executable: str,
     poll_seconds: int | None = None,
     detach: bool = False,
+    feature_version: str | None = None,
+    label_horizon: int | None = None,
 ) -> dict[str, Any]:
     """Run one bounded architecture canary family for the research autopilot."""
     spec = _load_research_program_spec(program_path)
@@ -1094,7 +1138,13 @@ def run_research_canary(
         state.update(payload)
         _write_program_state(local_state=local_state, program_id=program_id, payload=state)
         return payload
-    next_spec = _canary_experiment_spec(spec=spec, state=state, phase_policy=phase_policy)
+    next_spec = _canary_experiment_spec(
+        spec=spec,
+        state=state,
+        phase_policy=phase_policy,
+        feature_version=feature_version,
+        label_horizon=label_horizon,
+    )
     launched = _launch_program_family(
         program_id=program_id,
         program_state=state,
@@ -2019,6 +2069,7 @@ def _make_experiment_spec_from_phase_policy(
             or "baseline"
         ),
         "target": str(spec.get("target") or "local"),
+        "modeling": deepcopy(spec.get("modeling") or {}),
         "report_date_policy": str(phase_policy.get("report_date_policy") or spec.get("report_date_policy") or "phase1_freeze"),
         "max_concurrent": int(phase_policy.get("max_concurrent") or spec.get("max_concurrent") or 1),
         "supervision": {
@@ -2335,6 +2386,8 @@ def _frontier_architecture_spec(
             "architecture_family": architectures,
             "feature_family": [best_feature],
             "data_family": [best_data],
+            "label_horizon": [_frontier_label_horizon_for_epoch(spec=spec, epoch=epoch)],
+            "portfolio_profile": ["cost_aware_long_only_v1"],
             "data_profile": [_frontier_profile_for_epoch(epoch)],
             "validation.initial_train_years": [_frontier_train_years_for_epoch(epoch)],
         },
@@ -2431,7 +2484,14 @@ def _last_successful_frontier_run(frontier: dict[str, Any]) -> str | None:
     return None
 
 
-def _canary_experiment_spec(*, spec: dict[str, Any], state: dict[str, Any], phase_policy: dict[str, Any]) -> dict[str, Any]:
+def _canary_experiment_spec(
+    *,
+    spec: dict[str, Any],
+    state: dict[str, Any],
+    phase_policy: dict[str, Any],
+    feature_version: str | None = None,
+    label_horizon: int | None = None,
+) -> dict[str, Any]:
     """Build the fixed bounded architecture canary family."""
     phase = _current_ssot_phase(state=state, spec=spec)
     canary_state = {**state, "current_generation": int(state.get("current_generation", 0) or 0) + 1}
@@ -2455,9 +2515,13 @@ def _canary_experiment_spec(*, spec: dict[str, Any], state: dict[str, Any], phas
         "architecture_family": ["advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"],
         "feature_family": ["price_liquidity"],
         "data_family": [data_family],
+        "label_horizon": [int(label_horizon or (spec.get("modeling") or {}).get("primary_label_horizon") or 5)],
+        "portfolio_profile": ["cost_aware_long_only_v1"],
         "data_profile": ["phase1_default"],
         "validation.initial_train_years": [2],
     }
+    if feature_version:
+        next_spec["matrix"]["feature_version"] = [str(feature_version)]
     next_spec["proposal_policy"]["family_size_cap"] = 4
     next_spec["frontier_architecture"] = True
     next_spec["canary"] = True
@@ -2467,6 +2531,14 @@ def _canary_experiment_spec(*, spec: dict[str, Any], state: dict[str, Any], phas
         "auto_propose_next_family": False,
     }
     return _decorate_autonomous_experiment_spec(next_spec=next_spec, spec=spec)
+
+
+def _frontier_label_horizon_for_epoch(*, spec: dict[str, Any], epoch: int) -> int:
+    modeling = dict(spec.get("modeling") or {})
+    horizons = [int(item) for item in list(modeling.get("label_horizons") or [modeling.get("primary_label_horizon") or 5])]
+    primary = int(modeling.get("primary_label_horizon") or 5)
+    ordered = [primary] + [horizon for horizon in horizons if horizon != primary]
+    return ordered[int(epoch or 0) % len(ordered)]
 
 
 def _frontier_advanced_count_for_epoch(*, state: dict[str, Any], frontier: dict[str, Any]) -> int:
@@ -2921,6 +2993,7 @@ def _family_signature(next_spec: dict[str, Any]) -> str:
         "campaign_track": next_spec.get("campaign_track"),
         "search_epoch": next_spec.get("search_epoch"),
         "frontier_iteration": next_spec.get("frontier_iteration"),
+        "modeling": next_spec.get("modeling"),
         "matrix": next_spec.get("matrix"),
         "predictive_gate": next_spec.get("predictive_gate"),
         "backtest_gate": next_spec.get("backtest_gate"),
@@ -3068,6 +3141,11 @@ def _current_data_revision(
         if curated_files:
             latest_curated = max(curated_files, key=lambda item: (item.parent.name, item.stat().st_mtime))
             revision_parts.append(f"equities_ohlcv_adj:{latest_curated.parent.name.partition('=')[2]}:{int(latest_curated.stat().st_mtime)}")
+        registry = modeling_artifact_metadata(data_root=target.data_root)
+        if registry.get("data_revision"):
+            revision_parts.append(
+                f"modeling:{registry.get('feature_version')}:{registry.get('label_version')}:{registry.get('data_revision')}"
+            )
         for path in [
             reference_root / "security_master.parquet",
             reference_root / "fundamentals_daily.parquet",
@@ -3353,6 +3431,11 @@ def _program_family_preflight(
             model_suite=_most_capable_model_suite(next_spec),
         )
         payload["report_date"] = report_date
+        payload["feature_label"] = _feature_label_preflight_for_spec(
+            next_spec=next_spec,
+            target_data_root=target.data_root,
+            report_date=report_date,
+        )
         payload["target_paths"] = {
             "target_name": target.name,
             "target_kind": target.kind,
@@ -3362,6 +3445,9 @@ def _program_family_preflight(
             "controller_data_root": str(data_root),
             "controller_local_state": str(local_state),
         }
+        if not bool(payload["feature_label"].get("ok", False)):
+            payload["ok"] = False
+            payload["reason"] = payload["feature_label"].get("reason")
         if not bool(payload.get("ok", False)):
             payload.setdefault("status", "INFRA_BLOCKED")
         return payload
@@ -3376,6 +3462,42 @@ def _program_family_preflight(
                 "controller_local_state": str(local_state),
             },
         }
+
+
+def _feature_label_preflight_for_spec(*, next_spec: dict[str, Any], target_data_root: Path, report_date: str | None) -> dict[str, Any]:
+    matrix = dict(next_spec.get("matrix") or {})
+    modeling = dict(next_spec.get("modeling") or {})
+    if not bool((modeling.get("feature_store") or {}).get("enabled", False)):
+        return {"ok": True, "enabled": False}
+    registry = modeling_artifact_metadata(data_root=target_data_root)
+    feature_version = str(
+        (matrix.get("feature_version") or [None])[0]
+        or modeling.get("feature_version")
+        or registry.get("feature_version")
+        or DEFAULT_FEATURE_VERSION
+    )
+    label_version = str(modeling.get("label_version") or registry.get("label_version") or DEFAULT_LABEL_VERSION)
+    horizon_values = matrix.get("label_horizon") or [modeling.get("primary_label_horizon") or 5]
+    checks = [
+        feature_label_preflight(
+            data_root=target_data_root,
+            feature_version=feature_version,
+            label_version=label_version,
+            label_horizon=int(horizon),
+            report_date=report_date,
+        )
+        for horizon in horizon_values
+    ]
+    failed = [item for item in checks if not bool(item.get("ok", False))]
+    return {
+        "ok": not failed,
+        "enabled": True,
+        "feature_version": feature_version,
+        "label_version": label_version,
+        "label_horizons": [int(item) for item in horizon_values],
+        "checks": checks,
+        "reason": "; ".join(str(item.get("reason")) for item in failed if item.get("reason")) if failed else None,
+    }
 
 
 def _most_capable_model_suite(spec: dict[str, Any]) -> str | None:

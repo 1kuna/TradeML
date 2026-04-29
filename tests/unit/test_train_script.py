@@ -80,6 +80,22 @@ def test_prediction_report_scores_prediction_frame() -> None:
     assert report["folds"][0]["rank_ic"] == 1.0
 
 
+def test_prediction_report_supports_non_primary_label_horizon() -> None:
+    module = _load_train_module()
+    predictions = pd.DataFrame(
+        {
+            "date": ["2026-04-24", "2026-04-24", "2026-04-24"],
+            "symbol": ["A", "B", "C"],
+            "prediction": [0.1, 0.2, 0.3],
+            "label_1d": [0.1, 0.2, 0.3],
+        }
+    )
+
+    report = module._prediction_report(predictions, label_col="label_1d")
+
+    assert report["mean_rank_ic"] == 1.0
+
+
 def _load_train_module():
     module_path = Path(__file__).resolve().parents[2] / "src" / "scripts" / "train.py"
     spec = importlib.util.spec_from_file_location("train_under_test", module_path)
