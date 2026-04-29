@@ -706,6 +706,7 @@ def _dispatch_research(args: argparse.Namespace) -> int:
     data_root = Path(args.data_root or os.getenv("TRADEML_DATA_ROOT") or os.getenv("NAS_MOUNT") or ".").expanduser()
     local_state = Path(args.local_state or os.getenv("TRADEML_TRAIN_STATE") or "~/.trademl-training").expanduser()
     env_path = Path(args.env_file).expanduser() if args.env_file else Path(".env")
+    load_dotenv(env_path)
     repo_root = Path(__file__).resolve().parents[2]
     targets_config_path = repo_root / "configs" / "node.yml"
     common = {

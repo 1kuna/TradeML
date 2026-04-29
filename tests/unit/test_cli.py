@@ -493,9 +493,13 @@ def test_experiments_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
 def test_research_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     program_path = tmp_path / "program.yml"
     program_path.write_text("program_id: perpetual\nphase_order: [1]\n", encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("ALPACA_API_KEY=paper-key\nALPACA_API_SECRET=paper-secret\n", encoding="utf-8")
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_API_SECRET", raising=False)
     monkeypatch.setattr(cli, "start_research_program", lambda program_path, **kwargs: {"action": "start", "program": str(program_path), "detach": kwargs.get("detach", False)})
     monkeypatch.setattr(cli, "run_research_canary", lambda program_path, **kwargs: {"action": "canary", "program": str(program_path), "detach": kwargs.get("detach", False)})
-    monkeypatch.setattr(cli, "paper_account_smoke", lambda policy: {"action": "paper-smoke", "enabled": policy.get("enabled")})
+    monkeypatch.setattr(cli, "paper_account_smoke", lambda policy: {"action": "paper-smoke", "api_key": os.getenv("ALPACA_API_KEY"), "enabled": policy.get("enabled")})
     monkeypatch.setattr(cli, "submit_paper_orders", lambda payloads_path, policy: {"action": "paper-submit", "payloads": str(payloads_path), "enabled": policy.get("enabled")})
     monkeypatch.setattr(cli, "read_research_program_state", lambda local_state, program_id: {"action": "status", "program_id": program_id, "frontier": {"x": 1}})
     monkeypatch.setattr(cli, "pause_research_program", lambda local_state, program_id: {"action": "pause", "program_id": program_id})
@@ -508,14 +512,18 @@ def test_research_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli, "launch_agent_status", lambda label: {"action": "launchd-status", "label": label})
     monkeypatch.setattr(cli, "unload_launch_agent", lambda label: {"action": "unload-launchd", "label": label})
 
-    assert cli.main(["research", "start", "--program", str(program_path), "--detach"]) == 0
+    research_base = ["research", "--env-file", str(env_path)]
+
+    assert cli.main([*research_base, "start", "--program", str(program_path), "--detach"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "start"
-    assert cli.main(["research", "canary", "--program", str(program_path), "--detach"]) == 0
+    assert cli.main([*research_base, "canary", "--program", str(program_path), "--detach"]) == 0
     canary_payload = json.loads(capsys.readouterr().out)
     assert canary_payload["action"] == "canary"
     assert canary_payload["detach"] is True
-    assert cli.main(["research", "paper-smoke", "--program", str(program_path)]) == 0
-    assert json.loads(capsys.readouterr().out)["action"] == "paper-smoke"
+    assert cli.main([*research_base, "paper-smoke", "--program", str(program_path)]) == 0
+    paper_smoke_payload = json.loads(capsys.readouterr().out)
+    assert paper_smoke_payload["action"] == "paper-smoke"
+    assert paper_smoke_payload["api_key"] == "paper-key"
     assert cli.main(["research", "paper-submit", "--program", str(program_path), "--payloads", str(tmp_path / "payloads.json")]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "paper-submit"
     assert cli.main(["research", "status", "--program-id", "perpetual"]) == 0
