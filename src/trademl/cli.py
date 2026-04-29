@@ -253,6 +253,7 @@ def main(argv: list[str] | None = None) -> int:
     fleet_parser.add_argument("--env-file", default=None)
     fleet_subparsers = fleet_parser.add_subparsers(dest="fleet_command", required=True)
     fleet_health = fleet_subparsers.add_parser("health", help="Show one current-state verdict for Pi, Mac, NAS, and research.")
+    fleet_health.add_argument("--data-root", default=None)
     fleet_health.add_argument("--pi-host", default=None)
     fleet_health.add_argument("--pi-user", default="zach")
     fleet_health.add_argument("--pi-password-env", default="TRADEML_PI_PASSWORD")
@@ -403,6 +404,7 @@ def _dispatch_fleet(args: argparse.Namespace) -> int:
     load_dotenv(settings.env_path)
     if args.fleet_command == "health":
         snapshot = _collect_fleet_local_snapshot(settings)
+        data_root = Path(args.data_root).expanduser() if args.data_root else settings.nas_mount
         pi_host = args.pi_host or os.getenv("TRADEML_PI_HOST") or os.getenv("TRADEML_PI_TAILSCALE_HOST")
         mac_host = args.mac_host or os.getenv("TRADEML_MAC_HOST") or os.getenv("TRADEML_MAC_TAILSCALE_HOST")
         pi = (
@@ -415,7 +417,7 @@ def _dispatch_fleet(args: argparse.Namespace) -> int:
             if mac_host
             else None
         )
-        payload = collect_fleet_health(local_snapshot=snapshot, data_root=settings.nas_mount, pi=pi, mac=mac, heal=bool(args.heal))
+        payload = collect_fleet_health(local_snapshot=snapshot, data_root=data_root, pi=pi, mac=mac, heal=bool(args.heal))
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.fleet_command == "observability":

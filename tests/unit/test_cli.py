@@ -95,9 +95,15 @@ def test_fleet_health_cli_prints_current_state(tmp_path: Path, monkeypatch, caps
         encoding="utf-8",
     )
     monkeypatch.setattr(cli, "collect_dashboard_live_snapshot", lambda settings: {"runtime": {"running": True}, "collection_status": {}, "health": {}})
-    monkeypatch.setattr(cli, "collect_fleet_health", lambda **kwargs: {"verdict": "OK", "current_state": {"action": "OK"}})
+    data_root = tmp_path / "health-root"
 
-    rc = cli.main(["fleet", "--workspace-root", str(workspace), "--config", str(config_path), "health"])
+    def fake_collect_fleet_health(**kwargs):  # noqa: ANN003, ANN202
+        assert kwargs["data_root"] == data_root
+        return {"verdict": "OK", "current_state": {"action": "OK"}}
+
+    monkeypatch.setattr(cli, "collect_fleet_health", fake_collect_fleet_health)
+
+    rc = cli.main(["fleet", "--workspace-root", str(workspace), "--config", str(config_path), "health", "--data-root", str(data_root)])
 
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["verdict"] == "OK"
