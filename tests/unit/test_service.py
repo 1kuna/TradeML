@@ -3114,6 +3114,78 @@ def test_canonical_partial_task_permanently_fails_when_retry_adds_no_new_coverag
     assert progress.remaining_units == 1
 
 
+def test_canonical_repair_terminalizes_successful_vendor_with_remaining_units(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    alpaca = _BackfillConnector("alpaca")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": alpaca},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        source_name="alpaca",
+    )
+    db.upsert_planner_task(
+        task_key="canonical_repair::equities_eod::2026-04-20::008",
+        task_family="canonical_repair",
+        planner_group="canonical_repair",
+        dataset="equities_eod",
+        tier="A",
+        priority=8,
+        start_date="2026-04-20",
+        end_date="2026-04-21",
+        symbols=["HOLX"],
+        eligible_vendors=["alpaca"],
+        payload={
+            "scope_kind": "symbol_range",
+            "trading_days": ["2026-04-20", "2026-04-21"],
+        },
+    )
+    db.update_planner_task_progress(
+        task_key="canonical_repair::equities_eod::2026-04-20::008",
+        expected_units=2,
+        completed_units=0,
+        remaining_units=2,
+        remaining_symbols=["HOLX"],
+        state={"scope_kind": "symbol_range"},
+    )
+    task = db.lease_planner_task_by_key(
+        task_key="canonical_repair::equities_eod::2026-04-20::008",
+        lease_owner=service.worker_id,
+    )
+
+    assert task is not None
+    changed = service._canonical_runtime._process_canonical_planner_batch(
+        batch=[task], vendor="alpaca", exchange="XNYS"
+    )
+
+    assert changed == ["2026-04-20"]
+    refreshed = db.get_planner_task(
+        "canonical_repair::equities_eod::2026-04-20::008"
+    )
+    assert refreshed is not None
+    assert refreshed.status == "PERMANENT_FAILED"
+    assert refreshed.last_error == "canonical repair uncollectable: alpaca: remaining_units=1"
+    attempts = db.vendor_attempts_for_task(
+        "canonical_repair::equities_eod::2026-04-20::008"
+    )
+    assert [(attempt.vendor, attempt.status) for attempt in attempts] == [
+        ("alpaca", "SUCCESS")
+    ]
+    progress = db.fetch_planner_task_progress(
+        "canonical_repair::equities_eod::2026-04-20::008"
+    )
+    assert progress is not None
+    assert progress.remaining_units == 1
+
+
 def test_canonical_vendor_budget_failure_does_not_back_off_other_available_vendors(
     tmp_path: Path,
 ) -> None:

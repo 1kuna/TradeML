@@ -369,6 +369,20 @@ class CanonicalRuntime:
             if progress_payload["remaining_units"] == 0:
                 self.db.mark_planner_task_success(task.task_key)
             else:
+                if not (
+                    self._planner_task_vendor_success_reusable(
+                        task=task, vendor=vendor
+                    )
+                    or self._canonical_task_has_remaining_vendors(
+                        task, failed_vendor=vendor
+                    )
+                ):
+                    self._mark_terminal_canonical_failure(
+                        task,
+                        vendor=vendor,
+                        error=f"remaining_units={progress_payload['remaining_units']}",
+                    )
+                    continue
                 self.db.mark_planner_task_partial(
                     task.task_key,
                     error=f"remaining_units={progress_payload['remaining_units']}",
@@ -1112,6 +1126,8 @@ class CanonicalRuntime:
 
     def _planner_task_vendor_success_reusable(self, *, task: PlannerTask, vendor: str) -> bool:
         """Return whether an incomplete planner task may retry a vendor that previously succeeded."""
+        if task.task_family == "canonical_repair" or task.planner_group == "canonical_repair":
+            return False
         if task.status not in {"PARTIAL", "FAILED", "LEASED"}:
             return False
         if vendor not in task.eligible_vendors:
