@@ -232,7 +232,7 @@ def test_plan_auxiliary_tasks_includes_research_archive_lanes_with_historical_wi
     finnhub_news_tasks = [task for task in tasks if task.dataset == "company_news"]
 
     assert minute_tasks
-    assert tiingo_news_tasks
+    assert not tiingo_news_tasks
     assert finnhub_news_tasks
     assert all(
         task.planner_group == "supplemental_research_backlog"
@@ -248,19 +248,63 @@ def test_plan_auxiliary_tasks_includes_research_archive_lanes_with_historical_wi
     )
     assert any(
         task.start_date == "2025-04-10" and task.end_date == "2025-04-16"
-        for task in tiingo_news_tasks + finnhub_news_tasks
+        for task in finnhub_news_tasks
     )
     assert any(
         task.start_date == "2026-04-09" and task.end_date == "2026-04-10"
-        for task in tiingo_news_tasks + finnhub_news_tasks
+        for task in finnhub_news_tasks
     )
     assert all(
         task.payload["capture_family"] == "research_archive"
         for task in minute_tasks + tiingo_news_tasks + finnhub_news_tasks
     )
+
+
+def test_plan_auxiliary_tasks_uses_vendor_scoped_news_task_keys(
+    tmp_path: Path,
+) -> None:
+    audit_state = {
+        "capabilities": {
+            "alpaca.news.research": {
+                "doc_status": "doc_verified",
+                "live_status": "live_verified",
+                "enable_status": "research_only",
+            },
+            "fmp.stock_news.research": {
+                "doc_status": "doc_verified",
+                "live_status": "live_verified",
+                "enable_status": "research_only",
+            },
+        }
+    }
+
+    tasks = plan_auxiliary_tasks(
+        data_root=tmp_path,
+        stage_symbols=["AAPL", "MSFT"],
+        stage_years=1,
+        connectors={"alpaca": object(), "fmp": object(), "finnhub": object()},
+        audit_state=audit_state,
+        include_research=True,
+        current_date="2026-04-10",
+    )
+
+    news_tasks = [
+        task
+        for task in tasks
+        if task.output_name == "ticker_news"
+        and task.dataset in {"news", "stock_news", "company_news"}
+    ]
+    assert {task.preferred_vendors[0] for task in news_tasks} == {
+        "alpaca",
+        "fmp",
+        "finnhub",
+    }
+    assert len({task.task_key for task in news_tasks}) == len(news_tasks)
+    assert any(task.task_key.startswith("research_only::alpaca::news::") for task in news_tasks)
+    assert any(task.task_key.startswith("research_only::fmp::stock_news::") for task in news_tasks)
     assert all(
         task.payload["retention_class"] == "raw_archive"
-        for task in minute_tasks + tiingo_news_tasks + finnhub_news_tasks
+        for task in news_tasks
     )
 
 

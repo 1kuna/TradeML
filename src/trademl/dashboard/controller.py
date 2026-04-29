@@ -818,6 +818,7 @@ def replan_coverage(settings: NodeSettings) -> dict[str, Any]:
         stage_years=stage_years,
         connectors=_connectors_from_settings(settings),
         audit_state=audit_state,
+        include_research=True,
     )
     payload = {
         "generated_at": datetime.now(tz=UTC).isoformat(),

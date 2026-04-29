@@ -359,6 +359,46 @@ def test_run_vendor_audit_and_replan_coverage_persist_outputs(tmp_path: Path, mo
     assert plan["task_count"] >= 0
 
 
+def test_replan_coverage_includes_research_lanes(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    nas_mount = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_mount),
+                    "nas_share": "//127.0.0.1/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (workspace / ".env").write_text("", encoding="utf-8")
+    (workspace / "stage.yml").write_text(
+        yaml.safe_dump({"current": 1, "symbols": ["AAPL"], "years": 1}, sort_keys=False),
+        encoding="utf-8",
+    )
+    settings = resolve_node_settings(workspace_root=workspace, config_path=config_path)
+    seen: dict[str, object] = {}
+
+    def fake_plan_coverage_tasks(**kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(dashboard_controller, "plan_coverage_tasks", fake_plan_coverage_tasks)
+    monkeypatch.setattr(dashboard_controller, "_connectors_from_settings", lambda settings: {})
+
+    replan_coverage(settings)
+
+    assert seen["include_research"] is True
+
+
 def test_collect_dashboard_snapshot_uses_freeze_cutoff_in_training_command(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
     nas_mount = tmp_path / "nas"

@@ -24,6 +24,7 @@ from trademl.data_node.auditor import PartitionAuditor
 from trademl.data_node.auxiliary_runtime import (
     AuxiliaryRuntime,
     ReferenceCollectionResult,
+    _looks_like_entitlement_failure,
 )
 from trademl.data_node.capabilities import auxiliary_capabilities, forward_capabilities
 from trademl.data_node.canonical_runtime import CanonicalRuntime
@@ -1221,43 +1222,175 @@ class DataNodeService:
         """Process one eligible auxiliary task for a vendor lane."""
         if self._stop_event.is_set():
             return []
-        task = None
-        if self._should_prioritize_minute_lane(vendor):
-            task = self.db.lease_next_planner_task(
-                lease_owner=self.worker_id,
-                task_families=("supplemental_research",),
-                datasets=("equities_minute",),
-                vendor=vendor,
-            )
-        if task is None:
-            task = self.db.lease_next_planner_task(
-                lease_owner=self.worker_id,
-                task_families=(
-                    "security_master",
-                    "corp_actions",
-                    "events_filings",
-                    "macro",
-                    "supplemental_research",
-                ),
-                vendor=vendor,
-            )
+        task = self._lease_next_auxiliary_task_for_vendor(vendor)
         if task is None:
             return []
+        self._auxiliary_runtime._process_auxiliary_planner_task(task, vendor)
+        refreshed = self.db.get_planner_task(task.task_key)
+        if (
+            refreshed is not None
+            and refreshed.status == "PERMANENT_FAILED"
+            and _looks_like_entitlement_failure(str(refreshed.last_error or ""))
+        ):
+            self._mark_entitlement_blocked_lane(
+                vendor=vendor,
+                dataset=refreshed.dataset,
+                reason=str(refreshed.last_error or "entitlement blocked"),
+            )
+        return [task.task_key]
+
+    def _lease_next_auxiliary_task_for_vendor(self, vendor: str):
+        """Lease the highest-priority affordable auxiliary task for one vendor."""
+        task_families = (
+            "security_master",
+            "corp_actions",
+            "events_filings",
+            "macro",
+            "supplemental_research",
+        )
+        preferred_datasets = (
+            ("equities_minute",) if self._should_prioritize_minute_lane(vendor) else ()
+        )
+        dataset_passes: list[tuple[str, ...] | None] = []
+        if preferred_datasets:
+            dataset_passes.append(preferred_datasets)
+        dataset_passes.append(None)
+        for datasets_filter in dataset_passes:
+            page = 0
+            while not self._stop_event.is_set():
+                tasks = self.db.fetch_planner_tasks(
+                    task_families=task_families,
+                    statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+                    vendor=vendor,
+                    datasets=datasets_filter,
+                    limit=256,
+                    offset=page * 256,
+                )
+                if not tasks:
+                    break
+                for candidate in tasks:
+                    leased = self._lease_auxiliary_candidate_if_available(
+                        candidate, vendor
+                    )
+                    if leased is not None:
+                        return leased
+                page += 1
+        self._record_idle_budget_warning_for_vendor(vendor)
+        return None
+
+    def _lease_auxiliary_candidate_if_available(self, candidate, vendor: str):
+        """Lease an auxiliary candidate after lane-state and budget checks."""
+        if _looks_like_entitlement_failure(str(candidate.last_error or "")):
+            self._mark_entitlement_blocked_lane(
+                vendor=vendor,
+                dataset=candidate.dataset,
+                reason=str(candidate.last_error),
+            )
+            return None
+        lane = self.db.get_vendor_lane_health(vendor=vendor, dataset=candidate.dataset)
+        if lane is not None and lane.state == "ENTITLEMENT_BLOCKED":
+            return None
         cooldown = self.db.get_active_vendor_lane_cooldown(
-            vendor=vendor, dataset=task.dataset
+            vendor=vendor, dataset=candidate.dataset
         )
         if cooldown is not None:
-            self.db.mark_planner_task_partial(
-                task.task_key,
-                error=(
-                    f"{vendor}:{task.dataset}: lane cooldown until "
-                    f"{cooldown.cooldown_until}"
-                ),
-                backoff_minutes=30,
+            return None
+        if not self._auxiliary_vendor_can_afford_task(vendor, candidate):
+            self._auxiliary_runtime._mark_budget_blocked_lane(
+                vendor=vendor,
+                dataset=candidate.dataset,
+                reason="budget exhausted",
             )
-            return [task.task_key]
-        self._auxiliary_runtime._process_auxiliary_planner_task(task, vendor)
-        return [task.task_key]
+            return None
+        return self.db.lease_planner_task_by_key(
+            task_key=candidate.task_key,
+            lease_owner=self.worker_id,
+        )
+
+    def _auxiliary_vendor_can_afford_task(self, vendor: str, task) -> bool:
+        """Return whether a vendor has local budget for an auxiliary task."""
+        connector = self.connectors.get(vendor)
+        budget_manager = getattr(connector, "budget_manager", None)
+        if budget_manager is None:
+            return True
+        job = {
+            "credit_cost": task.payload.get("credit_cost"),
+            "request_units": task.payload.get("request_units", 1),
+        }
+        units = self._auxiliary_runtime._job_credit_cost(job)
+        return bool(budget_manager.can_spend(vendor, task_kind="OTHER", units=units))
+
+    def _mark_entitlement_blocked_lane(
+        self, *, vendor: str, dataset: str, reason: str
+    ) -> None:
+        """Persist a permanent free-plan entitlement block for a vendor/dataset."""
+        self.db.upsert_vendor_lane_health(
+            vendor=vendor,
+            dataset=dataset,
+            state="ENTITLEMENT_BLOCKED",
+            recent_permanent_failures=1,
+        )
+        self.db.mark_planner_tasks_permanent_for_vendor_dataset(
+            vendor=vendor,
+            dataset=dataset,
+            error=f"{vendor}:{dataset}: entitlement blocked: {reason}",
+            task_families=(
+                "security_master",
+                "corp_actions",
+                "events_filings",
+                "macro",
+                "supplemental_research",
+            ),
+        )
+
+    def _record_idle_budget_warning_for_vendor(self, vendor: str) -> bool:
+        """Record when a vendor has affordable eligible work but no leased task."""
+        now_iso = datetime.now(tz=UTC).isoformat()
+        tasks = self.db.fetch_planner_tasks(
+            task_families=(
+                "security_master",
+                "corp_actions",
+                "events_filings",
+                "macro",
+                "supplemental_research",
+            ),
+            statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+            vendor=vendor,
+            limit=256,
+        )
+        for candidate in tasks:
+            if (
+                candidate.status == "LEASED"
+                and candidate.lease_expires_at
+                and candidate.lease_expires_at > now_iso
+            ):
+                continue
+            if candidate.next_eligible_at and candidate.next_eligible_at > now_iso:
+                continue
+            lane = self.db.get_vendor_lane_health(
+                vendor=vendor, dataset=candidate.dataset
+            )
+            if lane is not None and lane.state == "ENTITLEMENT_BLOCKED":
+                continue
+            if self.db.get_active_vendor_lane_cooldown(
+                vendor=vendor, dataset=candidate.dataset
+            ):
+                continue
+            if not self._auxiliary_vendor_can_afford_task(vendor, candidate):
+                continue
+            self.db.upsert_vendor_lane_health(
+                vendor=vendor,
+                dataset=candidate.dataset,
+                state="IDLE_BUDGET",
+            )
+            LOGGER.warning(
+                "idle_vendor_budget vendor=%s dataset=%s task_key=%s",
+                vendor,
+                candidate.dataset,
+                candidate.task_key,
+            )
+            return True
+        return False
 
     def _should_prioritize_minute_lane(self, vendor: str) -> bool:
         """Return whether this vendor should pull minute archive work before fillers."""
@@ -1277,13 +1410,7 @@ class DataNodeService:
         )
         if not has_minute_capability:
             return False
-        macro_pressure = self.db.has_pending_planner_tasks(task_families=("macro",))
-        canonical_pressure = self.db.has_pending_planner_tasks(
-            task_families=("canonical_bars", "canonical_repair")
-        )
-        return not macro_pressure and (
-            not canonical_pressure or self._allow_auxiliary_during_canonical_tail()
-        )
+        return True
 
     def collect_reference_data(
         self, jobs: list[dict[str, object]]

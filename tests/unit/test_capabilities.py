@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from trademl.connectors.base import PermanentConnectorError
 from trademl.data_node.audit import run_capability_audit
 from trademl.data_node.capabilities import (
     backfill_capabilities,
@@ -97,7 +98,7 @@ def test_effective_capabilities_include_live_verified_research_lanes_only_when_r
     )
     research_ids = {capability.capability_id for capability in research_enabled}
     assert "alpaca.equities_minute.research" in research_ids
-    assert "tiingo.news.research" in research_ids
+    assert "tiingo.news.research" not in research_ids
     assert "finnhub.company_news.research" in research_ids
     assert "twelve_data.price_target.research" not in research_ids
 
@@ -137,9 +138,11 @@ def test_provider_role_matrix_captures_runtime_roles() -> None:
 
 def test_effective_enable_status_disables_doc_unverified_or_live_failed() -> None:
     capability = capability_map()["twelve_data.price_target.research"]
-    assert effective_enable_status(capability) == "research_only"
+    assert effective_enable_status(capability) == "disabled"
     failed_override = {"capabilities": {capability.capability_id: {"doc_status": "doc_verified", "live_status": "live_failed", "enable_status": "research_only"}}}
     assert effective_enable_status(capability, audit_state=failed_override) == "disabled"
+    verified_override = {"capabilities": {capability.capability_id: {"doc_status": "doc_verified", "live_status": "live_verified", "enable_status": "research_only"}}}
+    assert effective_enable_status(capability, audit_state=verified_override) == "research_only"
 
 
 def test_run_capability_audit_persists_summary(tmp_path: Path) -> None:
@@ -162,6 +165,25 @@ def test_run_capability_audit_persists_summary(tmp_path: Path) -> None:
     assert output.exists()
     assert report["summary"]["live_status"]["live_verified"] > 0
     assert "alpaca.equities_eod.forward" in report["capabilities"]
+
+
+def test_run_capability_audit_marks_permission_denials_entitlement_blocked() -> None:
+    capability = capability_map()["tiingo.news.research"]
+    report = run_capability_audit(
+        connectors={
+            "tiingo": _Connector(
+                "tiingo",
+                failures={"news": PermanentConnectorError('{"detail":"You do not have permission to access the News API"}')},
+            )
+        },
+        capabilities=[capability],
+    )
+
+    result = report["capabilities"]["tiingo.news.research"]
+    assert result["live_status"] == "entitlement_blocked"
+    assert result["enable_status"] == "disabled"
+    assert report["summary"]["live_status"]["entitlement_blocked"] == 1
+    assert report["summary"]["failures"] == []
 
 
 def test_default_macro_series_covers_minimum_pack() -> None:

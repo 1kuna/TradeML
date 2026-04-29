@@ -50,6 +50,7 @@ vendors:
     datasets:
     - equities_eod
     - equities_minute
+    - news
     role: primary_bars
   tiingo:
     rpm: 158
@@ -119,6 +120,7 @@ vendors:
     datasets:
     - corp_actions
     - listings
+    - news_sentiment
     role: reference
   fred:
     rpm: 114
@@ -142,6 +144,8 @@ vendors:
     - symbol_changes
     - earnings_calendar
     - fundamentals
+    - stock_news
+    - press_releases
     role: reference
   sec_edgar:
     rpm: 600

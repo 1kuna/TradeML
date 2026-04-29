@@ -149,6 +149,21 @@ class _BudgetBlockedAuxiliaryConnector:
         raise TemporaryConnectorError("budget exhausted for vendor=finnhub")
 
 
+class _EntitlementBlockedAuxiliaryConnector:
+    vendor_name = "tiingo"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def fetch(
+        self, dataset: str, symbols: list[str], start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        self.calls.append((dataset, tuple(symbols)))
+        raise PermanentConnectorError(
+            'tiingo request failed: 403 {"detail":"You do not have permission to access the News API"}'
+        )
+
+
 class _SecCompanyfactsConnector:
     vendor_name = "sec_edgar"
 
@@ -1474,6 +1489,164 @@ def test_budget_blocked_auxiliary_lane_defers_peer_tasks_without_retry_storm(
     assert first.next_eligible_at is not None
     assert second.next_eligible_at == lane.cooldown_until
     assert "budget exhausted" in str(second.last_error)
+
+
+def test_entitlement_blocked_auxiliary_lane_permanently_blocks_peer_tasks(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    connector = _EntitlementBlockedAuxiliaryConnector()
+    service = DataNodeService(
+        db=db,
+        connectors={"tiingo": connector},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    for symbol in ("AAPL", "MSFT"):
+        db.upsert_planner_task(
+            task_key=f"news::tiingo::{symbol}",
+            task_family="supplemental_research",
+            planner_group="supplemental_research_backlog",
+            dataset="news",
+            tier="B",
+            priority=255,
+            start_date="2026-04-01",
+            end_date="2026-04-28",
+            symbols=[symbol],
+            eligible_vendors=["tiingo"],
+            output_name="ticker_news",
+            payload={"scope_kind": "symbol_range"},
+        )
+
+    service._drain_auxiliary_lane("tiingo")
+    service._drain_auxiliary_lane("tiingo")
+
+    assert connector.calls == [("news", ("AAPL",))]
+    lane = db.get_vendor_lane_health(vendor="tiingo", dataset="news")
+    assert lane is not None
+    assert lane.state == "ENTITLEMENT_BLOCKED"
+    first = db.get_planner_task("news::tiingo::AAPL")
+    second = db.get_planner_task("news::tiingo::MSFT")
+    assert first is not None
+    assert second is not None
+    assert first.status == "PERMANENT_FAILED"
+    assert second.status == "PERMANENT_FAILED"
+    assert "entitlement blocked" in str(second.last_error)
+
+
+def test_auxiliary_lane_skips_blocked_news_and_runs_alpaca_minute_with_repair_pressure(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NewsConnector("alpaca")},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    service.default_symbols = ["AAPL"]
+    db.upsert_vendor_lane_health(
+        vendor="alpaca", dataset="news", state="ENTITLEMENT_BLOCKED"
+    )
+    db.upsert_planner_task(
+        task_key="canonical_repair::equities_eod::2026-04-27::000",
+        task_family="canonical_repair",
+        planner_group="canonical_repair",
+        dataset="equities_eod",
+        tier="A",
+        priority=8,
+        start_date="2026-04-27",
+        end_date="2026-04-27",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_bars",
+        payload={"scope_kind": "symbol_range"},
+    )
+    db.upsert_planner_task(
+        task_key="news::alpaca::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="news",
+        tier="B",
+        priority=70,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="ticker_news",
+        payload={"scope_kind": "symbol_range"},
+    )
+    db.upsert_planner_task(
+        task_key="minute::alpaca::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="equities_minute",
+        tier="B",
+        priority=205,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_minute",
+        payload={"scope_kind": "symbol_range"},
+    )
+    processed: list[str] = []
+
+    def process_task(task, vendor):  # noqa: ANN001
+        processed.append(f"{vendor}:{task.task_key}")
+
+    service._auxiliary_runtime._process_auxiliary_planner_task = process_task  # type: ignore[method-assign]
+
+    service._drain_auxiliary_lane("alpaca")
+
+    assert processed == ["alpaca:minute::alpaca::AAPL"]
+
+
+def test_idle_budget_warning_records_affordable_unleased_work(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    db.upsert_planner_task(
+        task_key="minute::idle::AAPL",
+        task_family="supplemental_research",
+        planner_group="supplemental_research_backlog",
+        dataset="equities_minute",
+        tier="B",
+        priority=205,
+        start_date="2026-04-01",
+        end_date="2026-04-01",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_minute",
+        payload={"scope_kind": "symbol_range"},
+    )
+
+    assert service._record_idle_budget_warning_for_vendor("alpaca") is True
+    lane = db.get_vendor_lane_health(vendor="alpaca", dataset="equities_minute")
+    assert lane is not None
+    assert lane.state == "IDLE_BUDGET"
 
 
 def test_run_cluster_forever_backfill_renews_runtime_heartbeat(tmp_path: Path) -> None:
@@ -4520,7 +4693,6 @@ def test_aux_lane_widths_keep_research_vendors_hot_under_canonical_pressure(
     widths = service._aux_lane_widths(task_kinds={"RESEARCH_ONLY"})
 
     assert widths["alpaca"] == 1
-    assert widths["tiingo"] == 1
     assert widths["finnhub"] == 1
 
 
@@ -4643,7 +4815,6 @@ def test_planned_auxiliary_work_includes_research_archive_jobs(tmp_path: Path) -
 
     datasets = {job["dataset"] for job in reference_jobs}
     assert "equities_minute" in datasets
-    assert "news" in datasets
     assert "company_news" in datasets
 
 

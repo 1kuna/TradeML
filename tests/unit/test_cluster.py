@@ -50,6 +50,7 @@ def _seed_workspace(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                     "maintenance_hour_local": 2,
                 },
                 "stage": {"current": 0},
+                "collection": {"saturation": {"enabled": True, "target_utilization": 0.98}},
                 "vendors": {"alpaca": {"rpm": 150, "daily_cap": 10000}},
             },
             sort_keys=False,
@@ -116,6 +117,9 @@ def test_coordinator_bootstrap_and_rebuild_state(tmp_path: Path) -> None:
         universe_builder=lambda count: [f"SYM{index:03d}" for index in range(count)],
     )
     manifest = coordinator.ensure_cluster_ready(passphrase="pass123")
+    node_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert manifest["collection"]["saturation"]["enabled"] is True
+    assert node_config["collection"]["saturation"]["target_utilization"] == 0.98
     rebuilt = coordinator.rebuild_local_state(local_db_path=workspace / "control" / "node.sqlite", current_date="2025-01-06")
 
     assert manifest["stage"]["symbols"]

@@ -485,7 +485,11 @@ def _materialize_capability_tasks(
             window_id = f"{window_index:04d}"
             tasks.append(
                 PlannedTask(
-                    task_key=f"{capability.task_kind.lower()}::{capability.dataset}::{chunk_id}::{window_id}::{start_date}::{end_date}",
+                    task_key=(
+                        f"{capability.task_kind.lower()}::{capability.vendor}::"
+                        f"{capability.dataset}::{chunk_id}::{window_id}::"
+                        f"{start_date}::{end_date}"
+                    ),
                     task_family="auxiliary",
                     planner_group=capability.planner_group,
                     dataset=capability.dataset,

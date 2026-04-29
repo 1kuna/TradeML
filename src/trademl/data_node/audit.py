@@ -14,6 +14,17 @@ import pandas as pd
 from trademl.connectors.base import BaseConnector, ConnectorError, PermanentConnectorError, TemporaryConnectorError
 from trademl.data_node.capabilities import VendorCapability, capability_registry, provider_role_matrix
 
+ENTITLEMENT_AUDIT_MARKERS = (
+    "403",
+    "402",
+    "not_entitled",
+    "not entitled",
+    "not permitted",
+    "forbidden",
+    "permission to access",
+    "subscription",
+)
+
 
 @dataclass(slots=True, frozen=True)
 class CapabilityAuditResult:
@@ -84,8 +95,7 @@ def run_capability_audit(
             frame = connector.fetch(capability.dataset, symbols, start_date, end_date)
         except PermanentConnectorError as exc:
             message = str(exc)
-            live_status = "entitlement_blocked" if "NOT_ENTITLED" in message or "403" in message or "402" in message else "live_failed"
-            enable_status = capability.enable_status if capability.doc_status == "doc_verified" and live_status == "entitlement_blocked" else "disabled"
+            live_status = "entitlement_blocked" if _looks_like_entitlement_failure(message) else "live_failed"
             results.append(
                 CapabilityAuditResult(
                     capability_id=capability.capability_id,
@@ -94,7 +104,7 @@ def run_capability_audit(
                     endpoint=capability.endpoint,
                     doc_status=capability.doc_status,
                     live_status=live_status,
-                    enable_status=enable_status,
+                    enable_status="disabled",
                     checked_at=checked_at,
                     elapsed_ms=(perf_counter() - started) * 1000,
                     rows=0,
@@ -161,6 +171,12 @@ def summarize_audit_results(results: list[CapabilityAuditResult]) -> dict[str, A
     return {"live_status": counts, "enable_status": enabled, "failures": failures[:25]}
 
 
+def _looks_like_entitlement_failure(message: str) -> bool:
+    """Return whether an audit failure means the key is not entitled to a lane."""
+    text = str(message or "").lower()
+    return any(marker in text for marker in ENTITLEMENT_AUDIT_MARKERS)
+
+
 def _sample_request(capability: VendorCapability, *, anchor: pd.Timestamp) -> tuple[str, str, list[str]]:
     """Return a tiny live canary request for a capability."""
     end_date = anchor.strftime("%Y-%m-%d")
@@ -172,7 +188,17 @@ def _sample_request(capability: VendorCapability, *, anchor: pd.Timestamp) -> tu
         return (anchor - pd.Timedelta(days=5)).strftime("%Y-%m-%d"), end_date, ["AAPL"]
     if capability.dataset in {"corp_actions", "reference_dividends", "reference_splits", "dividends", "splits"}:
         return annual_start, end_date, ["AAPL"]
-    if capability.dataset in {"financial_statements", "company_profile", "price_target", "insider_transactions", "news", "company_news"}:
+    if capability.dataset in {
+        "financial_statements",
+        "company_profile",
+        "price_target",
+        "insider_transactions",
+        "news",
+        "company_news",
+        "news_sentiment",
+        "stock_news",
+        "press_releases",
+    }:
         return annual_start, end_date, ["AAPL"]
     if capability.dataset == "filing_index":
         return annual_start, end_date, ["320193"]

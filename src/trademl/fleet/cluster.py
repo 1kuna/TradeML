@@ -197,6 +197,9 @@ class ClusterCoordinator:
             "stage": manifest["stage_config"],
             "vendors": manifest["vendors"],
         }
+        for section in ("collection", "training", "training_targets"):
+            if section in manifest:
+                node_payload[section] = manifest[section]
         _write_yaml(self.config_path, node_payload)
         env_values = read_env_file(self.env_path)
         env_values.update(
@@ -499,6 +502,9 @@ class ClusterCoordinator:
             },
             "stage_config": local_config.get("stage", {}),
             "vendors": local_config.get("vendors", {}),
+            "collection": local_config.get("collection", {}),
+            "training": local_config.get("training", {}),
+            "training_targets": local_config.get("training_targets", {}),
             "datasets": {
                 "equities_eod": {
                     "shard_count": int(local_config.get("node", {}).get("shard_count", 8)),

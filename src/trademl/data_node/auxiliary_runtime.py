@@ -35,6 +35,23 @@ from trademl.reference.security_master import rebuild_derived_references
 
 LOGGER = logging.getLogger(__name__)
 
+ENTITLEMENT_FAILURE_MARKERS = (
+    "403",
+    "402",
+    "not_entitled",
+    "not entitled",
+    "not permitted",
+    "forbidden",
+    "permission to access",
+    "subscription",
+)
+
+
+def _looks_like_entitlement_failure(message: str) -> bool:
+    """Return whether a connector error means the current key cannot use a lane."""
+    text = str(message or "").lower()
+    return any(marker in text for marker in ENTITLEMENT_FAILURE_MARKERS)
+
 
 @dataclass(slots=True)
 class ReferenceCollectionResult:
@@ -264,8 +281,12 @@ class AuxiliaryRuntime:
             planner_group=task.planner_group,
         )
         if result.failures:
+            permanent = bool(result.state.get("permanent_failure"))
             self.db.mark_planner_task_failed(
-                task.task_key, error=" | ".join(result.failures), backoff_minutes=15
+                task.task_key,
+                error=" | ".join(result.failures),
+                backoff_minutes=0 if permanent else 15,
+                permanent=permanent,
             )
         elif result.deferred:
             self.db.mark_planner_task_partial(
@@ -582,19 +603,27 @@ class AuxiliaryRuntime:
                 str(job["end_date"]),
             )
         except PermanentConnectorError as exc:
+            message = str(exc)
+            blocked_reason = (
+                "entitlement_blocked"
+                if _looks_like_entitlement_failure(message)
+                else "permanent_failure"
+            )
             self.db.mark_vendor_attempt_failed(
                 task_key=effective_task_key,
                 vendor=vendor,
-                error=str(exc),
+                error=message,
                 backoff_minutes=0,
                 permanent=True,
             )
             return AuxiliaryExecutionResult(
                 outputs=[],
-                failures=[f"{vendor}:{job['dataset']}:{job.get('symbols', [])}:{exc}"],
+                failures=[
+                    f"{vendor}:{job['dataset']}:{job.get('symbols', [])}:{message}"
+                ],
                 deferred=0,
                 rows_returned=0,
-                state={},
+                state={"permanent_failure": True, "blocked_reason": blocked_reason},
             )
         except ConnectorError as exc:
             message = str(exc)

@@ -199,6 +199,48 @@ def test_alpaca_connector_normalizes_minute_bars() -> None:
     assert session.calls[0][2]["limit"] == 10000
 
 
+def test_alpaca_connector_normalizes_news() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "news": [
+                        {
+                            "id": 123,
+                            "created_at": "2026-04-09T13:30:00Z",
+                            "updated_at": "2026-04-09T13:35:00Z",
+                            "headline": "Apple news",
+                            "summary": "Summary",
+                            "url": "https://example.com/apple",
+                            "source": "ExampleWire",
+                            "symbols": ["AAPL", "MSFT"],
+                            "images": [{"url": "https://example.com/apple.png"}],
+                        }
+                    ],
+                    "next_page_token": None,
+                },
+            )
+        ]
+    )
+    connector = AlpacaConnector(
+        base_url="https://data.alpaca.markets",
+        trading_base_url="https://paper-api.alpaca.markets/v2",
+        api_key="key",
+        secret_key="secret",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    frame = connector.fetch("news", ["AAPL", "MSFT"], "2026-04-09", "2026-04-09")
+
+    assert frame.iloc[0]["symbol"] == "AAPL"
+    assert frame.iloc[0]["related_symbols"] == ("AAPL", "MSFT")
+    assert frame.iloc[0]["headline"] == "Apple news"
+    assert session.calls[0][1] == "https://data.alpaca.markets/v1beta1/news"
+    assert session.calls[0][2]["symbols"] == "AAPL,MSFT"
+
+
 def test_twelve_data_batch_fetch_records_weighted_request_telemetry() -> None:
     session = FakeSession(
         [
@@ -594,6 +636,84 @@ def test_finnhub_connector_normalizes_company_news() -> None:
     assert frame.iloc[0]["category"] == "company"
     assert session.calls[0][2]["from"] == "2026-04-08"
     assert session.calls[0][2]["to"] == "2026-04-09"
+
+
+def test_alpha_vantage_connector_normalizes_news_sentiment() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "feed": [
+                        {
+                            "title": "Apple sentiment",
+                            "url": "https://example.com/av",
+                            "time_published": "20260409T133000",
+                            "summary": "AV summary",
+                            "source": "ExampleWire",
+                            "banner_image": "https://example.com/av.png",
+                            "ticker_sentiment": [
+                                {"ticker": "AAPL"},
+                                {"ticker": "MSFT"},
+                            ],
+                            "topics": [{"topic": "Technology"}],
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    connector = AlphaVantageConnector(
+        base_url="https://www.alphavantage.co",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    frame = connector.fetch(
+        "news_sentiment", ["AAPL", "MSFT"], "2026-04-09", "2026-04-09"
+    )
+
+    assert frame.iloc[0]["symbol"] == "AAPL"
+    assert frame.iloc[0]["related_symbols"] == ("AAPL", "MSFT")
+    assert frame.iloc[0]["tags"] == ("TECHNOLOGY",)
+    assert session.calls[0][2]["function"] == "NEWS_SENTIMENT"
+    assert session.calls[0][2]["limit"] == 1000
+
+
+def test_fmp_connector_normalizes_stock_news() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                [
+                    {
+                        "publishedDate": "2026-04-09T13:30:00Z",
+                        "title": "Apple FMP news",
+                        "text": "FMP summary",
+                        "url": "https://example.com/fmp",
+                        "image": "https://example.com/fmp.png",
+                        "site": "ExampleWire",
+                        "symbols": "AAPL,MSFT",
+                    }
+                ],
+            )
+        ]
+    )
+    connector = FMPConnector(
+        base_url="https://financialmodelingprep.com",
+        api_key="key",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    frame = connector.fetch("stock_news", ["AAPL", "MSFT"], "2026-04-09", "2026-04-09")
+
+    assert frame.iloc[0]["symbol"] == "AAPL"
+    assert frame.iloc[0]["related_symbols"] == ("AAPL", "MSFT")
+    assert frame.iloc[0]["headline"] == "Apple FMP news"
+    assert session.calls[0][1] == "https://financialmodelingprep.com/stable/news/stock"
+    assert session.calls[0][2]["symbols"] == "AAPL,MSFT"
 
 
 def test_alpha_vantage_and_fred_connectors() -> None:

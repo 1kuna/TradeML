@@ -1100,6 +1100,42 @@ class DataNodeDB:
             )
         return int(cursor.rowcount)
 
+    def mark_planner_tasks_permanent_for_vendor_dataset(
+        self,
+        *,
+        vendor: str,
+        dataset: str,
+        error: str,
+        task_families: tuple[str, ...] | None = None,
+    ) -> int:
+        """Permanently block all planner tasks for an unavailable vendor/dataset lane."""
+        clauses = [
+            "dataset = ?",
+            "eligible_vendors_json LIKE ?",
+            "status IN ('PENDING', 'PARTIAL', 'FAILED', 'LEASED')",
+        ]
+        params: list[object] = [dataset, f'%"{vendor}"%']
+        if task_families:
+            placeholders = ",".join("?" for _ in task_families)
+            clauses.append(f"task_family IN ({placeholders})")
+            params.extend(task_families)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE planner_tasks
+                SET status = 'PERMANENT_FAILED',
+                    lease_owner = NULL,
+                    leased_at = NULL,
+                    lease_expires_at = NULL,
+                    next_eligible_at = NULL,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE {" AND ".join(clauses)}
+                """,
+                (error, utc_now().isoformat(), *params),
+            )
+        return int(cursor.rowcount)
+
     def fetch_partition_status(self) -> list[sqlite3.Row]:
         """Return the mirrored partition ledger for testing and sync."""
         with self._connect() as connection:
