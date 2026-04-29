@@ -108,6 +108,33 @@ def test_current_state_issues_accept_remote_pi_online_when_local_pid_missing() -
     assert [issue["kind"] for issue in issues] == []
 
 
+def test_observability_uses_remote_mac_research_when_local_summary_missing(tmp_path: Path) -> None:
+    data_root = tmp_path / "nas"
+    data_root.mkdir()
+
+    payload = build_fleet_observability(
+        snapshot={
+            "runtime": {"running": True},
+            "fleet_remote": {
+                "mac": {
+                    "status": "online",
+                    "research": {
+                        "status": "RUNNING",
+                        "current_experiment_id": "perpetual-macmini-p1-f188",
+                        "wait_reason": None,
+                    },
+                }
+            },
+        },
+        data_root=data_root,
+        now=datetime(2026, 4, 29, 12, tzinfo=UTC),
+    )
+
+    assert payload["research"]["status"] == "RUNNING"
+    assert payload["research"]["current_experiment_id"] == "perpetual-macmini-p1-f188"
+    assert payload["research"]["supervisor_running"] is True
+
+
 def test_fleet_health_records_remote_failures_without_healing_active_services(tmp_path: Path, monkeypatch) -> None:
     data_root = tmp_path / "nas"
     data_root.mkdir()

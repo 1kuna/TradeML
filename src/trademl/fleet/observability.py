@@ -304,11 +304,12 @@ def _archive_schema_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
 def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     program = dict((snapshot.get("health") or {}).get("research_program_summary") or {})
     experiment = dict(snapshot.get("experiment_summary") or {})
+    remote_research = dict(((snapshot.get("fleet_remote") or {}).get("mac") or {}).get("research") or {})
     best = dict(program.get("best_candidate_summary") or {})
     return {
-        "status": str(program.get("status") or "UNKNOWN"),
-        "current_experiment_id": program.get("current_experiment_id") or experiment.get("experiment_id"),
-        "supervisor_running": str(program.get("status") or "").upper() == "RUNNING",
+        "status": str(program.get("status") or remote_research.get("status") or "UNKNOWN"),
+        "current_experiment_id": program.get("current_experiment_id") or experiment.get("experiment_id") or remote_research.get("current_experiment_id"),
+        "supervisor_running": str(program.get("status") or remote_research.get("status") or "").upper() == "RUNNING",
         "completed_runs_24h": int(program.get("completed_runs_24h") or experiment.get("completed_24h") or 0),
         "completed_runs_7d": int(program.get("completed_runs_7d") or experiment.get("completed_7d") or 0),
         "failed_runs_24h": int(program.get("failed_runs_24h") or experiment.get("failed_24h") or 0),
@@ -319,7 +320,7 @@ def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
         "best_decision_reason": best.get("best_decision_reason") or experiment.get("best_decision_reason"),
         "frontier_lane": program.get("frontier_architecture") or program.get("frontier") or {},
         "data_revision": program.get("data_revision") or experiment.get("data_revision"),
-        "reason": program.get("wait_reason") or best.get("best_decision_reason"),
+        "reason": program.get("wait_reason") or remote_research.get("wait_reason") or best.get("best_decision_reason"),
     }
 
 
