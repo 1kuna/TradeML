@@ -1032,6 +1032,7 @@ def research_health(
         python_executable=python_executable,
     )
     latest_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=current_experiment_id) if current_experiment_id else {}
+    active_run = _active_experiment_run_summary(latest_summary)
     modeling_metadata = modeling_artifact_metadata(data_root=data_root)
     alerts = evaluate_research_drift(
         program_id=program_id,
@@ -1073,11 +1074,28 @@ def research_health(
             "label_version": modeling_metadata.get("label_version"),
             "label_horizons": modeling_metadata.get("label_horizons"),
             "data_revision": modeling_metadata.get("data_revision"),
-            "current_label_horizon": latest_summary.get("label_horizon"),
-            "current_portfolio_profile": latest_summary.get("portfolio_profile"),
+            "current_label_horizon": latest_summary.get("label_horizon") or active_run.get("label_horizon"),
+            "current_feature_version": latest_summary.get("feature_version") or active_run.get("feature_version"),
+            "current_portfolio_profile": latest_summary.get("portfolio_profile") or active_run.get("portfolio_profile"),
         },
         "paths": _research_path_summary(local_state=local_state, data_root=data_root),
     }
+
+
+def _active_experiment_run_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Return the most relevant current run row from an experiment summary."""
+    status_order = {"RUNNING": 0, "STARTING": 1, "PLANNED": 2, "COMPLETED": 3}
+    rows = [dict(row) for row in list(summary.get("runs") or []) if isinstance(row, dict)]
+    if not rows:
+        return {}
+    rows.sort(
+        key=lambda row: (
+            status_order.get(str(row.get("status") or ""), 99),
+            int(row.get("phase") or 0),
+            str(row.get("run_id") or ""),
+        )
+    )
+    return rows[0]
 
 
 def build_research_features(

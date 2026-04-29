@@ -1719,6 +1719,66 @@ def test_research_health_uses_post_sweep_experiment_summary(tmp_path: Path, monk
     assert captured["summary"] == {"experiment_id": "exp-a", "counts": {"COMPLETED": 1}}
 
 
+def test_research_health_reports_active_run_modeling_metadata(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    data_root = tmp_path / "nas"
+    program_path = _program_spec(tmp_path)
+    state = research._initial_program_state(  # noqa: SLF001
+        spec=research._load_research_program_spec(program_path),  # noqa: SLF001
+        program_path=program_path,
+        poll_seconds=30,
+    )
+    state["current_experiment_id"] = "exp-a"
+    research._write_program_state(local_state=local_state, program_id="perpetual-macmini", payload=state)  # noqa: SLF001
+    summary_path = local_state / "experiments" / "exp-a" / "summary.json"
+    summary_path.parent.mkdir(parents=True)
+    summary_path.write_text(
+        json.dumps(
+            {
+                "experiment_id": "exp-a",
+                "runs": [
+                    {
+                        "run_id": "run-a",
+                        "status": "RUNNING",
+                        "feature_version": "price_liquidity_v1",
+                        "label_horizon": 20,
+                        "portfolio_profile": "cost_aware_long_only_v1",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(research, "sweep_stale_experiment_runs", lambda **kwargs: {"checked": 0, "reconciled": 0})
+    monkeypatch.setattr(research, "evaluate_research_drift", lambda **kwargs: [])
+    monkeypatch.setattr(research, "launch_agent_status", lambda label: {"loaded": True, "state": "running", "pid": 42, "label": label})
+    monkeypatch.setattr(
+        research,
+        "modeling_artifact_metadata",
+        lambda **kwargs: {
+            "feature_version": "price_liquidity_v1",
+            "feature_set": "daily_price_liquidity_v1",
+            "label_version": "universe_relative_forward_return_v1",
+            "label_horizons": [1, 5, 20],
+            "data_revision": "abc123",
+        },
+    )
+
+    payload = research.research_health(
+        program_id="perpetual-macmini",
+        local_state=local_state,
+        repo_root=tmp_path / "repo",
+        data_root=data_root,
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert payload["modeling"]["current_feature_version"] == "price_liquidity_v1"
+    assert payload["modeling"]["current_label_horizon"] == 20
+    assert payload["modeling"]["current_portfolio_profile"] == "cost_aware_long_only_v1"
+
+
 def test_update_research_incumbent_promotes_only_fully_gated_candidate(tmp_path: Path) -> None:
     local_state = tmp_path / "local"
     data_root = tmp_path / "nas"
