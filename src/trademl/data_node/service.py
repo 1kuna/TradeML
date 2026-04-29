@@ -423,6 +423,7 @@ class DataNodeService:
         exchange: str = "XNYS",
         heartbeat_fn: Callable[[], object] | None = None,
         heartbeat_interval_seconds: float = 30.0,
+        lane_stall_seconds: float = 45.0,
     ) -> list[str]:
         """Process planner-native canonical and auxiliary work."""
         if not self.db.has_pending_planner_tasks():
@@ -446,19 +447,15 @@ class DataNodeService:
         max_workers = max(
             1, sum(canonical_lane_widths.values()) + sum(aux_lane_widths.values())
         )
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        abandon_pending = False
+        try:
             aux_active: dict[str, int] = defaultdict(int)
             canonical_active: dict[str, int] = defaultdict(int)
             aux_submitted: dict[str, int] = defaultdict(int)
             canonical_submitted: dict[str, int] = defaultdict(int)
-            aux_submit_cap = {
-                vendor: max(1, int(width)) * 32
-                for vendor, width in aux_lane_widths.items()
-            }
-            canonical_submit_cap = {
-                vendor: max(1, int(width)) * 16
-                for vendor, width in canonical_lane_widths.items()
-            }
+            aux_submit_cap = {vendor: max(1, int(width)) * 32 for vendor, width in aux_lane_widths.items()}
+            canonical_submit_cap = {vendor: max(1, int(width)) * 16 for vendor, width in canonical_lane_widths.items()}
 
             def submit_auxiliary_lane(vendor: str) -> None:
                 futures[executor.submit(self._drain_auxiliary_lane, vendor)] = (
@@ -488,12 +485,26 @@ class DataNodeService:
                     submit_auxiliary_lane(vendor)
             last_heartbeat = monotonic()
             last_pending_log = monotonic()
+            queue_started = monotonic()
             while futures:
                 done, _pending = wait(
                     list(futures), return_when=FIRST_COMPLETED, timeout=0.5
                 )
                 if not done:
                     now = monotonic()
+                    if (now - queue_started) >= max(5.0, float(lane_stall_seconds)):
+                        lane_counts: dict[str, int] = {}
+                        for lane in futures.values():
+                            lane_counts[lane] = lane_counts.get(lane, 0) + 1
+                        LOGGER.warning(
+                            "planner_queue_stalled worker_id=%s elapsed_seconds=%.1f pending=%s",
+                            self.worker_id,
+                            now - queue_started,
+                            lane_counts,
+                        )
+                        self._reclaim_expired_runtime_leases()
+                        abandon_pending = True
+                        break
                     if (
                         heartbeat_fn is not None
                         and (now - last_heartbeat) >= heartbeat_interval_seconds
@@ -560,6 +571,8 @@ class DataNodeService:
                             result or self._auxiliary_vendor_has_eligible_work(vendor)
                         ):
                             submit_auxiliary_lane(vendor)
+        finally:
+            executor.shutdown(wait=not abandon_pending, cancel_futures=abandon_pending)
         return sorted(set(changed_dates))
 
     def _allow_auxiliary_during_canonical_tail(self) -> bool:

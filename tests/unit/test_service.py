@@ -1308,6 +1308,44 @@ def test_process_planner_queue_heartbeats_while_waiting_on_pending_lane(
     assert changed == ["2026-01-02", "2026-01-03"]
 
 
+def test_process_planner_queue_abandons_stalled_lane_without_waiting_forever(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        worker_id="rpi-01",
+    )
+    service.default_symbols = ["AAPL"]
+    service._ensure_planner_backlog_seeded = lambda trading_date=None: None  # type: ignore[method-assign]
+    service._canonical_runtime._backfill_lane_widths = lambda: {}  # type: ignore[method-assign]
+    service._aux_lane_widths = lambda task_kinds=None, canonical_pressure=None: {"alpaca": 1}  # type: ignore[method-assign]
+    release_lane = threading.Event()
+
+    def drain_auxiliary_lane(vendor: str) -> list[str]:
+        release_lane.wait(timeout=2.0)
+        return ["late"]
+
+    service._drain_auxiliary_lane = drain_auxiliary_lane  # type: ignore[method-assign]
+
+    started = time.monotonic()
+    changed = service.process_planner_queue(lane_stall_seconds=0.01)
+    elapsed = time.monotonic() - started
+    release_lane.set()
+
+    assert changed == []
+    assert elapsed < 6.0
+
+
 def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(
     tmp_path: Path,
 ) -> None:
