@@ -42,6 +42,7 @@ from trademl.dashboard.controller import (
     update_cluster_secrets,
     verify_recent_canonical_dates,
 )
+from trademl.env import load_dotenv
 from trademl.fleet.autopilot import collect_fleet_health
 from trademl.fleet.observability import build_fleet_observability, write_fleet_observability
 from trademl.experiments import (
@@ -399,16 +400,19 @@ def _dispatch_fleet(args: argparse.Namespace) -> int:
         config_path=args.config,
         env_path=args.env_file,
     )
+    load_dotenv(settings.env_path)
     if args.fleet_command == "health":
         snapshot = collect_dashboard_status_snapshot(settings)
+        pi_host = args.pi_host or os.getenv("TRADEML_PI_HOST") or os.getenv("TRADEML_PI_TAILSCALE_HOST")
+        mac_host = args.mac_host or os.getenv("TRADEML_MAC_HOST") or os.getenv("TRADEML_MAC_TAILSCALE_HOST")
         pi = (
-            {"host": args.pi_host, "user": args.pi_user, "password_env": args.pi_password_env}
-            if args.pi_host
+            {"host": pi_host, "user": os.getenv("TRADEML_PI_USER") or args.pi_user, "password_env": args.pi_password_env}
+            if pi_host
             else None
         )
         mac = (
-            {"host": args.mac_host, "user": args.mac_user, "password_env": args.mac_password_env}
-            if args.mac_host
+            {"host": mac_host, "user": os.getenv("TRADEML_MAC_USER") or args.mac_user, "password_env": args.mac_password_env}
+            if mac_host
             else None
         )
         payload = collect_fleet_health(local_snapshot=snapshot, data_root=settings.nas_mount, pi=pi, mac=mac, heal=bool(args.heal))
@@ -417,14 +421,16 @@ def _dispatch_fleet(args: argparse.Namespace) -> int:
     if args.fleet_command == "observability":
         snapshot = collect_dashboard_status_snapshot(settings)
         data_root = Path(args.data_root).expanduser() if args.data_root else settings.nas_mount
+        pi_host = args.pi_host or os.getenv("TRADEML_PI_HOST") or os.getenv("TRADEML_PI_TAILSCALE_HOST")
+        mac_host = args.mac_host or os.getenv("TRADEML_MAC_HOST") or os.getenv("TRADEML_MAC_TAILSCALE_HOST")
         pi = (
-            {"host": args.pi_host, "user": args.pi_user, "password_env": args.pi_password_env}
-            if args.pi_host
+            {"host": pi_host, "user": os.getenv("TRADEML_PI_USER") or args.pi_user, "password_env": args.pi_password_env}
+            if pi_host
             else None
         )
         mac = (
-            {"host": args.mac_host, "user": args.mac_user, "password_env": args.mac_password_env}
-            if args.mac_host
+            {"host": mac_host, "user": os.getenv("TRADEML_MAC_USER") or args.mac_user, "password_env": args.mac_password_env}
+            if mac_host
             else None
         )
         if pi or mac:

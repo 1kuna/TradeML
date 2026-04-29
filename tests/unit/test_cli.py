@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import yaml
@@ -97,6 +98,61 @@ def test_fleet_health_cli_prints_current_state(tmp_path: Path, monkeypatch, caps
     monkeypatch.setattr(cli, "collect_fleet_health", lambda **kwargs: {"verdict": "OK", "current_state": {"action": "OK"}})
 
     rc = cli.main(["fleet", "--workspace-root", str(workspace), "--config", str(config_path), "health"])
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["verdict"] == "OK"
+
+
+def test_fleet_cli_loads_env_file_for_password_env(tmp_path: Path, monkeypatch, capsys) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    env_path = workspace / ".env"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(tmp_path / "nas"),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    env_path.write_text(
+        "TRADEML_PI_PASSWORD=secret\n"
+        "TRADEML_PI_TAILSCALE_HOST=100.76.4.69\n"
+        "TRADEML_PI_USER=zach\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("TRADEML_PI_PASSWORD", raising=False)
+    monkeypatch.setattr(cli, "collect_dashboard_status_snapshot", lambda settings: {"runtime": {"running": True}, "collection_status": {}, "health": {}})
+
+    def fake_collect_fleet_health(**kwargs):  # noqa: ANN003, ANN202
+        assert kwargs["pi"]["host"] == "100.76.4.69"
+        assert kwargs["pi"]["user"] == "zach"
+        assert kwargs["pi"]["password_env"] == "TRADEML_PI_PASSWORD"
+        assert os.environ["TRADEML_PI_PASSWORD"] == "secret"
+        return {"verdict": "OK", "current_state": {"action": "OK"}}
+
+    monkeypatch.setattr(cli, "collect_fleet_health", fake_collect_fleet_health)
+
+    rc = cli.main(
+        [
+            "fleet",
+            "--workspace-root",
+            str(workspace),
+            "--config",
+            str(config_path),
+            "--env-file",
+            str(env_path),
+            "health",
+        ]
+    )
 
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["verdict"] == "OK"
