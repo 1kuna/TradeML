@@ -647,6 +647,29 @@ def test_research_canary_records_review_and_read_only_paper_smoke(tmp_path: Path
     assert state["latest_paper_account_smoke"]["status"] == "skipped"
 
 
+def test_refresh_last_canary_status_uses_summary_when_stale_running(tmp_path: Path) -> None:
+    local_state = tmp_path / "local"
+    program_id = "perpetual-macmini"
+    experiment_id = "perpetual-macmini-canary-20260429183133"
+    state = {
+        "program_id": program_id,
+        "last_canary": {"experiment_id": experiment_id, "status": "RUNNING"},
+    }
+    summary_root = local_state / "experiments" / experiment_id
+    summary_root.mkdir(parents=True)
+    (summary_root / "summary.json").write_text(
+        json.dumps({"experiment_id": experiment_id, "counts": {"COMPLETED": 4}}),
+        encoding="utf-8",
+    )
+
+    refreshed = research._refresh_last_canary_status(local_state=local_state, state=state)  # noqa: SLF001
+
+    assert refreshed["last_canary"]["status"] == "COMPLETED"
+    assert refreshed["last_canary"]["counts"] == {"COMPLETED": 4}
+    persisted = research.read_research_program_state(local_state=local_state, program_id=program_id)
+    assert persisted["last_canary"]["status"] == "COMPLETED"
+
+
 def test_frontier_architecture_failure_count_is_epoch_local(tmp_path: Path) -> None:
     spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
     spec["frontier_architecture_policy"] = {

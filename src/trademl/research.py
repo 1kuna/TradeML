@@ -1014,6 +1014,7 @@ def research_health(
     """Return the operator health surface for a research program."""
     state = read_research_program_state(local_state=local_state, program_id=program_id)
     spec = _load_research_program_spec(Path(str(state.get("spec_path")))) if state.get("spec_path") else {}
+    state = _refresh_last_canary_status(local_state=local_state, state=state)
     current_experiment_id = str(state.get("current_experiment_id") or "")
     incumbent = read_research_incumbent(local_state=local_state, program_id=program_id)
     sweep = sweep_stale_experiment_runs(
@@ -1158,6 +1159,38 @@ def _research_launchd_status(program_id: str) -> dict[str, Any]:
     status.pop("stdout", None)
     status.pop("stderr", None)
     return status
+
+
+def _refresh_last_canary_status(*, local_state: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """Refresh persisted canary status from its supervisor and summary artifacts."""
+    canary = dict(state.get("last_canary") or {})
+    experiment_id = str(canary.get("experiment_id") or "")
+    if not experiment_id:
+        return state
+    supervisor = read_experiment_supervisor_state(local_state=local_state, experiment_id=experiment_id)
+    summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=experiment_id)
+    counts = dict(summary.get("counts") or {})
+    status = str((supervisor or {}).get("status") or canary.get("status") or "").upper()
+    active_count = sum(int(counts.get(key, 0) or 0) for key in ("RUNNING", "STARTING", "PLANNED"))
+    terminal_count = sum(int(counts.get(key, 0) or 0) for key in ("COMPLETED", "FAILED", "STOPPED", "PERMANENT_FAILED"))
+    if active_count == 0 and terminal_count > 0 and status in {"", "RUNNING", "STARTING", "STOPPING"}:
+        status = "COMPLETED" if int(counts.get("COMPLETED", 0) or 0) == terminal_count else "COMPLETED_WITH_FAILURES"
+    if not status:
+        return state
+    refreshed = {**canary, "status": status}
+    if counts:
+        refreshed["counts"] = counts
+    completed_at = (supervisor or {}).get("completed_at")
+    if completed_at:
+        refreshed["completed_at"] = completed_at
+    if refreshed == canary:
+        return state
+    updated = deepcopy(state)
+    updated["last_canary"] = refreshed
+    program_id = str(updated.get("program_id") or "")
+    if program_id:
+        _write_program_state(local_state=local_state, program_id=program_id, payload=updated)
+    return updated
 
 
 def _research_alert_signature(alerts: list[dict[str, Any]]) -> str:
@@ -1320,6 +1353,7 @@ def write_research_review_packet(
     state = read_research_program_state(local_state=local_state, program_id=program_id)
     if not state:
         raise ValueError(f"no research program state for {program_id!r}")
+    state = _refresh_last_canary_status(local_state=local_state, state=state)
     current_experiment_id = str(state.get("current_experiment_id") or "")
     experiment_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=current_experiment_id) if current_experiment_id else {}
     completed_runs = int(((experiment_summary.get("counts") or {}).get("COMPLETED", 0)) or 0)
