@@ -1145,6 +1145,12 @@ class DataNodeService:
                     continue
                 if _looks_like_entitlement_failure(str(candidate.last_error or "")):
                     continue
+                if self._vendor_attempt_blocks_auxiliary_candidate(
+                    candidate,
+                    vendor=vendor,
+                    now_iso=now_iso,
+                ):
+                    continue
                 lane = self.db.get_vendor_lane_health(
                     vendor=vendor, dataset=candidate.dataset
                 )
@@ -1382,23 +1388,12 @@ class DataNodeService:
                 continue
             if candidate.next_eligible_at and candidate.next_eligible_at > now_iso:
                 continue
-            attempts = [
-                attempt
-                for attempt in self.db.vendor_attempts_for_task(candidate.task_key)
-                if attempt.vendor == vendor
-            ]
-            if attempts:
-                attempt = attempts[0]
-                if attempt.status in {"SUCCESS", "PERMANENT_FAILED"}:
-                    continue
-                if (
-                    attempt.status == "LEASED"
-                    and attempt.lease_expires_at
-                    and attempt.lease_expires_at > now_iso
-                ):
-                    continue
-                if attempt.next_eligible_at and attempt.next_eligible_at > now_iso:
-                    continue
+            if self._vendor_attempt_blocks_auxiliary_candidate(
+                candidate,
+                vendor=vendor,
+                now_iso=now_iso,
+            ):
+                continue
             lane = self.db.get_vendor_lane_health(
                 vendor=vendor, dataset=candidate.dataset
             )
@@ -1423,6 +1418,39 @@ class DataNodeService:
             )
             return True
         return False
+
+    def _vendor_attempt_blocks_auxiliary_candidate(
+        self,
+        candidate,
+        *,
+        vendor: str,
+        now_iso: str,
+    ) -> bool:
+        """Return whether existing vendor-attempt state makes a task unrunnable."""
+        attempts = [
+            attempt
+            for attempt in self.db.vendor_attempts_for_task(candidate.task_key)
+            if attempt.vendor == vendor
+        ]
+        if not attempts:
+            return False
+        attempt = attempts[0]
+        if attempt.status == "SUCCESS":
+            retry_empty_success = (
+                candidate.status in {"PARTIAL", "FAILED"}
+                and int(attempt.rows_returned or 0) == 0
+                and "empty result" in str(candidate.last_error or "").lower()
+            )
+            return not retry_empty_success
+        if attempt.status == "PERMANENT_FAILED":
+            return True
+        if (
+            attempt.status == "LEASED"
+            and attempt.lease_expires_at
+            and attempt.lease_expires_at > now_iso
+        ):
+            return True
+        return bool(attempt.next_eligible_at and attempt.next_eligible_at > now_iso)
 
     def _vendor_has_recent_outbound_spend(self, vendor: str) -> bool:
         """Return whether the vendor has spent any request in the current budget window."""

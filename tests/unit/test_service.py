@@ -4848,6 +4848,60 @@ def test_idle_budget_warning_skips_vendor_with_recent_outbound_spend(
     assert db.get_vendor_lane_health(vendor="alpaca", dataset="equities_minute") is None
 
 
+def test_auxiliary_vendor_eligible_work_skips_completed_vendor_attempt(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    budget = BudgetManager({"fred": {"rpm": 120, "daily_cap": 1000}})
+    connector = _BudgetedAuxiliaryConnector("fred", budget)
+    service = DataNodeService(
+        db=db,
+        connectors={"fred": connector},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    task_key = "macro::fred::vintagedates::2026-04-29"
+    db.upsert_planner_task(
+        task_key=task_key,
+        task_family="macro",
+        planner_group="macro_backlog",
+        dataset="vintagedates",
+        tier="A",
+        priority=20,
+        start_date="2026-04-29",
+        end_date="2026-04-29",
+        symbols=["DGS10"],
+        eligible_vendors=["fred"],
+        payload={"credit_cost": 1},
+    )
+    db.mark_planner_task_failed(
+        task_key,
+        error="partial task already served by fred",
+        backoff_minutes=0,
+    )
+    assert db.lease_vendor_attempt(
+        task_key=task_key,
+        task_family="macro",
+        planner_group="macro_backlog",
+        vendor="fred",
+        lease_owner="rpi-01",
+    )
+    db.mark_vendor_attempt_success(
+        task_key=task_key,
+        vendor="fred",
+        rows_returned=1,
+    )
+
+    assert service._auxiliary_vendor_has_eligible_work("fred") is False  # noqa: SLF001
+    assert service._record_idle_budget_warning_for_vendor("fred") is False  # noqa: SLF001
+
+
 def test_auxiliary_lane_widths_do_not_suppress_vendors_with_canonical_pressure(
     tmp_path: Path,
 ) -> None:
