@@ -10,6 +10,45 @@ from trademl.data_node import db as db_module
 from trademl.data_node.db import DataNodeDB
 
 
+def test_data_node_db_facade_delegates_to_focused_stores(tmp_path: Path) -> None:
+    database = DataNodeDB(tmp_path / "node.sqlite")
+
+    database.update_partition_status(
+        source="alpaca",
+        dataset="equities_eod",
+        date="2026-04-02",
+        status="OK",
+        row_count=1,
+    )
+    database.upsert_planner_task(
+        task_key="canonical::equities_eod::AAPL::2026-04-02",
+        task_family="canonical_bars",
+        planner_group="rolling_canonical",
+        dataset="equities_eod",
+        tier="A",
+        priority=1,
+        start_date="2026-04-02",
+        end_date="2026-04-02",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+    )
+    database.upsert_vendor_lane_health(vendor="alpaca", dataset="equities_eod", state="OK")
+    database.replace_canonical_units_for_date(
+        dataset="equities_eod",
+        trading_date="2026-04-02",
+        symbols=["AAPL"],
+        partition_revision=1,
+    )
+
+    assert database.runtime.fetch_partition_status()[0]["source"] == "alpaca"
+    assert database.planner.get_planner_task("canonical::equities_eod::AAPL::2026-04-02") is not None
+    assert database.vendors.get_vendor_lane_health(vendor="alpaca", dataset="equities_eod") is not None
+    assert database.canonical.fetch_canonical_units_for_date(
+        dataset="equities_eod",
+        trading_date="2026-04-02",
+    )[0].symbol == "AAPL"
+
+
 def test_vendor_attempt_lease_success_and_backoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     database = DataNodeDB(tmp_path / "node.sqlite")
     now = db_module.utc_now()
