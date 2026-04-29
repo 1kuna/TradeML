@@ -8,6 +8,11 @@ import pytest
 import yaml
 
 import trademl.experiments as experiments
+from trademl.research_architecture import (
+    architecture_registry_payload,
+    objective_registry_payload,
+    resolve_architecture_entry,
+)
 
 
 def test_plan_experiment_materializes_deterministic_runs(tmp_path: Path, monkeypatch) -> None:
@@ -285,6 +290,58 @@ def test_frontier_architecture_manifest_order_prefers_advanced(tmp_path: Path, m
     manifests = experiments._load_run_manifests(local_state=local_state, experiment_id="frontier-order")  # noqa: SLF001
     assert [manifest["model_suite"] for manifest in manifests] == ["advanced", "full", "ridge_only"]
     assert [manifest["run_priority"] for manifest in manifests] == [0, 1, 2]
+    assert manifests[0]["architecture_registry_entry"]["family"] == "advanced_challenger"
+    assert manifests[0]["objective_policy"]["primary"] == "research_profitability_v1"
+    assert manifests[0]["complexity_tier"] == 2
+
+
+def test_architecture_registry_resolves_current_and_blocks_deferred_lanes() -> None:
+    registry = architecture_registry_payload()
+    objective = objective_registry_payload()
+
+    assert registry["linear_baseline"]["model_suite"] == "ridge_only"
+    assert registry["tree_challenger"]["required_packages"] == ["lightgbm", "optuna"]
+    assert registry["advanced_challenger"]["primary_metrics"][0] == "catboost_mean_rank_ic"
+    assert registry["ensemble_meta"]["implemented"] is False
+    assert objective["research_profitability_v1"]["primary_metric"] == "rank_ic"
+
+    with pytest.raises(ValueError, match="deferred"):
+        resolve_architecture_entry("tabular_deep_challenger")
+
+
+def test_plan_experiment_rejects_disabled_future_architecture_lane(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "local"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    (repo_root / "configs").mkdir(parents=True, exist_ok=True)
+    (repo_root / "configs" / "equities_xs.yml").write_text("data: {}\n", encoding="utf-8")
+    (repo_root / "configs" / "node.yml").write_text("", encoding="utf-8")
+    spec_path = tmp_path / "future.yml"
+    spec_path.write_text(
+        yaml.safe_dump(
+            {
+                "experiment_id": "future-lane",
+                "phase": 1,
+                "matrix": {"architecture_family": ["rl_policy"]},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(experiments, "_resolve_default_report_date", lambda **kwargs: "2026-03-09")
+
+    with pytest.raises(ValueError, match="unsupported architecture_family"):
+        experiments.plan_experiment(
+            spec_path=spec_path,
+            repo_root=repo_root,
+            data_root=data_root,
+            local_state=local_state,
+            env_path=env_path,
+            targets_config_path=repo_root / "configs" / "node.yml",
+            python_executable="/usr/bin/python3",
+        )
 
 
 def test_primary_rank_ic_prefers_catboost_for_advanced_suite() -> None:
@@ -298,6 +355,45 @@ def test_primary_rank_ic_prefers_catboost_for_advanced_suite() -> None:
     )
 
     assert score == 0.05
+
+
+def test_objective_evaluation_groups_gate_failures_and_adjusts_for_complexity() -> None:
+    evaluation = experiments._evaluate_report(  # noqa: SLF001
+        manifest={
+            "run_id": "advanced-a",
+            "model_suite": "advanced",
+            "matrix_values": {"architecture_family": "advanced_challenger"},
+        },
+        report={
+            "coverage": 0.99,
+            "ridge": {"mean_rank_ic": 0.01},
+            "lightgbm": {"mean_rank_ic": 0.02},
+            "catboost": {"mean_rank_ic": 0.05},
+            "assessment": {"decision": "GO"},
+            "diagnostics": {
+                "ic_by_year": {"2024": 0.01, "2025": 0.02},
+                "placebo": [0.01],
+                "cost_stress": {"net_return": 0.02},
+                "pbo": 0.2,
+            },
+        },
+        gate={
+            "require_go_decision": True,
+            "min_rank_ic": 0.01,
+            "require_all_years_positive": True,
+            "max_abs_placebo_ic": 0.10,
+            "min_cost_stress_net_return": 0.0,
+            "max_pbo": 0.5,
+            "min_dsr": None,
+            "min_coverage": 0.0,
+        },
+    )
+
+    assert evaluation["primary_rank_ic"] == 0.05
+    assert evaluation["objective_verdict"]["primary_score"] == 0.05
+    assert evaluation["objective_verdict"]["complexity_tier"] == 2
+    assert evaluation["objective_verdict"]["complexity_adjusted_score"] < 0.05
+    assert evaluation["gate_failures_by_objective"] == {}
 
 
 def test_report_preview_preserves_catboost_primary_score() -> None:

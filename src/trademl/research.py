@@ -41,6 +41,12 @@ from trademl.data_node.training_control import (
     training_status_snapshot,
 )
 from trademl.portfolio.build import build_portfolio
+from trademl.research_architecture import (
+    architecture_registry_payload,
+    complexity_adjusted_score,
+    objective_registry_payload,
+    resolve_architecture_entry,
+)
 from trademl.research_alerts import (
     DEFAULT_ALERT_POLICY,
     send_research_alert_email as send_research_alert_email,
@@ -104,6 +110,16 @@ DEFAULT_FRONTIER_ARCHITECTURE_POLICY = {
     "max_advanced_failures_per_epoch": 12,
     "require_dependency_preflight": True,
     "auto_pivot_on_brake": True,
+}
+DEFAULT_OBJECTIVE_POLICY = {
+    "enabled": True,
+    "primary": "research_profitability_v1",
+    "complexity_penalty": {"enabled": True, "penalty_per_tier": 0.0005, "min_complexity_adjusted_improvement": 0.0},
+}
+DEFAULT_ARCHITECTURE_REGISTRY_POLICY = {"enabled": True}
+DEFAULT_AUTONOMOUS_PROGRESSION_POLICY = {
+    "enabled": True,
+    "disabled_future_lanes": ["rl_policy", "sequence_transformer", "gnn", "foundation_forecaster"],
 }
 
 
@@ -812,6 +828,13 @@ def research_health(
         "infra_blocker": state.get("last_infra_preflight", {}),
         "launchd": _research_launchd_status(program_id),
         "frontier_architecture": _frontier_architecture_status(spec=spec, state=state, frontier=dict(state.get("frontier") or {}), experiment_summary=latest_summary) if spec else {},
+        "architecture_lane": state.get("architecture_lane"),
+        "complexity_tier": state.get("complexity_tier"),
+        "objective_verdict": state.get("objective_verdict", {}),
+        "pivot_reason": (state.get("last_transition") or {}).get("reason"),
+        "next_lane": state.get("next_lane") or (state.get("frontier") or {}).get("next_lane"),
+        "sentinel_delta": state.get("sentinel_delta") or (state.get("frontier") or {}).get("sentinel_delta"),
+        "autonomous_progression": state.get("autonomous_progression", {}),
         "dependency_preflight": (state.get("last_infra_preflight") or {}).get("dependencies", {}),
         "paths": _research_path_summary(local_state=local_state, data_root=data_root),
     }
@@ -1071,6 +1094,13 @@ def write_research_review_packet(
         "current_campaign_track": state.get("current_campaign_track", state.get("current_track")),
         "current_experiment_id": current_experiment_id,
         "best_candidate_summary": state.get("best_candidate_summary", {}),
+        "architecture_lane": state.get("architecture_lane"),
+        "complexity_tier": state.get("complexity_tier"),
+        "objective_verdict": state.get("objective_verdict", {}),
+        "pivot_reason": (state.get("last_transition") or {}).get("reason"),
+        "next_lane": state.get("next_lane") or (state.get("frontier") or {}).get("next_lane"),
+        "sentinel_delta": state.get("sentinel_delta") or (state.get("frontier") or {}).get("sentinel_delta"),
+        "autonomous_progression": state.get("autonomous_progression", {}),
         "frontier": state.get("frontier", {}),
         "budgets": state.get("budgets", {}),
         "last_transition": state.get("last_transition", {}),
@@ -1112,6 +1142,10 @@ def write_research_review_packet(
         f"- current_ssot_phase: {payload['current_ssot_phase']}",
         f"- current_campaign_track: {payload['current_campaign_track'] or '-'}",
         f"- current_experiment_id: {payload['current_experiment_id'] or '-'}",
+        f"- architecture_lane: {payload['architecture_lane'] or '-'}",
+        f"- complexity_tier: {payload['complexity_tier']}",
+        f"- next_lane: {payload['next_lane'] or '-'}",
+        f"- sentinel_delta: {payload['sentinel_delta']}",
         f"- best_candidate: {(payload['best_candidate_summary'] or {}).get('best_candidate') or '-'}",
         f"- best_primary_score: {(payload['best_candidate_summary'] or {}).get('best_primary_score')}",
         f"- incumbent_run_id: {(payload['incumbent'] or {}).get('run_id') or '-'}",
@@ -1173,6 +1207,19 @@ def _incumbent_rejection_reasons(*, candidate: dict[str, Any], incumbent: dict[s
         return_improved = net_return >= incumbent_return + float(policy["min_net_return_improvement"])
         if not (score_improved or return_improved):
             reasons.append("does not improve incumbent")
+        candidate_adjusted = complexity_adjusted_score(candidate, policy=policy)
+        incumbent_adjusted = complexity_adjusted_score(incumbent, policy=policy)
+        min_adjusted = float((policy.get("complexity_penalty") or {}).get("min_complexity_adjusted_improvement") or 0.0)
+        candidate_tier = int(candidate.get("complexity_tier") or 0)
+        incumbent_tier = int(incumbent.get("complexity_tier") or 0)
+        if (
+            bool((policy.get("complexity_penalty") or {}).get("enabled", False))
+            and candidate_tier > incumbent_tier
+            and candidate_adjusted is not None
+            and incumbent_adjusted is not None
+            and candidate_adjusted <= incumbent_adjusted + min_adjusted
+        ):
+            reasons.append("does not beat incumbent after complexity penalty")
     return reasons
 
 
@@ -1349,6 +1396,11 @@ def _initial_program_state(*, spec: dict[str, Any], program_path: Path, poll_sec
         "current_family_signature": None,
         "active_experiment_supervisor": {},
         "frontier": _empty_frontier(),
+        "architecture_registry_policy": _architecture_registry_policy(spec),
+        "objective_policy": _objective_policy(spec),
+        "autonomous_progression": _autonomous_progression_policy(spec),
+        "architecture_registry": architecture_registry_payload(),
+        "objective_registry": objective_registry_payload(),
         "frontier_architecture": _frontier_architecture_status(
             spec=spec,
             state={"budgets": {"runs_completed": 0}},
@@ -1392,6 +1444,9 @@ def _empty_frontier() -> dict[str, Any]:
         "best_by_architecture_family": {},
         "best_by_feature_family": {},
         "best_by_data_family": {},
+        "exhausted_lanes": {},
+        "next_lane": None,
+        "sentinel_delta": None,
         "recent_rejection_reasons": [],
         "family_history": [],
         "processed_experiment_ids": [],
@@ -1555,7 +1610,7 @@ def _make_experiment_spec_from_phase_policy(
     family_size_cap = int(phase_policy.get("family_size_cap") or 6)
     breadth = _exploration_multiplier(str((program_state.get("steering") or {}).get("exploration_breadth") or "normal"))
     family_size_cap = max(1, int(round(family_size_cap * breadth)))
-    return {
+    next_spec = {
         "experiment_id": experiment_id,
         "family_root": str(spec["program_id"]),
         "generation": generation,
@@ -1588,6 +1643,7 @@ def _make_experiment_spec_from_phase_policy(
             "auto_launch_next_family": False,
         },
     }
+    return _decorate_autonomous_experiment_spec(next_spec=next_spec, spec=spec)
 
 
 def _determine_program_transition(
@@ -1761,6 +1817,41 @@ def _frontier_architecture_policy(spec: dict[str, Any]) -> dict[str, Any]:
     return {**DEFAULT_FRONTIER_ARCHITECTURE_POLICY, **dict(spec.get("frontier_architecture_policy") or {})}
 
 
+def _objective_policy(spec: dict[str, Any]) -> dict[str, Any]:
+    policy = deepcopy(DEFAULT_OBJECTIVE_POLICY)
+    incoming = dict(spec.get("objective_policy") or {})
+    penalty = {**dict(policy.get("complexity_penalty") or {}), **dict(incoming.get("complexity_penalty") or {})}
+    policy.update(incoming)
+    policy["complexity_penalty"] = penalty
+    return policy
+
+
+def _architecture_registry_policy(spec: dict[str, Any]) -> dict[str, Any]:
+    return {**DEFAULT_ARCHITECTURE_REGISTRY_POLICY, **dict(spec.get("architecture_registry_policy") or {})}
+
+
+def _autonomous_progression_policy(spec: dict[str, Any]) -> dict[str, Any]:
+    return {**DEFAULT_AUTONOMOUS_PROGRESSION_POLICY, **dict(spec.get("autonomous_progression_policy") or {})}
+
+
+def _decorate_autonomous_experiment_spec(*, next_spec: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+    matrix = dict(next_spec.get("matrix") or {})
+    architectures = [str(item) for item in matrix.get("architecture_family") or []]
+    suites = [str(item) for item in matrix.get("model_suite") or []]
+    suite_lane = "advanced_challenger" if "advanced" in suites else "tree_challenger" if "full" in suites else "linear_baseline"
+    primary_lane = architectures[0] if architectures else suite_lane
+    entry = resolve_architecture_entry(primary_lane)
+    next_spec["architecture_registry_policy"] = _architecture_registry_policy(spec)
+    next_spec["architecture_registry"] = architecture_registry_payload()
+    next_spec["objective_registry"] = objective_registry_payload()
+    next_spec["objective_policy"] = _objective_policy(spec)
+    next_spec["architecture_lane"] = primary_lane
+    next_spec["complexity_tier"] = int(entry["complexity_tier"])
+    next_spec["autonomous_progression"] = _autonomous_progression_policy(spec)
+    next_spec["next_lane"] = primary_lane
+    return next_spec
+
+
 def _frontier_architecture_status(
     *,
     spec: dict[str, Any],
@@ -1864,6 +1955,7 @@ def _frontier_architecture_spec(
     next_spec["frontier_architecture"] = True
     next_spec["frontier_iteration"] = advanced_count + 1
     next_spec["search_epoch"] = int(state.get("search_epoch", 0) or 0)
+    next_spec = _decorate_autonomous_experiment_spec(next_spec=next_spec, spec=spec)
     if _family_signature(next_spec) in set(frontier.get("tried_family_signatures") or []):
         return None
     return next_spec
@@ -2045,6 +2137,7 @@ def _expanded_search_spec(
         candidate["matrix"] = _apply_program_steering_to_matrix(matrix=matrix, steering=dict(state.get("steering") or {}))
         candidate["proposal_policy"]["family_size_cap"] = family_size_cap
         candidate["search_epoch"] = int(state.get("search_epoch", 0) or 0)
+        candidate = _decorate_autonomous_experiment_spec(next_spec=candidate, spec=spec)
         signature = _family_signature(candidate)
         if signature not in set(frontier.get("tried_family_signatures") or []):
             return candidate
@@ -2172,6 +2265,8 @@ def _update_frontier_memory(*, state: dict[str, Any], experiment_summary: dict[s
         }
     )
     frontier["family_history"] = family_history[-50:]
+    frontier["sentinel_delta"] = _sentinel_delta(best_by_architecture=dict(frontier.get("best_by_architecture_family") or {}))
+    frontier["next_lane"] = _next_frontier_lane(frontier=frontier)
     processed_ids.add(experiment_id)
     frontier["processed_experiment_ids"] = sorted(processed_ids)[-200:]
     budgets = state.setdefault("budgets", {})
@@ -2205,12 +2300,17 @@ def _update_frontier_memory(*, state: dict[str, Any], experiment_summary: dict[s
 
 def _program_best_candidate(*, frontier: dict[str, Any], experiment_summary: dict[str, Any]) -> dict[str, Any]:
     best_by_architecture = dict(frontier.get("best_by_architecture_family", {}) or {})
+    sentinel_delta = _sentinel_delta(best_by_architecture=best_by_architecture)
     return {
         "best_candidate": experiment_summary.get("best_candidate"),
         "best_primary_score": experiment_summary.get("best_primary_score"),
         "best_backtest_net_return": experiment_summary.get("best_backtest_net_return"),
         "best_decision": experiment_summary.get("best_decision"),
         "best_decision_reason": experiment_summary.get("best_decision_reason"),
+        "objective_verdict": experiment_summary.get("objective_verdict", {}),
+        "architecture_lane": experiment_summary.get("architecture_lane"),
+        "complexity_tier": experiment_summary.get("complexity_tier"),
+        "sentinel_delta": sentinel_delta,
         "experiment_id": experiment_summary.get("experiment_id"),
         "shortlist_count": experiment_summary.get("shortlist_count"),
         "best_by_phase": frontier.get("best_by_phase", {}),
@@ -2220,6 +2320,25 @@ def _program_best_candidate(*, frontier: dict[str, Any], experiment_summary: dic
         "best_baseline": best_by_architecture.get("linear_baseline"),
         "best_advanced": best_by_architecture.get("advanced_challenger"),
     }
+
+
+def _sentinel_delta(*, best_by_architecture: dict[str, Any]) -> float | None:
+    advanced = _safe_float((best_by_architecture.get("advanced_challenger") or {}).get("best_primary_score"))
+    tree = _safe_float((best_by_architecture.get("tree_challenger") or {}).get("best_primary_score"))
+    linear = _safe_float((best_by_architecture.get("linear_baseline") or {}).get("best_primary_score"))
+    sentinel = max([value for value in (tree, linear) if value is not None], default=None)
+    if advanced is None or sentinel is None:
+        return None
+    return advanced - sentinel
+
+
+def _next_frontier_lane(*, frontier: dict[str, Any]) -> str:
+    recent = list(frontier.get("recent_rejection_reasons") or [])
+    if any("cost" in str(reason) or "net_return" in str(reason) for reason in recent):
+        return "tree_challenger"
+    if any("rank_ic" in str(reason) or "assessment" in str(reason) for reason in recent):
+        return "advanced_challenger"
+    return "advanced_challenger"
 
 
 def _program_stop_reason(
@@ -2366,6 +2485,9 @@ def _update_best_lane(
         "experiment_id": run.get("experiment_id"),
         "best_candidate": run.get("model_suite"),
         "best_primary_score": score,
+        "architecture_lane": (run.get("matrix_values") or {}).get("architecture_family"),
+        "complexity_tier": run.get("complexity_tier"),
+        "objective_verdict": run.get("objective_verdict", {}),
         "evaluation_stage": run.get("evaluation_stage"),
         "shortlisted": bool(run.get("shortlisted")),
     }
@@ -2639,6 +2761,12 @@ def _launch_program_family(
         "current_ssot_phase": int(next_spec.get("ssot_phase", next_spec.get("phase", 1)) or 1),
         "current_track": str(next_spec.get("campaign_track") or "baseline"),
         "current_campaign_track": str(next_spec.get("campaign_track") or "baseline"),
+        "architecture_lane": next_spec.get("architecture_lane"),
+        "complexity_tier": next_spec.get("complexity_tier"),
+        "objective_policy": next_spec.get("objective_policy", {}),
+        "objective_verdict": next_spec.get("objective_verdict", {}),
+        "next_lane": next_spec.get("next_lane"),
+        "autonomous_progression": next_spec.get("autonomous_progression", {}),
         "active_experiment_supervisor": payload,
         "wait_reason": None,
         "waiting_since": None,
@@ -2805,6 +2933,13 @@ def _ensure_program_state(*, local_state: Path, program_id: str, payload: dict[s
         "last_transition",
         "wait_reason",
         "waiting_since",
+        "architecture_lane",
+        "complexity_tier",
+        "objective_policy",
+        "objective_verdict",
+        "next_lane",
+        "sentinel_delta",
+        "autonomous_progression",
     )
     for key in preserved_keys:
         if key in existing and existing.get(key) not in (None, {}, []):

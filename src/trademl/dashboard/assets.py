@@ -863,7 +863,11 @@ OPERATOR_HTML_PAGE = """<!doctype html>
         ['Shadow paper', (program.latest_shadow_paper_outputs || {}).shadow_orders_path || '-'],
         ['Drift alerts', formatNumber(driftAlerts.length || 0)],
         ['Infra blocker', infraBlocker.reason || program.wait_reason || '-'],
-        ['Frontier lane', frontierArchitecture.enabled ? 'Advanced-first' : '-'],
+        ['Architecture lane', program.architecture_lane || bestCandidate.architecture_lane || (frontierArchitecture.enabled ? 'Advanced-first' : '-')],
+        ['Next lane', program.next_lane || '-'],
+        ['Complexity tier', program.complexity_tier ?? bestCandidate.complexity_tier ?? '-'],
+        ['Pivot reason', program.pivot_reason || '-'],
+        ['Sentinel delta', formatDecimal(program.sentinel_delta ?? bestCandidate.sentinel_delta)],
         ['Dependency preflight', dependencyPreflight.ok === false ? (dependencyPreflight.reason || 'Blocked') : (dependencyPreflight.ok ? 'OK' : '-')],
         ['Top rejection', ((experiment.top_gate_failures || [])[0] || []).join(': ') || '-'],
         ['Budget left', formatNumber(((program.budgets || {}).max_total_runs ?? 0) - ((program.budgets || {}).runs_completed ?? 0))],
@@ -2544,4 +2548,3 @@ HTML_PAGE = """<!doctype html>
 </body>
 </html>
 """
-

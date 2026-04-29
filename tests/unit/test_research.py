@@ -321,6 +321,9 @@ def test_frontier_architecture_policy_unlocks_phase1_advanced_first(tmp_path: Pa
     assert matrix["feature_family"] == ["price_liquidity"]
     assert matrix["data_family"] == ["price_plus_liquidity"]
     assert decision["next_spec"]["proposal_policy"]["family_size_cap"] == 6
+    assert decision["next_spec"]["architecture_lane"] == "advanced_challenger"
+    assert decision["next_spec"]["complexity_tier"] == 2
+    assert decision["next_spec"]["objective_policy"]["primary"] == "research_profitability_v1"
 
 
 def test_initial_phase_spec_uses_frontier_lane_when_history_trigger_is_met(
@@ -488,6 +491,41 @@ def test_frontier_architecture_policy_respects_advanced_failure_brake(tmp_path: 
 
     assert decision["action"] == "launch_family"
     assert "advanced_challenger" not in decision["next_spec"]["matrix"]["architecture_family"]
+
+
+def test_autonomous_progression_policy_blocks_future_lanes_from_frontier(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec["frontier_architecture_policy"] = {
+        "enabled": True,
+        "allow_phase1_advanced": True,
+        "trigger_min_completed_runs": 100,
+        "advanced_first": True,
+        "sentinel_baseline_runs": 2,
+    }
+    spec["autonomous_progression_policy"] = {
+        "enabled": True,
+        "disabled_future_lanes": ["rl_policy", "sequence_transformer", "gnn", "foundation_forecaster"],
+    }
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 1186
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=research._empty_frontier(),  # noqa: SLF001
+        experiment_summary={"experiment_id": "perpetual-macmini-p1-f052", "shortlist_count": 0, "top_gate_failures": []},
+        proposal={},
+    )
+
+    assert set(decision["next_spec"]["matrix"]["architecture_family"]).isdisjoint(
+        {"rl_policy", "sequence_transformer", "gnn", "foundation_forecaster"}
+    )
+    assert decision["next_spec"]["autonomous_progression"]["disabled_future_lanes"] == [
+        "rl_policy",
+        "sequence_transformer",
+        "gnn",
+        "foundation_forecaster",
+    ]
 
 
 def test_frontier_architecture_brake_pivots_to_new_epoch_instead_of_waiting(tmp_path: Path) -> None:
@@ -1566,6 +1604,60 @@ def test_update_research_incumbent_promotes_only_fully_gated_candidate(tmp_path:
     assert incumbent["run_id"] == "strong"
     assert "does not improve incumbent" in rejected["rejections"][0]["reasons"]
     assert (data_root / "control" / "cluster" / "state" / "research" / "incumbents" / "perpetual-macmini.json").exists()
+
+
+def test_incumbent_complexity_penalty_keeps_simpler_model_when_scores_tie(tmp_path: Path) -> None:
+    local_state = tmp_path / "local"
+    data_root = tmp_path / "nas"
+    base = {
+        "experiment_id": "exp-a",
+        "run_id": "linear",
+        "architecture_lane": "linear_baseline",
+        "complexity_tier": 0,
+        "shortlisted": True,
+        "survived_predictive": True,
+        "decision": "GO",
+        "years_positive": True,
+        "primary_score": 0.031,
+        "backtest_net_return": 0.12,
+        "pbo": 0.2,
+        "assessment": {"decision": "GO"},
+        "backtest_status": "COMPLETED",
+    }
+    complex_candidate = {
+        **base,
+        "run_id": "advanced",
+        "architecture_lane": "advanced_challenger",
+        "complexity_tier": 2,
+        "primary_score": 0.032,
+        "backtest_net_return": 0.121,
+    }
+    policy = {
+        "max_pbo": 0.5,
+        "min_net_return": 0.0,
+        "min_rank_ic_improvement": 0.002,
+        "min_net_return_improvement": 0.01,
+        "complexity_penalty": {"enabled": True, "min_complexity_adjusted_improvement": 0.0},
+    }
+
+    promoted = research.update_research_incumbent(
+        program_id="perpetual-macmini",
+        local_state=local_state,
+        data_root=data_root,
+        candidates=[base],
+        policy=policy,
+    )
+    rejected = research.update_research_incumbent(
+        program_id="perpetual-macmini",
+        local_state=local_state,
+        data_root=data_root,
+        candidates=[complex_candidate],
+        policy=policy,
+    )
+
+    assert promoted["promoted"] is True
+    assert rejected["promoted"] is False
+    assert "does not beat incumbent after complexity penalty" in rejected["rejections"][0]["reasons"]
 
 
 def test_write_paper_outputs_for_incumbent_is_deterministic(tmp_path: Path) -> None:

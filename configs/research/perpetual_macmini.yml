@@ -40,6 +40,30 @@ paper_policy:
   rebalance_day: FRI
   output_root: control/cluster/state/research/paper
   no_live_orders: true
+architecture_registry_policy:
+  enabled: true
+objective_policy:
+  enabled: true
+  primary: research_profitability_v1
+  complexity_penalty:
+    enabled: true
+    penalty_per_tier: 0.0005
+    min_complexity_adjusted_improvement: 0.0
+  promotion_metrics:
+    - rank_ic
+    - net_return
+    - cost_stress_net_return
+    - pbo
+    - yearly_positivity
+    - drawdown
+    - turnover
+autonomous_progression_policy:
+  enabled: true
+  disabled_future_lanes:
+    - rl_policy
+    - sequence_transformer
+    - gnn
+    - foundation_forecaster
 frontier_architecture_policy:
   enabled: true
   allow_phase1_advanced: true

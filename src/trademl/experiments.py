@@ -29,6 +29,14 @@ from trademl.data_node.training_control import (
     stop_training_process,
     training_status_snapshot,
 )
+from trademl.research_architecture import (
+    build_objective_verdict,
+    gate_failures_by_objective,
+    launchable_architecture_presets,
+    primary_score_from_preview,
+    primary_score_from_report,
+    resolve_architecture_entry,
+)
 
 SPECIAL_MATRIX_DIMENSIONS = {"model_suite", "architecture_family", "feature_family", "data_profile", "data_family"}
 
@@ -44,11 +52,7 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
         with contextlib.suppress(FileNotFoundError):
             tmp_path.unlink()
 
-ARCHITECTURE_FAMILY_PRESETS: dict[str, dict[str, Any]] = {
-    "linear_baseline": {"model_suite": "ridge_only", "config_overrides": {}},
-    "tree_challenger": {"model_suite": "full", "config_overrides": {}},
-    "advanced_challenger": {"model_suite": "advanced", "config_overrides": {}},
-}
+ARCHITECTURE_FAMILY_PRESETS: dict[str, dict[str, Any]] = launchable_architecture_presets()
 
 FEATURE_FAMILY_PRESETS: dict[str, dict[str, Any]] = {
     "price_core": {
@@ -174,6 +178,8 @@ def plan_experiment(
         config_path.write_text(yaml.safe_dump(run_config, sort_keys=False), encoding="utf-8")
         output_root = target.data_root / "experiments" / experiment_id / "runs" / run_id
         model_suite = row.get("model_suite") or spec.get("model_suite") or ("ridge_only" if phase == 1 else "full")
+        architecture_entry = _architecture_entry_for_row(row={**row, "model_suite": model_suite})
+        objective_policy = _objective_policy(spec)
         base_manifest = {
             "experiment_id": experiment_id,
             "run_id": run_id,
@@ -185,6 +191,10 @@ def plan_experiment(
             "report_date": report_date,
             "model_suite": model_suite,
             "matrix_values": row["matrix_values"],
+            "architecture_registry_entry": architecture_entry,
+            "architecture_lane": architecture_entry["family"],
+            "objective_policy": objective_policy,
+            "complexity_tier": int(architecture_entry["complexity_tier"]),
             "config_overrides": row.get("config_overrides", {}),
             "config_path": str(config_path),
             "config_hash": hashlib.sha1(config_path.read_bytes()).hexdigest(),
@@ -219,6 +229,7 @@ def plan_experiment(
         "spec_path": str(spec_path),
         "base_config_path": str(base_config_path),
         "predictive_gate": _predictive_gate(spec),
+        "objective_policy": _objective_policy(spec),
         "backtest_gate": _backtest_gate(spec),
         "backtest_profile": dict(spec.get("backtest_profile") or {}),
         "proposal_policy": _proposal_policy(spec),
@@ -477,6 +488,8 @@ def evaluate_experiment(
         )
         manifest["evaluation_stage"] = evaluation["evaluation_stage"]
         manifest["gate_failures"] = evaluation["gate_failures"]
+        manifest["gate_failures_by_objective"] = evaluation["gate_failures_by_objective"]
+        manifest["objective_verdict"] = evaluation["objective_verdict"]
         manifest["evaluation_paths"] = evaluation_paths
         manifest["survived_predictive"] = evaluation["survived_predictive"]
         if evaluation["evaluation_stage"] == "REJECTED_PREDICTIVE":
@@ -895,6 +908,10 @@ def compare_experiment(
                 "target": manifest["target"],
                 "model_suite": manifest["model_suite"],
                 "matrix_values": manifest["matrix_values"],
+                "architecture_lane": manifest.get("architecture_lane"),
+                "architecture_registry_entry": manifest.get("architecture_registry_entry", {}),
+                "objective_policy": manifest.get("objective_policy", {}),
+                "complexity_tier": manifest.get("complexity_tier"),
                 "coverage": report.get("coverage"),
                 "ridge_mean_rank_ic": report.get("ridge", {}).get("mean_rank_ic"),
                 "lightgbm_mean_rank_ic": report.get("lightgbm", {}).get("mean_rank_ic"),
@@ -915,6 +932,7 @@ def compare_experiment(
                 "artifacts": report.get("artifacts", {}),
                 "report_path": str(manifest.get("report_path")),
                 "primary_score": primary_score,
+                "objective_verdict": manifest.get("objective_verdict", {}),
             }
         )
     rows.sort(key=lambda item: (bool(item.get("shortlisted")), float(item.get("primary_score") or 0.0), str(item["run_id"])), reverse=True)
@@ -1091,6 +1109,28 @@ def _materialize_matrix_row(matrix_values: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _architecture_entry_for_row(*, row: dict[str, Any]) -> dict[str, Any]:
+    family = dict(row.get("matrix_values") or {}).get("architecture_family")
+    if family is None:
+        model_suite = str(row.get("model_suite") or "")
+        family = "advanced_challenger" if model_suite == "advanced" else "tree_challenger" if model_suite == "full" else "linear_baseline"
+    return resolve_architecture_entry(str(family))
+
+
+def _objective_policy(spec: dict[str, Any]) -> dict[str, Any]:
+    policy = dict(spec.get("objective_policy") or {})
+    if not policy:
+        return {
+            "enabled": True,
+            "primary": "research_profitability_v1",
+            "complexity_penalty": {"enabled": True, "penalty_per_tier": 0.0005, "min_complexity_adjusted_improvement": 0.0},
+        }
+    policy.setdefault("enabled", True)
+    policy.setdefault("primary", "research_profitability_v1")
+    policy.setdefault("complexity_penalty", {"enabled": True, "penalty_per_tier": 0.0005, "min_complexity_adjusted_improvement": 0.0})
+    return policy
+
+
 def _apply_overrides(base_config: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
     payload = json.loads(json.dumps(base_config))
     for dotted_path, value in overrides.items():
@@ -1158,8 +1198,12 @@ def _run_priority(*, row: dict[str, Any], spec: dict[str, Any]) -> int:
     """Order controlled frontier runs so advanced challengers launch first."""
     if not bool(spec.get("frontier_architecture", False)):
         return 100
-    order = {"advanced": 0, "full": 1, "ridge_only": 2}
-    return order.get(str(row.get("model_suite") or ""), 100)
+    try:
+        entry = _architecture_entry_for_row(row=row)
+    except ValueError:
+        return 100
+    order = {"advanced_challenger": 0, "tree_challenger": 1, "linear_baseline": 2}
+    return order.get(str(entry["family"]), 100)
 
 
 def _local_experiment_root(local_state: Path, experiment_id: str) -> Path:
@@ -1230,6 +1274,9 @@ def _summary_run_row(manifest: dict[str, Any]) -> dict[str, Any]:
         "status": manifest["status"],
         "model_suite": manifest["model_suite"],
         "matrix_values": manifest["matrix_values"],
+        "architecture_lane": manifest.get("architecture_lane"),
+        "complexity_tier": manifest.get("complexity_tier"),
+        "objective_verdict": manifest.get("objective_verdict", {}),
         "config_overrides": manifest.get("config_overrides", {}),
         "config_path": manifest.get("config_path"),
         "runtime_name": manifest.get("runtime_name"),
@@ -1289,6 +1336,7 @@ def _preserved_manifest_state(existing: dict[str, Any]) -> dict[str, Any]:
             "retry_count",
             "failure_kind",
             "last_error",
+            "objective_verdict",
         ]
         if key in existing
     }
@@ -1350,6 +1398,9 @@ def _refresh_experiment_summary(
     best_backtest_net_return = None
     best_decision = None
     best_decision_reason = None
+    best_objective_verdict = {}
+    best_architecture_lane = None
+    best_complexity_tier = None
     best_score = float("-inf")
     for run in runs:
         stage = str(run.get("evaluation_stage") or "PLANNED")
@@ -1374,6 +1425,9 @@ def _refresh_experiment_summary(
             best_backtest_net_return = (run.get("backtest_summary") or {}).get("net_return")
             best_decision = (run.get("assessment") or {}).get("decision")
             best_decision_reason = (run.get("assessment") or {}).get("reason")
+            best_objective_verdict = dict(run.get("objective_verdict") or {})
+            best_architecture_lane = run.get("architecture_lane")
+            best_complexity_tier = run.get("complexity_tier")
     supervisor = read_experiment_supervisor_state(local_state=local_state, experiment_id=experiment_id)
     proposal_path = _local_experiment_root(local_state, experiment_id) / "next_family_proposal.json"
     proposal_summary = json.loads(proposal_path.read_text(encoding="utf-8")) if proposal_path.exists() else {}
@@ -1392,6 +1446,9 @@ def _refresh_experiment_summary(
         "best_backtest_net_return": best_backtest_net_return,
         "best_decision": best_decision,
         "best_decision_reason": best_decision_reason,
+        "objective_verdict": best_objective_verdict,
+        "architecture_lane": best_architecture_lane,
+        "complexity_tier": best_complexity_tier,
         "top_gate_failures": sorted(gate_failures.items(), key=lambda item: (-item[1], item[0]))[:5],
         "supervisor": supervisor,
         "proposal_summary": summary.get("proposal_summary") or proposal_summary,
@@ -1485,19 +1542,7 @@ else:
 
 
 def _primary_rank_ic(*, manifest: dict[str, Any], report: dict[str, Any]) -> float:
-    if manifest.get("model_suite") == "advanced":
-        catboost = report.get("catboost", {})
-        if not catboost.get("skipped"):
-            value = catboost.get("mean_rank_ic")
-            if value is not None:
-                return float(value)
-    if manifest.get("model_suite") == "full":
-        lightgbm = report.get("lightgbm", {})
-        if not lightgbm.get("skipped"):
-            value = lightgbm.get("mean_rank_ic")
-            if value is not None:
-                return float(value)
-    return float(report.get("ridge", {}).get("mean_rank_ic", 0.0) or 0.0)
+    return primary_score_from_report(manifest=manifest, report=report)
 
 
 def _report_preview_from_report(report: dict[str, Any]) -> dict[str, Any]:
@@ -1525,15 +1570,7 @@ def _manifest_needs_report_refresh(manifest: dict[str, Any]) -> bool:
 
 
 def _preview_primary_score(*, model_suite: str, preview: dict[str, Any]) -> float | None:
-    if model_suite == "advanced":
-        score = preview.get("catboost_mean_rank_ic")
-        if score is not None:
-            return score
-    if model_suite in {"full", "advanced"}:
-        score = preview.get("lightgbm_mean_rank_ic")
-        if score is not None:
-            return score
-    return preview.get("ridge_mean_rank_ic")
+    return primary_score_from_preview(model_suite=model_suite, preview=preview)
 
 
 def _evaluate_report(*, manifest: dict[str, Any], report: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any]:
@@ -1573,11 +1610,21 @@ def _evaluate_report(*, manifest: dict[str, Any], report: dict[str, Any], gate: 
     if float(coverage or 0.0) < gate["min_coverage"]:
         failures.append(f"coverage<{gate['min_coverage']}")
     survived = not failures
+    grouped_failures = gate_failures_by_objective(failures)
+    objective_verdict = build_objective_verdict(
+        manifest=manifest,
+        primary_score=rank_ic,
+        survived=survived,
+        gate_failures_by_objective=grouped_failures,
+        policy=manifest.get("objective_policy"),
+    )
     return {
         "run_id": manifest["run_id"],
         "evaluation_stage": "SURVIVES_PREDICTIVE" if survived else "REJECTED_PREDICTIVE",
         "survived_predictive": survived,
         "gate_failures": failures,
+        "gate_failures_by_objective": grouped_failures,
+        "objective_verdict": objective_verdict,
         "primary_rank_ic": rank_ic,
         "years_positive": years_positive,
         "max_abs_placebo": max_abs_placebo,

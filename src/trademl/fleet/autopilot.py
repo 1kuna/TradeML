@@ -296,6 +296,12 @@ def _architecture_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": status,
         "state": state,
+        "architecture_lane": program.get("architecture_lane") or best.get("architecture_lane") or experiment.get("architecture_lane"),
+        "complexity_tier": program.get("complexity_tier") or best.get("complexity_tier") or experiment.get("complexity_tier"),
+        "objective_verdict": program.get("objective_verdict") or best.get("objective_verdict") or experiment.get("objective_verdict") or {},
+        "pivot_reason": program.get("pivot_reason") or (program.get("last_transition") or {}).get("reason"),
+        "next_lane": program.get("next_lane") or (program.get("frontier") or {}).get("next_lane"),
+        "sentinel_delta": program.get("sentinel_delta") or best.get("sentinel_delta"),
         "best_candidate": best.get("best_candidate") or experiment.get("best_candidate"),
         "primary_score": best.get("best_primary_score") or experiment.get("best_primary_score"),
         "best_advanced_score": best_advanced.get("best_primary_score"),

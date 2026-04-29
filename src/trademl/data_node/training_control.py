@@ -25,6 +25,7 @@ from trademl.data_node.db import DataNodeDB
 from trademl.data_node.planner import training_readiness
 from trademl.env import read_env_file
 from trademl.fleet import remote as fleet_remote
+from trademl.research_architecture import model_suite_dependency_map
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,10 +33,7 @@ REMOTE_COMMAND_TIMEOUT_SECONDS = 60
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 SSH_SERVER_ALIVE_INTERVAL_SECONDS = 5
 SSH_SERVER_ALIVE_COUNT_MAX = 2
-MODEL_SUITE_DEPENDENCIES = {
-    "full": ["lightgbm", "optuna"],
-    "advanced": ["catboost", "lightgbm", "optuna"],
-}
+MODEL_SUITE_DEPENDENCIES = model_suite_dependency_map()
 
 
 @dataclass(slots=True)
