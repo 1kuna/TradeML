@@ -496,8 +496,6 @@ class AuxiliaryRuntime:
 
     def _vendor_has_canonical_pressure(self, vendor: str) -> bool:
         """Return whether a vendor is currently needed by canonical work."""
-        if self.db.has_pending_backfill():
-            return True
         page = 0
         limit = 256
         while True:

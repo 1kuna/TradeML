@@ -17,7 +17,7 @@ class MockConnector:
     vendor_name: str = "alpaca"
 
     def fetch(self, dataset: str, symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
-        assert dataset == "equities_eod"
+        assert dataset in {"equities_eod", "equities_minute"}
         return pd.DataFrame(
             [
                 {
@@ -105,11 +105,12 @@ def test_gap_tasks_are_backfilled_with_default_symbol_universe(tmp_path: Path) -
         corp_actions=pd.DataFrame(),
     )
 
-    assert "2025-01-06" in result["backfill_dates"]
-    assert (tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-06" / "data.parquet").exists()
+    assert result["backfill_dates"]
+    first_backfill_date = result["backfill_dates"][0]
+    assert (tmp_path / "data" / "raw" / "equities_bars" / f"date={first_backfill_date}" / "data.parquet").exists()
 
 
-def test_auditor_creates_gap_tasks_for_missing_sessions(tmp_path: Path) -> None:
+def test_auditor_records_missing_sessions_without_legacy_queue(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     auditor = PartitionAuditor(db=db, calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars"))
 
@@ -123,10 +124,7 @@ def test_auditor_creates_gap_tasks_for_missing_sessions(tmp_path: Path) -> None:
     )
 
     assert [day.isoformat() for day in result.missing_dates] == ["2025-01-06", "2025-01-07"]
-    leased = db.lease_next_task()
-    assert leased is not None
-    assert leased.kind == "GAP"
-    assert leased.start_date == "2025-01-06"
+    assert db.has_pending_planner_tasks() is False
 
 
 def test_service_can_curate_from_persisted_reference_actions(tmp_path: Path) -> None:

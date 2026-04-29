@@ -194,10 +194,32 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
         encoding="utf-8",
     )
     db = DataNodeDB(local_state / "node.sqlite")
-    db.enqueue_task("equities_eod", "AAPL", "2025-01-01", "2025-01-02", "GAP", 1)
-    leased = db.lease_next_task()
-    assert leased is not None
-    db.mark_task_failed(leased.id, "test", backoff_minutes=1)
+    db.upsert_planner_task(
+        task_key="canonical_bars::equities_eod::AAPL::2025-01-01::2025-01-02",
+        task_family="canonical_bars",
+        planner_group="equities_eod",
+        dataset="equities_eod",
+        tier="A",
+        priority=1,
+        start_date="2025-01-01",
+        end_date="2025-01-02",
+        symbols=["AAPL"],
+        eligible_vendors=["alpaca"],
+        output_name="equities_bars",
+    )
+    db.update_planner_task_progress(
+        task_key="canonical_bars::equities_eod::AAPL::2025-01-01::2025-01-02",
+        expected_units=2,
+        completed_units=0,
+        remaining_units=2,
+        remaining_symbols=["AAPL"],
+        state={"scope_kind": "symbol_range", "backlog_class": "historical_canonical"},
+    )
+    db.mark_planner_task_failed(
+        "canonical_bars::equities_eod::AAPL::2025-01-01::2025-01-02",
+        error="test",
+        backoff_minutes=1,
+    )
     db.update_partition_status("alpaca", "equities_eod", "2025-01-02", "GREEN", 2, 2, "OK")
     attempt = db.lease_vendor_attempt(
         task_key="canonical_bars::equities_eod::00001::0001::2025-01-01::2025-01-02",
@@ -300,7 +322,7 @@ def test_collect_dashboard_snapshot_reads_queue_qc_and_runtime(tmp_path: Path) -
     assert snapshot["vendor_throughput"]["rows"][0]["vendor"] == "alpaca"
     assert snapshot["vendor_throughput"]["rows"][0]["outbound_requests_per_min"] >= 0.0
     assert snapshot["vendor_throughput"]["rows"][0]["minute_window_used"] == 0
-    assert snapshot["planner_eta"] == {}
+    assert snapshot["planner_eta"]["canonical_bars"]["remaining_units"] == 2
     assert "cycle done" in snapshot["log_tail"]
     assert snapshot["collection_status"]["coverage_percent"] > 0.0
     assert snapshot["collection_status"]["remaining_datapoints"] > 1
@@ -1128,26 +1150,30 @@ def test_current_node_runtime_uses_systemd_main_pid_when_runtime_file_is_stale(t
     assert runtime["log_path"] == str(settings.log_path)
 
 
-def test_seed_stage_backfill_logs_enqueue_failures(tmp_path: Path, monkeypatch, caplog) -> None:
-    calls: list[str] = []
+def test_seed_stage_planner_backlog_logs_failures(tmp_path: Path, monkeypatch, caplog) -> None:
+    settings = NodeSettings(
+        repo_root=tmp_path,
+        workspace_root=tmp_path / "workspace",
+        config_path=tmp_path / "workspace" / "node.yml",
+        env_path=tmp_path / "workspace" / ".env",
+        local_state=tmp_path / "workspace" / "control",
+        nas_mount=tmp_path / "nas",
+        nas_share="//nas/trademl",
+        collection_time_et="16:30",
+        maintenance_hour_local=2,
+        worker_id="worker-1",
+    )
 
-    class _DummyDB:
-        def __init__(self, _path: Path) -> None:
-            pass
+    def fail_seed(_settings: dashboard_controller.NodeSettings):  # noqa: ANN001
+        raise RuntimeError("planner seed failed")
 
-        def enqueue_task(self, dataset: str, symbol: str, start_date: str, end_date: str, source: str, priority: int) -> None:
-            calls.append(symbol)
-            if symbol == "MSFT":
-                raise sqlite3.IntegrityError("duplicate task")
-
-    monkeypatch.setattr(dashboard_controller, "DataNodeDB", _DummyDB)
+    monkeypatch.setattr(dashboard_controller, "_service_from_settings", fail_seed)
 
     with caplog.at_level("WARNING"):
-        created = dashboard_controller._seed_stage_backfill(tmp_path / "node.sqlite", symbols=["AAPL", "MSFT"], years=5)
+        created = dashboard_controller._seed_stage_planner_backlog(settings)
 
-    assert created == 1
-    assert calls == ["AAPL", "MSFT"]
-    assert any("stage_backfill_seed_failed" in record.message and "MSFT" in record.message for record in caplog.records)
+    assert created == 0
+    assert any("stage_planner_seed_failed" in record.message for record in caplog.records)
 
 
 def test_read_runtime_state_logs_invalid_json(tmp_path: Path, caplog) -> None:
@@ -1290,7 +1316,7 @@ def test_advance_collection_stage_updates_stage_manifest_and_queue(tmp_path: Pat
     assert stage["symbols"] == ["AAA", "BBB", "CCC"]
     assert stage["years"] == 5
     assert result["history_probe"]["effective_years"] == 5
-    queued = sqlite3.connect(local_state / "node.sqlite").execute("SELECT COUNT(*) FROM backfill_queue").fetchone()[0]
+    queued = sqlite3.connect(local_state / "node.sqlite").execute("SELECT COUNT(*) FROM planner_tasks").fetchone()[0]
     assert queued >= 3
 
 

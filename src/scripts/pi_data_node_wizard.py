@@ -8,7 +8,6 @@ import os
 import platform
 import subprocess
 import tempfile
-from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
@@ -36,7 +35,7 @@ def run_wizard(
     """Initialize Pi-local state and seed Stage 0 bootstrap tasks."""
     local_state = root / "control"
     local_state.mkdir(parents=True, exist_ok=True)
-    db = DataNodeDB(local_state / "node.sqlite")
+    DataNodeDB(local_state / "node.sqlite")
     bookmarks = root / "bookmarks.json"
     stage_file = root / "stage.yml"
     bookmarks.write_text(json.dumps({"stage": 0, "symbols_seeded": len(stage_symbols)}, indent=2), encoding="utf-8")
@@ -69,14 +68,6 @@ def run_wizard(
         collection_time_et=collection_time_et,
         maintenance_hour_local=maintenance_hour_local,
     )
-
-    end_date = datetime.now(UTC).date().isoformat()
-    start_date = f"{int(end_date[:4]) - stage_years}-{end_date[5:]}"
-    for symbol in stage_symbols:
-        try:
-            db.enqueue_task("equities_eod", symbol, start_date, end_date, "BOOTSTRAP", 5)
-        except Exception:
-            continue
 
     return {
         "local_state": str(local_state),

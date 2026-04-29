@@ -131,8 +131,7 @@ def test_coordinator_bootstrap_and_rebuild_state(tmp_path: Path) -> None:
 
 def test_recreate_local_db_removes_sqlite_sidecars(tmp_path: Path) -> None:
     db_path = tmp_path / "control" / "node.sqlite"
-    db = DataNodeDB(db_path)
-    db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-01", "GAP", 1)
+    DataNodeDB(db_path)
     wal_path = db_path.with_name(f"{db_path.name}-wal")
     shm_path = db_path.with_name(f"{db_path.name}-shm")
     wal_path.write_text("stale", encoding="utf-8")
@@ -187,14 +186,10 @@ def test_rebuild_local_state_requeues_underfilled_partitions_after_stage_promoti
     import sqlite3
 
     conn = sqlite3.connect(workspace / "control" / "node.sqlite")
-    queued = conn.execute(
-        "SELECT COUNT(*) FROM backfill_queue WHERE dataset='equities_eod' AND start_date='2025-01-02' AND kind='GAP'"
-    ).fetchone()[0]
     status_row = conn.execute(
         "SELECT status, row_count, expected_rows FROM partition_status WHERE source='alpaca' AND dataset='equities_eod' AND date='2025-01-02'"
     ).fetchone()
     conn.close()
-    assert queued == 0
     assert status_row == ("AMBER", 6, 20)
 
 

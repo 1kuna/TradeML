@@ -552,7 +552,7 @@ def advance_collection_stage(
 
     coordinator = _coordinator(settings)
     manifest = coordinator.update_stage(current_stage=target_stage, symbols=symbols, years=stage_years)
-    seeded = _seed_stage_backfill(settings.db_path, symbols=symbols, years=stage_years)
+    seeded = _seed_stage_planner_backlog(settings)
 
     runtime_before = _current_node_runtime(settings)
     restarted = False
@@ -2787,20 +2787,23 @@ def _history_probe_connector(settings: NodeSettings) -> BaseConnector | None:
     return _alpaca_connector(settings)
 
 
-def _seed_stage_backfill(db_path: Path, *, symbols: list[str], years: int) -> int:
-    db = DataNodeDB(db_path)
-    end_date = datetime.now(tz=UTC).date().isoformat()
-    start_date = f"{int(end_date[:4]) - years}-{end_date[5:]}"
-    created = 0
-    for symbol in symbols:
-        try:
-            db.enqueue_task("equities_eod", symbol, start_date, end_date, "BOOTSTRAP", 5)
-        except Exception as exc:
-            LOGGER.warning("stage_backfill_seed_failed symbol=%s start=%s end=%s error=%s", symbol, start_date, end_date, exc)
-            continue
-        else:
-            created += 1
-    return created
+def _seed_stage_planner_backlog(settings: NodeSettings) -> int:
+    """Seed planner-native stage work after a stage change."""
+    started_at = datetime.now(tz=UTC).isoformat()
+    try:
+        service = _service_from_settings(settings)
+        service._seed_planner_tasks(  # noqa: SLF001
+            trading_date=datetime.now(tz=UTC).date().isoformat(),
+            verify_repairs=False,
+        )
+    except Exception as exc:
+        LOGGER.warning("stage_planner_seed_failed error=%s", exc)
+        return 0
+    counts = DataNodeDB(settings.db_path).count_planner_tasks_by_family(
+        statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+        updated_after=started_at,
+    )
+    return sum(int(value) for value in counts.values())
 
 
 def _probe_available_history_years(
@@ -2860,18 +2863,7 @@ def _read_queue_counts(db_path: Path) -> dict[str, int]:
     except sqlite3.OperationalError:
         return {"PENDING": 0, "LEASED": 0, "FAILED": 0, "DONE": 0, "BOOTSTRAP": 0, "FORWARD": 0, "GAP": 0}
     counts = _queue_counts_from_planner_summary(planner_summary)
-    if counts:
-        return counts
-    try:
-        with sqlite3.connect(db_path, timeout=5.0) as connection:
-            connection.execute("PRAGMA busy_timeout = 5000")
-            status_rows = connection.execute("SELECT status, COUNT(*) FROM backfill_queue GROUP BY status").fetchall()
-            kind_rows = connection.execute("SELECT kind, COUNT(*) FROM backfill_queue GROUP BY kind").fetchall()
-    except sqlite3.OperationalError:
-        return {"PENDING": 0, "LEASED": 0, "FAILED": 0, "DONE": 0, "BOOTSTRAP": 0, "FORWARD": 0, "GAP": 0}
-    counts = {str(status): int(count) for status, count in status_rows}
-    counts.update({str(kind): int(count) for kind, count in kind_rows})
-    return counts
+    return counts or {"PENDING": 0, "LEASED": 0, "FAILED": 0, "DONE": 0, "BOOTSTRAP": 0, "FORWARD": 0, "GAP": 0}
 
 
 def _read_qc_frame(qc_path: Path) -> pd.DataFrame:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass
 from datetime import date as date_type
 
@@ -37,7 +36,7 @@ class PartitionAuditor:
         expected_rows: int,
         gap_priority: int = 1,
     ) -> AuditResult:
-        """Audit the requested window and enqueue gap tasks for missing trading sessions."""
+        """Audit the requested window and record missing trading sessions."""
         missing_dates: list[date_type] = []
         amber_dates: list[date_type] = []
         green_dates: list[date_type] = []
@@ -74,17 +73,6 @@ class PartitionAuditor:
                     expected_rows=expected_rows,
                     qc_code="MISSING",
                 )
-                try:
-                    self.db.enqueue_task(
-                        dataset=dataset,
-                        symbol=None,
-                        start_date=row.date.isoformat(),
-                        end_date=row.date.isoformat(),
-                        kind="GAP",
-                        priority=gap_priority,
-                    )
-                except sqlite3.IntegrityError:
-                    pass
                 missing_dates.append(row.date)
                 continue
 

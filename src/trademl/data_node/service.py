@@ -264,157 +264,19 @@ class DataNodeService:
         self,
         *,
         trading_date: str | None = None,
-        prefer_legacy_backfill: bool = False,
         heartbeat_fn: Callable[[], object] | None = None,
         heartbeat_interval_seconds: float = 30.0,
     ) -> list[str]:
-        """Compatibility wrapper that now drains the planner-native queue."""
+        """Drain planner-native work and retire any leftover legacy queue rows."""
         seed_date = trading_date or datetime.now(tz=UTC).date().isoformat()
-        if prefer_legacy_backfill and self.db.has_pending_backfill():
-            return self._process_legacy_backfill_queue(
-                heartbeat_fn=heartbeat_fn,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-            )
-        if (
-            len(self.default_symbols) > 1
-            and not self.db.has_pending_planner_tasks(task_families=("canonical_bars",))
-            and self.db.has_pending_backfill()
-        ):
-            self._ensure_planner_backlog_seeded(trading_date=seed_date)
-            if self.db.has_pending_planner_tasks(task_families=("canonical_bars",)):
-                migrated = self.db.mark_legacy_datewide_backfill_migrated()
-                if migrated:
-                    LOGGER.info("migrated_legacy_backfill_rows count=%s", migrated)
-                return self.process_planner_queue(
-                    trading_date=seed_date,
-                    heartbeat_fn=heartbeat_fn,
-                    heartbeat_interval_seconds=heartbeat_interval_seconds,
-                )
-        if self.default_symbols and self.db.has_pending_datewide_backfill():
-            self._ensure_planner_backlog_seeded(trading_date=seed_date)
-            if self.db.has_pending_planner_tasks(task_families=("canonical_bars",)):
-                migrated = self.db.mark_legacy_datewide_backfill_migrated()
-                if migrated:
-                    LOGGER.info("migrated_legacy_datewide_backfill count=%s", migrated)
-                return self.process_planner_queue(
-                    trading_date=seed_date,
-                    heartbeat_fn=heartbeat_fn,
-                    heartbeat_interval_seconds=heartbeat_interval_seconds,
-                )
-        if self.db.has_pending_backfill():
-            return self._process_legacy_backfill_queue(
-                heartbeat_fn=heartbeat_fn,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-            )
+        migrated = self.db.mark_legacy_datewide_backfill_migrated()
+        if migrated:
+            LOGGER.info("migrated_legacy_backfill_rows count=%s", migrated)
         return self.process_planner_queue(
             trading_date=seed_date,
             heartbeat_fn=heartbeat_fn,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
         )
-
-    def _drain_lane_futures(
-        self,
-        futures: dict[object, str],
-        *,
-        heartbeat_fn: Callable[[], object] | None = None,
-        heartbeat_interval_seconds: float = 30.0,
-        wait_timeout_seconds: float = 0.5,
-    ) -> list[tuple[str, object]]:
-        """Drain lane futures without blocking heartbeats behind one slow lane."""
-        pending = dict(futures)
-        results: list[tuple[str, object]] = []
-        last_heartbeat = monotonic()
-        last_pending_log = monotonic()
-        while pending:
-            done, _pending = wait(
-                list(pending), return_when=FIRST_COMPLETED, timeout=wait_timeout_seconds
-            )
-            if not done:
-                now = monotonic()
-                if (
-                    heartbeat_fn is not None
-                    and (now - last_heartbeat) >= heartbeat_interval_seconds
-                ):
-                    try:
-                        heartbeat_fn()
-                    except Exception:
-                        LOGGER.exception(
-                            "planner_queue_heartbeat_failed worker_id=%s",
-                            self.worker_id,
-                        )
-                    last_heartbeat = now
-                if (now - last_pending_log) >= max(5.0, heartbeat_interval_seconds):
-                    lane_counts: dict[str, int] = {}
-                    for lane in pending.values():
-                        lane_counts[lane] = lane_counts.get(lane, 0) + 1
-                    LOGGER.warning(
-                        "planner_queue_waiting worker_id=%s pending=%s",
-                        self.worker_id,
-                        lane_counts,
-                    )
-                    last_pending_log = now
-                continue
-            for future in done:
-                lane = pending.pop(future)
-                results.append((lane, future))
-        return results
-
-    def _process_legacy_backfill_queue(
-        self,
-        *,
-        heartbeat_fn: Callable[[], object] | None = None,
-        heartbeat_interval_seconds: float = 30.0,
-    ) -> list[str]:
-        """Drain legacy date/symbol backfill rows during the migration window."""
-        lane_widths = self._canonical_runtime._backfill_lane_widths()
-        if not lane_widths:
-            return []
-        changed_dates: list[str] = []
-        futures: dict[object, str] = {}
-        with ThreadPoolExecutor(max_workers=sum(lane_widths.values())) as executor:
-            while True:
-                scheduled = False
-                for vendor, width in lane_widths.items():
-                    active_for_vendor = sum(
-                        1
-                        for active_vendor in futures.values()
-                        if active_vendor == vendor
-                    )
-                    while active_for_vendor < width:
-                        task = self._canonical_runtime._lease_next_task_for_vendor(
-                            vendor
-                        )
-                        if task is None:
-                            break
-                        future = executor.submit(
-                            self._canonical_runtime._process_backfill_task_for_vendor,
-                            task,
-                            vendor,
-                        )
-                        futures[future] = vendor
-                        active_for_vendor += 1
-                        scheduled = True
-                if not futures and not scheduled:
-                    break
-                if not futures:
-                    continue
-                done = self._drain_lane_futures(
-                    futures,
-                    heartbeat_fn=heartbeat_fn,
-                    heartbeat_interval_seconds=heartbeat_interval_seconds,
-                    wait_timeout_seconds=0.1,
-                )
-                for _lane, future in done:
-                    changed_dates.extend(future.result())
-                    futures.pop(future, None)
-            for _lane, future in self._drain_lane_futures(
-                futures,
-                heartbeat_fn=heartbeat_fn,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-                wait_timeout_seconds=0.1,
-            ):
-                changed_dates.extend(future.result())
-        return sorted(set(changed_dates))
 
     def process_planner_queue(
         self,
@@ -439,7 +301,6 @@ class DataNodeService:
             self.db.has_pending_planner_tasks(
                 task_families=("canonical_bars", "canonical_repair")
             )
-            or self.db.has_pending_backfill()
         )
         aux_task_kinds = {"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"}
         aux_lane_widths = self._aux_lane_widths(
@@ -1835,7 +1696,6 @@ class DataNodeService:
         )
         backfill_dates = self.process_backfill_queue(
             trading_date=trading_date,
-            prefer_legacy_backfill=True,
         )
         changed_dates = sorted(set(forward_dates + backfill_dates))
         if not changed_dates:
@@ -2099,9 +1959,6 @@ class DataNodeService:
             int(part) for part in collection_time_et.split(":", 1)
         )
         self._reclaim_startup_leases()
-        requeued_failures = self.db.requeue_retryable_failures()
-        if requeued_failures:
-            LOGGER.info("requeued_retryable_failures count=%s", requeued_failures)
 
         while not self._stop_event.is_set():
             current = now_fn()
@@ -2165,10 +2022,7 @@ class DataNodeService:
                     self._collection_history.add(trading_date)
 
                 local_day = current_local.date().isoformat()
-                pending_backfill = (
-                    self.db.has_pending_planner_tasks()
-                    or self.db.has_pending_backfill()
-                )
+                pending_backfill = self.db.has_pending_planner_tasks()
                 should_run_backfill = self._should_run_maintenance(
                     local_day=local_day,
                     current_local=current_local,
@@ -2199,7 +2053,6 @@ class DataNodeService:
                     and not self.db.has_pending_planner_tasks(
                         task_families=("canonical_bars",)
                     )
-                    and not self.db.has_pending_backfill()
                 ):
                     anchor_date = self._latest_raw_date()
                     if anchor_date:
@@ -2428,18 +2281,12 @@ class DataNodeService:
         if str(state.get("bucket")) != bucket_key:
             return False
         last_success = state.get("updated_at")
-        latest_planner_update = self.db.latest_planner_update(
+        latest_update = self.db.latest_planner_update(
             statuses=("PENDING", "PARTIAL", "FAILED")
-        )
-        latest_queue_update = self.db.latest_queue_update(
-            statuses=("PENDING", "FAILED")
-        )
-        latest_update = max(
-            str(latest_planner_update or ""), str(latest_queue_update or "")
         )
         if not last_success or not latest_update:
             return False
-        return latest_update > str(last_success)
+        return str(latest_update) > str(last_success)
 
     @staticmethod
     def _week_key(current_et: datetime) -> str:

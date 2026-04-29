@@ -21,25 +21,6 @@ def utc_now() -> datetime:
 
 
 @dataclass(slots=True)
-class BackfillTask:
-    """SQLite-backed queue task."""
-
-    id: int
-    dataset: str
-    symbol: str | None
-    start_date: str
-    end_date: str
-    kind: str
-    priority: int
-    status: str
-    attempts: int
-    next_not_before: str | None
-    last_error: str | None
-    created_at: str
-    updated_at: str
-
-
-@dataclass(slots=True)
 class VendorAttempt:
     """Persistent per-vendor attempt state for canonical and supplemental tasks."""
 
@@ -469,163 +450,6 @@ class DataNodeDB:
         missing = self.REQUIRED_TABLES.difference(existing)
         if missing:
             raise sqlite3.OperationalError(f"missing sqlite tables: {', '.join(sorted(missing))}")
-
-    def enqueue_task(
-        self,
-        dataset: str,
-        symbol: str | None,
-        start_date: str,
-        end_date: str,
-        kind: str,
-        priority: int,
-    ) -> int:
-        """Insert a new task and return its identifier."""
-        timestamp = utc_now().isoformat()
-        with self._connect() as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO backfill_queue (
-                  dataset, symbol, start_date, end_date, kind, priority, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
-                """,
-                (dataset, symbol, start_date, end_date, kind, priority, timestamp, timestamp),
-            )
-            return int(cursor.lastrowid)
-
-    def lease_next_task(self, now: datetime | None = None) -> BackfillTask | None:
-        """Lease the next available task ordered by priority then age."""
-        lease_time = (now or utc_now()).isoformat()
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT *
-                FROM backfill_queue
-                WHERE status IN ('PENDING', 'FAILED')
-                  AND COALESCE(next_not_before, '1970-01-01T00:00:00+00:00') <= ?
-                ORDER BY priority ASC, created_at ASC, id ASC
-                LIMIT 1
-                """,
-                (lease_time,),
-            ).fetchone()
-            if row is None:
-                return None
-            connection.execute(
-                """
-                UPDATE backfill_queue
-                SET status = 'LEASED', updated_at = ?
-                WHERE id = ?
-                """,
-                (lease_time, row["id"]),
-            )
-            leased_row = connection.execute("SELECT * FROM backfill_queue WHERE id = ?", (row["id"],)).fetchone()
-            assert leased_row is not None
-            return BackfillTask(**dict(leased_row))
-
-    def peek_next_tasks(self, *, limit: int = 25, offset: int = 0, now: datetime | None = None) -> list[BackfillTask]:
-        """Return eligible tasks without leasing them."""
-        lease_time = (now or utc_now()).isoformat()
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM backfill_queue
-                WHERE status IN ('PENDING', 'FAILED')
-                  AND COALESCE(next_not_before, '1970-01-01T00:00:00+00:00') <= ?
-                ORDER BY priority ASC, created_at ASC, id ASC
-                LIMIT ?
-                OFFSET ?
-                """,
-                (lease_time, limit, offset),
-            ).fetchall()
-        return [BackfillTask(**dict(row)) for row in rows]
-
-    def lease_task_by_id(self, task_id: int, now: datetime | None = None) -> BackfillTask | None:
-        """Lease a specific task if it is still eligible."""
-        lease_time = (now or utc_now()).isoformat()
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT *
-                FROM backfill_queue
-                WHERE id = ?
-                  AND status IN ('PENDING', 'FAILED')
-                  AND COALESCE(next_not_before, '1970-01-01T00:00:00+00:00') <= ?
-                """,
-                (task_id, lease_time),
-            ).fetchone()
-            if row is None:
-                return None
-            connection.execute(
-                "UPDATE backfill_queue SET status = 'LEASED', updated_at = ? WHERE id = ?",
-                (lease_time, task_id),
-            )
-            leased_row = connection.execute("SELECT * FROM backfill_queue WHERE id = ?", (task_id,)).fetchone()
-        return BackfillTask(**dict(leased_row)) if leased_row is not None else None
-
-    def mark_task_done(self, task_id: int) -> None:
-        """Mark a leased task as complete."""
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE backfill_queue SET status = 'DONE', updated_at = ? WHERE id = ?",
-                (utc_now().isoformat(), task_id),
-            )
-
-    def mark_task_failed(self, task_id: int, error: str, backoff_minutes: int) -> None:
-        """Mark a task failed and defer it until the backoff expires."""
-        next_not_before = utc_now() + timedelta(minutes=backoff_minutes)
-        with self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE backfill_queue
-                SET status = 'FAILED',
-                    attempts = attempts + 1,
-                    last_error = ?,
-                    next_not_before = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (error, next_not_before.isoformat(), utc_now().isoformat(), task_id),
-            )
-
-    def defer_task(self, task_id: int, *, reason: str, backoff_minutes: int) -> None:
-        """Return a leased task to pending state with a future eligibility time."""
-        next_not_before = utc_now() + timedelta(minutes=backoff_minutes)
-        with self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE backfill_queue
-                SET status = 'PENDING',
-                    last_error = ?,
-                    next_not_before = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (reason, next_not_before.isoformat(), utc_now().isoformat(), task_id),
-            )
-
-    def requeue_retryable_failures(self) -> int:
-        """Move retryable failed tasks back to pending without discarding backoff."""
-        patterns = (
-            "%budget exhausted%",
-            "%request failed: 429%",
-            "%hourly request allocation%",
-            "%daily request allocation%",
-            "%too many requests%",
-            "%rate limit%",
-        )
-        where_clause = " OR ".join("lower(coalesce(last_error, '')) LIKE ?" for _ in patterns)
-        with self._connect() as connection:
-            cursor = connection.execute(
-                f"""
-                UPDATE backfill_queue
-                SET status = 'PENDING',
-                    updated_at = ?
-                WHERE status = 'FAILED'
-                  AND ({where_clause})
-                """,
-                (utc_now().isoformat(), *patterns),
-            )
-        return int(cursor.rowcount)
 
     def update_partition_status(
         self,
@@ -1143,37 +967,6 @@ class DataNodeDB:
                 "SELECT * FROM partition_status ORDER BY source, dataset, date"
             ).fetchall()
 
-    def has_pending_backfill(self) -> bool:
-        """Return whether any backfill work is currently eligible to run."""
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT 1
-                FROM backfill_queue
-                WHERE status IN ('PENDING', 'FAILED')
-                  AND COALESCE(next_not_before, '1970-01-01T00:00:00+00:00') <= ?
-                LIMIT 1
-                """,
-                (utc_now().isoformat(),),
-            ).fetchone()
-            return row is not None
-
-    def has_pending_datewide_backfill(self) -> bool:
-        """Return whether any legacy datewide backlog remains."""
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT 1
-                FROM backfill_queue
-                WHERE symbol IS NULL
-                  AND status IN ('PENDING', 'FAILED')
-                  AND COALESCE(next_not_before, '1970-01-01T00:00:00+00:00') <= ?
-                LIMIT 1
-                """,
-                (utc_now().isoformat(),),
-            ).fetchone()
-        return row is not None
-
     def mark_legacy_datewide_backfill_migrated(self) -> int:
         """Retire legacy backlog rows after planner migration is active."""
         with self._connect() as connection:
@@ -1188,21 +981,6 @@ class DataNodeDB:
                 (utc_now().isoformat(),),
             )
         return int(cursor.rowcount)
-
-    def latest_queue_update(self, *, statuses: tuple[str, ...] | None = None) -> str | None:
-        """Return the most recent queue update timestamp, optionally filtered by status."""
-        with self._connect() as connection:
-            if statuses:
-                placeholders = ",".join("?" for _ in statuses)
-                row = connection.execute(
-                    f"SELECT MAX(updated_at) AS updated_at FROM backfill_queue WHERE status IN ({placeholders})",
-                    statuses,
-                ).fetchone()
-            else:
-                row = connection.execute("SELECT MAX(updated_at) AS updated_at FROM backfill_queue").fetchone()
-        if row is None:
-            return None
-        return row["updated_at"]
 
     def has_pending_planner_tasks(
         self,

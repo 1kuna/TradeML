@@ -188,11 +188,10 @@ trademl/
    - See SSOT §1.8
 
 2. **SQLite helpers** — `src/trademl/data_node/db.py`
-   - Create `backfill_queue` and `partition_status` tables (schemas from SSOT §1.4)
-   - `enqueue_task(dataset, symbol, start_date, end_date, kind, priority)`
-   - `lease_next_task() -> Task | None` (FIFO within priority, respects `next_not_before`)
-   - `mark_task_done(task_id)`
-   - `mark_task_failed(task_id, error, backoff_minutes)`
+   - Create planner task/progress, vendor attempt, canonical ledger, and `partition_status` tables
+   - `upsert_planner_task(...)` / `bulk_upsert_planner_tasks(...)`
+   - `lease_next_planner_task(...)` and `lease_vendor_attempt(...)`
+   - `mark_planner_task_success/partial/failed(...)`
    - `update_partition_status(source, dataset, date, status, row_count, ...)`
    - All operations transactional
 

@@ -321,6 +321,37 @@ class _BackfillConnector:
         )
 
 
+def _insert_pending_canonical_planner_task(
+    db: DataNodeDB,
+    *,
+    task_key: str = "canonical::AAPL::pending",
+    symbol: str = "AAPL",
+    day: str = "2026-03-31",
+) -> None:
+    db.upsert_planner_task(
+        task_key=task_key,
+        task_family="canonical_bars",
+        planner_group="canonical_bars_backlog",
+        dataset="equities_eod",
+        tier="A",
+        priority=5,
+        start_date=day,
+        end_date=day,
+        symbols=[symbol],
+        eligible_vendors=["alpaca"],
+        output_name="equities_bars",
+        payload={"scope_kind": "symbol_range", "trading_days": [day]},
+    )
+    db.update_planner_task_progress(
+        task_key=task_key,
+        expected_units=1,
+        completed_units=0,
+        remaining_units=1,
+        remaining_symbols=[symbol],
+        state={"scope_kind": "symbol_range", "trading_days": [day]},
+    )
+
+
 class _BudgetedBackfillConnector(_BackfillConnector):
     def __init__(self, vendor_name: str, budget_manager: BudgetManager) -> None:
         super().__init__(vendor_name)
@@ -826,230 +857,6 @@ def test_seed_planner_tasks_skips_recomputing_settled_canonical_progress(
     assert progress.remaining_units == 0
 
 
-def test_backfill_budget_exhaustion_defers_task_instead_of_marking_failed(
-    tmp_path: Path,
-) -> None:
-    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    task_id = db.enqueue_task(
-        "equities_eod", "AAPL", "2025-01-01", "2025-01-02", "GAP", 1
-    )
-    leased = db.lease_task_by_id(task_id)
-    assert leased is not None
-    service = DataNodeService(
-        db=db,
-        connectors={"finnhub": _BudgetFailConnector()},
-        auditor=PartitionAuditor(
-            db=db,
-            calendar_store=ExchangeCalendarStore(
-                root=tmp_path / "reference" / "calendars"
-            ),
-        ),
-        curator=Curator(),
-        paths=DataNodePaths(root=tmp_path),
-        source_name="finnhub",
-    )
-
-    changed = service._canonical_runtime._process_backfill_task_for_vendor(
-        leased, "finnhub"
-    )
-    with sqlite3.connect(tmp_path / "control" / "node.sqlite") as connection:
-        row = connection.execute(
-            "SELECT status, last_error, next_not_before FROM backfill_queue WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-
-    assert changed == []
-    assert row is not None
-    assert row[0] == "PENDING"
-    assert "budget exhausted" in (row[1] or "")
-    assert row[2] is not None
-
-
-def test_lease_next_task_for_vendor_skips_single_symbol_vendors_for_datewide_backfill(
-    tmp_path: Path,
-) -> None:
-    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-02", "GAP", 1)
-    service = DataNodeService(
-        db=db,
-        connectors={
-            "alpaca": _BackfillConnector("alpaca"),
-            "tiingo": _BackfillConnector("tiingo"),
-        },
-        auditor=PartitionAuditor(
-            db=db,
-            calendar_store=ExchangeCalendarStore(
-                root=tmp_path / "reference" / "calendars"
-            ),
-        ),
-        curator=Curator(),
-        paths=DataNodePaths(root=tmp_path),
-        source_name="alpaca",
-    )
-
-    tiingo_task = service._canonical_runtime._lease_next_task_for_vendor("tiingo")
-    alpaca_task = service._canonical_runtime._lease_next_task_for_vendor("alpaca")
-
-    assert tiingo_task is None
-    assert alpaca_task is not None
-    assert alpaca_task.symbol is None
-
-
-def test_lease_next_task_for_vendor_scans_past_front_slice_when_vendor_matches_later_task(
-    tmp_path: Path,
-) -> None:
-    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    for index in range(64):
-        db.enqueue_task(
-            "equities_eod", f"SYM{index:03d}", "2025-01-01", "2025-01-02", "GAP", 1
-        )
-    db.enqueue_task("equities_eod", None, "2025-01-01", "2025-01-02", "GAP", 1)
-    service = DataNodeService(
-        db=db,
-        connectors={
-            "alpaca": _BackfillConnector("alpaca"),
-            "tiingo": _BackfillConnector("tiingo"),
-        },
-        auditor=PartitionAuditor(
-            db=db,
-            calendar_store=ExchangeCalendarStore(
-                root=tmp_path / "reference" / "calendars"
-            ),
-        ),
-        curator=Curator(),
-        paths=DataNodePaths(root=tmp_path),
-        source_name="alpaca",
-    )
-
-    leased = service._canonical_runtime._lease_next_task_for_vendor("alpaca")
-
-    assert leased is not None
-    assert leased.symbol is None
-
-
-def test_datewide_backfill_merges_parallel_vendor_results_and_marks_task_done(
-    tmp_path: Path,
-) -> None:
-    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    task_id = db.enqueue_task(
-        "equities_eod", None, "2025-01-01", "2025-01-01", "GAP", 1
-    )
-    leased = db.lease_task_by_id(task_id)
-    assert leased is not None
-    alpaca = _SelectiveBackfillConnector("alpaca", ["AAPL", "MSFT"])
-    tiingo = _SelectiveBackfillConnector("tiingo", ["NVDA"])
-    service = DataNodeService(
-        db=db,
-        connectors={"alpaca": alpaca, "tiingo": tiingo},
-        auditor=PartitionAuditor(
-            db=db,
-            calendar_store=ExchangeCalendarStore(
-                root=tmp_path / "reference" / "calendars"
-            ),
-        ),
-        curator=Curator(),
-        paths=DataNodePaths(root=tmp_path),
-        source_name="alpaca",
-    )
-    service.default_symbols = ["AAPL", "MSFT", "NVDA"]
-
-    changed = service._canonical_runtime._process_backfill_task_for_vendor(
-        leased, "alpaca"
-    )
-
-    assert changed == ["2025-01-01"]
-    stored = pd.read_parquet(
-        tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-01" / "data.parquet"
-    )
-    assert sorted(stored["symbol"].tolist()) == ["AAPL", "MSFT", "NVDA"]
-    with sqlite3.connect(tmp_path / "control" / "node.sqlite") as connection:
-        status_row = connection.execute(
-            "SELECT status FROM backfill_queue WHERE id = ?", (task_id,)
-        ).fetchone()
-    assert status_row == ("DONE",)
-    assert alpaca.calls
-    assert tiingo.calls
-
-
-def test_datewide_backfill_persists_failed_vendor_attempts(tmp_path: Path) -> None:
-    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    task_id = db.enqueue_task(
-        "equities_eod", None, "2025-01-01", "2025-01-01", "GAP", 1
-    )
-    leased = db.lease_task_by_id(task_id)
-    assert leased is not None
-    service = DataNodeService(
-        db=db,
-        connectors={"alpaca": _ForwardFailConnector("alpaca")},
-        auditor=PartitionAuditor(
-            db=db,
-            calendar_store=ExchangeCalendarStore(
-                root=tmp_path / "reference" / "calendars"
-            ),
-        ),
-        curator=Curator(),
-        paths=DataNodePaths(root=tmp_path),
-        source_name="alpaca",
-    )
-    service.default_symbols = ["AAPL", "MSFT"]
-
-    changed = service._canonical_runtime._process_backfill_task_for_vendor(
-        leased, "alpaca"
-    )
-
-    assert changed == []
-    attempts = db.vendor_attempts_for_task(
-        "canonical::equities_eod::__ALL__::2025-01-01::2025-01-01::GAP"
-    )
-    assert len(attempts) == 1
-    assert attempts[0].vendor == "alpaca"
-    assert attempts[0].status == "FAILED"
-    assert attempts[0].last_error == "alpaca unavailable"
-
-
-def test_datewide_backfill_keeps_partial_progress_and_defers_remaining_symbols(
-    tmp_path: Path,
-) -> None:
-    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    task_id = db.enqueue_task(
-        "equities_eod", None, "2025-01-02", "2025-01-02", "GAP", 1
-    )
-    leased = db.lease_task_by_id(task_id)
-    assert leased is not None
-    alpaca = _SelectiveBackfillConnector("alpaca", ["AAPL"])
-    service = DataNodeService(
-        db=db,
-        connectors={"alpaca": alpaca},
-        auditor=PartitionAuditor(
-            db=db,
-            calendar_store=ExchangeCalendarStore(
-                root=tmp_path / "reference" / "calendars"
-            ),
-        ),
-        curator=Curator(),
-        paths=DataNodePaths(root=tmp_path),
-        source_name="alpaca",
-    )
-    service.default_symbols = ["AAPL", "MSFT"]
-
-    changed = service._canonical_runtime._process_backfill_task_for_vendor(
-        leased, "alpaca"
-    )
-
-    assert changed == ["2025-01-02"]
-    stored = pd.read_parquet(
-        tmp_path / "data" / "raw" / "equities_bars" / "date=2025-01-02" / "data.parquet"
-    )
-    assert stored["symbol"].tolist() == ["AAPL"]
-    with sqlite3.connect(tmp_path / "control" / "node.sqlite") as connection:
-        row = connection.execute(
-            "SELECT status, last_error FROM backfill_queue WHERE id = ?", (task_id,)
-        ).fetchone()
-    assert row is not None
-    assert row[0] == "PENDING"
-    assert "remaining_symbols=1" in (row[1] or "")
-
-
 def test_canonical_planner_batch_uses_atomic_symbol_tasks_and_multisymbol_fetch(
     tmp_path: Path,
 ) -> None:
@@ -1350,7 +1157,7 @@ def test_run_cluster_forever_drains_backlog_even_outside_maintenance_window(
     tmp_path: Path,
 ) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    db.enqueue_task("equities_eod", "AAPL", "2026-03-31", "2026-03-31", "GAP", 1)
+    _insert_pending_canonical_planner_task(db)
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
@@ -1736,7 +1543,7 @@ def test_idle_budget_warning_records_affordable_unleased_work(tmp_path: Path) ->
 
 def test_run_cluster_forever_backfill_renews_runtime_heartbeat(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    db.enqueue_task("equities_eod", "AAPL", "2026-03-31", "2026-03-31", "GAP", 1)
+    _insert_pending_canonical_planner_task(db)
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
@@ -4304,7 +4111,7 @@ def test_run_cluster_forever_reruns_backfill_when_same_day_queue_is_reseeded(
     tmp_path: Path,
 ) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    db.enqueue_task("equities_eod", None, "2026-04-02", "2026-04-02", "GAP", 1)
+    _insert_pending_canonical_planner_task(db, day="2026-04-02")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
@@ -4352,7 +4159,7 @@ def test_run_cluster_forever_renews_backfill_lease_while_backlog_remains(
     tmp_path: Path,
 ) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    db.enqueue_task("equities_eod", None, "2026-04-02", "2026-04-02", "GAP", 1)
+    _insert_pending_canonical_planner_task(db, day="2026-04-02")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
@@ -4449,7 +4256,7 @@ def test_run_cluster_forever_backfill_curates_only_changed_dates(
     tmp_path: Path,
 ) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    db.enqueue_task("equities_eod", None, "2026-04-02", "2026-04-02", "GAP", 1)
+    _insert_pending_canonical_planner_task(db, day="2026-04-02")
     service = DataNodeService(
         db=db,
         connectors={"alpaca": _NoopConnector()},
@@ -5983,34 +5790,3 @@ def test_aux_lane_width_caps_sec_edgar_while_companyfacts_pending(
     )
 
     assert widths["sec_edgar"] == 1
-
-
-def test_process_backfill_queue_prefers_tiingo_for_equities_history(
-    tmp_path: Path,
-) -> None:
-    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
-    db.enqueue_task("equities_eod", "AAPL", "2019-01-02", "2019-01-02", "BOOTSTRAP", 1)
-    alpaca = _NoopConnector()
-    tiingo = _BackfillConnector("tiingo")
-    service = DataNodeService(
-        db=db,
-        connectors={"alpaca": alpaca, "tiingo": tiingo},
-        auditor=PartitionAuditor(
-            db=db,
-            calendar_store=ExchangeCalendarStore(
-                root=tmp_path / "reference" / "calendars"
-            ),
-        ),
-        curator=Curator(),
-        paths=DataNodePaths(root=tmp_path),
-    )
-    service.default_symbols = ["AAPL"]
-
-    changed = service.process_backfill_queue()
-
-    assert changed == ["2019-01-02"]
-    assert tiingo.calls == [("equities_eod", ["AAPL"], "2019-01-02", "2019-01-02")]
-    stored = pd.read_parquet(
-        tmp_path / "data" / "raw" / "equities_bars" / "date=2019-01-02" / "data.parquet"
-    )
-    assert stored.iloc[0]["source_name"] == "tiingo"
