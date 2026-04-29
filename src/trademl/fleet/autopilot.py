@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shlex
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from trademl.fleet.remote import run_password_ssh
 
 SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 
@@ -339,13 +338,13 @@ def _normalize_issue(issue: dict[str, Any], *, now: datetime) -> dict[str, Any]:
 
 def _ssh_service_health(target: dict[str, str], *, service_command: str, service_name: str, heal: bool) -> dict[str, Any]:
     command = f"{service_command} is-active {service_name}"
-    result = _run_password_ssh(target, command)
+    result = run_password_ssh(target, command).to_dict()
     active = result.get("returncode") == 0 and str(result.get("stdout") or "").strip() == "active"
     healed = False
     if heal and not active:
-        restart = _run_password_ssh(target, f"{service_command} restart {service_name}")
+        restart = run_password_ssh(target, f"{service_command} restart {service_name}").to_dict()
         healed = restart.get("returncode") == 0
-        result = _run_password_ssh(target, command)
+        result = run_password_ssh(target, command).to_dict()
         active = result.get("returncode") == 0 and str(result.get("stdout") or "").strip() == "active"
     return {"status": "online" if active else "offline", "healed": healed, "raw": result, "reason": None if active else result.get("stderr") or result.get("stdout")}
 
@@ -354,13 +353,13 @@ def _ssh_mac_health(target: dict[str, str], *, heal: bool) -> dict[str, Any]:
     label = target.get("label") or "com.trademl.research.perpetual-macmini"
     service = f"gui/$(id -u)/{label}"
     command = f"launchctl print {service} >/dev/null && echo active"
-    result = _run_password_ssh(target, command)
+    result = run_password_ssh(target, command).to_dict()
     active = result.get("returncode") == 0 and "active" in str(result.get("stdout") or "")
     healed = False
     if heal and not active:
-        restart = _run_password_ssh(target, f"launchctl kickstart -k {service}")
+        restart = run_password_ssh(target, f"launchctl kickstart -k {service}").to_dict()
         healed = restart.get("returncode") == 0
-        result = _run_password_ssh(target, command)
+        result = run_password_ssh(target, command).to_dict()
         active = result.get("returncode") == 0 and "active" in str(result.get("stdout") or "")
     research = _ssh_mac_research_status(target) if active else {}
     return {
@@ -383,7 +382,7 @@ def _ssh_mac_research_status(target: dict[str, str]) -> dict[str, Any]:
         f"--data-root {data_root} --local-state {local_state} --env-file {env_file} "
         f"status --program-id {program_id}"
     )
-    result = _run_password_ssh(target, command)
+    result = run_password_ssh(target, command).to_dict()
     if result.get("returncode") != 0:
         return {"status": "unknown", "error": result.get("stderr") or result.get("stdout")}
     try:
@@ -396,33 +395,3 @@ def _ssh_mac_research_status(target: dict[str, str]) -> dict[str, Any]:
         "current_experiment_id": payload.get("current_experiment_id"),
         "wait_reason": payload.get("wait_reason"),
     }
-
-
-def _run_password_ssh(target: dict[str, str], command: str) -> dict[str, Any]:
-    host = target.get("host")
-    user = target.get("user")
-    password_env = target.get("password_env")
-    if not host or not user:
-        return {"returncode": 2, "stdout": "", "stderr": "missing host/user"}
-    env = dict(os.environ)
-    prefix = ["ssh"]
-    if password_env and env.get(password_env):
-        env["SSHPASS"] = env[password_env]
-        prefix = ["sshpass", "-e", "ssh"]
-    ssh = [
-        *prefix,
-        "-o",
-        "PreferredAuthentications=password",
-        "-o",
-        "PubkeyAuthentication=no",
-        "-o",
-        "NumberOfPasswordPrompts=1",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "ConnectTimeout=8",
-        f"{user}@{host}",
-        command,
-    ]
-    result = subprocess.run(ssh, capture_output=True, text=True, check=False, timeout=30, env=env)
-    return {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
