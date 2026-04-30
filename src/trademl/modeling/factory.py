@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
@@ -686,24 +687,35 @@ def _sec_filing_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
     frame["symbol"] = frame["symbol"].astype(str)
     frame["available_at"] = pd.to_datetime(frame["available_at"], errors="coerce")
     frame = frame.dropna(subset=["available_at"])
+    modeling_dates = np.array(sorted(pd.to_datetime(dates).dropna().unique()), dtype="datetime64[ns]")
+    if len(modeling_dates) == 0:
+        return pd.DataFrame()
     rows: list[dict[str, Any]] = []
-    for date_value in sorted(pd.to_datetime(dates).dropna().unique()):
-        current = pd.Timestamp(date_value)
-        eligible = frame[frame["available_at"] <= current]
-        if eligible.empty:
+    for symbol, group in frame.sort_values("available_at").groupby("symbol", sort=True):
+        times = np.array(pd.to_datetime(group["available_at"]).to_numpy(dtype="datetime64[ns]"))
+        if len(times) == 0:
             continue
-        for symbol, group in eligible.groupby("symbol"):
-            age = (current - group["available_at"].max()).days
+        forms = group["form"].astype(str).str.upper().to_numpy()
+        form_8k = forms == "8-K"
+        form_10q = forms == "10-Q"
+        form_10k = forms == "10-K"
+        for current in modeling_dates:
+            end = int(np.searchsorted(times, current, side="right"))
+            if end <= 0:
+                continue
+            start_30 = int(np.searchsorted(times, current - np.timedelta64(30, "D"), side="left"))
+            start_90 = int(np.searchsorted(times, current - np.timedelta64(90, "D"), side="left"))
+            latest = pd.Timestamp(times[end - 1])
             rows.append(
                 {
-                    "date": current,
+                    "date": pd.Timestamp(current),
                     "symbol": str(symbol),
-                    "sec_filings_30d": float((group["available_at"] >= current - pd.Timedelta(days=30)).sum()),
-                    "sec_filings_90d": float((group["available_at"] >= current - pd.Timedelta(days=90)).sum()),
-                    "sec_8k_30d": float(((group["form"].astype(str).str.upper() == "8-K") & (group["available_at"] >= current - pd.Timedelta(days=30))).sum()),
-                    "sec_10q_90d": float(((group["form"].astype(str).str.upper() == "10-Q") & (group["available_at"] >= current - pd.Timedelta(days=90))).sum()),
-                    "sec_10k_90d": float(((group["form"].astype(str).str.upper() == "10-K") & (group["available_at"] >= current - pd.Timedelta(days=90))).sum()),
-                    "sec_days_since_last_filing": float(max(age, 0)),
+                    "sec_filings_30d": float(end - start_30),
+                    "sec_filings_90d": float(end - start_90),
+                    "sec_8k_30d": float(form_8k[start_30:end].sum()),
+                    "sec_10q_90d": float(form_10q[start_90:end].sum()),
+                    "sec_10k_90d": float(form_10k[start_90:end].sum()),
+                    "sec_days_since_last_filing": float(max((pd.Timestamp(current) - latest).days, 0)),
                 }
             )
     return pd.DataFrame(rows)
