@@ -596,6 +596,7 @@ def _ssh_mac_research_status(target: dict[str, str]) -> dict[str, Any]:
         "autonomous_progression",
         "dependency_preflight",
         "feature_label_readiness",
+        "feature_family_leaderboard",
         "modeling",
     }
     return {key: payload.get(key) for key in safe_keys if key in payload}

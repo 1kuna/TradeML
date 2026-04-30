@@ -150,6 +150,14 @@ def test_observability_uses_remote_mac_research_when_local_summary_missing(tmp_p
                             "net_return": 0.01,
                             "no_live_orders": True,
                         },
+                        "feature_family_leaderboard": {
+                            "entries": [
+                                {
+                                    "feature_version": "news_event_aggregates_v1",
+                                    "readiness_status": "BLOCKED",
+                                }
+                            ]
+                        },
                     },
                 }
             },
@@ -162,6 +170,7 @@ def test_observability_uses_remote_mac_research_when_local_summary_missing(tmp_p
     assert payload["research"]["current_experiment_id"] == "perpetual-macmini-p1-f188"
     assert payload["research"]["supervisor_running"] is True
     assert payload["research"]["paper_account_smoke"]["status"] == "ok"
+    assert payload["research"]["feature_family_leaderboard"]["entries"][0]["feature_version"] == "news_event_aggregates_v1"
     assert payload["paper_pnl"]["status"] == "available"
     assert payload["paper_pnl"]["paper_account_smoke_status"] == "ok"
 
