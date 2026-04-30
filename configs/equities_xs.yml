@@ -49,6 +49,12 @@ validation:
   embargo_days: 10
   additional: [ic_by_year, ic_by_sector, placebo, cost_stress]
   portfolio_profiles: [equal_weight_top_quintile, cost_aware_long_only_v1]
+  negative_controls:
+    require_negative_controls: true
+    max_abs_negative_control_ic: 0.10
+    max_abs_future_news_leak_ic: 0.10
+    max_single_feature_score_drop: 0.75
+    min_feature_ablation_score_ratio: 0.25
 
 portfolio:
   method: equal_weight_top_quintile

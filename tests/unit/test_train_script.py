@@ -116,6 +116,37 @@ def test_training_diagnostics_helpers_capture_temporal_and_feature_fragility() -
     assert dependence["max_single_feature_score_drop"] == 1.0
 
 
+def test_negative_controls_are_deterministic_and_include_fragility() -> None:
+    module = _load_train_module()
+    predictions = pd.DataFrame(
+        {
+            "date": ["2026-04-24", "2026-04-24", "2026-04-27", "2026-04-27"],
+            "symbol": ["A", "B", "A", "B"],
+            "prediction": [0.1, 0.9, 0.2, 0.8],
+            "label_5d": [0.0, 1.0, 0.1, 0.9],
+        }
+    )
+    feature_frame = predictions.rename(columns={"prediction": "news_count_7d"})
+
+    first = module.compute_negative_control_diagnostics(
+        predictions=predictions,
+        label_col="label_5d",
+        feature_frame=feature_frame,
+        feature_cols=["news_count_7d"],
+    )
+    second = module.compute_negative_control_diagnostics(
+        predictions=predictions,
+        label_col="label_5d",
+        feature_frame=feature_frame,
+        feature_cols=["news_count_7d"],
+    )
+
+    assert first == second
+    assert first["controls_version"] == "negative_controls_v1"
+    assert "future_news_leak_sentinel_ic" in first
+    assert "ticker_news_permutation_max_abs_ic" in first
+
+
 def _load_train_module():
     module_path = Path(__file__).resolve().parents[2] / "src" / "scripts" / "train.py"
     spec = importlib.util.spec_from_file_location("train_under_test", module_path)

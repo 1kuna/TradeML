@@ -114,6 +114,11 @@ DEFAULT_PAPER_POLICY = {
     "no_live_orders": True,
     "pnl_horizon_trading_days": 5,
     "portfolio_notional": 100_000.0,
+    "min_mature_net_return": 0.0,
+    "min_mature_excess_return": -1.0,
+    "max_backtest_paper_gap": 0.05,
+    "max_mature_drawdown": 0.05,
+    "max_mature_turnover": 2.0,
     "broker": {
         "provider": "alpaca_paper",
         "base_url": "https://paper-api.alpaca.markets/v2",
@@ -741,6 +746,8 @@ def _write_paper_outputs(
         "status": "written",
         "date": latest_date.date().isoformat(),
         "latest_prediction_date": latest_available_date.date().isoformat(),
+        "source_run_id": source.get("run_id"),
+        "source_experiment_id": source.get("experiment_id"),
         "signals_path": str(signals_path),
         "target_weights_path": str(targets_path),
         "paper_orders_path": str(orders_path),
@@ -944,8 +951,10 @@ def evaluate_paper_pnl(
         "cost_drag": cost_drag,
         "net_return": gross_return - cost_drag,
         "turnover": turnover,
+        "max_drawdown": min(0.0, gross_return - cost_drag),
         "benchmark_symbol": benchmark_symbol,
         "benchmark_return": benchmark_return,
+        "benchmark_spy_return": benchmark_return if benchmark_symbol == "SPY" else None,
         "excess_return": (gross_return - cost_drag - benchmark_return) if benchmark_return is not None else None,
         "positions": int(len(weighted)),
         "no_live_orders": True,
@@ -974,12 +983,20 @@ def evaluate_paper_evidence(
     failures: list[str] = []
     net_return = _safe_float(paper_pnl.get("net_return"))
     excess_return = _safe_float(paper_pnl.get("excess_return"))
+    drawdown = abs(_safe_float(paper_pnl.get("max_drawdown")) or 0.0)
+    turnover = _safe_float(paper_pnl.get("turnover"))
     min_net_return = float(merged.get("min_mature_net_return", 0.0) or 0.0)
     min_excess_return = float(merged.get("min_mature_excess_return", -1.0) or -1.0)
     if net_return is None or net_return < min_net_return:
         failures.append(f"paper_net_return<{min_net_return}")
     if excess_return is not None and excess_return < min_excess_return:
         failures.append(f"paper_excess_return<{min_excess_return}")
+    max_drawdown = float(merged.get("max_mature_drawdown", 0.05) or 0.05)
+    if drawdown > max_drawdown:
+        failures.append(f"paper_drawdown>{max_drawdown}")
+    max_turnover = float(merged.get("max_mature_turnover", 2.0) or 2.0)
+    if turnover is not None and turnover > max_turnover:
+        failures.append(f"paper_turnover>{max_turnover}")
     backtest = dict(backtest_summary or {})
     backtest_return = _safe_float(backtest.get("net_return") or backtest.get("backtest_net_return"))
     gap = None
@@ -996,17 +1013,54 @@ def evaluate_paper_evidence(
         "hard_stop_triggered": bool(failures),
         "net_return": net_return,
         "excess_return": excess_return,
+        "max_drawdown": -drawdown,
+        "turnover": turnover,
         "backtest_net_return": backtest_return,
         "path": paper_pnl.get("path"),
         "no_live_orders": True,
     }
 
 
+def write_paper_evidence_record(
+    *,
+    data_root: Path,
+    local_state: Path,
+    program_id: str,
+    paper_outputs: dict[str, Any],
+    paper_pnl: dict[str, Any],
+    paper_evidence: dict[str, Any],
+    candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist rolling non-live paper evidence keyed by signal date and candidate."""
+    date = str(paper_pnl.get("signal_date") or paper_outputs.get("date") or datetime.now(tz=UTC).date().isoformat())
+    run_id = str((candidate or {}).get("run_id") or paper_outputs.get("source_run_id") or "unknown")
+    payload = {
+        "program_id": program_id,
+        "run_id": run_id,
+        "experiment_id": (candidate or {}).get("experiment_id"),
+        "date": date,
+        "written_at": datetime.now(tz=UTC).isoformat(),
+        "paper_outputs": paper_outputs,
+        "paper_pnl": paper_pnl,
+        "paper_evidence": paper_evidence,
+        "no_live_orders": True,
+    }
+    rel = Path("paper_evidence") / date / f"{run_id}.json"
+    local_path = _local_research_root(local_state=local_state) / rel
+    shared_path = _shared_research_root(data_root=data_root) / rel
+    _atomic_write_json(local_path, payload)
+    _atomic_write_json(shared_path, payload)
+    return {"status": "written", "local_path": str(local_path), "shared_path": str(shared_path), **payload}
+
+
 def _paper_policy(policy: dict[str, Any] | None) -> dict[str, Any]:
     merged = deepcopy(DEFAULT_PAPER_POLICY)
     incoming = dict(policy or {})
+    evidence = {**dict(merged.get("evidence") or {}), **dict(incoming.get("evidence") or {})}
     broker = {**dict(merged.get("broker") or {}), **dict(incoming.get("broker") or {})}
     merged.update(incoming)
+    merged.update(evidence)
+    merged["evidence"] = evidence
     merged["broker"] = broker
     return merged
 
@@ -1519,6 +1573,7 @@ def write_research_review_packet(
     )
     incumbent = incumbent_update.get("incumbent") or read_research_incumbent(local_state=local_state, program_id=program_id)
     paper_outputs = {}
+    paper_candidate: dict[str, Any] | None = incumbent if incumbent else None
     if incumbent:
         paper_outputs = write_paper_outputs_for_incumbent(
             incumbent=incumbent,
@@ -1530,6 +1585,7 @@ def write_research_review_packet(
     if not incumbent:
         shadow_candidate = _best_candidate_with_predictions(list(comparison.get("rows") or []))
         if shadow_candidate:
+            paper_candidate = shadow_candidate
             shadow_paper_outputs = write_shadow_paper_outputs_for_candidate(
                 candidate=shadow_candidate,
                 data_root=data_root,
@@ -1554,6 +1610,18 @@ def write_research_review_packet(
         backtest_summary=dict(comparison.get("best") or {}),
         policy=dict(spec.get("paper_policy") or {}),
     )
+    paper_evidence_record = {}
+    source_paper_outputs = paper_outputs if paper_outputs.get("status") == "written" else shadow_paper_outputs
+    if source_paper_outputs.get("status") == "written":
+        paper_evidence_record = write_paper_evidence_record(
+            data_root=data_root,
+            local_state=local_state,
+            program_id=program_id,
+            paper_outputs=source_paper_outputs,
+            paper_pnl=paper_pnl,
+            paper_evidence=paper_evidence,
+            candidate=paper_candidate,
+        )
     drift_alerts = evaluate_research_drift(
         program_id=program_id,
         state=state,
@@ -1609,6 +1677,7 @@ def write_research_review_packet(
         "shadow_paper_outputs": shadow_paper_outputs,
         "paper_pnl": paper_pnl,
         "paper_evidence": paper_evidence,
+        "paper_evidence_record": paper_evidence_record,
         "drift_alerts": drift_alerts,
         "alert_result": alert_result,
         "infra_blocker": state.get("last_infra_preflight", {}),
@@ -1673,6 +1742,7 @@ def write_research_review_packet(
     state["latest_shadow_paper_outputs"] = shadow_paper_outputs
     state["latest_paper_pnl"] = paper_pnl
     state["latest_paper_evidence"] = paper_evidence
+    state["latest_paper_evidence_record"] = paper_evidence_record
     state["latest_drift_alerts"] = drift_alerts
     if alert_result.get("status") == "written":
         state["last_alert_at"] = datetime.now(tz=UTC).isoformat()
@@ -2172,6 +2242,7 @@ def _make_experiment_spec_from_phase_policy(
         ),
         "target": str(spec.get("target") or "local"),
         "modeling": deepcopy(spec.get("modeling") or {}),
+        "validation": deepcopy(spec.get("validation") or {}),
         "report_date_policy": str(phase_policy.get("report_date_policy") or spec.get("report_date_policy") or "phase1_freeze"),
         "max_concurrent": int(phase_policy.get("max_concurrent") or spec.get("max_concurrent") or 1),
         "supervision": {

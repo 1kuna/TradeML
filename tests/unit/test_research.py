@@ -2173,6 +2173,29 @@ def test_evaluate_paper_evidence_marks_pending_positive_and_failing() -> None:
     assert "paper_vs_backtest_gap>0.05" in failing["failures"]
 
 
+def test_write_paper_evidence_record_persists_shared_and_local(tmp_path: Path) -> None:
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "control"
+
+    result = research.write_paper_evidence_record(
+        data_root=data_root,
+        local_state=local_state,
+        program_id="perpetual-macmini",
+        paper_outputs={"status": "written", "date": "2026-04-24", "source_run_id": "run-a", "no_live_orders": True},
+        paper_pnl={"status": "available", "signal_date": "2026-04-24", "net_return": 0.01, "no_live_orders": True},
+        paper_evidence={"status": "positive", "no_live_orders": True},
+        candidate={"run_id": "run-a", "experiment_id": "exp-a"},
+    )
+
+    assert result["status"] == "written"
+    assert result["no_live_orders"] is True
+    assert Path(result["local_path"]).exists()
+    assert Path(result["shared_path"]).exists()
+    payload = json.loads(Path(result["shared_path"]).read_text(encoding="utf-8"))
+    assert payload["run_id"] == "run-a"
+    assert payload["paper_evidence"]["status"] == "positive"
+
+
 def test_research_alerts_write_files_and_skip_email_without_env(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("TRADEML_SMTP_HOST", raising=False)
     monkeypatch.delenv("TRADEML_ALERT_EMAIL_TO", raising=False)

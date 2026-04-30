@@ -69,6 +69,11 @@ def build_modeling_artifacts(
         "feature_root": str(feature_root),
         "label_root": str(label_root),
         "feature_groups": _feature_groups_for(feature_set=feature_set, feature_version=feature_version),
+        "feature_group_metadata": _feature_group_metadata(
+            frame=feature_frame,
+            feature_set=feature_set,
+            feature_version=feature_version,
+        ),
     }
     _write_registry(data_root=data_root, payload=payload)
     return payload
@@ -204,13 +209,94 @@ def _modeling_features(
 def _feature_groups_for(*, feature_set: str, feature_version: str) -> list[str]:
     name = f"{feature_set} {feature_version}".lower()
     groups = ["price_liquidity"]
-    if "multi_source" in name or "fundamental" in name or "sec" in name:
+    if "multi_source" in name or "fundamental" in name or "sec" in name or "filing" in name:
         groups.append("fundamentals_sec")
     if "multi_source" in name or "news" in name or "event" in name:
         groups.append("news_events")
     if "multi_source" in name or "minute" in name or "intraday" in name:
         groups.append("minute_daily")
     return groups
+
+
+def _feature_group_metadata(*, frame: pd.DataFrame, feature_set: str, feature_version: str) -> dict[str, Any]:
+    groups = _feature_groups_for(feature_set=feature_set, feature_version=feature_version)
+    metadata: dict[str, Any] = {}
+    for group in groups:
+        columns = _feature_group_columns(group)
+        present = [column for column in columns if column in frame.columns]
+        if present:
+            coverage = float(frame[present].notna().any(axis=1).mean())
+        else:
+            coverage = 0.0
+        metadata[group] = {
+            "columns": present,
+            "row_coverage": coverage,
+            **_feature_group_policy(group),
+        }
+    return metadata
+
+
+def _feature_group_columns(group: str) -> list[str]:
+    if group == "fundamentals_sec":
+        return [
+            "fundamental_metric_count",
+            "fundamental_numeric_mean",
+            "fundamental_days_since_latest_metric",
+            "sec_filings_30d",
+            "sec_filings_90d",
+            "sec_8k_30d",
+            "sec_10q_90d",
+            "sec_10k_90d",
+            "sec_days_since_last_filing",
+        ]
+    if group == "news_events":
+        return [
+            "news_count_1d",
+            "news_count_7d",
+            "news_source_count_7d",
+            "news_vendor_count_7d",
+            "news_abnormal_volume_7d",
+            "news_days_since_last",
+            "news_novelty_proxy_7d",
+        ]
+    if group == "minute_daily":
+        return [
+            "minute_intraday_return",
+            "minute_intraday_range",
+            "minute_realized_vol",
+            "minute_first_30m_return",
+            "minute_last_30m_return",
+            "minute_volume_sum",
+            "minute_volume_ratio",
+            "minute_close_imbalance_proxy",
+        ]
+    return []
+
+
+def _feature_group_policy(group: str) -> dict[str, Any]:
+    if group == "fundamentals_sec":
+        return {
+            "source_datasets": ["sec_filing_index", "fundamentals_daily"],
+            "feature_available_at_policy": "SEC accepted_at or reference last_verified must be <= modeling date",
+            "safety_delay": "none",
+        }
+    if group == "news_events":
+        return {
+            "source_datasets": ["ticker_news"],
+            "feature_available_at_policy": "published/vendor timestamp plus one calendar day safety delay must be <= modeling date",
+            "safety_delay": "1d",
+        }
+    if group == "minute_daily":
+        return {
+            "source_datasets": ["equities_minute"],
+            "feature_available_at_policy": "prior-session minute aggregates are shifted to the next modeling date",
+            "safety_delay": "next_trading_day",
+        }
+    return {
+        "source_datasets": ["equities_ohlcv_adj"],
+        "feature_available_at_policy": "daily adjusted OHLCV available by modeling date",
+        "safety_delay": "none",
+    }
 
 
 def _attach_optional_feature_groups(
@@ -342,7 +428,13 @@ def _news_event_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
             last_age = (current - group["available_at"].max()).days
             recent_1d = group[group["available_at"] >= current - pd.Timedelta(days=1)]
             recent_7d = group[group["available_at"] >= current - pd.Timedelta(days=7)]
+            prior_30d = group[(group["available_at"] < current - pd.Timedelta(days=7)) & (group["available_at"] >= current - pd.Timedelta(days=37))]
             source_count = recent_7d[source_col].nunique() if source_col else 0
+            vendor_col = "vendor" if "vendor" in group.columns else "source_name" if "source_name" in group.columns else source_col
+            vendor_count = recent_7d[vendor_col].nunique() if vendor_col else 0
+            baseline = max(float(len(prior_30d)) / 30.0 * 7.0, 1.0)
+            headline_col = "headline" if "headline" in group.columns else "title" if "title" in group.columns else None
+            novelty = float(recent_7d[headline_col].astype(str).nunique()) / max(1.0, float(len(recent_7d))) if headline_col and not recent_7d.empty else 0.0
             rows.append(
                 {
                     "date": current,
@@ -350,6 +442,9 @@ def _news_event_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
                     "news_count_1d": float(len(recent_1d)),
                     "news_count_7d": float(len(recent_7d)),
                     "news_source_count_7d": float(source_count),
+                    "news_vendor_count_7d": float(vendor_count),
+                    "news_abnormal_volume_7d": float(len(recent_7d)) / baseline,
+                    "news_novelty_proxy_7d": novelty,
                     "news_days_since_last": float(max(last_age, 0)),
                 }
             )
@@ -393,6 +488,12 @@ def _minute_daily_features(*, data_root: Path, panel: pd.DataFrame) -> pd.DataFr
     minute = pd.DataFrame(rows)
     if minute.empty:
         return minute
+    minute = minute.sort_values(["symbol", "source_date"]).reset_index(drop=True)
+    minute["minute_volume_ratio"] = (
+        minute["minute_volume_sum"]
+        / minute.groupby("symbol")["minute_volume_sum"].transform(lambda series: series.rolling(20, min_periods=1).mean()).replace(0.0, pd.NA)
+    ).fillna(0.0)
+    minute["minute_close_imbalance_proxy"] = minute["minute_last_30m_return"] * minute["minute_volume_ratio"]
     calendar = sorted(pd.to_datetime(panel["date"]).dropna().unique())
     next_dates = {pd.Timestamp(calendar[idx - 1]): pd.Timestamp(calendar[idx]) for idx in range(1, len(calendar))}
     minute["date"] = minute["source_date"].map(next_dates)

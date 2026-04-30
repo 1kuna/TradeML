@@ -36,6 +36,7 @@ from trademl.validation.diagnostics import (
 from trademl.validation.metrics import bucket_metrics, rank_ic
 from trademl.validation.cpcv import combinatorially_purged_cv
 from trademl.validation.dsr import deflated_sharpe_ratio
+from trademl.validation.negative_controls import compute_negative_control_diagnostics
 from trademl.validation.pbo import probability_of_backtest_overfitting
 from trademl.validation.walk_forward import expanding_walk_forward
 
@@ -332,6 +333,24 @@ def run_training(
         ),
         "fold_windows": fold_window_summary(_primary_folds_for_suite(model_suite=model_suite, ridge_folds=ridge_folds, lgbm_folds=lgbm_folds, catboost_folds=catboost_folds)),
     }
+    diagnostics["feature_ablation"] = feature_dependence_summary(
+        normalized.dropna(subset=[label_col]),
+        feature_cols,
+        label_col,
+        primary_score=float(primary_report["mean_rank_ic"]),
+    )
+    diagnostics["negative_controls"] = compute_negative_control_diagnostics(
+        predictions=primary_predictions,
+        label_col=label_col,
+        feature_frame=normalized.dropna(subset=[label_col]),
+        feature_cols=feature_cols,
+    )
+    diagnostics["negative_controls"].update(
+        {
+            "max_single_feature_score_drop": diagnostics["feature_ablation"].get("max_single_feature_score_drop"),
+            "min_feature_ablation_score_ratio": diagnostics["feature_ablation"].get("min_feature_ablation_score_ratio"),
+        }
+    )
 
     assessment = _phase_one_assessment(
         ridge_mean_ic=float(primary_report["mean_rank_ic"]),
@@ -415,12 +434,6 @@ def run_training(
             },
         ),
     }
-    diagnostics["feature_ablation"] = feature_dependence_summary(
-        normalized.dropna(subset=[label_col]),
-        feature_cols,
-        label_col,
-        primary_score=float(primary_report["mean_rank_ic"]),
-    )
     diagnostics["model_comparison"] = model_comparison_summary(report)
     report["candidate_autopsy"] = build_candidate_autopsy(
         manifest={

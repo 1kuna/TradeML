@@ -217,7 +217,18 @@ def test_modeling_feature_factory_adds_multisource_pit_features(tmp_path) -> Non
     apple = frame.loc[(frame["symbol"] == "AAPL") & (pd.to_datetime(frame["date"]) >= pd.Timestamp("2020-01-22"))]
 
     assert {"fundamentals_sec", "news_events", "minute_daily"}.issubset(set(payload["feature_groups"]))
-    assert {"fundamental_metric_count", "sec_filings_30d", "news_count_7d", "minute_intraday_return"}.issubset(frame.columns)
+    assert {
+        "fundamental_metric_count",
+        "sec_filings_30d",
+        "news_count_7d",
+        "news_abnormal_volume_7d",
+        "news_novelty_proxy_7d",
+        "minute_intraday_return",
+        "minute_volume_ratio",
+        "minute_close_imbalance_proxy",
+    }.issubset(frame.columns)
+    assert payload["feature_group_metadata"]["news_events"]["safety_delay"] == "1d"
+    assert payload["feature_group_metadata"]["minute_daily"]["feature_available_at_policy"] == "prior-session minute aggregates are shifted to the next modeling date"
     assert not apple.empty
     assert apple["news_count_7d"].max() >= 1
     assert apple["minute_intraday_return"].max() > 0

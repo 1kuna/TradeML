@@ -292,7 +292,8 @@ def build_candidate_autopsy(
         classification = "strong_overfit_risk"
     else:
         classification = "weak_rejected"
-    if "infra" in " ".join(gate_failures).lower() or "missing" in " ".join(gate_failures).lower():
+    infra_text = " ".join(failure for failure in gate_failures if failure != "negative_controls.missing").lower()
+    if "infra" in infra_text or "missing" in infra_text:
         classification = "infra_invalid"
     root_failure_mode = _root_failure_mode(classification=classification, gate_failures=gate_failures, overfit_evidence=overfit_evidence)
     return {
@@ -347,14 +348,16 @@ def gate_failures_by_objective(failures: list[str]) -> dict[str, list[str]]:
         key = "predictive"
         if "cost" in failure or "net_return" in failure:
             key = "cost"
+        elif "future_news" in failure or "negative_controls.missing" in failure:
+            key = "leakage"
+        elif "negative_control" in failure:
+            key = "false_discovery"
+        elif "feature_ablation" in failure or "single_feature" in failure:
+            key = "fragility"
         elif (
             "pbo" in failure
             or "placebo" in failure
             or "coverage" in failure
-            or "negative_control" in failure
-            or "future_news" in failure
-            or "feature_ablation" in failure
-            or "single_feature" in failure
         ):
             key = "robustness"
         elif "year" in failure:

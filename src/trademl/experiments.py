@@ -1230,7 +1230,8 @@ def _apply_overrides(base_config: dict[str, Any], overrides: dict[str, Any]) -> 
 
 def _predictive_gate(spec: dict[str, Any]) -> dict[str, Any]:
     acceptance = dict(spec.get("acceptance") or {})
-    gate = dict(spec.get("predictive_gate") or {})
+    control_gate = dict((dict(spec.get("validation") or {}).get("negative_controls") or {}))
+    gate = {**control_gate, **dict(spec.get("predictive_gate") or {})}
     return {
         "require_go_decision": bool(gate.get("require_go_decision", acceptance.get("require_go_decision", False))),
         "min_rank_ic": float(gate.get("min_rank_ic", acceptance.get("min_rank_ic", 0.0)) or 0.0),
@@ -1240,6 +1241,7 @@ def _predictive_gate(spec: dict[str, Any]) -> dict[str, Any]:
         "max_abs_future_news_leak_ic": float(gate.get("max_abs_future_news_leak_ic", 0.10) or 0.10),
         "max_single_feature_score_drop": float(gate.get("max_single_feature_score_drop", 0.75) or 0.75),
         "min_feature_ablation_score_ratio": float(gate.get("min_feature_ablation_score_ratio", 0.25) or 0.25),
+        "require_negative_controls": bool(gate.get("require_negative_controls", acceptance.get("require_negative_controls", True))),
         "min_cost_stress_net_return": float(gate.get("min_cost_stress_net_return", 0.0) or 0.0),
         "max_pbo": float(gate["max_pbo"]) if gate.get("max_pbo") is not None else None,
         "min_dsr": float(gate["min_dsr"]) if gate.get("min_dsr") is not None else None,

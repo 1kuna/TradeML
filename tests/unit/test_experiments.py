@@ -379,6 +379,15 @@ def test_objective_evaluation_groups_gate_failures_and_adjusts_for_complexity() 
                 "placebo": [0.01],
                 "cost_stress": {"net_return": 0.02},
                 "pbo": 0.2,
+                "negative_controls": {
+                    "shuffled_label_max_abs_ic": 0.01,
+                    "date_shifted_label_max_abs_ic": 0.01,
+                    "random_feature_max_abs_ic": 0.01,
+                    "ticker_news_permutation_max_abs_ic": 0.0,
+                    "future_news_leak_sentinel_ic": 0.0,
+                    "max_single_feature_score_drop": 0.1,
+                    "min_feature_ablation_score_ratio": 0.9,
+                },
             },
         },
         gate={
@@ -427,6 +436,15 @@ def test_strong_unstable_candidate_gets_autopsy_classification() -> None:
                 "cost_stress": {"net_return": 1.5},
                 "pbo": 0.57,
                 "cpcv": {"mean_oos_score": -0.03},
+                "negative_controls": {
+                    "shuffled_label_max_abs_ic": 0.01,
+                    "date_shifted_label_max_abs_ic": 0.01,
+                    "random_feature_max_abs_ic": 0.01,
+                    "ticker_news_permutation_max_abs_ic": 0.0,
+                    "future_news_leak_sentinel_ic": 0.0,
+                    "max_single_feature_score_drop": 0.1,
+                    "min_feature_ablation_score_ratio": 0.9,
+                },
             },
         },
         gate={
@@ -487,7 +505,7 @@ def test_objective_evaluation_rejects_negative_control_failures() -> None:
     assert "negative_control.shuffled_label_max_abs_ic>0.1" in evaluation["gate_failures"]
     assert "future_news_leak_sentinel_ic>0.1" in evaluation["gate_failures"]
     assert "single_feature_dependence>0.75" in evaluation["gate_failures"]
-    assert set(evaluation["gate_failures_by_objective"]) == {"robustness"}
+    assert set(evaluation["gate_failures_by_objective"]) == {"false_discovery", "leakage", "fragility"}
 
 
 def test_report_preview_preserves_catboost_primary_score() -> None:
