@@ -956,6 +956,51 @@ def evaluate_paper_pnl(
     return payload
 
 
+def evaluate_paper_evidence(
+    *,
+    paper_pnl: dict[str, Any],
+    backtest_summary: dict[str, Any] | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate mature paper/shadow PnL as non-live promotion evidence."""
+    merged = _paper_policy(policy)
+    if not paper_pnl or paper_pnl.get("status") != "available":
+        return {
+            "status": "pending",
+            "reason": paper_pnl.get("status") if paper_pnl else "no paper pnl yet",
+            "no_live_orders": True,
+        }
+    failures: list[str] = []
+    net_return = _safe_float(paper_pnl.get("net_return"))
+    excess_return = _safe_float(paper_pnl.get("excess_return"))
+    min_net_return = float(merged.get("min_mature_net_return", 0.0) or 0.0)
+    min_excess_return = float(merged.get("min_mature_excess_return", -1.0) or -1.0)
+    if net_return is None or net_return < min_net_return:
+        failures.append(f"paper_net_return<{min_net_return}")
+    if excess_return is not None and excess_return < min_excess_return:
+        failures.append(f"paper_excess_return<{min_excess_return}")
+    backtest = dict(backtest_summary or {})
+    backtest_return = _safe_float(backtest.get("net_return") or backtest.get("backtest_net_return"))
+    gap = None
+    if net_return is not None and backtest_return is not None:
+        gap = backtest_return - net_return
+        max_gap = float(merged.get("max_backtest_paper_gap", 0.05) or 0.05)
+        if gap > max_gap:
+            failures.append(f"paper_vs_backtest_gap>{max_gap}")
+    status = "failing" if failures else "positive"
+    return {
+        "status": status,
+        "failures": failures,
+        "paper_vs_backtest_gap": gap,
+        "hard_stop_triggered": bool(failures),
+        "net_return": net_return,
+        "excess_return": excess_return,
+        "backtest_net_return": backtest_return,
+        "path": paper_pnl.get("path"),
+        "no_live_orders": True,
+    }
+
+
 def _paper_policy(policy: dict[str, Any] | None) -> dict[str, Any]:
     merged = deepcopy(DEFAULT_PAPER_POLICY)
     incoming = dict(policy or {})
@@ -1503,6 +1548,11 @@ def write_research_review_packet(
             data_root=data_root,
             policy=dict(spec.get("paper_policy") or {}),
         )
+    paper_evidence = evaluate_paper_evidence(
+        paper_pnl=paper_pnl,
+        backtest_summary=dict(comparison.get("best") or {}),
+        policy=dict(spec.get("paper_policy") or {}),
+    )
     drift_alerts = evaluate_research_drift(
         program_id=program_id,
         state=state,
@@ -1554,6 +1604,7 @@ def write_research_review_packet(
         "paper_outputs": paper_outputs,
         "shadow_paper_outputs": shadow_paper_outputs,
         "paper_pnl": paper_pnl,
+        "paper_evidence": paper_evidence,
         "drift_alerts": drift_alerts,
         "alert_result": alert_result,
         "infra_blocker": state.get("last_infra_preflight", {}),
@@ -1594,6 +1645,7 @@ def write_research_review_packet(
         f"- paper_outputs: {(payload['paper_outputs'] or {}).get('paper_orders_path') or '-'}",
         f"- shadow_paper_outputs: {(payload['shadow_paper_outputs'] or {}).get('shadow_orders_path') or '-'}",
         f"- paper_pnl: {(payload['paper_pnl'] or {}).get('status') or '-'}",
+        f"- paper_evidence: {(payload['paper_evidence'] or {}).get('status') or '-'}",
         f"- alert_count: {len(payload['drift_alerts'])}",
         f"- last_transition: {(payload['last_transition'] or {}).get('reason') or '-'}",
         "",
@@ -1614,6 +1666,7 @@ def write_research_review_packet(
     state["latest_paper_outputs"] = paper_outputs
     state["latest_shadow_paper_outputs"] = shadow_paper_outputs
     state["latest_paper_pnl"] = paper_pnl
+    state["latest_paper_evidence"] = paper_evidence
     state["latest_drift_alerts"] = drift_alerts
     if alert_result.get("status") == "written":
         state["last_alert_at"] = datetime.now(tz=UTC).isoformat()

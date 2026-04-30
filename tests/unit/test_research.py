@@ -2096,6 +2096,27 @@ def test_evaluate_paper_pnl_writes_mature_non_live_summary(tmp_path: Path) -> No
     assert Path(result["path"]).exists()
 
 
+def test_evaluate_paper_evidence_marks_pending_positive_and_failing() -> None:
+    pending = research.evaluate_paper_evidence(paper_pnl={"status": "pending_labels"})
+    positive = research.evaluate_paper_evidence(
+        paper_pnl={"status": "available", "net_return": 0.02, "excess_return": 0.01},
+        backtest_summary={"net_return": 0.04},
+        policy={"max_backtest_paper_gap": 0.05},
+    )
+    failing = research.evaluate_paper_evidence(
+        paper_pnl={"status": "available", "net_return": -0.01, "excess_return": -0.03},
+        backtest_summary={"net_return": 0.08},
+        policy={"max_backtest_paper_gap": 0.05, "min_mature_excess_return": 0.0},
+    )
+
+    assert pending["status"] == "pending"
+    assert positive["status"] == "positive"
+    assert failing["status"] == "failing"
+    assert failing["hard_stop_triggered"] is True
+    assert "paper_net_return<0.0" in failing["failures"]
+    assert "paper_vs_backtest_gap>0.05" in failing["failures"]
+
+
 def test_research_alerts_write_files_and_skip_email_without_env(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("TRADEML_SMTP_HOST", raising=False)
     monkeypatch.delenv("TRADEML_ALERT_EMAIL_TO", raising=False)

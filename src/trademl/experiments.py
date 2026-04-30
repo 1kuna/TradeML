@@ -38,6 +38,7 @@ from trademl.research_architecture import (
     primary_score_from_report,
     resolve_architecture_entry,
 )
+from trademl.validation.negative_controls import evaluate_negative_controls
 
 SPECIAL_MATRIX_DIMENSIONS = {
     "model_suite",
@@ -1222,6 +1223,10 @@ def _predictive_gate(spec: dict[str, Any]) -> dict[str, Any]:
         "min_rank_ic": float(gate.get("min_rank_ic", acceptance.get("min_rank_ic", 0.0)) or 0.0),
         "require_all_years_positive": bool(gate.get("require_all_years_positive", True)),
         "max_abs_placebo_ic": float(gate.get("max_abs_placebo_ic", 0.10) or 0.10),
+        "max_abs_negative_control_ic": float(gate.get("max_abs_negative_control_ic", 0.10) or 0.10),
+        "max_abs_future_news_leak_ic": float(gate.get("max_abs_future_news_leak_ic", 0.10) or 0.10),
+        "max_single_feature_score_drop": float(gate.get("max_single_feature_score_drop", 0.75) or 0.75),
+        "min_feature_ablation_score_ratio": float(gate.get("min_feature_ablation_score_ratio", 0.25) or 0.25),
         "min_cost_stress_net_return": float(gate.get("min_cost_stress_net_return", 0.0) or 0.0),
         "max_pbo": float(gate["max_pbo"]) if gate.get("max_pbo") is not None else None,
         "min_dsr": float(gate["min_dsr"]) if gate.get("min_dsr") is not None else None,
@@ -1700,6 +1705,8 @@ def _evaluate_report(*, manifest: dict[str, Any], report: dict[str, Any], gate: 
         failures.append("not all yearly IC values are positive")
     if max_abs_placebo > gate["max_abs_placebo_ic"]:
         failures.append(f"abs(placebo)>{gate['max_abs_placebo_ic']}")
+    negative_controls = evaluate_negative_controls(diagnostics, gate=gate)
+    failures.extend(list(negative_controls["gate_failures"]))
     if cost_stress_net_return < gate["min_cost_stress_net_return"]:
         failures.append(f"cost_stress_net_return<{gate['min_cost_stress_net_return']}")
     if gate["max_pbo"] is not None and float(pbo or 0.0) > gate["max_pbo"]:
@@ -1732,6 +1739,7 @@ def _evaluate_report(*, manifest: dict[str, Any], report: dict[str, Any], gate: 
         "dsr": dsr,
         "coverage": coverage,
         "assessment": assessment,
+        "negative_controls": negative_controls,
     }
 
 

@@ -38,10 +38,12 @@ def build_fleet_observability(
     archive_schema = _archive_schema_observability(snapshot)
     research = _research_observability(snapshot)
     paper_pnl = _paper_pnl_observability(snapshot)
+    collection_saturation = _collection_saturation_observability(vendors)
     payload = {
         "generated_at": current.isoformat(),
         "vendors": vendors,
         "scheduler": scheduler,
+        "collection_saturation": collection_saturation,
         "freshness": freshness,
         "resources": resources,
         "archive_schema": archive_schema,
@@ -77,6 +79,19 @@ def write_fleet_observability(
         history_path = history / f"{current.strftime('%H%M%S')}.json"
         history_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
         written.append(str(history_path))
+    saturation = payload.get("collection_saturation")
+    if saturation:
+        saturation_root = data_root / "control" / "cluster" / "state" / "autopilot" / "collection_saturation"
+        saturation_root.mkdir(parents=True, exist_ok=True)
+        saturation_latest = saturation_root / "latest.json"
+        saturation_latest.write_text(json.dumps(saturation, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        written.append(str(saturation_latest))
+        if write_history:
+            saturation_history = saturation_root / "history" / current.date().isoformat()
+            saturation_history.mkdir(parents=True, exist_ok=True)
+            saturation_path = saturation_history / f"{current.strftime('%H%M%S')}.json"
+            saturation_path.write_text(json.dumps(saturation, indent=2, sort_keys=True, default=str), encoding="utf-8")
+            written.append(str(saturation_path))
     return {"observability_root": str(root), "latest_path": str(latest), "written": written}
 
 
@@ -242,6 +257,40 @@ def _scheduler_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _collection_saturation_observability(vendors: dict[str, Any]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for row in list(vendors.get("rows") or []):
+        verdict = str(row.get("utilization_verdict") or "idle")
+        eligible = bool(row.get("eligible_work"))
+        blocker = row.get("current_blocker")
+        intentionally_idle = (not eligible) or bool(blocker)
+        rows.append(
+            {
+                "vendor": row.get("vendor"),
+                "dataset": row.get("dataset"),
+                "eligible_work": eligible,
+                "budget_remaining_minute": row.get("remaining_minute"),
+                "budget_remaining_daily": row.get("remaining_daily"),
+                "calls_spent_current_window": row.get("actual_requests_per_minute"),
+                "rows_per_credit": row.get("rows_per_request"),
+                "blocker": blocker,
+                "next_eligible_at": row.get("next_eligible_at"),
+                "intentionally_idle": intentionally_idle,
+                "unused_capacity": row.get("unused_capacity"),
+                "verdict": verdict,
+            }
+        )
+    return {
+        "rows": rows,
+        "summary": {
+            "active": sum(1 for row in rows if row["verdict"] == "active"),
+            "underutilized": sum(1 for row in rows if row["verdict"] == "underutilized"),
+            "blocked": sum(1 for row in rows if row["verdict"] == "blocked"),
+            "intentionally_idle": sum(1 for row in rows if row["intentionally_idle"]),
+        },
+    }
+
+
 def _freshness_observability(snapshot: dict[str, Any], *, policy: dict[str, Any], now: datetime) -> dict[str, Any]:
     stale_after = int(policy["dataset_stale_after_minutes"])
     datasets = [
@@ -352,6 +401,7 @@ def _paper_pnl_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     paper = dict(program.get("latest_paper_outputs") or program.get("paper_outputs") or {})
     shadow = dict(program.get("latest_shadow_paper_outputs") or {})
     pnl = dict(program.get("latest_paper_pnl") or program.get("paper_pnl") or {})
+    evidence = dict(program.get("latest_paper_evidence") or program.get("paper_evidence") or {})
     paper_smoke = dict(program.get("latest_paper_account_smoke") or program.get("paper_account_smoke") or {})
     paper_submission = dict(program.get("latest_paper_submission") or program.get("paper_submission") or {})
     source = paper if paper.get("status") == "written" else shadow
@@ -368,7 +418,10 @@ def _paper_pnl_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
             "source": "paper" if paper.get("status") == "written" else "shadow",
             "paper_order_payloads_path": source.get("paper_order_payloads_path") or source.get("shadow_order_payloads_path"),
             "paper_account_smoke_status": paper_smoke.get("status"),
+            "paper_account_smoke_checked_at": paper_smoke.get("checked_at"),
             "paper_submission_status": paper_submission.get("status"),
+            "evidence_status": evidence.get("status"),
+            "evidence_failures": evidence.get("failures", []),
             "no_live_orders": True,
         }
     if source:
@@ -379,7 +432,10 @@ def _paper_pnl_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
             "source": "shadow" if source.get("non_incumbent") else "paper",
             "paper_order_payloads_path": source.get("paper_order_payloads_path") or source.get("shadow_order_payloads_path"),
             "paper_account_smoke_status": paper_smoke.get("status"),
+            "paper_account_smoke_checked_at": paper_smoke.get("checked_at"),
             "paper_submission_status": paper_submission.get("status"),
+            "evidence_status": evidence.get("status"),
+            "evidence_failures": evidence.get("failures", []),
             "no_live_orders": True,
             "non_incumbent": bool(source.get("non_incumbent")),
         }
@@ -387,7 +443,10 @@ def _paper_pnl_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
         "status": "pending",
         "reason": "No paper/shadow outputs yet",
         "paper_account_smoke_status": paper_smoke.get("status"),
+        "paper_account_smoke_checked_at": paper_smoke.get("checked_at"),
         "paper_submission_status": paper_submission.get("status"),
+        "evidence_status": evidence.get("status"),
+        "evidence_failures": evidence.get("failures", []),
         "no_live_orders": True,
     }
 

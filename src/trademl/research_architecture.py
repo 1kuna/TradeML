@@ -257,7 +257,15 @@ def gate_failures_by_objective(failures: list[str]) -> dict[str, list[str]]:
         key = "predictive"
         if "cost" in failure or "net_return" in failure:
             key = "cost"
-        elif "pbo" in failure or "placebo" in failure or "coverage" in failure:
+        elif (
+            "pbo" in failure
+            or "placebo" in failure
+            or "coverage" in failure
+            or "negative_control" in failure
+            or "future_news" in failure
+            or "feature_ablation" in failure
+            or "single_feature" in failure
+        ):
             key = "robustness"
         elif "year" in failure:
             key = "stability"

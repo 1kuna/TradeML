@@ -300,6 +300,54 @@ def test_reset_update_and_uninstall_cli_dispatch(tmp_path: Path, monkeypatch, ca
     assert json.loads(capsys.readouterr().out)["action"] == "uninstall"
 
 
+def test_fleet_watchdog_cli_dispatches_without_leaking_password(tmp_path: Path, monkeypatch, capsys) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    env_path = workspace / ".env"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {"nas_mount": str(tmp_path / "nas"), "nas_share": "//nas/trademl", "local_state": str(workspace / "control")},
+                "fleet": {"watchdog": {"repeated_issue_count": 2}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    env_path.write_text("TRADEML_PI_PASSWORD=super-secret\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "collect_dashboard_live_snapshot", lambda settings: {"runtime": {"running": True}})
+    monkeypatch.setattr(
+        cli,
+        "run_fleet_watchdog_once",
+        lambda **kwargs: {"verdict": "OK", "heal_requested": kwargs["heal"], "pi": kwargs["pi"]},
+    )
+
+    rc = cli.main(
+        [
+            "fleet",
+            "--workspace-root",
+            str(workspace),
+            "--config",
+            str(config_path),
+            "--env-file",
+            str(env_path),
+            "watchdog",
+            "--data-root",
+            str(tmp_path / "nas"),
+            "--pi-host",
+            "100.76.4.69",
+            "--heal",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["heal_requested"] is True
+    assert payload["pi"]["host"] == "100.76.4.69"
+    assert "super-secret" not in json.dumps(payload)
+
+
 def test_audit_and_replan_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)

@@ -12,6 +12,7 @@ from trademl.fleet.autopilot import (
     write_codex_issue_bucket,
 )
 from trademl.fleet.observability import build_fleet_observability
+from trademl.fleet.watchdog import run_fleet_watchdog_once
 
 
 def test_current_state_summary_rolls_up_system_architecture_profit_and_codex() -> None:
@@ -376,6 +377,96 @@ def test_observability_treats_disabled_lane_as_blocked_not_underutilized(tmp_pat
     assert row["current_blocker"] == "disabled"
     assert row["utilization_verdict"] == "blocked"
     assert payload["issues"] == []
+
+
+def test_observability_writes_collection_saturation_audit(tmp_path: Path) -> None:
+    from trademl.fleet.observability import write_fleet_observability
+
+    data_root = tmp_path / "nas"
+    data_root.mkdir()
+    payload = build_fleet_observability(
+        snapshot={
+            "runtime": {"running": True},
+            "planner_summary": {"progress": {"supplemental_research": {"remaining_units": 10}}},
+            "budget_summary": {
+                "rows": [
+                    {
+                        "vendor": "alpaca",
+                        "state": "available",
+                        "rpm_limit": 200,
+                        "rpm_used": 0,
+                        "day_remaining": 1000,
+                        "minute_available": True,
+                        "day_available": True,
+                        "outbound_requests_60s": 0,
+                    }
+                ]
+            },
+            "vendor_throughput": {"rows": [{"vendor": "alpaca", "state": "available"}]},
+            "lane_health": {"rows": [{"vendor": "alpaca", "dataset": "equities_minute", "state": "HEALTHY"}]},
+        },
+        data_root=data_root,
+        now=datetime(2026, 4, 29, 12, 1, tzinfo=UTC),
+    )
+    result = write_fleet_observability(data_root=data_root, payload=payload, now=datetime(2026, 4, 29, 12, 1, tzinfo=UTC))
+
+    audit_path = data_root / "control" / "cluster" / "state" / "autopilot" / "collection_saturation" / "latest.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert str(audit_path) in result["written"]
+    assert audit["summary"]["underutilized"] == 1
+    assert audit["rows"][0]["vendor"] == "alpaca"
+    assert audit["rows"][0]["intentionally_idle"] is False
+
+
+def test_fleet_watchdog_writes_current_state_and_repeated_issue_alert(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "nas"
+    issue = {
+        "source": "pi",
+        "severity": "warning",
+        "kind": "vendor_underutilized",
+        "message": "alpaca idle",
+        "count": 4,
+        "suggested_codex_action": "inspect scheduler",
+    }
+
+    def fake_collect(**kwargs):  # noqa: ANN003
+        assert kwargs["heal"] is True
+        return {
+            "verdict": "DEGRADED",
+            "issue_bucket": {"issues": [issue]},
+            "remote": {"pi": {"recovery": {"status": "not_needed"}}},
+            "observability": {"paper_pnl": {"paper_account_smoke_status": "ok"}},
+        }
+
+    monkeypatch.setattr("trademl.fleet.watchdog.collect_fleet_health", fake_collect)
+
+    payload = run_fleet_watchdog_once(
+        local_snapshot={},
+        data_root=data_root,
+        heal=True,
+        now=datetime(2026, 4, 29, 12, 1, tzinfo=UTC),
+    )
+
+    latest = data_root / "control" / "cluster" / "state" / "autopilot" / "watchdog" / "latest.json"
+    assert latest.exists()
+    assert payload["action"] == "Watch"
+    assert payload["alerts"][0]["kind"] == "repeated_vendor_underutilized"
+    assert payload["recovery_attempts"][0]["target"] == "pi"
+    assert "password" not in json.dumps(payload).lower()
+
+
+def test_fleet_watchdog_reports_write_failure_without_crashing(tmp_path: Path, monkeypatch) -> None:
+    blocker = tmp_path / "blocked"
+    blocker.write_text("file where directory should be", encoding="utf-8")
+    monkeypatch.setattr(
+        "trademl.fleet.watchdog.collect_fleet_health",
+        lambda **kwargs: {"verdict": "OK", "issue_bucket": {"issues": []}, "observability": {}},  # noqa: ARG005
+    )
+
+    payload = run_fleet_watchdog_once(local_snapshot={}, data_root=blocker)
+
+    assert payload["verdict"] == "OK"
+    assert payload["write"]["status"] == "write_failed"
 
 
 def test_current_state_uses_observability_top_cards_without_degrading_for_pending_pnl(tmp_path: Path) -> None:

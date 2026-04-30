@@ -400,6 +400,48 @@ def test_objective_evaluation_groups_gate_failures_and_adjusts_for_complexity() 
     assert evaluation["gate_failures_by_objective"] == {}
 
 
+def test_objective_evaluation_rejects_negative_control_failures() -> None:
+    evaluation = experiments._evaluate_report(  # noqa: SLF001
+        manifest={"run_id": "advanced-leaky", "model_suite": "advanced"},
+        report={
+            "coverage": 0.99,
+            "catboost": {"mean_rank_ic": 0.05},
+            "assessment": {"decision": "GO"},
+            "diagnostics": {
+                "ic_by_year": {"2024": 0.01, "2025": 0.02},
+                "placebo": [0.01],
+                "cost_stress": {"net_return": 0.02},
+                "pbo": 0.2,
+                "negative_controls": {
+                    "shuffled_label_max_abs_ic": 0.22,
+                    "future_news_leak_sentinel_ic": 0.18,
+                    "max_single_feature_score_drop": 0.9,
+                },
+            },
+        },
+        gate={
+            "require_go_decision": True,
+            "min_rank_ic": 0.01,
+            "require_all_years_positive": True,
+            "max_abs_placebo_ic": 0.10,
+            "max_abs_negative_control_ic": 0.10,
+            "max_abs_future_news_leak_ic": 0.10,
+            "max_single_feature_score_drop": 0.75,
+            "min_feature_ablation_score_ratio": 0.25,
+            "min_cost_stress_net_return": 0.0,
+            "max_pbo": 0.5,
+            "min_dsr": None,
+            "min_coverage": 0.0,
+        },
+    )
+
+    assert evaluation["survived_predictive"] is False
+    assert "negative_control.shuffled_label_max_abs_ic>0.1" in evaluation["gate_failures"]
+    assert "future_news_leak_sentinel_ic>0.1" in evaluation["gate_failures"]
+    assert "single_feature_dependence>0.75" in evaluation["gate_failures"]
+    assert set(evaluation["gate_failures_by_objective"]) == {"robustness"}
+
+
 def test_report_preview_preserves_catboost_primary_score() -> None:
     preview = experiments._report_preview_from_report(  # noqa: SLF001
         {

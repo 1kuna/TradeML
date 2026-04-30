@@ -150,3 +150,75 @@ def test_modeling_feature_label_factory_writes_pit_versioned_artifacts(tmp_path)
     )
     immature = pd.to_datetime(cutoff_frame["target_date_5d"]) > pd.Timestamp("2020-10-23")
     assert cutoff_frame.loc[immature, "label_5d"].isna().all()
+
+
+def test_modeling_feature_factory_adds_multisource_pit_features(tmp_path) -> None:
+    data_root = tmp_path / "nas"
+    panel = _panel().loc[lambda frame: frame["date"] <= pd.Timestamp("2020-02-14")].copy()
+    for date_value, day_frame in panel.groupby(panel["date"].dt.strftime("%Y-%m-%d")):
+        partition = data_root / "data" / "curated" / "equities_ohlcv_adj" / f"date={date_value}"
+        partition.mkdir(parents=True)
+        day_frame.to_parquet(partition / "data.parquet", index=False)
+    reference = data_root / "data" / "reference"
+    reference.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "symbol": ["AAPL"],
+            "metric_date": ["2019-12-31"],
+            "metric_name": ["assets"],
+            "metric_value": [100.0],
+            "last_verified": ["2020-01-10"],
+        }
+    ).to_parquet(reference / "fundamentals_daily.parquet", index=False)
+    pd.DataFrame(
+        {
+            "symbol": ["AAPL"],
+            "form": ["10-Q"],
+            "accepted_at": ["2020-01-15T22:00:00Z"],
+        }
+    ).to_parquet(reference / "sec_filing_index.parquet", index=False)
+    news_partition = data_root / "data" / "raw" / "ticker_news" / "date=2020-01-20"
+    news_partition.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "symbol": ["AAPL"],
+            "published_at": ["2020-01-20T15:00:00Z"],
+            "source": ["alpaca"],
+            "headline": ["test"],
+        }
+    ).to_parquet(news_partition / "data.parquet", index=False)
+    minute_partition = data_root / "data" / "raw" / "equities_minute" / "date=2020-01-21"
+    minute_partition.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "symbol": ["AAPL"] * 35,
+            "timestamp": pd.date_range("2020-01-21 14:30", periods=35, freq="min", tz="UTC"),
+            "open": [100.0] * 35,
+            "high": [101.0] * 35,
+            "low": [99.0] * 35,
+            "close": [100.0 + idx * 0.1 for idx in range(35)],
+            "volume": [1000] * 35,
+        }
+    ).to_parquet(minute_partition / "data.parquet", index=False)
+
+    payload = build_modeling_artifacts(
+        data_root=data_root,
+        feature_config=_feature_config(),
+        feature_set="daily_multi_source_v1",
+        feature_version="daily_multi_source_test_v1",
+        label_horizons=[1, 5],
+    )
+    frame, _ = load_modeling_dataset(
+        data_root=data_root,
+        feature_version="daily_multi_source_test_v1",
+        label_version="universe_relative_forward_return_v1",
+        label_horizon=1,
+    )
+    apple = frame.loc[(frame["symbol"] == "AAPL") & (pd.to_datetime(frame["date"]) >= pd.Timestamp("2020-01-22"))]
+
+    assert {"fundamentals_sec", "news_events", "minute_daily"}.issubset(set(payload["feature_groups"]))
+    assert {"fundamental_metric_count", "sec_filings_30d", "news_count_7d", "minute_intraday_return"}.issubset(frame.columns)
+    assert not apple.empty
+    assert apple["news_count_7d"].max() >= 1
+    assert apple["minute_intraday_return"].max() > 0
+    assert (pd.to_datetime(frame["feature_available_at"], utc=True).dt.tz_convert(None) <= pd.to_datetime(frame["date"])).all()

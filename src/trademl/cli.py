@@ -46,6 +46,7 @@ from trademl.dashboard.controller import (
 from trademl.env import load_dotenv
 from trademl.fleet.autopilot import collect_fleet_health
 from trademl.fleet.observability import build_fleet_observability, write_fleet_observability
+from trademl.fleet.watchdog import run_fleet_watchdog_once
 from trademl.experiments import (
     backtest_experiment_survivors,
     compare_experiment,
@@ -293,6 +294,16 @@ def main(argv: list[str] | None = None) -> int:
     fleet_observability.add_argument("--mac-user", default="openclaw")
     fleet_observability.add_argument("--mac-password-env", default="TRADEML_MAC_PASSWORD")
     fleet_observability.add_argument("--json", action="store_true")
+    fleet_watchdog = fleet_subparsers.add_parser("watchdog", help="Run one scheduled fleet watchdog pass.")
+    fleet_watchdog.add_argument("--data-root", default=None)
+    fleet_watchdog.add_argument("--pi-host", default=None)
+    fleet_watchdog.add_argument("--pi-user", default="zach")
+    fleet_watchdog.add_argument("--pi-password-env", default="TRADEML_PI_PASSWORD")
+    fleet_watchdog.add_argument("--mac-host", default=None)
+    fleet_watchdog.add_argument("--mac-user", default="openclaw")
+    fleet_watchdog.add_argument("--mac-password-env", default="TRADEML_MAC_PASSWORD")
+    fleet_watchdog.add_argument("--heal", action="store_true")
+    fleet_watchdog.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
     if args.command == "dashboard":
@@ -495,6 +506,32 @@ def _dispatch_fleet(args: argparse.Namespace) -> int:
             config=yaml.safe_load(settings.config_path.read_text(encoding="utf-8")) or {},
         )
         write_fleet_observability(data_root=data_root, payload=payload)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.fleet_command == "watchdog":
+        snapshot = _collect_fleet_local_snapshot(settings)
+        data_root = Path(args.data_root).expanduser() if args.data_root else settings.nas_mount
+        pi_host = args.pi_host or os.getenv("TRADEML_PI_HOST") or os.getenv("TRADEML_PI_TAILSCALE_HOST")
+        mac_host = args.mac_host or os.getenv("TRADEML_MAC_HOST") or os.getenv("TRADEML_MAC_TAILSCALE_HOST")
+        pi = (
+            {"host": pi_host, "user": os.getenv("TRADEML_PI_USER") or args.pi_user, "password_env": args.pi_password_env}
+            if pi_host
+            else None
+        )
+        mac = (
+            {"host": mac_host, "user": os.getenv("TRADEML_MAC_USER") or args.mac_user, "password_env": args.mac_password_env}
+            if mac_host
+            else None
+        )
+        config = yaml.safe_load(settings.config_path.read_text(encoding="utf-8")) or {}
+        payload = run_fleet_watchdog_once(
+            local_snapshot=snapshot,
+            data_root=data_root,
+            pi=pi,
+            mac=mac,
+            heal=bool(args.heal),
+            policy=(config.get("fleet") or {}).get("watchdog") if isinstance(config, dict) else None,
+        )
         print(json.dumps(payload, indent=2, default=str))
         return 0
     raise SystemExit(f"unsupported fleet command: {args.fleet_command}")
