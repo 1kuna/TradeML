@@ -547,6 +547,16 @@ def test_research_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.delenv("ALPACA_API_SECRET", raising=False)
     monkeypatch.setattr(cli, "start_research_program", lambda program_path, **kwargs: {"action": "start", "program": str(program_path), "detach": kwargs.get("detach", False)})
     monkeypatch.setattr(cli, "run_research_canary", lambda program_path, **kwargs: {"action": "canary", "program": str(program_path), "detach": kwargs.get("detach", False)})
+    monkeypatch.setattr(
+        cli,
+        "run_feature_version_canary_batch",
+        lambda program_path, **kwargs: {
+            "action": "feature-canary",
+            "program": str(program_path),
+            "feature_versions": kwargs.get("feature_versions"),
+            "label_horizon": kwargs.get("label_horizon"),
+        },
+    )
     monkeypatch.setattr(cli, "run_and_persist_paper_account_smoke", lambda program_path, local_state: {"action": "paper-smoke", "api_key": os.getenv("ALPACA_API_KEY"), "program": str(program_path), "local_state": str(local_state)})
     monkeypatch.setattr(cli, "submit_paper_orders", lambda payloads_path, policy: {"action": "paper-submit", "payloads": str(payloads_path), "enabled": policy.get("enabled")})
     monkeypatch.setattr(cli, "read_research_program_state", lambda local_state, program_id: {"action": "status", "program_id": program_id, "frontier": {"x": 1}})
@@ -568,6 +578,11 @@ def test_research_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     canary_payload = json.loads(capsys.readouterr().out)
     assert canary_payload["action"] == "canary"
     assert canary_payload["detach"] is True
+    assert cli.main([*research_base, "feature-canary", "--program", str(program_path), "--feature-version", "price_liquidity_v1", "--label-horizon", "5"]) == 0
+    feature_canary_payload = json.loads(capsys.readouterr().out)
+    assert feature_canary_payload["action"] == "feature-canary"
+    assert feature_canary_payload["feature_versions"] == ["price_liquidity_v1"]
+    assert feature_canary_payload["label_horizon"] == 5
     assert cli.main([*research_base, "paper-smoke", "--program", str(program_path)]) == 0
     paper_smoke_payload = json.loads(capsys.readouterr().out)
     assert paper_smoke_payload["action"] == "paper-smoke"

@@ -127,6 +127,13 @@ DEFAULT_PAPER_POLICY = {
         "api_secret_env": "ALPACA_API_SECRET",
     },
 }
+DEFAULT_FEATURE_CANARY_VERSIONS = [
+    "price_liquidity_v1",
+    "sec_filing_events_v1",
+    "news_event_aggregates_v1",
+    "minute_daily_aggregates_v1",
+    "multi_source_daily_v1",
+]
 DEFAULT_FRONTIER_ARCHITECTURE_POLICY = {
     "enabled": False,
     "allow_phase1_advanced": False,
@@ -1159,6 +1166,7 @@ def research_health(
     latest_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=current_experiment_id) if current_experiment_id else {}
     active_run = _active_experiment_run_summary(latest_summary)
     modeling_metadata = modeling_artifact_metadata(data_root=data_root)
+    feature_leaderboard = read_feature_family_leaderboard(data_root=data_root)
     alerts = evaluate_research_drift(
         program_id=program_id,
         state=state,
@@ -1181,6 +1189,23 @@ def research_health(
         "latest_paper_account_smoke": state.get("latest_paper_account_smoke", {}),
         "latest_paper_submission": state.get("latest_paper_submission", {}),
         "last_canary": state.get("last_canary", {}),
+        "feature_family_leaderboard": {
+            "path": feature_leaderboard.get("path"),
+            "updated_at": feature_leaderboard.get("updated_at"),
+            "label_horizon": feature_leaderboard.get("label_horizon"),
+            "best_feature_version": feature_leaderboard.get("best_feature_version"),
+            "best_objective_score": feature_leaderboard.get("best_objective_score"),
+            "entries": [
+                {
+                    "feature_version": entry.get("feature_version"),
+                    "verdict": entry.get("verdict"),
+                    "best_objective_score": entry.get("best_objective_score"),
+                    "top_rejection_reason": entry.get("top_rejection_reason"),
+                }
+                for entry in list(feature_leaderboard.get("entries") or [])[:5]
+                if isinstance(entry, dict)
+            ],
+        },
         "infra_blocker": state.get("last_infra_preflight", {}),
         "launchd": _research_launchd_status(program_id),
         "frontier_architecture": _frontier_architecture_status(spec=spec, state=state, frontier=dict(state.get("frontier") or {}), experiment_summary=latest_summary) if spec else {},
@@ -1245,6 +1270,143 @@ def build_research_features(
         label_horizons=[int(item) for item in list(modeling.get("label_horizons") or [1, 5, 20])],
         report_date=report_date,
     )
+
+
+def run_feature_version_canary_batch(
+    *,
+    program_path: Path,
+    repo_root: Path,
+    data_root: Path,
+    local_state: Path,
+    env_path: Path,
+    targets_config_path: Path,
+    python_executable: str,
+    poll_seconds: int | None = None,
+    detach: bool = False,
+    feature_versions: list[str] | None = None,
+    label_horizon: int | None = None,
+    report_date: str | None = None,
+) -> dict[str, Any]:
+    """Build and canary each configured modeling feature version once per data revision."""
+    spec = _load_research_program_spec(program_path)
+    program_id = str(spec["program_id"])
+    modeling = dict(spec.get("modeling") or {})
+    versions = _feature_canary_versions(spec=spec, requested=feature_versions)
+    resolved_horizon = int(label_horizon or modeling.get("primary_label_horizon") or 5)
+    label_version = str(modeling.get("label_version") or DEFAULT_LABEL_VERSION)
+    objective_policy = dict(spec.get("objective_policy") or {})
+    entries: list[dict[str, Any]] = []
+    for version in versions:
+        try:
+            build_payload = build_research_features(
+                program_path=program_path,
+                data_root=data_root,
+                feature_version=version,
+                report_date=report_date,
+            )
+            preflight = feature_label_preflight(
+                data_root=data_root,
+                feature_version=version,
+                label_version=label_version,
+                label_horizon=resolved_horizon,
+                report_date=report_date,
+            )
+        except Exception as exc:  # noqa: BLE001
+            entry = _feature_canary_leaderboard_entry(
+                feature_version=version,
+                label_horizon=resolved_horizon,
+                build_payload={},
+                preflight={"ok": False, "reason": str(exc)},
+                canary_payload={},
+                summary={},
+                objective_policy=objective_policy,
+                status="BLOCKED",
+            )
+            entries.append(entry)
+            _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
+            break
+        if not bool(preflight.get("ok", False)):
+            entry = _feature_canary_leaderboard_entry(
+                feature_version=version,
+                label_horizon=resolved_horizon,
+                build_payload=build_payload,
+                preflight=preflight,
+                canary_payload={},
+                summary={},
+                objective_policy=objective_policy,
+                status="BLOCKED",
+            )
+            entries.append(entry)
+            _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
+            break
+        if _feature_canary_already_recorded(
+            data_root=data_root,
+            feature_version=version,
+            label_horizon=resolved_horizon,
+            data_revision=str(build_payload.get("data_revision") or ""),
+            objective_policy=objective_policy,
+        ):
+            entry = _feature_canary_leaderboard_entry(
+                feature_version=version,
+                label_horizon=resolved_horizon,
+                build_payload=build_payload,
+                preflight=preflight,
+                canary_payload={},
+                summary={},
+                objective_policy=objective_policy,
+                status="SKIPPED_DUPLICATE",
+            )
+            entries.append(entry)
+            _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
+            continue
+        canary_payload = run_research_canary(
+            program_path=program_path,
+            repo_root=repo_root,
+            data_root=data_root,
+            local_state=local_state,
+            env_path=env_path,
+            targets_config_path=targets_config_path,
+            python_executable=python_executable,
+            poll_seconds=poll_seconds,
+            detach=detach,
+            feature_version=version,
+            label_horizon=resolved_horizon,
+        )
+        experiment_id = str(
+            canary_payload.get("current_experiment_id")
+            or (canary_payload.get("canary_spec") or {}).get("experiment_id")
+            or ""
+        )
+        summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=experiment_id) if experiment_id else {}
+        entry = _feature_canary_leaderboard_entry(
+            feature_version=version,
+            label_horizon=resolved_horizon,
+            build_payload=build_payload,
+            preflight=preflight,
+            canary_payload=canary_payload,
+            summary=summary,
+            objective_policy=objective_policy,
+            status=str(canary_payload.get("status") or "PENDING"),
+        )
+        entries.append(entry)
+        _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
+        if entry["verdict"] == "blocked":
+            break
+    leaderboard = _write_feature_family_leaderboard(
+        data_root=data_root,
+        program_id=program_id,
+        label_horizon=resolved_horizon,
+        entries=entries,
+    )
+    state = read_research_program_state(local_state=local_state, program_id=program_id)
+    state["feature_version_canary_batch"] = {
+        "updated_at": leaderboard["updated_at"],
+        "label_horizon": resolved_horizon,
+        "entries": entries,
+        "leaderboard_path": leaderboard["path"],
+    }
+    _write_program_state(local_state=local_state, program_id=program_id, payload=state)
+    return {"program_id": program_id, "status": _feature_canary_batch_status(entries), "leaderboard": leaderboard, "entries": entries}
 
 
 def run_research_canary(
@@ -1841,6 +2003,190 @@ def _local_research_root(*, local_state: Path) -> Path:
 
 def _shared_research_root(*, data_root: Path) -> Path:
     return data_root / "control" / "cluster" / "state" / "research"
+
+
+def read_feature_family_leaderboard(*, data_root: Path) -> dict[str, Any]:
+    """Return the latest backend feature-family canary leaderboard."""
+    path = _feature_family_leaderboard_path(data_root=data_root)
+    if not path.exists():
+        return {"path": str(path), "entries": []}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.setdefault("path", str(path))
+    payload.setdefault("entries", [])
+    return payload
+
+
+def _feature_family_leaderboard_path(*, data_root: Path) -> Path:
+    return _shared_research_root(data_root=data_root) / "feature_family_leaderboard" / "latest.json"
+
+
+def _feature_canary_versions(*, spec: dict[str, Any], requested: list[str] | None) -> list[str]:
+    values = requested or list((spec.get("modeling") or {}).get("feature_versions") or [])
+    if not values:
+        values = DEFAULT_FEATURE_CANARY_VERSIONS
+    ordered = []
+    for value in values:
+        text = str(value)
+        if text and text not in ordered:
+            ordered.append(text)
+    return ordered
+
+
+def _feature_canary_objective_hash(objective_policy: dict[str, Any]) -> str:
+    payload = json.dumps(objective_policy or {}, sort_keys=True, default=str)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _feature_canary_already_recorded(
+    *,
+    data_root: Path,
+    feature_version: str,
+    label_horizon: int,
+    data_revision: str,
+    objective_policy: dict[str, Any],
+) -> bool:
+    if not data_revision:
+        return False
+    objective_hash = _feature_canary_objective_hash(objective_policy)
+    for entry in read_feature_family_leaderboard(data_root=data_root).get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("feature_version")) != feature_version:
+            continue
+        if int(entry.get("label_horizon") or 0) != int(label_horizon):
+            continue
+        if str(entry.get("data_revision") or "") != data_revision:
+            continue
+        if str(entry.get("objective_policy_hash") or "") != objective_hash:
+            continue
+        if str(entry.get("status") or "").upper() in {"BLOCKED", "INFRA_BLOCKED"}:
+            return False
+        return True
+    return False
+
+
+def _feature_canary_leaderboard_entry(
+    *,
+    feature_version: str,
+    label_horizon: int,
+    build_payload: dict[str, Any],
+    preflight: dict[str, Any],
+    canary_payload: dict[str, Any],
+    summary: dict[str, Any],
+    objective_policy: dict[str, Any],
+    status: str,
+) -> dict[str, Any]:
+    experiment_id = str(
+        canary_payload.get("current_experiment_id")
+        or (canary_payload.get("canary_spec") or {}).get("experiment_id")
+        or summary.get("experiment_id")
+        or ""
+    )
+    top_gate_failures = list(summary.get("top_gate_failures") or [])
+    top_rejection_reason = summary.get("best_decision_reason")
+    if not top_rejection_reason and top_gate_failures:
+        top_rejection_reason = str(top_gate_failures[0][0] if isinstance(top_gate_failures[0], (list, tuple)) else top_gate_failures[0])
+    if not bool(preflight.get("ok", False)):
+        verdict = "blocked"
+        top_rejection_reason = str(preflight.get("reason") or "feature/label preflight failed")
+    elif str(status).upper() == "SKIPPED_DUPLICATE":
+        verdict = "skipped_duplicate"
+    elif str(status).upper() in {"INFRA_BLOCKED", "BLOCKED"}:
+        verdict = "blocked"
+        top_rejection_reason = str(canary_payload.get("wait_reason") or top_rejection_reason or "canary blocked")
+    elif summary.get("shortlist_count"):
+        verdict = "promising"
+    elif summary:
+        verdict = "rejected"
+    else:
+        verdict = "pending"
+    return {
+        "feature_version": feature_version,
+        "feature_groups": list(build_payload.get("feature_groups") or []),
+        "feature_group_metadata": dict(build_payload.get("feature_group_metadata") or {}),
+        "label_horizon": int(label_horizon),
+        "label_version": build_payload.get("label_version") or preflight.get("label_version"),
+        "data_revision": build_payload.get("data_revision") or preflight.get("data_revision"),
+        "feature_rows": int(build_payload.get("feature_rows") or 0),
+        "label_rows": int(build_payload.get("label_rows") or 0),
+        "preflight": preflight,
+        "canary_experiment_id": experiment_id or None,
+        "canary_status": str(canary_payload.get("status") or status),
+        "status": str(status).upper(),
+        "best_run_id": summary.get("best_run_id"),
+        "best_candidate": summary.get("best_candidate"),
+        "best_objective_score": summary.get("best_primary_score"),
+        "candidate_classifications": summary.get("candidate_classifications") or {},
+        "negative_control_status": _negative_control_status(summary),
+        "paper_evidence_status": _paper_evidence_status(summary),
+        "top_rejection_reason": top_rejection_reason,
+        "verdict": verdict,
+        "objective_policy_hash": _feature_canary_objective_hash(objective_policy),
+        "recorded_at": datetime.now(tz=UTC).isoformat(),
+    }
+
+
+def _negative_control_status(summary: dict[str, Any]) -> str:
+    autopsy = dict(summary.get("candidate_autopsy") or {})
+    evidence = dict(autopsy.get("evidence") or {})
+    controls = evidence.get("negative_controls") or summary.get("negative_controls")
+    if not controls:
+        return "pending"
+    failures = controls.get("gate_failures") if isinstance(controls, dict) else None
+    return "failed" if failures else "ok"
+
+
+def _paper_evidence_status(summary: dict[str, Any]) -> str:
+    evidence = summary.get("paper_evidence") or (summary.get("objective_verdict") or {}).get("paper_evidence")
+    if not evidence:
+        return "pending"
+    if isinstance(evidence, dict):
+        if evidence.get("hard_stop"):
+            return "failed"
+        return str(evidence.get("status") or "available")
+    return "available"
+
+
+def _write_feature_family_leaderboard(
+    *,
+    data_root: Path,
+    program_id: str,
+    label_horizon: int,
+    entries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    ranked = sorted(
+        entries,
+        key=lambda entry: (
+            0 if entry.get("best_objective_score") is not None else 1,
+            -(float(entry.get("best_objective_score") or 0.0)),
+            str(entry.get("feature_version") or ""),
+        ),
+    )
+    best = next((entry for entry in ranked if entry.get("best_objective_score") is not None), None)
+    payload = {
+        "program_id": program_id,
+        "updated_at": datetime.now(tz=UTC).isoformat(),
+        "label_horizon": int(label_horizon),
+        "best_feature_version": (best or {}).get("feature_version"),
+        "best_objective_score": (best or {}).get("best_objective_score"),
+        "entries": ranked,
+    }
+    path = _feature_family_leaderboard_path(data_root=data_root)
+    _atomic_write_json(path, payload)
+    history = path.parent / "history" / f"{datetime.now(tz=UTC).strftime('%Y-%m-%dT%H%M%SZ')}.json"
+    _atomic_write_json(history, payload)
+    payload["path"] = str(path)
+    return payload
+
+
+def _feature_canary_batch_status(entries: list[dict[str, Any]]) -> str:
+    if not entries:
+        return "NO_FEATURE_VERSIONS"
+    if any(str(entry.get("verdict") or "") == "blocked" for entry in entries):
+        return "BLOCKED"
+    if any(str(entry.get("verdict") or "") == "pending" for entry in entries):
+        return "RUNNING"
+    return "COMPLETED"
 
 
 def _latest_prior_paper_targets(*, data_root: Path, local_state: Path, current_date: str) -> pd.DataFrame:

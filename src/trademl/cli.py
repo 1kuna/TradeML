@@ -73,6 +73,7 @@ from trademl.research import (
     research_health,
     resume_research_program,
     run_and_persist_paper_account_smoke,
+    run_feature_version_canary_batch,
     run_research_canary,
     start_research_program,
     steer_research_program,
@@ -224,6 +225,13 @@ def main(argv: list[str] | None = None) -> int:
     research_build_features.add_argument("--program", default="configs/research/perpetual_macmini.yml")
     research_build_features.add_argument("--feature-version", default=None)
     research_build_features.add_argument("--report-date", default=None)
+    research_feature_canary = research_subparsers.add_parser("feature-canary", help="Build and canary configured modeling feature versions.")
+    research_feature_canary.add_argument("--program", default="configs/research/perpetual_macmini.yml")
+    research_feature_canary.add_argument("--poll-seconds", type=int, default=None)
+    research_feature_canary.add_argument("--detach", action="store_true")
+    research_feature_canary.add_argument("--feature-version", action="append", default=None)
+    research_feature_canary.add_argument("--label-horizon", type=int, default=None)
+    research_feature_canary.add_argument("--report-date", default=None)
     research_paper_smoke = research_subparsers.add_parser("paper-smoke", help="Run a read-only Alpaca paper account smoke check.")
     research_paper_smoke.add_argument("--program", required=True)
     research_paper_submit = research_subparsers.add_parser("paper-submit", help="Submit generated Alpaca paper payloads with explicit guards.")
@@ -780,6 +788,18 @@ def _dispatch_research(args: argparse.Namespace) -> int:
             data_root=data_root,
             feature_version=args.feature_version,
             report_date=args.report_date,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "feature-canary":
+        payload = run_feature_version_canary_batch(
+            program_path=Path(args.program).expanduser(),
+            poll_seconds=args.poll_seconds,
+            detach=bool(args.detach),
+            feature_versions=args.feature_version,
+            label_horizon=args.label_horizon,
+            report_date=args.report_date,
+            **common,
         )
         print(json.dumps(payload, indent=2, default=str))
         return 0

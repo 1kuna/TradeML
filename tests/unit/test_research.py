@@ -703,6 +703,176 @@ def test_research_canary_records_review_and_read_only_paper_smoke(tmp_path: Path
     assert state["latest_paper_account_smoke"]["status"] == "skipped"
 
 
+def test_feature_version_canary_batch_builds_versions_in_order_and_writes_leaderboard(tmp_path: Path, monkeypatch) -> None:
+    program_path = _program_spec(tmp_path)
+    versions = ["price_liquidity_v1", "sec_filing_events_v1", "multi_source_daily_v1"]
+    calls: list[tuple[str, str]] = []
+
+    def fake_build(**kwargs):  # noqa: ANN001
+        version = kwargs["feature_version"]
+        calls.append(("build", version))
+        return {
+            "feature_version": version,
+            "label_version": "universe_relative_forward_return_v1",
+            "data_revision": f"rev-{version}",
+            "feature_rows": 100,
+            "label_rows": 100,
+            "feature_groups": ["price_liquidity"],
+            "feature_group_metadata": {"price_liquidity": {"row_coverage": 1.0}},
+        }
+
+    def fake_preflight(**kwargs):  # noqa: ANN001
+        calls.append(("preflight", kwargs["feature_version"]))
+        return {
+            "ok": True,
+            "feature_version": kwargs["feature_version"],
+            "label_version": kwargs["label_version"],
+            "label_horizon": kwargs["label_horizon"],
+            "rows": 100,
+            "data_revision": f"rev-{kwargs['feature_version']}",
+        }
+
+    def fake_canary(**kwargs):  # noqa: ANN001
+        version = kwargs["feature_version"]
+        calls.append(("canary", version))
+        return {"status": "COMPLETED", "current_experiment_id": f"exp-{version}"}
+
+    monkeypatch.setattr(research, "build_research_features", fake_build)
+    monkeypatch.setattr(research, "feature_label_preflight", fake_preflight)
+    monkeypatch.setattr(research, "run_research_canary", fake_canary)
+    monkeypatch.setattr(
+        research,
+        "_read_experiment_summary_direct",
+        lambda **kwargs: {
+            "experiment_id": kwargs["experiment_id"],
+            "best_run_id": "run-a",
+            "best_candidate": "catboost",
+            "best_primary_score": 0.02 if kwargs["experiment_id"].endswith("multi_source_daily_v1") else 0.01,
+            "shortlist_count": 0,
+            "best_decision_reason": "not all yearly IC positive",
+            "candidate_classifications": {"weak_rejected": 1},
+        },
+    )
+
+    payload = research.run_feature_version_canary_batch(
+        program_path=program_path,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        feature_versions=versions,
+        label_horizon=5,
+        detach=True,
+    )
+
+    assert payload["status"] == "COMPLETED"
+    assert [call for call in calls if call[0] == "build"] == [("build", version) for version in versions]
+    assert [entry["feature_version"] for entry in payload["leaderboard"]["entries"]] == [
+        "multi_source_daily_v1",
+        "price_liquidity_v1",
+        "sec_filing_events_v1",
+    ]
+    assert payload["leaderboard"]["best_feature_version"] == "multi_source_daily_v1"
+    assert Path(payload["leaderboard"]["path"]).exists()
+
+
+def test_feature_version_canary_batch_blocks_on_feature_preflight_without_crash(tmp_path: Path, monkeypatch) -> None:
+    program_path = _program_spec(tmp_path)
+    launched: list[str] = []
+
+    monkeypatch.setattr(
+        research,
+        "build_research_features",
+        lambda **kwargs: {
+            "feature_version": kwargs["feature_version"],
+            "label_version": "universe_relative_forward_return_v1",
+            "data_revision": f"rev-{kwargs['feature_version']}",
+            "feature_rows": 10,
+            "label_rows": 10,
+        },
+    )
+    monkeypatch.setattr(
+        research,
+        "feature_label_preflight",
+        lambda **kwargs: {"ok": kwargs["feature_version"] == "price_liquidity_v1", "reason": "missing source rows"},
+    )
+
+    def fake_canary(**kwargs):  # noqa: ANN001
+        launched.append(kwargs["feature_version"])
+        return {"status": "COMPLETED", "current_experiment_id": f"exp-{kwargs['feature_version']}"}
+
+    monkeypatch.setattr(research, "run_research_canary", fake_canary)
+
+    payload = research.run_feature_version_canary_batch(
+        program_path=program_path,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=tmp_path / "local",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        feature_versions=["price_liquidity_v1", "sec_filing_events_v1", "news_event_aggregates_v1"],
+        label_horizon=5,
+        detach=True,
+    )
+
+    assert payload["status"] == "BLOCKED"
+    assert launched == ["price_liquidity_v1"]
+    assert payload["entries"][-1]["feature_version"] == "sec_filing_events_v1"
+    assert payload["entries"][-1]["verdict"] == "blocked"
+
+
+def test_feature_version_canary_batch_skips_duplicate_data_revision(tmp_path: Path, monkeypatch) -> None:
+    program_path = _program_spec(tmp_path)
+    data_root = tmp_path / "nas"
+    research._write_feature_family_leaderboard(  # noqa: SLF001
+        data_root=data_root,
+        program_id="perpetual-macmini",
+        label_horizon=5,
+        entries=[
+            {
+                "feature_version": "price_liquidity_v1",
+                "label_horizon": 5,
+                "data_revision": "rev-a",
+                "objective_policy_hash": research._feature_canary_objective_hash({}),  # noqa: SLF001
+                "status": "COMPLETED",
+                "verdict": "rejected",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        research,
+        "build_research_features",
+        lambda **kwargs: {
+            "feature_version": "price_liquidity_v1",
+            "label_version": "universe_relative_forward_return_v1",
+            "data_revision": "rev-a",
+            "feature_rows": 10,
+            "label_rows": 10,
+        },
+    )
+    monkeypatch.setattr(research, "feature_label_preflight", lambda **kwargs: {"ok": True, "data_revision": "rev-a"})
+    monkeypatch.setattr(research, "run_research_canary", lambda **kwargs: (_ for _ in ()).throw(AssertionError("duplicate canary launched")))
+
+    payload = research.run_feature_version_canary_batch(
+        program_path=program_path,
+        repo_root=tmp_path / "repo",
+        data_root=data_root,
+        local_state=tmp_path / "local",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        feature_versions=["price_liquidity_v1"],
+        label_horizon=5,
+        detach=True,
+    )
+
+    assert payload["status"] == "COMPLETED"
+    assert payload["entries"][0]["verdict"] == "skipped_duplicate"
+
+
 def test_paper_smoke_persists_safe_program_state(tmp_path: Path, monkeypatch) -> None:
     program_path = _program_spec(tmp_path)
     local_state = tmp_path / "local"
@@ -1851,6 +2021,25 @@ def test_research_health_reports_active_run_modeling_metadata(tmp_path: Path, mo
             "data_revision": "abc123",
         },
     )
+    monkeypatch.setattr(
+        research,
+        "read_feature_family_leaderboard",
+        lambda **kwargs: {
+            "path": str(tmp_path / "nas" / "control" / "cluster" / "state" / "research" / "feature_family_leaderboard" / "latest.json"),
+            "updated_at": "2026-04-30T00:00:00+00:00",
+            "label_horizon": 5,
+            "best_feature_version": "multi_source_daily_v1",
+            "best_objective_score": 0.03,
+            "entries": [
+                {
+                    "feature_version": "multi_source_daily_v1",
+                    "verdict": "rejected",
+                    "best_objective_score": 0.03,
+                    "top_rejection_reason": "not all yearly IC positive",
+                }
+            ],
+        },
+    )
 
     payload = research.research_health(
         program_id="perpetual-macmini",
@@ -1864,6 +2053,8 @@ def test_research_health_reports_active_run_modeling_metadata(tmp_path: Path, mo
     assert payload["modeling"]["current_feature_version"] == "price_liquidity_v1"
     assert payload["modeling"]["current_label_horizon"] == 20
     assert payload["modeling"]["current_portfolio_profile"] == "cost_aware_long_only_v1"
+    assert payload["feature_family_leaderboard"]["best_feature_version"] == "multi_source_daily_v1"
+    assert payload["feature_family_leaderboard"]["entries"][0]["top_rejection_reason"] == "not all yearly IC positive"
 
 
 def test_update_research_incumbent_promotes_only_fully_gated_candidate(tmp_path: Path) -> None:
