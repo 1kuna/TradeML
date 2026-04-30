@@ -2489,7 +2489,16 @@ def _strong_rejected_follow_up_spec(
     next_spec["diagnostic_mode"] = "strong_unstable"
     next_spec["follow_up_of_run_id"] = str(best_run_id)
     next_spec["follow_up_reason"] = str(best_autopsy.get("root_failure_mode") or "strong rejected candidate failed stability gates")
-    next_spec["proposal_policy"]["family_size_cap"] = max(int(next_spec["proposal_policy"].get("family_size_cap") or 6), 12)
+    next_spec["matrix"] = _cap_matrix_combinations(
+        next_spec["matrix"],
+        family_size_cap=int(next_spec["proposal_policy"].get("family_size_cap") or 6),
+        expansion_order=[
+            "architecture_family",
+            "label_horizon",
+            "validation.initial_train_years",
+            "data_profile",
+        ],
+    )
     next_spec["supervision"] = {
         **dict(next_spec.get("supervision") or {}),
         "auto_backtest_survivors": True,
@@ -2517,6 +2526,36 @@ def _best_run_from_summary(experiment_summary: dict[str, Any]) -> dict[str, Any]
         if isinstance(run, dict) and str(run.get("run_id") or "") == best_run_id:
             return run
     return {}
+
+
+def _cap_matrix_combinations(
+    matrix: dict[str, list[Any]],
+    *,
+    family_size_cap: int,
+    expansion_order: list[str],
+) -> dict[str, list[Any]]:
+    """Trim a matrix so a diagnostic family stays within its configured cap."""
+    cap = max(1, int(family_size_cap or 1))
+    result: dict[str, list[Any]] = {}
+    for key, raw_values in matrix.items():
+        values = list(raw_values)
+        result[key] = values[:1] if values else []
+
+    for key in expansion_order:
+        values = list(matrix.get(key) or [])
+        if not values:
+            continue
+        current = _matrix_combination_count({name: vals for name, vals in result.items() if name != key})
+        allowed = max(1, cap // max(1, current))
+        result[key] = values[:allowed]
+    return result
+
+
+def _matrix_combination_count(matrix: dict[str, list[Any]]) -> int:
+    size = 1
+    for values in matrix.values():
+        size *= max(1, len(values))
+    return size
 
 
 def _diagnostic_follow_up_already_tried(*, frontier: dict[str, Any], run_id: str) -> bool:

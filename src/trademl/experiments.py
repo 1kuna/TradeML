@@ -1965,6 +1965,16 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
         )
         if "label_horizon" in allowed_dimensions:
             next_matrix["label_horizon"] = horizon_values
+        next_matrix = _cap_matrix_combinations(
+            next_matrix,
+            family_size_cap=policy["family_size_cap"],
+            expansion_order=[
+                "architecture_family",
+                "label_horizon",
+                "validation.initial_train_years",
+                "data_profile",
+            ],
+        )
         next_spec["matrix"] = next_matrix
         next_spec["diagnostic_mode"] = "strong_unstable"
         next_spec["follow_up_of_run_id"] = strong_unstable.get("run_id")
@@ -2127,6 +2137,29 @@ def _bounded_matrix(
         max_values = max(1, family_size_cap // max(1, current_size))
         matrix[key] = list(dict.fromkeys(values))[:max_values]
     return matrix
+
+
+def _cap_matrix_combinations(
+    matrix: dict[str, list[Any]],
+    *,
+    family_size_cap: int,
+    expansion_order: list[str],
+) -> dict[str, list[Any]]:
+    """Trim a matrix so realized combinations stay inside the family cap."""
+    cap = max(1, int(family_size_cap or 1))
+    result: dict[str, list[Any]] = {}
+    for key, raw_values in matrix.items():
+        values = list(raw_values)
+        result[key] = values[:1] if values else []
+
+    for key in expansion_order:
+        values = list(matrix.get(key) or [])
+        if not values:
+            continue
+        current = _matrix_combination_count({name: vals for name, vals in result.items() if name != key})
+        allowed = max(1, cap // max(1, current))
+        result[key] = values[:allowed]
+    return result
 
 
 def _matrix_combination_count(matrix: dict[str, list[Any]]) -> int:

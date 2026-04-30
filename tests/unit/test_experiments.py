@@ -925,7 +925,9 @@ def test_build_next_family_proposal_prioritizes_strong_unstable_follow_up() -> N
         "tree_challenger",
         "linear_baseline",
     ]
-    assert proposal["next_spec"]["matrix"]["label_horizon"] == [20, 1, 5]
+    matrix = proposal["next_spec"]["matrix"]
+    assert matrix["label_horizon"] == [20, 1, 5]
+    assert _matrix_size(matrix) <= 12
     assert proposal["next_spec"]["diagnostic_family_signature"]
 
 
@@ -1533,3 +1535,10 @@ def test_stop_experiment_supervisor_stops_active_training_runs(tmp_path: Path, m
     assert killed == [4321]
     assert payload["stopped_training_runs"] == [{"run_id": "run-a", "stopped": True}]
     assert stopped[0]["runtime_name"] == "runtime-a"
+
+
+def _matrix_size(matrix: dict[str, list[object]]) -> int:
+    size = 1
+    for values in matrix.values():
+        size *= max(1, len(values))
+    return size

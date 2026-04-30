@@ -622,7 +622,8 @@ def test_strong_unstable_candidate_launches_diagnostic_follow_up_before_frontier
     assert decision["next_spec"]["diagnostic_mode"] == "strong_unstable"
     assert decision["next_spec"]["follow_up_of_run_id"] == "ae6b12e3df"
     assert decision["next_spec"]["matrix"]["architecture_family"][0] == "advanced_challenger"
-    assert decision["next_spec"]["matrix"]["label_horizon"] == [20, 1, 5]
+    assert decision["next_spec"]["matrix"]["label_horizon"] == [20]
+    assert _matrix_size(decision["next_spec"]["matrix"]) <= decision["next_spec"]["proposal_policy"]["family_size_cap"]
 
 
 def test_research_canary_preflight_blocks_without_creating_doomed_manifests(tmp_path: Path, monkeypatch) -> None:
@@ -2294,3 +2295,10 @@ def _write_price_partition(data_root: Path, date: str, closes: dict[str, float])
             "close": list(closes.values()),
         }
     ).to_parquet(root / "data.parquet", index=False)
+
+
+def _matrix_size(matrix: dict[str, list[object]]) -> int:
+    size = 1
+    for values in matrix.values():
+        size *= max(1, len(values))
+    return size
