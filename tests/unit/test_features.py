@@ -5,6 +5,7 @@ import pandas as pd
 
 from trademl.features.equities import build_features
 from trademl.modeling import build_modeling_artifacts, feature_label_preflight, load_modeling_dataset
+from trademl.modeling.factory import _feature_groups_for
 
 
 def _panel() -> pd.DataFrame:
@@ -233,3 +234,22 @@ def test_modeling_feature_factory_adds_multisource_pit_features(tmp_path) -> Non
     assert apple["news_count_7d"].max() >= 1
     assert apple["minute_intraday_return"].max() > 0
     assert (pd.to_datetime(frame["feature_available_at"], utc=True).dt.tz_convert(None) <= pd.to_datetime(frame["date"])).all()
+
+
+def test_feature_version_names_select_only_their_intended_optional_groups() -> None:
+    assert _feature_groups_for(
+        feature_set="daily_price_liquidity_v1",
+        feature_version="sec_filing_events_v1",
+    ) == ["price_liquidity", "fundamentals_sec"]
+    assert _feature_groups_for(
+        feature_set="daily_price_liquidity_v1",
+        feature_version="news_event_aggregates_v1",
+    ) == ["price_liquidity", "news_events"]
+    assert _feature_groups_for(
+        feature_set="daily_price_liquidity_v1",
+        feature_version="minute_daily_aggregates_v1",
+    ) == ["price_liquidity", "minute_daily"]
+    assert _feature_groups_for(
+        feature_set="daily_price_liquidity_v1",
+        feature_version="multi_source_daily_v1",
+    ) == ["price_liquidity", "fundamentals_sec", "news_events", "minute_daily"]

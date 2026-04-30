@@ -209,11 +209,13 @@ def _modeling_features(
 def _feature_groups_for(*, feature_set: str, feature_version: str) -> list[str]:
     name = f"{feature_set} {feature_version}".lower()
     groups = ["price_liquidity"]
-    if "multi_source" in name or "fundamental" in name or "sec" in name or "filing" in name:
+    if "multi_source" in name:
+        return [*groups, "fundamentals_sec", "news_events", "minute_daily"]
+    if "fundamental" in name or "sec" in name or "filing" in name:
         groups.append("fundamentals_sec")
-    if "multi_source" in name or "news" in name or "event" in name:
+    if "news" in name:
         groups.append("news_events")
-    if "multi_source" in name or "minute" in name or "intraday" in name:
+    if "minute" in name or "intraday" in name:
         groups.append("minute_daily")
     return groups
 
