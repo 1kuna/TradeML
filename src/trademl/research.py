@@ -267,6 +267,12 @@ def supervise_research_program(
             _write_program_state(local_state=local_state, program_id=program_id, payload=state)
             time.sleep(max(1, resolved_poll))
             continue
+        if bool(state.get("feature_canary_batch_active")) and int(state.get("feature_canary_batch_owner_pid") or -1) != os.getpid():
+            state["status"] = "FEATURE_CANARY_RUNNING"
+            state["wait_reason"] = "feature-version canary batch is active"
+            _write_program_state(local_state=local_state, program_id=program_id, payload=state)
+            time.sleep(max(1, resolved_poll))
+            continue
         if state.get("status") in {"WAITING_FOR_DATA", "INFRA_BLOCKED"}:
             resumed = _resume_if_data_changed(
                 spec=spec,
@@ -1296,102 +1302,125 @@ def run_feature_version_canary_batch(
     label_version = str(modeling.get("label_version") or DEFAULT_LABEL_VERSION)
     objective_policy = dict(spec.get("objective_policy") or {})
     entries: list[dict[str, Any]] = []
-    for version in versions:
-        try:
-            build_payload = build_research_features(
+    batch_started_at = datetime.now(tz=UTC).isoformat()
+    state = _ensure_program_state(
+        local_state=local_state,
+        program_id=program_id,
+        payload=_initial_program_state(spec=spec, program_path=program_path, poll_seconds=int(poll_seconds or spec.get("poll_seconds") or 30)),
+    )
+    state["feature_canary_batch_active"] = True
+    state["feature_canary_batch_owner_pid"] = os.getpid()
+    state["feature_version_canary_batch"] = {
+        "started_at": batch_started_at,
+        "updated_at": batch_started_at,
+        "label_horizon": resolved_horizon,
+        "entries": entries,
+    }
+    _write_program_state(local_state=local_state, program_id=program_id, payload=state)
+    try:
+        for version in versions:
+            try:
+                build_payload = build_research_features(
+                    program_path=program_path,
+                    data_root=data_root,
+                    feature_version=version,
+                    report_date=report_date,
+                )
+                preflight = feature_label_preflight(
+                    data_root=data_root,
+                    feature_version=version,
+                    label_version=label_version,
+                    label_horizon=resolved_horizon,
+                    report_date=report_date,
+                )
+            except Exception as exc:  # noqa: BLE001
+                entry = _feature_canary_leaderboard_entry(
+                    feature_version=version,
+                    label_horizon=resolved_horizon,
+                    build_payload={},
+                    preflight={"ok": False, "reason": str(exc)},
+                    canary_payload={},
+                    summary={},
+                    objective_policy=objective_policy,
+                    status="BLOCKED",
+                )
+                entries.append(entry)
+                _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
+                break
+            if not bool(preflight.get("ok", False)):
+                entry = _feature_canary_leaderboard_entry(
+                    feature_version=version,
+                    label_horizon=resolved_horizon,
+                    build_payload=build_payload,
+                    preflight=preflight,
+                    canary_payload={},
+                    summary={},
+                    objective_policy=objective_policy,
+                    status="BLOCKED",
+                )
+                entries.append(entry)
+                _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
+                break
+            if _feature_canary_already_recorded(
+                data_root=data_root,
+                feature_version=version,
+                label_horizon=resolved_horizon,
+                data_revision=str(build_payload.get("data_revision") or ""),
+                objective_policy=objective_policy,
+            ):
+                entry = _feature_canary_leaderboard_entry(
+                    feature_version=version,
+                    label_horizon=resolved_horizon,
+                    build_payload=build_payload,
+                    preflight=preflight,
+                    canary_payload={},
+                    summary={},
+                    objective_policy=objective_policy,
+                    status="SKIPPED_DUPLICATE",
+                )
+                entries.append(entry)
+                _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
+                continue
+            canary_payload = run_research_canary(
                 program_path=program_path,
+                repo_root=repo_root,
                 data_root=data_root,
-                feature_version=version,
-                report_date=report_date,
-            )
-            preflight = feature_label_preflight(
-                data_root=data_root,
-                feature_version=version,
-                label_version=label_version,
-                label_horizon=resolved_horizon,
-                report_date=report_date,
-            )
-        except Exception as exc:  # noqa: BLE001
-            entry = _feature_canary_leaderboard_entry(
+                local_state=local_state,
+                env_path=env_path,
+                targets_config_path=targets_config_path,
+                python_executable=python_executable,
+                poll_seconds=poll_seconds,
+                detach=detach,
                 feature_version=version,
                 label_horizon=resolved_horizon,
-                build_payload={},
-                preflight={"ok": False, "reason": str(exc)},
-                canary_payload={},
-                summary={},
-                objective_policy=objective_policy,
-                status="BLOCKED",
             )
-            entries.append(entry)
-            _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
-            break
-        if not bool(preflight.get("ok", False)):
+            experiment_id = str(
+                canary_payload.get("current_experiment_id")
+                or (canary_payload.get("canary_spec") or {}).get("experiment_id")
+                or ""
+            )
+            summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=experiment_id) if experiment_id else {}
             entry = _feature_canary_leaderboard_entry(
                 feature_version=version,
                 label_horizon=resolved_horizon,
                 build_payload=build_payload,
                 preflight=preflight,
-                canary_payload={},
-                summary={},
+                canary_payload=canary_payload,
+                summary=summary,
                 objective_policy=objective_policy,
-                status="BLOCKED",
+                status=str(canary_payload.get("status") or "PENDING"),
             )
             entries.append(entry)
             _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
-            break
-        if _feature_canary_already_recorded(
-            data_root=data_root,
-            feature_version=version,
-            label_horizon=resolved_horizon,
-            data_revision=str(build_payload.get("data_revision") or ""),
-            objective_policy=objective_policy,
-        ):
-            entry = _feature_canary_leaderboard_entry(
-                feature_version=version,
-                label_horizon=resolved_horizon,
-                build_payload=build_payload,
-                preflight=preflight,
-                canary_payload={},
-                summary={},
-                objective_policy=objective_policy,
-                status="SKIPPED_DUPLICATE",
-            )
-            entries.append(entry)
-            _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
-            continue
-        canary_payload = run_research_canary(
-            program_path=program_path,
-            repo_root=repo_root,
-            data_root=data_root,
-            local_state=local_state,
-            env_path=env_path,
-            targets_config_path=targets_config_path,
-            python_executable=python_executable,
-            poll_seconds=poll_seconds,
-            detach=detach,
-            feature_version=version,
-            label_horizon=resolved_horizon,
-        )
-        experiment_id = str(
-            canary_payload.get("current_experiment_id")
-            or (canary_payload.get("canary_spec") or {}).get("experiment_id")
-            or ""
-        )
-        summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=experiment_id) if experiment_id else {}
-        entry = _feature_canary_leaderboard_entry(
-            feature_version=version,
-            label_horizon=resolved_horizon,
-            build_payload=build_payload,
-            preflight=preflight,
-            canary_payload=canary_payload,
-            summary=summary,
-            objective_policy=objective_policy,
-            status=str(canary_payload.get("status") or "PENDING"),
-        )
-        entries.append(entry)
-        _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
-        if entry["verdict"] == "blocked":
-            break
+            if entry["verdict"] == "blocked":
+                break
+    finally:
+        state = read_research_program_state(local_state=local_state, program_id=program_id)
+        if int(state.get("feature_canary_batch_owner_pid") or -1) == os.getpid():
+            state["feature_canary_batch_active"] = False
+            state["feature_canary_batch_completed_at"] = datetime.now(tz=UTC).isoformat()
+            state["feature_canary_batch_owner_pid"] = None
+            _write_program_state(local_state=local_state, program_id=program_id, payload=state)
     leaderboard = _write_feature_family_leaderboard(
         data_root=data_root,
         program_id=program_id,
@@ -4268,6 +4297,9 @@ def _ensure_program_state(*, local_state: Path, program_id: str, payload: dict[s
         "next_lane",
         "sentinel_delta",
         "autonomous_progression",
+        "feature_canary_batch_active",
+        "feature_canary_batch_owner_pid",
+        "feature_version_canary_batch",
     )
     for key in preserved_keys:
         if key in existing and existing.get(key) not in (None, {}, []):

@@ -776,6 +776,50 @@ def test_feature_version_canary_batch_builds_versions_in_order_and_writes_leader
     ]
     assert payload["leaderboard"]["best_feature_version"] == "multi_source_daily_v1"
     assert Path(payload["leaderboard"]["path"]).exists()
+    state = research.read_research_program_state(local_state=tmp_path / "local", program_id="perpetual-macmini")
+    assert state["feature_canary_batch_active"] is False
+    assert state["feature_version_canary_batch"]["leaderboard_path"] == payload["leaderboard"]["path"]
+
+
+def test_supervisor_waits_while_feature_canary_batch_is_active(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    program_path = _program_spec(tmp_path)
+    spec = research._load_research_program_spec(program_path)  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=program_path, poll_seconds=1)  # noqa: SLF001
+    state["feature_canary_batch_active"] = True
+    state["feature_canary_batch_owner_pid"] = 999_999
+    research._write_program_state(local_state=local_state, program_id="perpetual-macmini", payload=state)  # noqa: SLF001
+    writes: list[str] = []
+    original_write = research._write_program_state  # noqa: SLF001
+
+    def capturing_write(**kwargs):  # noqa: ANN001
+        writes.append(str((kwargs["payload"] or {}).get("status")))
+        original_write(**kwargs)
+
+    def stop_after_wait(seconds):  # noqa: ANN001, ARG001
+        payload = research.read_research_program_state(local_state=local_state, program_id="perpetual-macmini")
+        payload["stop_requested"] = True
+        payload["feature_canary_batch_active"] = False
+        original_write(local_state=local_state, program_id="perpetual-macmini", payload=payload)
+
+    monkeypatch.setattr(research, "_write_program_state", capturing_write)
+    monkeypatch.setattr(research, "time", type("FakeTime", (), {"sleep": staticmethod(stop_after_wait)}))
+    monkeypatch.setattr(research, "sweep_stale_experiment_runs", lambda **kwargs: {"checked": 0, "reconciled": 0})
+    monkeypatch.setattr(research, "_bootstrap_research_state_from_training_history", lambda **kwargs: kwargs["state"])
+
+    result = research.supervise_research_program(
+        program_path=program_path,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        local_state=local_state,
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        poll_seconds=1,
+    )
+
+    assert "FEATURE_CANARY_RUNNING" in writes
+    assert result["status"] == "STOPPED"
 
 
 def test_feature_version_canary_batch_blocks_on_feature_preflight_without_crash(tmp_path: Path, monkeypatch) -> None:
