@@ -864,7 +864,12 @@ def test_feature_version_canary_batch_blocks_on_feature_preflight_without_crash(
 
     assert payload["status"] == "BLOCKED"
     assert launched == ["price_liquidity_v1"]
-    assert payload["entries"][-1]["feature_version"] == "sec_filing_events_v1"
+    assert [entry["feature_version"] for entry in payload["entries"]] == [
+        "price_liquidity_v1",
+        "sec_filing_events_v1",
+        "news_event_aggregates_v1",
+    ]
+    assert payload["entries"][1]["verdict"] == "blocked"
     assert payload["entries"][-1]["verdict"] == "blocked"
 
 

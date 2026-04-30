@@ -1360,7 +1360,7 @@ def run_feature_version_canary_batch(
                 )
                 entries.append(entry)
                 _write_feature_family_leaderboard(data_root=data_root, program_id=program_id, label_horizon=resolved_horizon, entries=entries)
-                break
+                continue
             if _feature_canary_already_recorded(
                 data_root=data_root,
                 feature_version=version,
