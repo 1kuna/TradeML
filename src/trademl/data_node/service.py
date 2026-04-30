@@ -40,6 +40,18 @@ from trademl.data_node.training_control import recommended_training_cutoff
 from trademl.fleet.cluster import ClusterCoordinator, ShardSpec
 
 LOGGER = logging.getLogger(__name__)
+ALPACA_EXPANSION_DATASETS = (
+    "stock_trades",
+    "stock_quotes",
+    "stock_snapshots",
+    "crypto_bars",
+    "crypto_trades",
+    "crypto_quotes",
+    "crypto_snapshots",
+    "option_chain_reference",
+    "option_snapshots",
+    "option_bars",
+)
 
 
 @dataclass(slots=True)
@@ -113,6 +125,7 @@ class DataNodeService:
             "planner_tasks": 0,
             "vendor_attempts": 0,
         }
+        self._auxiliary_claim_counts: dict[str, int] = {}
         self._auxiliary_runtime = AuxiliaryRuntime(
             db=self.db,
             connectors=self.connectors,
@@ -1181,12 +1194,18 @@ class DataNodeService:
             "macro",
             "supplemental_research",
         )
+        claim_count = self._auxiliary_claim_counts.get(vendor, 0)
+        minute_priority_turn = claim_count % 4 != 3
         preferred_datasets = (
-            ("equities_minute",) if self._should_prioritize_minute_lane(vendor) else ()
+            ("equities_minute",)
+            if minute_priority_turn and self._should_prioritize_minute_lane(vendor)
+            else ()
         )
         dataset_passes: list[tuple[str, ...] | None] = []
         if preferred_datasets:
             dataset_passes.append(preferred_datasets)
+        if vendor == "alpaca":
+            dataset_passes.append(ALPACA_EXPANSION_DATASETS)
         dataset_passes.append(None)
         for datasets_filter in dataset_passes:
             claim = self.db.claim_next_vendor_task(
@@ -1199,6 +1218,7 @@ class DataNodeService:
                 ),
             )
             if claim.task is not None:
+                self._auxiliary_claim_counts[vendor] = claim_count + 1
                 self.db.record_scheduler_decision(
                     vendor=vendor,
                     dataset=claim.task.dataset,

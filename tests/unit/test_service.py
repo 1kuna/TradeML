@@ -1436,6 +1436,44 @@ def test_drain_auxiliary_lane_prioritizes_minute_when_pressure_is_low(
     assert processed == ["minute::AAPL"]
 
 
+def test_auxiliary_claim_gives_alpaca_expansion_lane_a_turn(tmp_path: Path) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={"alpaca": _NoopConnector()},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(root=tmp_path / "reference" / "calendars"),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+    )
+    for task_key, dataset, priority in (
+        ("minute::AAPL", "equities_minute", 205),
+        ("stock-trades::AAPL", "stock_trades", 260),
+    ):
+        db.upsert_planner_task(
+            task_key=task_key,
+            task_family="supplemental_research",
+            planner_group="supplemental_research_backlog",
+            dataset=dataset,
+            tier="C",
+            priority=priority,
+            start_date="2026-04-01",
+            end_date="2026-04-01",
+            symbols=["AAPL"],
+            eligible_vendors=["alpaca"],
+            output_name="alpaca_market_events",
+            payload={"scope_kind": "symbol_range"},
+        )
+    service._auxiliary_claim_counts["alpaca"] = 3
+
+    task = service._lease_next_auxiliary_task_for_vendor("alpaca")
+
+    assert task is not None
+    assert task.dataset == "stock_trades"
+
+
 def test_budget_blocked_auxiliary_lane_defers_peer_tasks_without_retry_storm(
     tmp_path: Path,
 ) -> None:
