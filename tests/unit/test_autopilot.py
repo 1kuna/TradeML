@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -138,6 +139,16 @@ def test_observability_uses_remote_mac_research_when_local_summary_missing(tmp_p
                         "status": "RUNNING",
                         "current_experiment_id": "perpetual-macmini-p1-f188",
                         "wait_reason": None,
+                        "latest_paper_account_smoke": {
+                            "status": "ok",
+                            "read_only": True,
+                            "base_url": "https://paper-api.alpaca.markets/v2",
+                        },
+                        "latest_paper_pnl": {
+                            "status": "available",
+                            "net_return": 0.01,
+                            "no_live_orders": True,
+                        },
                     },
                 }
             },
@@ -149,6 +160,9 @@ def test_observability_uses_remote_mac_research_when_local_summary_missing(tmp_p
     assert payload["research"]["status"] == "RUNNING"
     assert payload["research"]["current_experiment_id"] == "perpetual-macmini-p1-f188"
     assert payload["research"]["supervisor_running"] is True
+    assert payload["research"]["paper_account_smoke"]["status"] == "ok"
+    assert payload["paper_pnl"]["status"] == "available"
+    assert payload["paper_pnl"]["paper_account_smoke_status"] == "ok"
 
 
 def test_fleet_health_records_remote_failures_without_healing_active_services(tmp_path: Path, monkeypatch) -> None:
@@ -190,7 +204,14 @@ def test_fleet_health_uses_remote_mac_status_when_local_program_state_is_absent(
         if "research --data-root" in command:
             return {
                 "returncode": 0,
-                "stdout": '{"status": "RUNNING", "program_id": "perpetual-macmini", "current_experiment_id": "exp-remote"}',
+                "stdout": json.dumps(
+                    {
+                        "status": "RUNNING",
+                        "program_id": "perpetual-macmini",
+                        "current_experiment_id": "exp-remote",
+                        "latest_paper_account_smoke": {"status": "ok", "read_only": True},
+                    }
+                ),
                 "stderr": "",
             }
         return {"returncode": 0, "stdout": "active\n", "stderr": ""}
@@ -206,6 +227,7 @@ def test_fleet_health_uses_remote_mac_status_when_local_program_state_is_absent(
     assert payload["current_state"]["mac"]["status"] == "online"
     assert payload["current_state"]["mac"]["headline"] == "Research running"
     assert payload["current_state"]["mac"]["detail"] == "exp-remote"
+    assert payload["observability"]["research"]["paper_account_smoke"]["status"] == "ok"
 
 
 def test_current_state_distinguishes_running_research_without_promotable_candidate() -> None:
@@ -320,6 +342,40 @@ def test_observability_snapshot_reports_vendor_underutilization_and_pending_pnl(
     assert payload["paper_pnl"]["status"] == "pending_labels"
     assert payload["verdict"] == "DEGRADED"
     assert payload["issues"][0]["kind"] == "vendor_underutilized"
+
+
+def test_observability_treats_disabled_lane_as_blocked_not_underutilized(tmp_path: Path) -> None:
+    data_root = tmp_path / "nas"
+    data_root.mkdir()
+    payload = build_fleet_observability(
+        snapshot={
+            "runtime": {"running": True},
+            "planner_summary": {"progress": {"supplemental_research": {"remaining_units": 10}}},
+            "budget_summary": {
+                "rows": [
+                    {
+                        "vendor": "alpha_vantage",
+                        "state": "available",
+                        "rpm_limit": 5,
+                        "rpm_used": 0,
+                        "day_remaining": 25,
+                        "minute_available": True,
+                        "day_available": True,
+                        "outbound_requests_60s": 0,
+                    }
+                ]
+            },
+            "vendor_throughput": {"rows": [{"vendor": "alpha_vantage", "state": "available"}]},
+            "lane_health": {"rows": [{"vendor": "alpha_vantage", "dataset": "news_sentiment", "state": "DISABLED"}]},
+        },
+        data_root=data_root,
+        now=datetime(2026, 4, 29, 12, 1, tzinfo=UTC),
+    )
+
+    row = payload["vendors"]["rows"][0]
+    assert row["current_blocker"] == "disabled"
+    assert row["utilization_verdict"] == "blocked"
+    assert payload["issues"] == []
 
 
 def test_current_state_uses_observability_top_cards_without_degrading_for_pending_pnl(tmp_path: Path) -> None:

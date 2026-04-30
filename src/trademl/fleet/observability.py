@@ -302,9 +302,12 @@ def _archive_schema_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
-    program = dict((snapshot.get("health") or {}).get("research_program_summary") or {})
-    experiment = dict(snapshot.get("experiment_summary") or {})
     remote_research = dict(((snapshot.get("fleet_remote") or {}).get("mac") or {}).get("research") or {})
+    program = {
+        **remote_research,
+        **dict((snapshot.get("health") or {}).get("research_program_summary") or {}),
+    }
+    experiment = dict(snapshot.get("experiment_summary") or {})
     best = dict(program.get("best_candidate_summary") or {})
     progression = dict(program.get("autonomous_progression") or program.get("progression") or {})
     paper_smoke = dict(program.get("latest_paper_account_smoke") or program.get("paper_account_smoke") or {})
@@ -341,7 +344,11 @@ def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 def _paper_pnl_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
-    program = dict((snapshot.get("health") or {}).get("research_program_summary") or {})
+    remote_research = dict(((snapshot.get("fleet_remote") or {}).get("mac") or {}).get("research") or {})
+    program = {
+        **remote_research,
+        **dict((snapshot.get("health") or {}).get("research_program_summary") or {}),
+    }
     paper = dict(program.get("latest_paper_outputs") or program.get("paper_outputs") or {})
     shadow = dict(program.get("latest_shadow_paper_outputs") or {})
     pnl = dict(program.get("latest_paper_pnl") or program.get("paper_pnl") or {})
@@ -422,6 +429,10 @@ def _vendor_blocker(*, budget: dict[str, Any], lane_matches: list[dict[str, Any]
     states = {str(row.get("state")) for row in lane_matches if row.get("state")}
     if "ENTITLEMENT_BLOCKED" in states:
         return "entitlement_blocked"
+    if "AUDIT_FAILED" in states:
+        return "audit_failed"
+    if "DISABLED" in states:
+        return "disabled"
     if "BUDGET_BLOCKED" in states or not bool(budget.get("day_available", True)) or not bool(budget.get("minute_available", True)):
         return str(budget.get("reason") or "budget_blocked")
     if "COOLDOWN" in states:

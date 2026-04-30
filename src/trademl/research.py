@@ -828,6 +828,31 @@ def paper_account_smoke(
     return paper_account_smoke_check(policy=merged_policy, environ=environ)
 
 
+def run_and_persist_paper_account_smoke(
+    *,
+    program_path: Path,
+    local_state: Path,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Run a read-only paper account smoke check and persist the safe result."""
+    spec = _load_research_program_spec(program_path)
+    program_id = str(spec.get("program_id") or program_path.stem)
+    payload = paper_account_smoke(
+        policy=dict(spec.get("paper_policy") or {}),
+        environ=environ,
+    )
+    payload = {
+        **payload,
+        "checked_at": datetime.now(tz=UTC).isoformat(),
+        "read_only": True,
+    }
+    state = read_research_program_state(local_state=local_state, program_id=program_id)
+    state["program_id"] = program_id
+    state["latest_paper_account_smoke"] = payload
+    _write_program_state(local_state=local_state, program_id=program_id, payload=state)
+    return payload
+
+
 def submit_paper_orders(
     *,
     payloads_path: Path,

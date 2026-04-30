@@ -25,7 +25,12 @@ from trademl.data_node.auxiliary_runtime import (
     _looks_like_entitlement_failure,
 )
 from trademl.data_node.budgets import BudgetDecision
-from trademl.data_node.capabilities import auxiliary_capabilities, forward_capabilities
+from trademl.data_node.capabilities import (
+    auxiliary_capabilities,
+    capability_registry,
+    effective_enable_status,
+    forward_capabilities,
+)
 from trademl.data_node.canonical_runtime import CanonicalRuntime
 from trademl.data_node.curator import Curator, CuratorResult
 from trademl.data_node.db import DataNodeDB
@@ -1338,6 +1343,123 @@ class DataNodeService:
                 reason="cleared stale budget backoff after current budget recovered",
             )
         return reconciled
+
+    def _reconcile_current_lane_health(self) -> int:
+        """Reconcile current lane-health rows against active capability/audit state."""
+        changed = 0
+        capabilities_by_lane: dict[tuple[str, str], list[object]] = {}
+        for capability in capability_registry():
+            capabilities_by_lane.setdefault(
+                (capability.vendor, capability.dataset), []
+            ).append(capability)
+        for lane in self.db.fetch_vendor_lane_health():
+            if lane.state == "ENTITLEMENT_BLOCKED":
+                continue
+            if (
+                lane.state in {"BUDGET_BLOCKED", "COOLDOWN"}
+                and lane.cooldown_until
+                and lane.cooldown_until > datetime.now(tz=UTC).isoformat()
+            ):
+                continue
+            capabilities = capabilities_by_lane.get((lane.vendor, lane.dataset), [])
+            target_state: str | None = None
+            if not capabilities:
+                target_state = "DISABLED"
+            else:
+                records = [
+                    dict(
+                        (self.capability_audit_state or {})
+                        .get("capabilities", {})
+                        .get(capability.capability_id, {})
+                    )
+                    for capability in capabilities
+                ]
+                live_statuses = {
+                    str(record.get("live_status") or capability.live_status)
+                    for capability, record in zip(capabilities, records)
+                }
+                enable_statuses = {
+                    effective_enable_status(
+                        capability, audit_state=self.capability_audit_state
+                    )
+                    for capability in capabilities
+                }
+                if "entitlement_blocked" in live_statuses:
+                    target_state = "ENTITLEMENT_BLOCKED"
+                elif "live_failed" in live_statuses and not any(
+                    status != "disabled" for status in enable_statuses
+                ):
+                    target_state = "AUDIT_FAILED"
+                elif not any(status != "disabled" for status in enable_statuses):
+                    target_state = "DISABLED"
+            if target_state and target_state != lane.state:
+                self.db.upsert_vendor_lane_health(
+                    vendor=lane.vendor,
+                    dataset=lane.dataset,
+                    state=target_state,
+                    recent_outbound_requests=lane.recent_outbound_requests,
+                    recent_success_units=lane.recent_success_units,
+                    recent_remote_429s=lane.recent_remote_429s,
+                    recent_local_budget_blocks=lane.recent_local_budget_blocks,
+                    recent_empty_valid=lane.recent_empty_valid,
+                    recent_permanent_failures=lane.recent_permanent_failures,
+                )
+                changed += 1
+        return changed
+
+    def _planner_lane_wait_context(
+        self, *, lane_kind: str, vendor: str, elapsed_seconds: float
+    ) -> dict[str, object]:
+        """Classify a pending scheduler lane as paced waiting or actionable stall."""
+        _ = elapsed_seconds
+        now_iso = datetime.now(tz=UTC).isoformat()
+        if lane_kind == "auxiliary":
+            attempts = self.db.fetch_vendor_attempts(limit=256)
+            for attempt in attempts:
+                if (
+                    attempt.vendor == vendor
+                    and attempt.status == "LEASED"
+                    and attempt.lease_expires_at
+                    and attempt.lease_expires_at > now_iso
+                ):
+                    return {
+                        "actionable": False,
+                        "reason": "active_vendor_attempt",
+                        "task_key": attempt.task_key,
+                        "lease_expires_at": attempt.lease_expires_at,
+                    }
+            for lane in self.db.fetch_vendor_lane_health():
+                if lane.vendor != vendor:
+                    continue
+                if (
+                    lane.state in {"BUDGET_BLOCKED", "COOLDOWN"}
+                    and lane.cooldown_until
+                    and lane.cooldown_until > now_iso
+                ):
+                    return {
+                        "actionable": False,
+                        "reason": f"vendor_{lane.state.lower()}",
+                        "dataset": lane.dataset,
+                        "cooldown_until": lane.cooldown_until,
+                    }
+            if not self._auxiliary_vendor_has_eligible_work(vendor):
+                return {"actionable": False, "reason": "no_current_eligible_auxiliary_work"}
+        if lane_kind == "canonical":
+            tasks = self.db.fetch_planner_tasks(
+                task_families=("canonical_bars", "canonical_repair"),
+                statuses=("LEASED",),
+                vendor=vendor,
+                limit=64,
+            )
+            for task in tasks:
+                if task.lease_expires_at and task.lease_expires_at > now_iso:
+                    return {
+                        "actionable": False,
+                        "reason": "active_planner_task_lease",
+                        "task_key": task.task_key,
+                        "lease_expires_at": task.lease_expires_at,
+                    }
+        return {"actionable": True, "reason": "pending_lane_exceeded_wait_window"}
 
     def _mark_entitlement_blocked_lane(
         self, *, vendor: str, dataset: str, reason: str

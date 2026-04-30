@@ -811,7 +811,7 @@ def test_clear_stale_idle_vendor_lanes_resolves_old_idle_marker(
     tmp_path: Path,
 ) -> None:
     database = DataNodeDB(tmp_path / "node.sqlite")
-    now = datetime(2026, 4, 29, 12, tzinfo=UTC)
+    now = datetime.now(tz=UTC)
     database.upsert_vendor_lane_health(
         vendor="alpaca",
         dataset="news",

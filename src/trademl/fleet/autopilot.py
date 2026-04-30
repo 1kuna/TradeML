@@ -571,12 +571,30 @@ def _ssh_mac_research_status(target: dict[str, str]) -> dict[str, Any]:
         payload = json.loads(str(result.get("stdout") or "{}"))
     except json.JSONDecodeError as exc:
         return {"status": "unknown", "error": str(exc)}
-    return {
-        "status": payload.get("status"),
-        "program_id": payload.get("program_id"),
-        "current_experiment_id": payload.get("current_experiment_id"),
-        "wait_reason": payload.get("wait_reason"),
+    safe_keys = {
+        "program_id",
+        "status",
+        "wait_reason",
+        "current_experiment_id",
+        "latest_paper_outputs",
+        "latest_shadow_paper_outputs",
+        "latest_paper_pnl",
+        "latest_paper_account_smoke",
+        "latest_paper_submission",
+        "last_canary",
+        "frontier_architecture",
+        "architecture_lane",
+        "complexity_tier",
+        "objective_verdict",
+        "pivot_reason",
+        "next_lane",
+        "sentinel_delta",
+        "autonomous_progression",
+        "dependency_preflight",
+        "feature_label_readiness",
+        "modeling",
     }
+    return {key: payload.get(key) for key in safe_keys if key in payload}
 
 
 def _ssh_result_dict(result: Any) -> dict[str, Any]:

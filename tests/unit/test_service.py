@@ -1588,6 +1588,61 @@ def test_reconcile_budget_blocked_auxiliary_lanes_clears_recovered_budget(
     assert task.next_eligible_at is None
 
 
+def test_reconcile_current_lane_health_marks_disabled_audit_and_entitlement_lanes(
+    tmp_path: Path,
+) -> None:
+    db = DataNodeDB(tmp_path / "control" / "node.sqlite")
+    service = DataNodeService(
+        db=db,
+        connectors={},
+        auditor=PartitionAuditor(
+            db=db,
+            calendar_store=ExchangeCalendarStore(
+                root=tmp_path / "reference" / "calendars"
+            ),
+        ),
+        curator=Curator(),
+        paths=DataNodePaths(root=tmp_path),
+        capability_audit_state={
+            "capabilities": {
+                "alpha_vantage.listings.reference": {
+                    "doc_status": "doc_verified",
+                    "live_status": "live_failed",
+                    "enable_status": "core",
+                }
+            }
+        },
+    )
+    db.upsert_vendor_lane_health(
+        vendor="alpha_vantage",
+        dataset="listings",
+        state="HEALTHY",
+    )
+    db.upsert_vendor_lane_health(
+        vendor="tiingo",
+        dataset="news",
+        state="HEALTHY",
+    )
+    db.upsert_vendor_lane_health(
+        vendor="old_vendor",
+        dataset="old_dataset",
+        state="HEALTHY",
+    )
+
+    changed = service._reconcile_current_lane_health()
+
+    assert changed == 3
+    alpha_lane = db.get_vendor_lane_health(vendor="alpha_vantage", dataset="listings")
+    tiingo_lane = db.get_vendor_lane_health(vendor="tiingo", dataset="news")
+    old_lane = db.get_vendor_lane_health(vendor="old_vendor", dataset="old_dataset")
+    assert alpha_lane is not None
+    assert tiingo_lane is not None
+    assert old_lane is not None
+    assert alpha_lane.state == "AUDIT_FAILED"
+    assert tiingo_lane.state == "ENTITLEMENT_BLOCKED"
+    assert old_lane.state == "DISABLED"
+
+
 def test_entitlement_blocked_auxiliary_lane_permanently_blocks_peer_tasks(
     tmp_path: Path,
 ) -> None:

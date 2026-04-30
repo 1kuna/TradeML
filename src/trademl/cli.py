@@ -66,12 +66,12 @@ from trademl.research import (
     build_research_features,
     list_research_alerts,
     latest_research_program_summary,
-    paper_account_smoke,
     pause_research_program,
     read_research_incumbent,
     read_research_program_state,
     research_health,
     resume_research_program,
+    run_and_persist_paper_account_smoke,
     run_research_canary,
     start_research_program,
     steer_research_program,
@@ -747,8 +747,10 @@ def _dispatch_research(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.research_command == "paper-smoke":
-        spec = yaml.safe_load(Path(args.program).expanduser().read_text(encoding="utf-8")) or {}
-        payload = paper_account_smoke(policy=dict(spec.get("paper_policy") or {}))
+        payload = run_and_persist_paper_account_smoke(
+            program_path=Path(args.program).expanduser(),
+            local_state=local_state,
+        )
         print(json.dumps(payload, indent=2, default=str))
         return 0
     if args.research_command == "paper-submit":

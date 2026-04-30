@@ -499,7 +499,7 @@ def test_research_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.delenv("ALPACA_API_SECRET", raising=False)
     monkeypatch.setattr(cli, "start_research_program", lambda program_path, **kwargs: {"action": "start", "program": str(program_path), "detach": kwargs.get("detach", False)})
     monkeypatch.setattr(cli, "run_research_canary", lambda program_path, **kwargs: {"action": "canary", "program": str(program_path), "detach": kwargs.get("detach", False)})
-    monkeypatch.setattr(cli, "paper_account_smoke", lambda policy: {"action": "paper-smoke", "api_key": os.getenv("ALPACA_API_KEY"), "enabled": policy.get("enabled")})
+    monkeypatch.setattr(cli, "run_and_persist_paper_account_smoke", lambda program_path, local_state: {"action": "paper-smoke", "api_key": os.getenv("ALPACA_API_KEY"), "program": str(program_path), "local_state": str(local_state)})
     monkeypatch.setattr(cli, "submit_paper_orders", lambda payloads_path, policy: {"action": "paper-submit", "payloads": str(payloads_path), "enabled": policy.get("enabled")})
     monkeypatch.setattr(cli, "read_research_program_state", lambda local_state, program_id: {"action": "status", "program_id": program_id, "frontier": {"x": 1}})
     monkeypatch.setattr(cli, "pause_research_program", lambda local_state, program_id: {"action": "pause", "program_id": program_id})
@@ -524,6 +524,7 @@ def test_research_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     paper_smoke_payload = json.loads(capsys.readouterr().out)
     assert paper_smoke_payload["action"] == "paper-smoke"
     assert paper_smoke_payload["api_key"] == "paper-key"
+    assert paper_smoke_payload["program"] == str(program_path)
     assert cli.main(["research", "paper-submit", "--program", str(program_path), "--payloads", str(tmp_path / "payloads.json")]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "paper-submit"
     assert cli.main(["research", "status", "--program-id", "perpetual"]) == 0

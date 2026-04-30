@@ -647,6 +647,37 @@ def test_research_canary_records_review_and_read_only_paper_smoke(tmp_path: Path
     assert state["latest_paper_account_smoke"]["status"] == "skipped"
 
 
+def test_paper_smoke_persists_safe_program_state(tmp_path: Path, monkeypatch) -> None:
+    program_path = _program_spec(tmp_path)
+    local_state = tmp_path / "local"
+    monkeypatch.setattr(
+        research,
+        "paper_account_smoke",
+        lambda **kwargs: {
+            "status": "ok",
+            "account_id": "acct-1",
+            "portfolio_value": "100000",
+            "base_url": "https://paper-api.alpaca.markets/v2",
+            "read_only": True,
+        },
+    )
+
+    payload = research.run_and_persist_paper_account_smoke(
+        program_path=program_path,
+        local_state=local_state,
+    )
+
+    state = research.read_research_program_state(
+        local_state=local_state,
+        program_id="perpetual-macmini",
+    )
+    assert payload["status"] == "ok"
+    assert payload["checked_at"]
+    assert state["latest_paper_account_smoke"]["account_id"] == "acct-1"
+    assert state["latest_paper_account_smoke"]["read_only"] is True
+    assert "secret" not in json.dumps(state).lower()
+
+
 def test_refresh_last_canary_status_uses_summary_when_stale_running(tmp_path: Path) -> None:
     local_state = tmp_path / "local"
     program_id = "perpetual-macmini"

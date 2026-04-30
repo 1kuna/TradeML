@@ -35,6 +35,7 @@ class PlannerLaneScheduler:
             )
         service.db.clear_expired_vendor_lane_cooldowns()
         service.db.clear_stale_idle_vendor_lanes()
+        service._reconcile_current_lane_health()  # noqa: SLF001
         service._reconcile_budget_blocked_auxiliary_lanes()  # noqa: SLF001
         service._reclaim_expired_runtime_leases()  # noqa: SLF001
         service._terminalize_unservable_canonical_repairs()  # noqa: SLF001
@@ -61,6 +62,7 @@ class PlannerLaneScheduler:
             canonical_active: dict[str, int] = defaultdict(int)
             aux_submitted: dict[str, int] = defaultdict(int)
             canonical_submitted: dict[str, int] = defaultdict(int)
+            future_started_at: dict[object, float] = {}
             aux_submit_cap = {
                 vendor: max(1, int(width)) * 32
                 for vendor, width in aux_lane_widths.items()
@@ -71,16 +73,16 @@ class PlannerLaneScheduler:
             }
 
             def submit_auxiliary_lane(vendor: str) -> None:
-                futures[executor.submit(service._drain_auxiliary_lane, vendor)] = (  # noqa: SLF001
-                    f"auxiliary:{vendor}"
-                )
+                future = executor.submit(service._drain_auxiliary_lane, vendor)  # noqa: SLF001
+                futures[future] = f"auxiliary:{vendor}"
+                future_started_at[future] = monotonic()
                 aux_active[vendor] += 1
                 aux_submitted[vendor] += 1
 
             def submit_canonical_lane(vendor: str) -> None:
-                futures[
-                    executor.submit(service._drain_canonical_lane, vendor, exchange)  # noqa: SLF001
-                ] = f"canonical:{vendor}"
+                future = executor.submit(service._drain_canonical_lane, vendor, exchange)  # noqa: SLF001
+                futures[future] = f"canonical:{vendor}"
+                future_started_at[future] = monotonic()
                 canonical_active[vendor] += 1
                 canonical_submitted[vendor] += 1
 
@@ -129,6 +131,50 @@ class PlannerLaneScheduler:
                     ):
                         submit_auxiliary_lane(vendor)
 
+            def pending_lane_summary(now: float) -> tuple[dict[str, int], str, float, dict[str, object]]:
+                lane_counts: dict[str, int] = {}
+                longest_lane = ""
+                longest_elapsed = 0.0
+                context: dict[str, object] = {"actionable": True, "reason": "unknown"}
+                for future, lane in futures.items():
+                    lane_counts[lane] = lane_counts.get(lane, 0) + 1
+                    elapsed = now - future_started_at.get(future, now)
+                    if elapsed >= longest_elapsed:
+                        longest_lane = lane
+                        longest_elapsed = elapsed
+                lane_kind, _, vendor = longest_lane.partition(":")
+                context_fn = getattr(service, "_planner_lane_wait_context", None)
+                if callable(context_fn) and lane_kind and vendor:
+                    context = dict(
+                        context_fn(
+                            lane_kind=lane_kind,
+                            vendor=vendor,
+                            elapsed_seconds=longest_elapsed,
+                        )
+                        or {}
+                    )
+                    context.setdefault("actionable", True)
+                    context.setdefault("reason", "unknown")
+                return lane_counts, longest_lane, longest_elapsed, context
+
+            def record_wait_decision(lane: str, decision: str, reason: str) -> None:
+                _, _, vendor = lane.partition(":")
+                if not vendor:
+                    return
+                try:
+                    service.db.record_scheduler_decision(
+                        vendor=vendor,
+                        decision=decision,
+                        reason=reason,
+                    )
+                except Exception:
+                    LOGGER.debug(
+                        "scheduler_decision_record_failed lane=%s decision=%s",
+                        lane,
+                        decision,
+                        exc_info=True,
+                    )
+
             refill_ready_lanes()
             last_heartbeat = monotonic()
             last_pending_log = monotonic()
@@ -140,15 +186,30 @@ class PlannerLaneScheduler:
                 if not done:
                     now = monotonic()
                     if (now - queue_started) >= max(0.01, float(lane_stall_seconds)):
-                        lane_counts: dict[str, int] = {}
-                        for lane in futures.values():
-                            lane_counts[lane] = lane_counts.get(lane, 0) + 1
-                        LOGGER.warning(
-                            "planner_queue_stalled worker_id=%s elapsed_seconds=%.1f pending=%s",
-                            service.worker_id,
-                            now - queue_started,
-                            lane_counts,
-                        )
+                        lane_counts, longest_lane, longest_elapsed, context = pending_lane_summary(now)
+                        reason = str(context.get("reason") or "unknown")
+                        if bool(context.get("actionable", True)):
+                            LOGGER.warning(
+                                "planner_queue_stalled worker_id=%s elapsed_seconds=%.1f pending=%s longest_lane=%s longest_elapsed_seconds=%.1f reason=%s",
+                                service.worker_id,
+                                now - queue_started,
+                                lane_counts,
+                                longest_lane,
+                                longest_elapsed,
+                                reason,
+                            )
+                            record_wait_decision(longest_lane, "stalled", reason)
+                        else:
+                            LOGGER.info(
+                                "planner_queue_waiting worker_id=%s elapsed_seconds=%.1f pending=%s longest_lane=%s longest_elapsed_seconds=%.1f reason=%s",
+                                service.worker_id,
+                                now - queue_started,
+                                lane_counts,
+                                longest_lane,
+                                longest_elapsed,
+                                reason,
+                            )
+                            record_wait_decision(longest_lane, "paced_wait", reason)
                         service._reclaim_expired_runtime_leases()  # noqa: SLF001
                         service._terminalize_unservable_canonical_repairs()  # noqa: SLF001
                         refill_ready_lanes()
@@ -167,18 +228,20 @@ class PlannerLaneScheduler:
                         last_heartbeat = now
                     if (now - last_pending_log) >= max(5.0, heartbeat_interval_seconds):
                         service._reclaim_expired_runtime_leases()  # noqa: SLF001
-                        lane_counts: dict[str, int] = {}
-                        for lane in futures.values():
-                            lane_counts[lane] = lane_counts.get(lane, 0) + 1
+                        lane_counts, longest_lane, longest_elapsed, context = pending_lane_summary(now)
                         LOGGER.warning(
-                            "planner_queue_waiting worker_id=%s pending=%s",
+                            "planner_queue_waiting worker_id=%s pending=%s longest_lane=%s longest_elapsed_seconds=%.1f reason=%s",
                             service.worker_id,
                             lane_counts,
+                            longest_lane,
+                            longest_elapsed,
+                            str(context.get("reason") or "unknown"),
                         )
                         last_pending_log = now
                     continue
                 for future in done:
                     task_type = futures.pop(future)
+                    future_started_at.pop(future, None)
                     lane_kind, _, vendor = task_type.partition(":")
                     if lane_kind == "auxiliary":
                         aux_active[vendor] = max(0, aux_active[vendor] - 1)
