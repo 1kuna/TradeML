@@ -1368,7 +1368,19 @@ def run_feature_version_canary_batch(
                 data_revision=str(build_payload.get("data_revision") or ""),
                 objective_policy=objective_policy,
             ):
-                entry = _feature_canary_leaderboard_entry(
+                prior = _feature_canary_existing_entry(
+                    data_root=data_root,
+                    feature_version=version,
+                    label_horizon=resolved_horizon,
+                    data_revision=str(build_payload.get("data_revision") or ""),
+                    objective_policy=objective_policy,
+                )
+                entry = {
+                    **prior,
+                    "status": "SKIPPED_DUPLICATE",
+                    "duplicate_of_status": prior.get("status"),
+                    "recorded_at": datetime.now(tz=UTC).isoformat(),
+                } if prior else _feature_canary_leaderboard_entry(
                     feature_version=version,
                     label_horizon=resolved_horizon,
                     build_payload=build_payload,
@@ -2099,6 +2111,32 @@ def _feature_canary_already_recorded(
             return False
         return True
     return False
+
+
+def _feature_canary_existing_entry(
+    *,
+    data_root: Path,
+    feature_version: str,
+    label_horizon: int,
+    data_revision: str,
+    objective_policy: dict[str, Any],
+) -> dict[str, Any]:
+    objective_hash = _feature_canary_objective_hash(objective_policy)
+    for entry in read_feature_family_leaderboard(data_root=data_root).get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("feature_version")) != feature_version:
+            continue
+        if int(entry.get("label_horizon") or 0) != int(label_horizon):
+            continue
+        if str(entry.get("data_revision") or "") != data_revision:
+            continue
+        if str(entry.get("objective_policy_hash") or "") != objective_hash:
+            continue
+        if str(entry.get("status") or "").upper() in {"BLOCKED", "INFRA_BLOCKED"}:
+            continue
+        return dict(entry)
+    return {}
 
 
 def _feature_canary_leaderboard_entry(

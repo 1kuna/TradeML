@@ -888,6 +888,7 @@ def test_feature_version_canary_batch_skips_duplicate_data_revision(tmp_path: Pa
                 "objective_policy_hash": research._feature_canary_objective_hash({}),  # noqa: SLF001
                 "status": "COMPLETED",
                 "verdict": "rejected",
+                "best_objective_score": 0.0123,
             }
         ],
     )
@@ -919,7 +920,9 @@ def test_feature_version_canary_batch_skips_duplicate_data_revision(tmp_path: Pa
     )
 
     assert payload["status"] == "COMPLETED"
-    assert payload["entries"][0]["verdict"] == "skipped_duplicate"
+    assert payload["entries"][0]["verdict"] == "rejected"
+    assert payload["entries"][0]["best_objective_score"] == 0.0123
+    assert payload["entries"][0]["duplicate_of_status"] == "COMPLETED"
 
 
 def test_feature_canary_entry_marks_summary_backed_pending_as_completed() -> None:
