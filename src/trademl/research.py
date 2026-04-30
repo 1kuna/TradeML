@@ -2136,6 +2136,9 @@ def _feature_canary_leaderboard_entry(
         verdict = "rejected"
     else:
         verdict = "pending"
+    normalized_status = str(status).upper()
+    if summary and normalized_status in {"", "PENDING", "RUNNING", "STARTING"}:
+        normalized_status = "COMPLETED"
     readiness = dict(build_payload.get("feature_readiness") or preflight.get("feature_readiness") or {})
     group_metadata = dict(build_payload.get("feature_group_metadata") or {})
     return {
@@ -2153,8 +2156,8 @@ def _feature_canary_leaderboard_entry(
         "label_rows": int(build_payload.get("label_rows") or 0),
         "preflight": preflight,
         "canary_experiment_id": experiment_id or None,
-        "canary_status": str(canary_payload.get("status") or status),
-        "status": str(status).upper(),
+        "canary_status": normalized_status,
+        "status": normalized_status,
         "best_run_id": summary.get("best_run_id"),
         "best_candidate": summary.get("best_candidate"),
         "best_objective_score": summary.get("best_primary_score"),

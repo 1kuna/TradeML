@@ -922,6 +922,27 @@ def test_feature_version_canary_batch_skips_duplicate_data_revision(tmp_path: Pa
     assert payload["entries"][0]["verdict"] == "skipped_duplicate"
 
 
+def test_feature_canary_entry_marks_summary_backed_pending_as_completed() -> None:
+    entry = research._feature_canary_leaderboard_entry(  # noqa: SLF001
+        feature_version="sec_filing_events_v1",
+        label_horizon=5,
+        build_payload={
+            "feature_version": "sec_filing_events_v1",
+            "feature_readiness": {"ok": True, "status": "READY"},
+            "feature_group_metadata": {"fundamentals_sec": {"row_coverage": 1.0, "readiness_status": "READY"}},
+        },
+        preflight={"ok": True},
+        canary_payload={"status": "PENDING", "current_experiment_id": "exp-a"},
+        summary={"best_primary_score": 0.01, "best_decision_reason": "ic_ok=False"},
+        objective_policy={},
+        status="PENDING",
+    )
+
+    assert entry["status"] == "COMPLETED"
+    assert entry["canary_status"] == "COMPLETED"
+    assert entry["verdict"] == "rejected"
+
+
 def test_paper_smoke_persists_safe_program_state(tmp_path: Path, monkeypatch) -> None:
     program_path = _program_spec(tmp_path)
     local_state = tmp_path / "local"
