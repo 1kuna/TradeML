@@ -193,12 +193,165 @@ def test_alpaca_connector_normalizes_minute_bars() -> None:
 
     assert frame.iloc[0]["symbol"] == "AAPL"
     assert frame.iloc[0]["volume"] == 50
+    assert frame.iloc[0]["feed"] == "iex"
     assert str(frame.iloc[0]["date"]) == "2026-04-09"
     assert frame.iloc[0]["vendor_ts"].isoformat() == "2026-04-09T14:31:00+00:00"
     assert session.calls[0][2]["timeframe"] == "1Min"
     assert session.calls[0][2]["start"] == "2026-04-09T00:00:00Z"
     assert session.calls[0][2]["end"] == "2026-04-09T23:59:59Z"
     assert session.calls[0][2]["limit"] == 10000
+
+
+def test_alpaca_news_requests_content_and_preserves_raw_payload() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "news": [
+                        {
+                            "id": 123,
+                            "created_at": "2026-04-29T12:00:00Z",
+                            "updated_at": "2026-04-29T12:01:00Z",
+                            "headline": "AAPL news",
+                            "summary": "summary",
+                            "content": "full article text",
+                            "url": "https://example.com/a",
+                            "symbols": ["AAPL", "BTC/USD"],
+                            "source": "Benzinga",
+                        }
+                    ],
+                    "next_page_token": None,
+                },
+            )
+        ]
+    )
+    connector = AlpacaConnector(
+        base_url="https://data.alpaca.markets",
+        trading_base_url="https://paper-api.alpaca.markets/v2",
+        api_key="key",
+        secret_key="secret",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    frame = connector.fetch("news", ["AAPL"], "2026-04-29", "2026-04-29")
+
+    assert session.calls[0][2]["include_content"] == "true"
+    assert frame.iloc[0]["content"] == "full article text"
+    assert frame.iloc[0]["news_id"] == "123"
+    assert frame.iloc[0]["raw_payload_hash"]
+    assert set(frame.iloc[0]["related_symbols"]) == {"AAPL", "BTC/USD"}
+
+
+def test_alpaca_connector_normalizes_stock_trades_quotes_and_snapshots() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(200, {"trades": {"AAPL": [{"t": "2026-04-29T14:30:00Z", "p": 190.1, "s": 10, "x": "V", "c": ["@"], "i": 1}]}}),
+            FakeResponse(200, {"quotes": {"AAPL": [{"t": "2026-04-29T14:30:01Z", "bp": 190.0, "bs": 2, "ap": 190.2, "as": 3, "bx": "V", "ax": "V", "c": ["R"]}]}}),
+            FakeResponse(
+                200,
+                {
+                    "snapshots": {
+                        "AAPL": {
+                            "latestTrade": {"t": "2026-04-29T14:30:02Z", "p": 190.3, "s": 1},
+                            "latestQuote": {"bp": 190.2, "bs": 2, "ap": 190.4, "as": 3},
+                            "minuteBar": {"o": 190.0, "h": 190.5, "l": 190.0, "c": 190.3, "v": 100},
+                        }
+                    }
+                },
+            ),
+        ]
+    )
+    connector = AlpacaConnector(
+        base_url="https://data.alpaca.markets",
+        trading_base_url="https://paper-api.alpaca.markets/v2",
+        api_key="key",
+        secret_key="secret",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    trades = connector.fetch("stock_trades", ["AAPL"], "2026-04-29", "2026-04-29")
+    quotes = connector.fetch("stock_quotes", ["AAPL"], "2026-04-29", "2026-04-29")
+    snapshots = connector.fetch("stock_snapshots", ["AAPL"], "2026-04-29", "2026-04-29")
+
+    assert trades.iloc[0]["event_type"] == "trade"
+    assert trades.iloc[0]["price"] == 190.1
+    assert quotes.iloc[0]["event_type"] == "quote"
+    assert quotes.iloc[0]["bid_price"] == 190.0
+    assert snapshots.iloc[0]["latest_trade_price"] == 190.3
+    assert snapshots.iloc[0]["asset_class"] == "us_equity"
+
+
+def test_alpaca_audit_sample_bounds_pagination_for_high_volume_lanes() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "trades": {"AAPL": [{"t": "2026-04-29T14:30:00Z", "p": 190.1, "s": 10}]},
+                    "next_page_token": "next",
+                },
+            )
+        ]
+    )
+    connector = AlpacaConnector(
+        base_url="https://data.alpaca.markets",
+        trading_base_url="https://paper-api.alpaca.markets/v2",
+        api_key="key",
+        secret_key="secret",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    frame = connector.fetch_audit_sample("stock_trades", ["AAPL"], "2026-04-29", "2026-04-29")
+
+    assert len(frame) == 1
+    assert session.calls[0][2]["limit"] == 100
+    assert session.responses == []
+
+
+def test_alpaca_connector_normalizes_crypto_and_option_archives() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(200, {"bars": {"BTC/USD": [{"t": "2026-04-29T14:30:00Z", "o": 1, "h": 2, "l": 1, "c": 2, "v": 3, "n": 4, "vw": 1.5}]}}),
+            FakeResponse(200, {"quotes": {"BTC/USD": [{"t": "2026-04-29T14:30:01Z", "bp": 1.0, "bs": 2.0, "ap": 1.1, "as": 3.0}]}}),
+            FakeResponse(200, {"snapshots": {"BTC/USD": {"latestQuote": {"t": "2026-04-29T14:30:02Z", "bp": 1.0, "ap": 1.1}}}}),
+            FakeResponse(
+                200,
+                {
+                    "snapshots": {
+                        "SPY260116C00500000": {
+                            "latestTrade": {"t": "2026-04-29T14:30:00Z", "p": 10.0, "s": 1},
+                            "greeks": {"delta": 0.5},
+                            "impliedVolatility": 0.2,
+                        }
+                    }
+                },
+            ),
+        ]
+    )
+    connector = AlpacaConnector(
+        base_url="https://data.alpaca.markets",
+        trading_base_url="https://paper-api.alpaca.markets/v2",
+        api_key="key",
+        secret_key="secret",
+        budget_manager=_budget_manager(),
+        session=session,
+    )
+
+    bars = connector.fetch("crypto_bars", ["BTC/USD"], "2026-04-29", "2026-04-29")
+    quotes = connector.fetch("crypto_quotes", ["BTC/USD"], "2026-04-29", "2026-04-29")
+    crypto_snapshot = connector.fetch("crypto_snapshots", ["BTC/USD"], "2026-04-29", "2026-04-29")
+    chain = connector.fetch("option_chain_reference", ["SPY"], "2026-04-29", "2026-04-29")
+
+    assert bars.iloc[0]["feed"] == "alpaca_crypto_us"
+    assert quotes.iloc[0]["asset_class"] == "crypto"
+    assert crypto_snapshot.iloc[0]["asset_class"] == "crypto"
+    assert chain.iloc[0]["underlying_symbol"] == "SPY"
+    assert bool(chain.iloc[0]["indicative"]) is True
+    assert bool(chain.iloc[0]["not_live_trade_approved"]) is True
 
 
 def test_alpaca_connector_normalizes_news() -> None:

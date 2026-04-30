@@ -139,6 +139,47 @@ def test_plan_auxiliary_tasks_uses_vendor_scoped_news_task_keys(
     )
 
 
+def test_plan_auxiliary_tasks_includes_audited_alpaca_free_plan_expansion_lanes(
+    tmp_path: Path,
+) -> None:
+    audit_state = {
+        "capabilities": {
+            capability: {
+                "doc_status": "doc_verified",
+                "live_status": "live_verified",
+                "enable_status": "research_only",
+            }
+            for capability in [
+                "alpaca.stock_trades.research",
+                "alpaca.stock_quotes.research",
+                "alpaca.stock_snapshots.research",
+                "alpaca.crypto_bars.research",
+                "alpaca.crypto_quotes.research",
+                "alpaca.crypto_snapshots.research",
+                "alpaca.option_chain_reference.research",
+            ]
+        }
+    }
+
+    tasks = plan_auxiliary_tasks(
+        data_root=tmp_path,
+        stage_symbols=["AAPL", "MSFT"],
+        stage_years=1,
+        connectors={"alpaca": object()},
+        audit_state=audit_state,
+        include_research=True,
+        current_date="2026-04-10",
+    )
+    by_dataset = {task.dataset: task for task in tasks}
+
+    assert {"stock_trades", "stock_quotes", "stock_snapshots", "crypto_bars", "crypto_quotes", "crypto_snapshots", "option_chain_reference"}.issubset(by_dataset)
+    assert by_dataset["crypto_bars"].symbols == ("BTC/USD", "ETH/USD", "SOL/USD")
+    assert any(task.dataset == "option_chain_reference" and task.symbols == ("SPY",) for task in tasks)
+    assert by_dataset["stock_snapshots"].start_date == "2026-04-10"
+    assert by_dataset["stock_trades"].output_name == "alpaca_market_events"
+    assert by_dataset["option_chain_reference"].output_name == "option_snapshots"
+
+
 def test_plan_canonical_bar_tasks_uses_symbol_range_windows() -> None:
     tasks = plan_canonical_bar_tasks(
         stage_symbols=["AAPL", "MSFT", "NVDA"],

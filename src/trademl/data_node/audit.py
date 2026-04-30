@@ -56,6 +56,10 @@ class CapabilityAuditResult:
             "elapsed_ms": self.elapsed_ms,
             "rows": self.rows,
             "message": self.message,
+            "lane_status": _lane_status(
+                live_status=self.live_status,
+                enable_status=self.enable_status,
+            ),
         }
 
 
@@ -92,7 +96,10 @@ def run_capability_audit(
         start_date, end_date, symbols = _sample_request(capability, anchor=anchor)
         started = perf_counter()
         try:
-            frame = connector.fetch(capability.dataset, symbols, start_date, end_date)
+            if hasattr(connector, "fetch_audit_sample"):
+                frame = connector.fetch_audit_sample(capability.dataset, symbols, start_date, end_date)  # type: ignore[attr-defined]
+            else:
+                frame = connector.fetch(capability.dataset, symbols, start_date, end_date)
         except PermanentConnectorError as exc:
             message = str(exc)
             live_status = "entitlement_blocked" if _looks_like_entitlement_failure(message) else "live_failed"
@@ -171,6 +178,17 @@ def summarize_audit_results(results: list[CapabilityAuditResult]) -> dict[str, A
     return {"live_status": counts, "enable_status": enabled, "failures": failures[:25]}
 
 
+def _lane_status(*, live_status: str, enable_status: str) -> str:
+    """Return the coarse entitlement status used by scheduler/operator surfaces."""
+    if live_status == "entitlement_blocked":
+        return "ENTITLEMENT_BLOCKED"
+    if live_status == "live_failed":
+        return "AUDIT_FAILED"
+    if enable_status == "disabled":
+        return "DISABLED"
+    return "ENABLED"
+
+
 def _looks_like_entitlement_failure(message: str) -> bool:
     """Return whether an audit failure means the key is not entitled to a lane."""
     text = str(message or "").lower()
@@ -186,6 +204,20 @@ def _sample_request(capability: VendorCapability, *, anchor: pd.Timestamp) -> tu
         return recent_start, end_date, ["AAPL"]
     if capability.dataset == "equities_minute":
         return (anchor - pd.Timedelta(days=5)).strftime("%Y-%m-%d"), end_date, ["AAPL"]
+    if capability.dataset in {"stock_trades", "stock_quotes", "stock_bars_boats", "stock_bars_otc"}:
+        return (anchor - pd.Timedelta(days=5)).strftime("%Y-%m-%d"), end_date, ["AAPL"]
+    if capability.dataset == "stock_snapshots":
+        return end_date, end_date, ["AAPL"]
+    if capability.dataset in {"crypto_bars", "crypto_trades", "crypto_quotes"}:
+        return (anchor - pd.Timedelta(days=5)).strftime("%Y-%m-%d"), end_date, ["BTC/USD"]
+    if capability.dataset == "crypto_snapshots":
+        return end_date, end_date, ["BTC/USD"]
+    if capability.dataset == "option_chain_reference":
+        return end_date, end_date, ["SPY"]
+    if capability.dataset == "option_snapshots":
+        return end_date, end_date, ["SPY260116C00500000"]
+    if capability.dataset == "option_bars":
+        return (anchor - pd.Timedelta(days=5)).strftime("%Y-%m-%d"), end_date, ["SPY260116C00500000"]
     if capability.dataset in {"corp_actions", "reference_dividends", "reference_splits", "dividends", "splits"}:
         return annual_start, end_date, ["AAPL"]
     if capability.dataset in {

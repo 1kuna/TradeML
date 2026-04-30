@@ -165,6 +165,7 @@ def test_run_capability_audit_persists_summary(tmp_path: Path) -> None:
     assert output.exists()
     assert report["summary"]["live_status"]["live_verified"] > 0
     assert "alpaca.equities_eod.forward" in report["capabilities"]
+    assert report["capabilities"]["alpaca.equities_eod.forward"]["lane_status"] == "ENABLED"
 
 
 def test_run_capability_audit_marks_permission_denials_entitlement_blocked() -> None:
@@ -182,6 +183,7 @@ def test_run_capability_audit_marks_permission_denials_entitlement_blocked() -> 
     result = report["capabilities"]["tiingo.news.research"]
     assert result["live_status"] == "entitlement_blocked"
     assert result["enable_status"] == "disabled"
+    assert result["lane_status"] == "ENTITLEMENT_BLOCKED"
     assert report["summary"]["live_status"]["entitlement_blocked"] == 1
     assert report["summary"]["failures"] == []
 

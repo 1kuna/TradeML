@@ -764,7 +764,16 @@ class AuxiliaryRuntime:
                 state={},
             )
         output_name = str(job["output_name"])
-        if output_name in {"equities_minute", "ticker_news"}:
+        if output_name in {
+            "equities_minute",
+            "ticker_news",
+            "stock_bars_extended",
+            "alpaca_market_events",
+            "alpaca_snapshots",
+            "crypto_bars",
+            "option_snapshots",
+            "option_bars",
+        }:
             outputs = self._append_partitioned_archive_frame(
                 output_name=output_name, frame=frame
             )

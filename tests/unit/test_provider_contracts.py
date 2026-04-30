@@ -35,6 +35,17 @@ def test_provider_contract_exposes_canonical_contracts() -> None:
     assert dataset_contract("massive", "equities_minute").pagination_mode == "next_url"
     assert dataset_contract("massive", "equities_minute").critical_path_allowed is False
     assert dataset_contract("alpaca", "news").pagination_mode == "page_token"
+    assert dataset_contract("alpaca", "stock_trades").pagination_limit == 10000
+    assert dataset_contract("alpaca", "stock_quotes").max_batch_symbols == 100
+    assert dataset_contract("alpaca", "stock_snapshots").endpoint_key == "stock_snapshots"
+    assert dataset_contract("alpaca", "stock_bars_boats").pagination_mode == "page_token"
+    assert dataset_contract("alpaca", "crypto_bars").pagination_limit == 10000
+    assert dataset_contract("alpaca", "crypto_quotes").docs_urls
+    assert dataset_contract("alpaca", "crypto_snapshots").max_batch_symbols == 100
+    assert dataset_contract("alpaca", "crypto_websocket").max_batch_symbols == 30
+    assert dataset_contract("alpaca", "option_chain_reference").pagination_limit == 1000
+    assert "not trade-approved" in dataset_contract("alpaca", "option_chain_reference").notes
+    assert dataset_contract("alpaca", "option_bars").pagination_limit == 10000
     assert dataset_contract("tiingo", "news").max_batch_symbols == 50
     assert "permission to access the news api" in dataset_contract(
         "tiingo", "news"

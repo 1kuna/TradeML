@@ -18,6 +18,9 @@ from trademl.data_node.capabilities import (
 )
 from trademl.data_node.provider_contracts import dataset_contract
 
+DEFAULT_CRYPTO_SYMBOLS = ("BTC/USD", "ETH/USD", "SOL/USD")
+DEFAULT_OPTION_UNDERLYINGS = ("SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL")
+
 
 @dataclass(slots=True, frozen=True)
 class PlannedTask:
@@ -69,6 +72,7 @@ def plan_auxiliary_tasks(
     ):
         task_specs = _materialize_capability_tasks(
             capability=capability,
+            data_root=data_root,
             stage_symbols=stage_symbols,
             company_ticker_map=company_ticker_map,
             current_ts=current_ts,
@@ -327,6 +331,7 @@ def _eligible_trading_days(
 def _materialize_capability_tasks(
     *,
     capability: VendorCapability,
+    data_root: Path,
     stage_symbols: list[str],
     company_ticker_map: dict[str, str],
     current_ts: pd.Timestamp,
@@ -381,7 +386,13 @@ def _materialize_capability_tasks(
             )
         ]
 
-    if capability.vendor == "sec_edgar" and capability.dataset in {
+    if capability.vendor == "alpaca" and capability.dataset.startswith("crypto_"):
+        symbols = list(DEFAULT_CRYPTO_SYMBOLS)
+    elif capability.vendor == "alpaca" and capability.dataset == "option_chain_reference":
+        symbols = list(DEFAULT_OPTION_UNDERLYINGS)
+    elif capability.vendor == "alpaca" and capability.dataset in {"option_snapshots", "option_bars"}:
+        symbols = _load_option_contract_symbols(data_root=data_root)
+    elif capability.vendor == "sec_edgar" and capability.dataset in {
         "filing_index",
         "companyfacts",
     }:
@@ -444,9 +455,23 @@ def _capability_windows(
     if capability.dataset == "equities_minute":
         start_ts = end_ts - pd.DateOffset(years=history_years)
         return _date_chunks(start_ts=start_ts, end_ts=end_ts, chunk_days=5)
+    elif capability.dataset in {"stock_snapshots", "crypto_snapshots", "option_chain_reference", "option_snapshots"}:
+        return [(end_ts.strftime("%Y-%m-%d"), end_ts.strftime("%Y-%m-%d"))]
     elif capability.dataset in {"news", "company_news"}:
         start_ts = end_ts - pd.DateOffset(years=history_years)
         return _date_chunks(start_ts=start_ts, end_ts=end_ts, chunk_days=7)
+    elif capability.dataset in {
+        "stock_trades",
+        "stock_quotes",
+        "stock_bars_boats",
+        "stock_bars_otc",
+        "crypto_bars",
+        "crypto_trades",
+        "crypto_quotes",
+        "option_bars",
+    }:
+        start_ts = end_ts - pd.DateOffset(years=history_years)
+        return _date_chunks(start_ts=start_ts, end_ts=end_ts, chunk_days=5)
     else:
         start_ts = end_ts - pd.DateOffset(years=max(1, int(stage_years)))
     return [(start_ts.strftime("%Y-%m-%d"), end_ts.strftime("%Y-%m-%d"))]
@@ -556,3 +581,19 @@ def _load_sec_company_tickers(path: Path) -> dict[str, str]:
         str(row[ticker_col]).strip().upper(): str(row[cik_col]).strip()
         for row in frame[[ticker_col, cik_col]].dropna().to_dict("records")
     }
+
+
+def _load_option_contract_symbols(data_root: Path | None) -> list[str]:
+    """Return discovered option contract symbols for contract-scoped lanes."""
+    if data_root is None:
+        return []
+    path = data_root / "data" / "reference" / "option_contracts.parquet"
+    if not path.exists():
+        return []
+    frame = pd.read_parquet(path)
+    if frame.empty:
+        return []
+    symbol_col = "symbol" if "symbol" in frame.columns else "contract_symbol" if "contract_symbol" in frame.columns else None
+    if symbol_col is None:
+        return []
+    return sorted({str(value).strip().upper() for value in frame[symbol_col].dropna() if str(value).strip()})[:500]
