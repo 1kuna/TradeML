@@ -343,6 +343,7 @@ def _architecture_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
         state = "No incumbent"
         status = "pending"
     best_advanced = dict(best.get("best_advanced") or {})
+    autopsy = dict(program.get("candidate_autopsy") or best.get("candidate_autopsy") or experiment.get("candidate_autopsy") or {})
     return {
         "status": status,
         "state": state,
@@ -352,6 +353,9 @@ def _architecture_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
         "label_horizon": (program.get("modeling") or {}).get("current_label_horizon") or experiment.get("label_horizon"),
         "portfolio_profile": (program.get("modeling") or {}).get("current_portfolio_profile") or experiment.get("portfolio_profile"),
         "objective_verdict": program.get("objective_verdict") or best.get("objective_verdict") or experiment.get("objective_verdict") or {},
+        "candidate_autopsy": autopsy,
+        "diagnostic_mode": program.get("diagnostic_mode") or experiment.get("diagnostic_mode"),
+        "follow_up_of_run_id": program.get("follow_up_of_run_id") or experiment.get("follow_up_of_run_id"),
         "pivot_reason": program.get("pivot_reason") or progression.get("pivot_reason") or (program.get("last_transition") or {}).get("reason"),
         "next_lane": program.get("next_lane") or progression.get("next_lane") or (program.get("frontier") or {}).get("next_lane"),
         "exhausted_lanes": progression.get("exhausted_lanes") or [],

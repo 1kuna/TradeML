@@ -22,7 +22,17 @@ from trademl.models.lgbm import LightGBMModel, tune_lightgbm_via_walk_forward
 from trademl.models.ridge import RidgeModel, tune_ridge_via_walk_forward
 from trademl.portfolio.build import build_portfolio
 from trademl.reports.emitter import emit_report
-from trademl.validation.diagnostics import ic_by_year, placebo_test, portfolio_cost_stress_test, sign_flip_canary
+from trademl.research_architecture import build_candidate_autopsy
+from trademl.validation.diagnostics import (
+    feature_dependence_summary,
+    fold_window_summary,
+    ic_by_quarter,
+    ic_by_year,
+    model_comparison_summary,
+    placebo_test,
+    portfolio_cost_stress_test,
+    sign_flip_canary,
+)
 from trademl.validation.metrics import bucket_metrics, rank_ic
 from trademl.validation.cpcv import combinatorially_purged_cv
 from trademl.validation.dsr import deflated_sharpe_ratio
@@ -294,6 +304,7 @@ def run_training(
     )
     diagnostics = {
         "ic_by_year": ic_by_year(primary_predictions["prediction"], primary_predictions[label_col], primary_predictions["date"]),
+        "ic_by_quarter": ic_by_quarter(primary_predictions["prediction"], primary_predictions[label_col], primary_predictions["date"]),
         "placebo": placebo_test(
             normalized.dropna(subset=[label_col]),
             feature_cols,
@@ -319,6 +330,7 @@ def run_training(
             pd.Series([fold.decile_spread for fold in ridge_folds], dtype=float).dropna().to_numpy(),
             num_trials=max(1, len(cpcv_results)),
         ),
+        "fold_windows": fold_window_summary(_primary_folds_for_suite(model_suite=model_suite, ridge_folds=ridge_folds, lgbm_folds=lgbm_folds, catboost_folds=catboost_folds)),
     }
 
     assessment = _phase_one_assessment(
@@ -403,6 +415,27 @@ def run_training(
             },
         ),
     }
+    diagnostics["feature_ablation"] = feature_dependence_summary(
+        normalized.dropna(subset=[label_col]),
+        feature_cols,
+        label_col,
+        primary_score=float(primary_report["mean_rank_ic"]),
+    )
+    diagnostics["model_comparison"] = model_comparison_summary(report)
+    report["candidate_autopsy"] = build_candidate_autopsy(
+        manifest={
+            "run_id": "training_report",
+            "model_suite": model_suite,
+            "matrix_values": {"architecture_family": _architecture_family_for_model_suite(model_suite)},
+        },
+        report=report,
+        gate_failures=[] if assessment["decision"] == "GO" else ["assessment.decision != GO"],
+        gate={
+            "max_abs_placebo_ic": 0.10,
+            "min_cost_stress_net_return": 0.0,
+            "strong_rejected_min_rank_ic": 0.05,
+        },
+    )
     emit_report(report=report, output_root=output_root, report_date=report_date)
     _write_training_log(output_root=output_root, run_ts=run_ts, report=report)
     return report
@@ -492,6 +525,26 @@ def _primary_predictions_for_suite(
     if model_suite == "ensemble" and not ensemble_predictions.empty:
         return ensemble_predictions
     return ridge_predictions
+
+
+def _primary_folds_for_suite(*, model_suite: str, ridge_folds: list[Any], lgbm_folds: list[Any], catboost_folds: list[Any]) -> list[Any]:
+    """Return the fold set used by the suite's primary score."""
+    if model_suite == "advanced" and catboost_folds:
+        return catboost_folds
+    if model_suite == "full" and lgbm_folds:
+        return lgbm_folds
+    return ridge_folds
+
+
+def _architecture_family_for_model_suite(model_suite: str) -> str:
+    """Return the registry family for a model suite."""
+    if model_suite == "advanced":
+        return "advanced_challenger"
+    if model_suite == "ensemble":
+        return "ensemble_meta"
+    if model_suite == "full":
+        return "tree_challenger"
+    return "linear_baseline"
 
 
 def main() -> int:

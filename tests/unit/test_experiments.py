@@ -400,6 +400,54 @@ def test_objective_evaluation_groups_gate_failures_and_adjusts_for_complexity() 
     assert evaluation["gate_failures_by_objective"] == {}
 
 
+def test_strong_unstable_candidate_gets_autopsy_classification() -> None:
+    evaluation = experiments._evaluate_report(  # noqa: SLF001
+        manifest={
+            "run_id": "advanced-unstable",
+            "model_suite": "advanced",
+            "matrix_values": {"architecture_family": "advanced_challenger"},
+        },
+        report={
+            "coverage": 1.0,
+            "ridge": {"mean_rank_ic": -0.08},
+            "lightgbm": {"mean_rank_ic": 0.05},
+            "catboost": {
+                "mean_rank_ic": 0.077,
+                "folds": [
+                    {"rank_ic": -0.29},
+                    {"rank_ic": 0.13},
+                    {"rank_ic": 0.19},
+                ],
+            },
+            "assessment": {"decision": "NO_GO"},
+            "diagnostics": {
+                "ic_by_year": {"2025": -0.01, "2026": 0.28},
+                "ic_by_quarter": {"2025Q2": -0.29, "2025Q3": 0.12},
+                "placebo": [0.01],
+                "cost_stress": {"net_return": 1.5},
+                "pbo": 0.57,
+                "cpcv": {"mean_oos_score": -0.03},
+            },
+        },
+        gate={
+            "require_go_decision": True,
+            "min_rank_ic": 0.01,
+            "require_all_years_positive": True,
+            "max_abs_placebo_ic": 0.10,
+            "min_cost_stress_net_return": 0.0,
+            "max_pbo": None,
+            "min_dsr": None,
+            "min_coverage": 0.0,
+        },
+    )
+
+    autopsy = evaluation["candidate_autopsy"]
+    assert autopsy["classification"] == "strong_unstable"
+    assert autopsy["recommended_follow_up"]["diagnostic_mode"] == "strong_unstable"
+    assert autopsy["evidence"]["worst_quarter"] == {"period": "2025Q2", "value": -0.29}
+    assert "cpcv_mean_oos_score<0" in autopsy["evidence"]["overfit_evidence"]
+
+
 def test_objective_evaluation_rejects_negative_control_failures() -> None:
     evaluation = experiments._evaluate_report(  # noqa: SLF001
         manifest={"run_id": "advanced-leaky", "model_suite": "advanced"},
@@ -812,6 +860,73 @@ def test_build_next_family_proposal_pivots_axes_after_feature_sweep(tmp_path: Pa
     assert sorted(matrix["architecture_family"]) == ["linear_baseline", "tree_challenger"]
     assert matrix["data_profile"] == ["phase1_default", "phase1_short_window", "phase1_long_window"]
     assert "validation.initial_train_years" not in matrix
+
+
+def test_build_next_family_proposal_prioritizes_strong_unstable_follow_up() -> None:
+    proposal = experiments._build_next_family_proposal(  # noqa: SLF001
+        experiment_id="phase1-advanced",
+        base_spec={
+            "experiment_id": "phase1-advanced",
+            "family_root": "perpetual-macmini",
+            "generation": 10,
+            "phase": 1,
+            "target": "local",
+            "objective_policy": {"primary": "research_profitability_v1"},
+            "matrix": {
+                "architecture_family": ["advanced_challenger", "tree_challenger"],
+                "feature_family": ["price_short_horizon"],
+                "data_family": ["price_plus_liquidity"],
+                "data_profile": ["phase1_long_window"],
+                "label_horizon": [20],
+                "validation.initial_train_years": [4],
+            },
+            "proposal_policy": {
+                "family_size_cap": 12,
+                "allowed_dimensions": [
+                    "architecture_family",
+                    "feature_family",
+                    "data_family",
+                    "label_horizon",
+                    "validation.initial_train_years",
+                    "data_profile",
+                ],
+                "max_generations": 100,
+            },
+        },
+        comparison={
+            "rows": [
+                {
+                    "run_id": "ae6b12e3df",
+                    "primary_score": 0.077,
+                    "model_suite": "advanced",
+                    "feature_version": "price_liquidity_v1",
+                    "label_version": "universe_relative_forward_return_v1",
+                    "data_revision": "rev1",
+                    "portfolio_profile": "cost_aware_long_only_v1",
+                    "matrix_values": {
+                        "architecture_family": "advanced_challenger",
+                        "feature_family": "price_short_horizon",
+                        "data_family": "price_plus_liquidity",
+                        "data_profile": "phase1_long_window",
+                        "label_horizon": 20,
+                        "validation.initial_train_years": 4,
+                    },
+                    "candidate_autopsy": {"classification": "strong_unstable"},
+                }
+            ]
+        },
+    )
+
+    assert proposal["diagnostic_mode"] == "strong_unstable"
+    assert proposal["next_spec"]["follow_up_of_run_id"] == "ae6b12e3df"
+    assert proposal["next_spec"]["matrix"]["architecture_family"] == [
+        "advanced_challenger",
+        "ensemble_meta",
+        "tree_challenger",
+        "linear_baseline",
+    ]
+    assert proposal["next_spec"]["matrix"]["label_horizon"] == [20, 1, 5]
+    assert proposal["next_spec"]["diagnostic_family_signature"]
 
 
 def test_build_next_family_proposal_pivots_feature_family_after_architecture_window_sweep() -> None:

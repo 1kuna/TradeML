@@ -570,6 +570,61 @@ def test_frontier_architecture_brake_pivots_to_new_epoch_instead_of_waiting(tmp_
     assert decision["next_spec"]["matrix"]["data_profile"] == ["phase1_short_window"]
 
 
+def test_strong_unstable_candidate_launches_diagnostic_follow_up_before_frontier(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec["frontier_architecture_policy"] = {
+        "enabled": True,
+        "allow_phase1_advanced": True,
+        "trigger_min_completed_runs": 100,
+        "advanced_first": True,
+        "sentinel_baseline_runs": 2,
+        "max_advanced_failures_per_epoch": 12,
+    }
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 200
+    frontier = research._empty_frontier()  # noqa: SLF001
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=frontier,
+        experiment_summary={
+            "experiment_id": "perpetual-macmini-p1-f244",
+            "best_run_id": "ae6b12e3df",
+            "best_primary_score": 0.077,
+            "shortlist_count": 0,
+            "candidate_autopsy": {
+                "classification": "strong_unstable",
+                "root_failure_mode": "strong signal is not stable across years, quarters, or folds",
+            },
+            "runs": [
+                {
+                    "run_id": "ae6b12e3df",
+                    "feature_version": "price_liquidity_v1",
+                    "label_version": "universe_relative_forward_return_v1",
+                    "data_revision": "rev1",
+                    "label_horizon": 20,
+                    "portfolio_profile": "cost_aware_long_only_v1",
+                    "matrix_values": {
+                        "architecture_family": "advanced_challenger",
+                        "feature_family": "price_short_horizon",
+                        "data_family": "price_plus_liquidity",
+                        "label_horizon": 20,
+                        "validation.initial_train_years": 4,
+                    },
+                }
+            ],
+        },
+        proposal={},
+    )
+
+    assert decision["action"] == "launch_family"
+    assert decision["next_spec"]["diagnostic_mode"] == "strong_unstable"
+    assert decision["next_spec"]["follow_up_of_run_id"] == "ae6b12e3df"
+    assert decision["next_spec"]["matrix"]["architecture_family"][0] == "advanced_challenger"
+    assert decision["next_spec"]["matrix"]["label_horizon"] == [20, 1, 5]
+
+
 def test_research_canary_preflight_blocks_without_creating_doomed_manifests(tmp_path: Path, monkeypatch) -> None:
     program_path = _program_spec(tmp_path)
     calls = {"supervise": 0}

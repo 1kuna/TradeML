@@ -31,7 +31,9 @@ from trademl.data_node.training_control import (
 )
 from trademl.modeling import DEFAULT_LABEL_VERSION, modeling_artifact_metadata
 from trademl.research_architecture import (
+    build_candidate_autopsy,
     build_objective_verdict,
+    diagnostic_family_signature,
     gate_failures_by_objective,
     launchable_architecture_presets,
     primary_score_from_preview,
@@ -214,6 +216,10 @@ def plan_experiment(
             "label_definition": modeling["label_definition"],
             "data_revision": modeling.get("data_revision"),
             "portfolio_profile": modeling["portfolio_profile"],
+            "follow_up_of_run_id": spec.get("follow_up_of_run_id"),
+            "follow_up_reason": spec.get("follow_up_reason"),
+            "diagnostic_mode": spec.get("diagnostic_mode"),
+            "diagnostic_family_signature": spec.get("diagnostic_family_signature"),
             "config_overrides": row.get("config_overrides", {}),
             "config_path": str(config_path),
             "config_hash": hashlib.sha1(config_path.read_bytes()).hexdigest(),
@@ -252,6 +258,10 @@ def plan_experiment(
         "backtest_gate": _backtest_gate(spec),
         "backtest_profile": dict(spec.get("backtest_profile") or {}),
         "proposal_policy": _proposal_policy(spec),
+        "follow_up_of_run_id": spec.get("follow_up_of_run_id"),
+        "follow_up_reason": spec.get("follow_up_reason"),
+        "diagnostic_mode": spec.get("diagnostic_mode"),
+        "diagnostic_family_signature": spec.get("diagnostic_family_signature"),
         "supervision": _supervision_policy(spec),
         "max_concurrent": max_concurrent,
         "run_count": len(runs),
@@ -509,6 +519,7 @@ def evaluate_experiment(
         manifest["gate_failures"] = evaluation["gate_failures"]
         manifest["gate_failures_by_objective"] = evaluation["gate_failures_by_objective"]
         manifest["objective_verdict"] = evaluation["objective_verdict"]
+        manifest["candidate_autopsy"] = evaluation["candidate_autopsy"]
         manifest["evaluation_paths"] = evaluation_paths
         manifest["survived_predictive"] = evaluation["survived_predictive"]
         if evaluation["evaluation_stage"] == "REJECTED_PREDICTIVE":
@@ -519,6 +530,7 @@ def evaluate_experiment(
                 "run_id": manifest["run_id"],
                 "evaluation_stage": evaluation["evaluation_stage"],
                 "gate_failures": evaluation["gate_failures"],
+                "candidate_autopsy": evaluation["candidate_autopsy"],
             }
         )
     refreshed = experiment_status(
@@ -974,6 +986,7 @@ def compare_experiment(
                 "report_path": str(manifest.get("report_path")),
                 "primary_score": primary_score,
                 "objective_verdict": manifest.get("objective_verdict", {}),
+                "candidate_autopsy": manifest.get("candidate_autopsy") or report.get("candidate_autopsy") or {},
             }
         )
     rows.sort(key=lambda item: (bool(item.get("shortlisted")), float(item.get("primary_score") or 0.0), str(item["run_id"])), reverse=True)
@@ -1340,6 +1353,10 @@ def _dashboard_summary_payload(summary: dict[str, Any], *, recent_limit: int = 1
         "best_backtest_net_return": summary.get("best_backtest_net_return"),
         "best_decision": summary.get("best_decision"),
         "best_decision_reason": summary.get("best_decision_reason"),
+        "candidate_autopsy": summary.get("candidate_autopsy") or {},
+        "candidate_classifications": summary.get("candidate_classifications") or {},
+        "follow_up_of_run_id": summary.get("follow_up_of_run_id"),
+        "diagnostic_mode": summary.get("diagnostic_mode"),
         "shortlist_count": summary.get("shortlist_count"),
         "recent_runs": recent_runs,
     }
@@ -1367,6 +1384,11 @@ def _summary_run_row(manifest: dict[str, Any]) -> dict[str, Any]:
         "data_revision": manifest.get("data_revision"),
         "portfolio_profile": manifest.get("portfolio_profile"),
         "objective_verdict": manifest.get("objective_verdict", {}),
+        "candidate_autopsy": manifest.get("candidate_autopsy", {}),
+        "follow_up_of_run_id": manifest.get("follow_up_of_run_id"),
+        "follow_up_reason": manifest.get("follow_up_reason"),
+        "diagnostic_mode": manifest.get("diagnostic_mode"),
+        "diagnostic_family_signature": manifest.get("diagnostic_family_signature"),
         "config_overrides": manifest.get("config_overrides", {}),
         "config_path": manifest.get("config_path"),
         "runtime_name": manifest.get("runtime_name"),
@@ -1427,6 +1449,11 @@ def _preserved_manifest_state(existing: dict[str, Any]) -> dict[str, Any]:
             "failure_kind",
             "last_error",
             "objective_verdict",
+            "candidate_autopsy",
+            "follow_up_of_run_id",
+            "follow_up_reason",
+            "diagnostic_mode",
+            "diagnostic_family_signature",
         ]
         if key in existing
     }
@@ -1489,6 +1516,8 @@ def _refresh_experiment_summary(
     best_decision = None
     best_decision_reason = None
     best_objective_verdict = {}
+    best_candidate_autopsy = {}
+    candidate_classifications: dict[str, int] = {}
     best_architecture_lane = None
     best_complexity_tier = None
     best_label_horizon = None
@@ -1502,6 +1531,10 @@ def _refresh_experiment_summary(
             shortlist.append(run["run_id"])
         for failure in run.get("gate_failures", []) or []:
             gate_failures[str(failure)] = gate_failures.get(str(failure), 0) + 1
+        autopsy = dict(run.get("candidate_autopsy") or {})
+        classification = autopsy.get("classification")
+        if classification:
+            candidate_classifications[str(classification)] = candidate_classifications.get(str(classification), 0) + 1
         preview = run.get("report_preview") or {}
         score = _preview_primary_score(model_suite=str(run.get("model_suite") or ""), preview=preview)
         if score is None:
@@ -1519,6 +1552,7 @@ def _refresh_experiment_summary(
             best_decision = (run.get("assessment") or {}).get("decision")
             best_decision_reason = (run.get("assessment") or {}).get("reason")
             best_objective_verdict = dict(run.get("objective_verdict") or {})
+            best_candidate_autopsy = dict(run.get("candidate_autopsy") or {})
             best_architecture_lane = run.get("architecture_lane")
             best_complexity_tier = run.get("complexity_tier")
             best_label_horizon = run.get("label_horizon")
@@ -1543,11 +1577,17 @@ def _refresh_experiment_summary(
         "best_decision": best_decision,
         "best_decision_reason": best_decision_reason,
         "objective_verdict": best_objective_verdict,
+        "candidate_autopsy": best_candidate_autopsy,
+        "candidate_classifications": candidate_classifications,
         "architecture_lane": best_architecture_lane,
         "complexity_tier": best_complexity_tier,
         "label_horizon": best_label_horizon,
         "feature_version": best_feature_version,
         "portfolio_profile": best_portfolio_profile,
+        "follow_up_of_run_id": summary.get("follow_up_of_run_id") or existing.get("follow_up_of_run_id"),
+        "follow_up_reason": summary.get("follow_up_reason") or existing.get("follow_up_reason"),
+        "diagnostic_mode": summary.get("diagnostic_mode") or existing.get("diagnostic_mode"),
+        "diagnostic_family_signature": summary.get("diagnostic_family_signature") or existing.get("diagnostic_family_signature"),
         "top_gate_failures": sorted(gate_failures.items(), key=lambda item: (-item[1], item[0]))[:5],
         "supervisor": supervisor,
         "proposal_summary": summary.get("proposal_summary") or proposal_summary,
@@ -1724,6 +1764,12 @@ def _evaluate_report(*, manifest: dict[str, Any], report: dict[str, Any], gate: 
         gate_failures_by_objective=grouped_failures,
         policy=manifest.get("objective_policy"),
     )
+    candidate_autopsy = build_candidate_autopsy(
+        manifest=manifest,
+        report=report,
+        gate_failures=failures,
+        gate=gate,
+    )
     return {
         "run_id": manifest["run_id"],
         "evaluation_stage": "SURVIVES_PREDICTIVE" if survived else "REJECTED_PREDICTIVE",
@@ -1740,6 +1786,7 @@ def _evaluate_report(*, manifest: dict[str, Any], report: dict[str, Any], gate: 
         "coverage": coverage,
         "assessment": assessment,
         "negative_controls": negative_controls,
+        "candidate_autopsy": candidate_autopsy,
     }
 
 
@@ -1759,6 +1806,7 @@ def _write_evaluation_artifacts(*, local_state: Path, experiment_id: str, run_id
                 f"- years_positive: {evaluation['years_positive']}",
                 f"- max_abs_placebo: {evaluation['max_abs_placebo']}",
                 f"- cost_stress_net_return: {evaluation['cost_stress_net_return']}",
+                f"- candidate_classification: {(evaluation.get('candidate_autopsy') or {}).get('classification')}",
                 f"- gate_failures: {evaluation['gate_failures']}",
             ]
         ),
@@ -1899,6 +1947,52 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
         base_spec=base_spec,
         current_architecture_families=current_architecture_families,
     )
+    strong_unstable = _best_classified_row(rows=rows, classification="strong_unstable")
+    if strong_unstable is not None:
+        horizon_values = list(dict.fromkeys([int((strong_unstable.get("matrix_values") or {}).get("label_horizon") or strong_unstable.get("label_horizon") or 5), 1, 5, 20]))
+        next_matrix = _bounded_matrix(
+            allowed_dimensions=allowed_dimensions,
+            architecture_families=[
+                family
+                for family in ["advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"]
+                if family in ARCHITECTURE_FAMILY_PRESETS
+            ],
+            initial_years=sorted({int((strong_unstable.get("matrix_values") or {}).get("validation.initial_train_years", 2) or 2), 2, 3, 4}),
+            feature_families=[_feature_family_for_row(strong_unstable)],
+            data_families=[_data_family_for_row(strong_unstable)],
+            data_profiles=["phase1_short_window", "phase1_default", "phase1_long_window"],
+            family_size_cap=policy["family_size_cap"],
+        )
+        if "label_horizon" in allowed_dimensions:
+            next_matrix["label_horizon"] = horizon_values
+        next_spec["matrix"] = next_matrix
+        next_spec["diagnostic_mode"] = "strong_unstable"
+        next_spec["follow_up_of_run_id"] = strong_unstable.get("run_id")
+        next_spec["follow_up_reason"] = "strong rejected candidate failed stability gates"
+        next_spec["diagnostic_family_signature"] = diagnostic_family_signature(
+            {
+                "run_id": strong_unstable.get("run_id"),
+                "feature_version": strong_unstable.get("feature_version"),
+                "label_version": strong_unstable.get("label_version"),
+                "data_revision": strong_unstable.get("data_revision"),
+                "objective_policy": base_spec.get("objective_policy"),
+                "diagnostic_mode": "strong_unstable",
+                "matrix": next_matrix,
+            }
+        )
+        return {
+            "experiment_id": experiment_id,
+            "recommended_experiment_id": next_spec["experiment_id"],
+            "rationale": [
+                "a strong rejected candidate failed stability gates, so the next family runs horizon, architecture, and window diagnostics before broad search"
+            ],
+            "data_recommendations": [],
+            "next_spec": next_spec,
+            "chain_allowed": current_generation < policy["max_generations"],
+            "generation": next_generation,
+            "follow_up_of_run_id": strong_unstable.get("run_id"),
+            "diagnostic_mode": "strong_unstable",
+        }
 
     architecture_scores = {
         family: max((float(row.get("primary_score") or 0.0) for row in rows if _architecture_family_for_row(row) == family), default=-1.0)
@@ -2056,6 +2150,17 @@ def _architecture_family_for_row(row: dict[str, Any]) -> str:
 def _alternate_architectures(family: str, allowed_families: list[str] | None = None) -> list[str]:
     candidates = allowed_families or list(ARCHITECTURE_FAMILY_PRESETS)
     return [candidate for candidate in candidates if candidate != family]
+
+
+def _best_classified_row(*, rows: list[dict[str, Any]], classification: str) -> dict[str, Any] | None:
+    matches = [
+        row
+        for row in rows
+        if str((row.get("candidate_autopsy") or {}).get("classification") or "") == classification
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda row: float(row.get("primary_score") or 0.0))
 
 
 def _feature_family_for_row(row: dict[str, Any]) -> str:

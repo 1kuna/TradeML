@@ -359,6 +359,7 @@ def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     experiment = dict(snapshot.get("experiment_summary") or {})
     best = dict(program.get("best_candidate_summary") or {})
     progression = dict(program.get("autonomous_progression") or program.get("progression") or {})
+    autopsy = dict(program.get("candidate_autopsy") or best.get("candidate_autopsy") or experiment.get("candidate_autopsy") or {})
     paper_smoke = dict(program.get("latest_paper_account_smoke") or program.get("paper_account_smoke") or {})
     modeling = dict(program.get("modeling") or {})
     return {
@@ -377,6 +378,9 @@ def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
         "architecture_lane": program.get("architecture_lane") or progression.get("current_lane"),
         "complexity_tier": program.get("complexity_tier"),
         "objective_verdict": program.get("objective_verdict") or {},
+        "candidate_autopsy": autopsy,
+        "diagnostic_mode": program.get("diagnostic_mode") or experiment.get("diagnostic_mode"),
+        "follow_up_of_run_id": program.get("follow_up_of_run_id") or experiment.get("follow_up_of_run_id"),
         "progression": progression,
         "pivot_reason": program.get("pivot_reason") or progression.get("pivot_reason"),
         "next_lane": program.get("next_lane") or progression.get("next_lane"),

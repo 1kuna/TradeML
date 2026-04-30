@@ -96,6 +96,26 @@ def test_prediction_report_supports_non_primary_label_horizon() -> None:
     assert report["mean_rank_ic"] == 1.0
 
 
+def test_training_diagnostics_helpers_capture_temporal_and_feature_fragility() -> None:
+    module = _load_train_module()
+    frame = pd.DataFrame(
+        {
+            "date": ["2025-04-01", "2025-04-02", "2025-07-01", "2025-07-02"],
+            "feature_a": [1.0, 2.0, 3.0, 4.0],
+            "feature_b": [4.0, 3.0, 2.0, 1.0],
+            "label_5d": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+
+    quarterly = module.ic_by_quarter(frame["feature_a"], frame["label_5d"], frame["date"])
+    dependence = module.feature_dependence_summary(frame, ["feature_a", "feature_b"], "label_5d", primary_score=1.0)
+
+    assert abs(quarterly["2025Q2"] - 1.0) < 1e-12
+    assert abs(quarterly["2025Q3"] - 1.0) < 1e-12
+    assert dependence["top_fragile_features"][0]["feature"] == "feature_a"
+    assert dependence["max_single_feature_score_drop"] == 1.0
+
+
 def _load_train_module():
     module_path = Path(__file__).resolve().parents[2] / "src" / "scripts" / "train.py"
     spec = importlib.util.spec_from_file_location("train_under_test", module_path)

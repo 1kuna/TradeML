@@ -20,6 +20,92 @@ def ic_by_year(predictions: pd.Series, actuals: pd.Series, dates: pd.Series) -> 
     }
 
 
+def ic_by_quarter(predictions: pd.Series, actuals: pd.Series, dates: pd.Series) -> dict[str, float]:
+    """Return per-quarter rank ICs."""
+    frame = pd.DataFrame({"prediction": predictions, "actual": actuals, "date": pd.to_datetime(dates)})
+    return {
+        str(quarter): rank_ic(group["prediction"], group["actual"])
+        for quarter, group in frame.groupby(frame["date"].dt.to_period("Q"))
+    }
+
+
+def fold_window_summary(folds: list[object]) -> list[dict[str, object]]:
+    """Return a compact fold stability summary."""
+    rows: list[dict[str, object]] = []
+    for idx, fold in enumerate(folds, start=1):
+        predictions = getattr(fold, "predictions", pd.DataFrame())
+        date_min = date_max = None
+        if isinstance(predictions, pd.DataFrame) and not predictions.empty and "date" in predictions.columns:
+            dates = pd.to_datetime(predictions["date"])
+            date_min = dates.min().date().isoformat()
+            date_max = dates.max().date().isoformat()
+        rows.append(
+            {
+                "fold": idx,
+                "rank_ic": float(getattr(fold, "rank_ic", 0.0) or 0.0),
+                "decile_spread": float(getattr(fold, "decile_spread", 0.0) or 0.0),
+                "hit_rate": float(getattr(fold, "hit_rate", 0.0) or 0.0),
+                "date_start": date_min,
+                "date_end": date_max,
+            }
+        )
+    return rows
+
+
+def feature_dependence_summary(frame: pd.DataFrame, feature_cols: list[str], label_col: str, *, primary_score: float) -> dict[str, object]:
+    """Return lightweight single-feature dependence diagnostics."""
+    if frame.empty or not feature_cols or label_col not in frame.columns:
+        return {
+            "max_single_feature_abs_ic": 0.0,
+            "max_single_feature_score_drop": 0.0,
+            "min_feature_ablation_score_ratio": 1.0,
+            "top_fragile_features": [],
+        }
+    rows: list[dict[str, object]] = []
+    for feature in feature_cols:
+        if feature not in frame.columns:
+            continue
+        value = rank_ic(frame[feature].fillna(0.0), frame[label_col])
+        rows.append({"feature": feature, "single_feature_ic": float(value), "abs_ic": abs(float(value))})
+    rows = sorted(rows, key=lambda item: float(item["abs_ic"]), reverse=True)
+    max_abs = float(rows[0]["abs_ic"]) if rows else 0.0
+    baseline = abs(float(primary_score or 0.0))
+    if baseline <= 0:
+        drop = 0.0
+        ratio = 1.0
+    else:
+        drop = min(1.0, max_abs / baseline)
+        ratio = max(0.0, 1.0 - drop)
+    return {
+        "max_single_feature_abs_ic": max_abs,
+        "max_single_feature_score_drop": drop,
+        "min_feature_ablation_score_ratio": ratio,
+        "top_fragile_features": rows[:10],
+    }
+
+
+def model_comparison_summary(report: dict[str, object]) -> dict[str, object]:
+    """Return cross-model primary-score deltas for a report."""
+    scores: dict[str, float] = {}
+    for model_name in ("ridge", "lightgbm", "catboost", "ensemble"):
+        payload = report.get(model_name)
+        if isinstance(payload, dict) and not payload.get("skipped") and payload.get("mean_rank_ic") is not None:
+            scores[model_name] = float(payload.get("mean_rank_ic") or 0.0)
+    best_name = max(scores, key=scores.get) if scores else None
+    ridge_score = scores.get("ridge")
+    return {
+        "scores": scores,
+        "best_model": best_name,
+        "best_score": scores.get(best_name) if best_name else None,
+        "best_minus_ridge": (scores[best_name] - ridge_score) if best_name and ridge_score is not None else None,
+        "catboost_minus_lightgbm": (
+            scores["catboost"] - scores["lightgbm"]
+            if "catboost" in scores and "lightgbm" in scores
+            else None
+        ),
+    }
+
+
 def ic_by_sector(predictions: pd.Series, actuals: pd.Series, sectors: pd.Series) -> dict[str, float]:
     """Return per-sector rank ICs."""
     frame = pd.DataFrame({"prediction": predictions, "actual": actuals, "sector": sectors})

@@ -51,6 +51,7 @@ from trademl.portfolio.build import build_portfolio
 from trademl.research_architecture import (
     architecture_registry_payload,
     complexity_adjusted_score,
+    diagnostic_family_signature,
     objective_registry_payload,
     resolve_architecture_entry,
 )
@@ -1585,6 +1586,7 @@ def write_research_review_packet(
         "current_campaign_track": state.get("current_campaign_track", state.get("current_track")),
         "current_experiment_id": current_experiment_id,
         "best_candidate_summary": state.get("best_candidate_summary", {}),
+        "candidate_autopsy": (state.get("best_candidate_summary") or {}).get("candidate_autopsy") or experiment_summary.get("candidate_autopsy", {}),
         "architecture_lane": state.get("architecture_lane"),
         "complexity_tier": state.get("complexity_tier"),
         "objective_verdict": state.get("objective_verdict", {}),
@@ -1592,6 +1594,8 @@ def write_research_review_packet(
         "next_lane": state.get("next_lane") or (state.get("frontier") or {}).get("next_lane"),
         "sentinel_delta": state.get("sentinel_delta") or (state.get("frontier") or {}).get("sentinel_delta"),
         "autonomous_progression": state.get("autonomous_progression", {}),
+        "diagnostic_mode": experiment_summary.get("diagnostic_mode"),
+        "follow_up_of_run_id": experiment_summary.get("follow_up_of_run_id"),
         "frontier": state.get("frontier", {}),
         "budgets": state.get("budgets", {}),
         "last_transition": state.get("last_transition", {}),
@@ -1641,6 +1645,8 @@ def write_research_review_packet(
         f"- sentinel_delta: {payload['sentinel_delta']}",
         f"- best_candidate: {(payload['best_candidate_summary'] or {}).get('best_candidate') or '-'}",
         f"- best_primary_score: {(payload['best_candidate_summary'] or {}).get('best_primary_score')}",
+        f"- candidate_classification: {(payload['candidate_autopsy'] or {}).get('classification') or '-'}",
+        f"- candidate_failure_mode: {(payload['candidate_autopsy'] or {}).get('root_failure_mode') or '-'}",
         f"- incumbent_run_id: {(payload['incumbent'] or {}).get('run_id') or '-'}",
         f"- paper_outputs: {(payload['paper_outputs'] or {}).get('paper_orders_path') or '-'}",
         f"- shadow_paper_outputs: {(payload['shadow_paper_outputs'] or {}).get('shadow_orders_path') or '-'}",
@@ -2226,6 +2232,22 @@ def _determine_program_transition(
                 "novelty_score": novelty,
             }
 
+    diagnostic_spec = _strong_rejected_follow_up_spec(
+        spec=spec,
+        state=state,
+        phase_policy=phase_policy,
+        frontier=frontier,
+        experiment_summary=experiment_summary,
+    )
+    if diagnostic_spec is not None:
+        return {
+            "action": "launch_family",
+            "reason": "strong rejected candidate failed stability gates; launching targeted diagnostic follow-up",
+            "next_spec": diagnostic_spec,
+            "family_signature": _family_signature(diagnostic_spec),
+            "novelty_score": _novelty_score(frontier=frontier, next_spec=diagnostic_spec),
+        }
+
     frontier_spec = _frontier_architecture_spec(spec=spec, state=state, phase_policy=phase_policy, frontier=frontier, experiment_summary=experiment_summary)
     if frontier_spec is not None:
         return {
@@ -2421,6 +2443,85 @@ def _frontier_architecture_status(
         "brake_active": bool(int(policy.get("max_advanced_failures_per_epoch") or 0) > 0 and advanced_count >= int(policy.get("max_advanced_failures_per_epoch") or 0)),
         "shortlist_count": int(experiment_summary.get("shortlist_count", 0) or 0),
     }
+
+
+def _strong_rejected_follow_up_spec(
+    *,
+    spec: dict[str, Any],
+    state: dict[str, Any],
+    phase_policy: dict[str, Any],
+    frontier: dict[str, Any],
+    experiment_summary: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Build a diagnostic family for the strongest unstable rejected candidate."""
+    best_autopsy = dict(experiment_summary.get("candidate_autopsy") or {})
+    if str(best_autopsy.get("classification") or "") != "strong_unstable":
+        return None
+    best_run_id = experiment_summary.get("best_run_id")
+    if not best_run_id:
+        return None
+    if _diagnostic_follow_up_already_tried(frontier=frontier, run_id=str(best_run_id)):
+        return None
+    phase = _current_ssot_phase(state=state, spec=spec)
+    next_spec = _make_experiment_spec_from_phase_policy(
+        spec=spec,
+        program_state=state,
+        phase_policy=phase_policy,
+        experiment_id=_next_experiment_id(program_state=state, spec=spec, phase=phase),
+        generation=int(state.get("current_generation", 0) or 0) + 1,
+    )
+    best_run = _best_run_from_summary(experiment_summary)
+    matrix_values = dict(best_run.get("matrix_values") or {})
+    modeling = dict(spec.get("modeling") or {})
+    horizons = list(dict.fromkeys([int(best_run.get("label_horizon") or matrix_values.get("label_horizon") or 5), 1, 5, 20]))
+    feature_family = str(matrix_values.get("feature_family") or "price_liquidity")
+    data_family = str(matrix_values.get("data_family") or "price_plus_liquidity")
+    train_year = int(matrix_values.get("validation.initial_train_years") or 2)
+    next_spec["matrix"] = {
+        "architecture_family": ["advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"],
+        "feature_family": [feature_family],
+        "data_family": [data_family],
+        "label_horizon": horizons,
+        "portfolio_profile": [str(best_run.get("portfolio_profile") or "cost_aware_long_only_v1")],
+        "data_profile": ["phase1_short_window", "phase1_default", "phase1_long_window"],
+        "validation.initial_train_years": sorted({train_year, 2, 3, 4}),
+    }
+    next_spec["diagnostic_mode"] = "strong_unstable"
+    next_spec["follow_up_of_run_id"] = str(best_run_id)
+    next_spec["follow_up_reason"] = str(best_autopsy.get("root_failure_mode") or "strong rejected candidate failed stability gates")
+    next_spec["proposal_policy"]["family_size_cap"] = max(int(next_spec["proposal_policy"].get("family_size_cap") or 6), 12)
+    next_spec["supervision"] = {
+        **dict(next_spec.get("supervision") or {}),
+        "auto_backtest_survivors": True,
+        "auto_propose_next_family": False,
+    }
+    seed = {
+        "run_id": best_run_id,
+        "feature_version": best_run.get("feature_version") or modeling.get("feature_version"),
+        "label_version": best_run.get("label_version") or modeling.get("label_version"),
+        "data_revision": best_run.get("data_revision") or experiment_summary.get("data_revision"),
+        "objective_policy": _objective_policy(spec),
+        "diagnostic_mode": "strong_unstable",
+        "matrix": next_spec["matrix"],
+    }
+    next_spec["diagnostic_family_signature"] = diagnostic_family_signature(seed)
+    next_spec = _decorate_autonomous_experiment_spec(next_spec=next_spec, spec=spec)
+    if _family_signature(next_spec) in set(frontier.get("tried_family_signatures") or []):
+        return None
+    return next_spec
+
+
+def _best_run_from_summary(experiment_summary: dict[str, Any]) -> dict[str, Any]:
+    best_run_id = str(experiment_summary.get("best_run_id") or "")
+    for run in list(experiment_summary.get("runs") or []):
+        if isinstance(run, dict) and str(run.get("run_id") or "") == best_run_id:
+            return run
+    return {}
+
+
+def _diagnostic_follow_up_already_tried(*, frontier: dict[str, Any], run_id: str) -> bool:
+    history = [item for item in list(frontier.get("family_history") or []) if isinstance(item, dict)]
+    return any(str(item.get("follow_up_of_run_id") or "") == run_id for item in history)
 
 
 def _frontier_architecture_spec(
@@ -2938,6 +3039,10 @@ def _update_frontier_memory(*, state: dict[str, Any], experiment_summary: dict[s
             "best_primary_score": experiment_summary.get("best_primary_score"),
             "shortlist_count": experiment_summary.get("shortlist_count"),
             "top_gate_failures": top_failures,
+            "candidate_autopsy": experiment_summary.get("candidate_autopsy") or {},
+            "follow_up_of_run_id": experiment_summary.get("follow_up_of_run_id"),
+            "diagnostic_mode": experiment_summary.get("diagnostic_mode"),
+            "diagnostic_family_signature": experiment_summary.get("diagnostic_family_signature"),
         }
     )
     frontier["family_history"] = family_history[-50:]
@@ -2984,6 +3089,7 @@ def _program_best_candidate(*, frontier: dict[str, Any], experiment_summary: dic
         "best_decision": experiment_summary.get("best_decision"),
         "best_decision_reason": experiment_summary.get("best_decision_reason"),
         "objective_verdict": experiment_summary.get("objective_verdict", {}),
+        "candidate_autopsy": experiment_summary.get("candidate_autopsy", {}),
         "architecture_lane": experiment_summary.get("architecture_lane"),
         "complexity_tier": experiment_summary.get("complexity_tier"),
         "sentinel_delta": sentinel_delta,
@@ -3089,6 +3195,9 @@ def _family_signature(next_spec: dict[str, Any]) -> str:
         "campaign_track": next_spec.get("campaign_track"),
         "search_epoch": next_spec.get("search_epoch"),
         "frontier_iteration": next_spec.get("frontier_iteration"),
+        "diagnostic_mode": next_spec.get("diagnostic_mode"),
+        "follow_up_of_run_id": next_spec.get("follow_up_of_run_id"),
+        "diagnostic_family_signature": next_spec.get("diagnostic_family_signature"),
         "modeling": next_spec.get("modeling"),
         "matrix": next_spec.get("matrix"),
         "predictive_gate": next_spec.get("predictive_gate"),

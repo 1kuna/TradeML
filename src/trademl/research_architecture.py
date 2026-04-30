@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -233,6 +235,94 @@ def build_objective_verdict(
     }
 
 
+def build_candidate_autopsy(
+    *,
+    manifest: dict[str, Any],
+    report: dict[str, Any],
+    gate_failures: list[str] | None = None,
+    gate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Classify a candidate rejection and recommend a deterministic follow-up."""
+    diagnostics = dict(report.get("diagnostics") or {})
+    primary_score = primary_score_from_report(manifest=manifest, report=report)
+    gate_failures = [str(item) for item in list(gate_failures or [])]
+    gate = dict(gate or {})
+    strong_threshold = float(gate.get("strong_rejected_min_rank_ic", 0.05) or 0.05)
+    max_abs_placebo = max((abs(float(value)) for value in list(diagnostics.get("placebo") or [])), default=0.0)
+    max_abs_placebo_limit = float(gate.get("max_abs_placebo_ic", 0.10) or 0.10)
+    cost_stress = dict(diagnostics.get("cost_stress") or {})
+    cost_net = _safe_float(cost_stress.get("net_return")) or 0.0
+    min_cost_net = float(gate.get("min_cost_stress_net_return", 0.0) or 0.0)
+    pbo = _safe_float(diagnostics.get("pbo"))
+    max_pbo = _safe_float(gate.get("max_pbo"))
+    cpcv = dict(diagnostics.get("cpcv") or {})
+    cpcv_mean = _safe_float(cpcv.get("mean_oos_score"))
+    ic_by_year = _string_float_map(diagnostics.get("ic_by_year"))
+    ic_by_quarter = _string_float_map(diagnostics.get("ic_by_quarter"))
+    fold_ic = _fold_rank_ics(report=report, manifest=manifest)
+    years_positive = all(value > 0 for value in ic_by_year.values()) if ic_by_year else False
+    quarters_positive = all(value > 0 for value in ic_by_quarter.values()) if ic_by_quarter else True
+    folds_positive = all(value > 0 for value in fold_ic) if fold_ic else True
+    robust_failures = [
+        failure
+        for failure in gate_failures
+        if "negative_control" in failure
+        or "future_news" in failure
+        or "single_feature" in failure
+        or "feature_ablation" in failure
+        or "placebo" in failure
+    ]
+    cost_failed = cost_net < min_cost_net or any("cost" in failure or "net_return" in failure for failure in gate_failures)
+    overfit_evidence: list[str] = []
+    if max_pbo is not None and pbo is not None and pbo > max_pbo:
+        overfit_evidence.append(f"pbo>{max_pbo}")
+    if cpcv_mean is not None and cpcv_mean < 0:
+        overfit_evidence.append("cpcv_mean_oos_score<0")
+    if primary_score < strong_threshold:
+        classification = "weak_rejected" if gate_failures else "promotable"
+    elif not gate_failures:
+        classification = "promotable"
+    elif cost_failed:
+        classification = "strong_cost_failed"
+    elif robust_failures:
+        classification = "strong_robustness_failed"
+    elif (not years_positive) or (not quarters_positive) or (not folds_positive):
+        classification = "strong_unstable"
+    elif overfit_evidence:
+        classification = "strong_overfit_risk"
+    else:
+        classification = "weak_rejected"
+    if "infra" in " ".join(gate_failures).lower() or "missing" in " ".join(gate_failures).lower():
+        classification = "infra_invalid"
+    root_failure_mode = _root_failure_mode(classification=classification, gate_failures=gate_failures, overfit_evidence=overfit_evidence)
+    return {
+        "classification": classification,
+        "root_failure_mode": root_failure_mode,
+        "recommended_follow_up": _recommended_follow_up(classification),
+        "evidence": {
+            "primary_score": primary_score,
+            "strong_threshold": strong_threshold,
+            "gate_failures": gate_failures,
+            "ic_by_year": ic_by_year,
+            "ic_by_quarter": ic_by_quarter,
+            "fold_rank_ic": fold_ic,
+            "worst_year": _min_item(ic_by_year),
+            "worst_quarter": _min_item(ic_by_quarter),
+            "worst_fold_rank_ic": min(fold_ic) if fold_ic else None,
+            "pbo": pbo,
+            "max_pbo": max_pbo,
+            "cpcv_mean_oos_score": cpcv_mean,
+            "cost_stress_net_return": cost_net,
+            "max_abs_placebo": max_abs_placebo,
+            "max_abs_placebo_limit": max_abs_placebo_limit,
+            "negative_controls": diagnostics.get("negative_controls") or {},
+            "feature_ablation": diagnostics.get("feature_ablation") or {},
+            "model_comparison": diagnostics.get("model_comparison") or {},
+            "overfit_evidence": overfit_evidence,
+        },
+    }
+
+
 def complexity_adjusted_score(candidate: dict[str, Any], *, policy: dict[str, Any] | None = None) -> float | None:
     """Return a candidate score adjusted by configured complexity penalty."""
     score = _safe_float(candidate.get("primary_score") or candidate.get("rank_ic"))
@@ -273,6 +363,20 @@ def gate_failures_by_objective(failures: list[str]) -> dict[str, list[str]]:
     return grouped
 
 
+def diagnostic_family_signature(seed: dict[str, Any]) -> str:
+    """Return a deterministic signature for a targeted diagnostic family seed."""
+    payload = {
+        "follow_up_of_run_id": seed.get("run_id"),
+        "feature_version": seed.get("feature_version"),
+        "label_version": seed.get("label_version"),
+        "data_revision": seed.get("data_revision"),
+        "objective_policy": seed.get("objective_policy"),
+        "diagnostic_mode": seed.get("diagnostic_mode"),
+        "matrix": seed.get("matrix"),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
 def _objective_policy(policy: dict[str, Any] | None) -> dict[str, Any]:
     base = {
         "primary": "research_profitability_v1",
@@ -303,6 +407,85 @@ def _metric_from_report(report: dict[str, Any], metric: str) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _string_float_map(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    parsed: dict[str, float] = {}
+    for key, item in value.items():
+        number = _safe_float(item)
+        if number is not None:
+            parsed[str(key)] = number
+    return parsed
+
+
+def _fold_rank_ics(*, report: dict[str, Any], manifest: dict[str, Any]) -> list[float]:
+    family = architecture_family_for_manifest(manifest)
+    entry = resolve_architecture_entry(family)
+    for metric in entry["primary_metrics"]:
+        section = metric.split("_mean_rank_ic", 1)[0]
+        payload = report.get(section)
+        if isinstance(payload, dict) and isinstance(payload.get("folds"), list):
+            return [
+                float(item["rank_ic"])
+                for item in payload["folds"]
+                if isinstance(item, dict) and item.get("rank_ic") is not None
+            ]
+    return []
+
+
+def _min_item(values: dict[str, float]) -> dict[str, Any] | None:
+    if not values:
+        return None
+    key, value = min(values.items(), key=lambda item: item[1])
+    return {"period": key, "value": value}
+
+
+def _root_failure_mode(*, classification: str, gate_failures: list[str], overfit_evidence: list[str]) -> str:
+    if classification == "strong_unstable":
+        return "strong signal is not stable across years, quarters, or folds"
+    if classification == "strong_overfit_risk":
+        return "strong signal has CPCV/PBO overfit-risk evidence"
+    if classification == "strong_cost_failed":
+        return "strong signal fails cost-aware portfolio gates"
+    if classification == "strong_robustness_failed":
+        return "strong signal fails robustness or leakage controls"
+    if classification == "infra_invalid":
+        return "run is invalid because infrastructure or report artifacts are incomplete"
+    if classification == "promotable":
+        return "candidate passed current objective gates"
+    if overfit_evidence:
+        return ", ".join(overfit_evidence)
+    return gate_failures[0] if gate_failures else "candidate did not produce a strong actionable signal"
+
+
+def _recommended_follow_up(classification: str) -> dict[str, Any]:
+    if classification == "strong_unstable":
+        return {
+            "diagnostic_mode": "strong_unstable",
+            "actions": ["horizon_replay", "model_family_comparison", "window_profile_check", "ensemble_stabilization"],
+            "next_lane": "ensemble_meta",
+        }
+    if classification == "strong_overfit_risk":
+        return {
+            "diagnostic_mode": "overfit_risk",
+            "actions": ["cpcv_replay", "feature_ablation", "lower_complexity_sentinel"],
+            "next_lane": "tree_challenger",
+        }
+    if classification == "strong_robustness_failed":
+        return {
+            "diagnostic_mode": "robustness_failure",
+            "actions": ["negative_control_replay", "feature_ablation", "leakage_audit"],
+            "next_lane": "linear_baseline",
+        }
+    if classification == "strong_cost_failed":
+        return {
+            "diagnostic_mode": "cost_failure",
+            "actions": ["cost_stress_replay", "turnover_constrained_profile"],
+            "next_lane": "tree_challenger",
+        }
+    return {"diagnostic_mode": "none", "actions": [], "next_lane": None}
 
 
 def _safe_float(value: Any) -> float | None:

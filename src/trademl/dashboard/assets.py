@@ -791,6 +791,8 @@ OPERATOR_HTML_PAGE = """<!doctype html>
       const frontierArchitecture = program.frontier_architecture || {};
       const dependencyPreflight = program.dependency_preflight || ((program.last_infra_preflight || {}).dependencies || {});
       const launchd = program.launchd || {};
+      const candidateAutopsy = program.candidate_autopsy || bestCandidate.candidate_autopsy || experiment.candidate_autopsy || {};
+      const autopsyEvidence = candidateAutopsy.evidence || {};
       const readinessPill = document.getElementById('status-readiness-pill');
       readinessPill.textContent = phase1.ready ? 'Phase 1 ready' : 'Phase 1 blocked';
       readinessPill.className = `pill ${phase1.ready ? 'good' : 'warn'}`;
@@ -847,6 +849,8 @@ OPERATOR_HTML_PAGE = """<!doctype html>
         ['Backtest net', formatDecimal(bestCandidate.best_backtest_net_return ?? experiment.best_backtest_net_return)],
         ['Decision', bestCandidate.best_decision || experiment.best_decision || 'No GO yet'],
         ['Reason', bestCandidate.best_decision_reason || experiment.best_decision_reason || '-'],
+        ['Candidate class', candidateAutopsy.classification || '-'],
+        ['Failure mode', candidateAutopsy.root_failure_mode || '-'],
       ]);
       const queueActive = Boolean(program.status || supervisor.status || experiment.experiment_id);
       const progression = program.autonomous_progression || program.progression || {};
@@ -872,6 +876,8 @@ OPERATOR_HTML_PAGE = """<!doctype html>
         ['Label horizon', (program.modeling || {}).current_label_horizon || experiment.label_horizon || '-'],
         ['Portfolio profile', (program.modeling || {}).current_portfolio_profile || experiment.portfolio_profile || '-'],
         ['Next lane', program.next_lane || progression.next_lane || '-'],
+        ['Diagnostic mode', program.diagnostic_mode || experiment.diagnostic_mode || candidateAutopsy.recommended_follow_up?.diagnostic_mode || '-'],
+        ['Follow-up seed', program.follow_up_of_run_id || experiment.follow_up_of_run_id || '-'],
         ['Progression', progression.pivot_reason || program.pivot_reason || '-'],
         ['Exhausted lanes', (progression.exhausted_lanes || []).join(', ') || '-'],
         ['Complexity tier', program.complexity_tier ?? bestCandidate.complexity_tier ?? '-'],
@@ -879,6 +885,7 @@ OPERATOR_HTML_PAGE = """<!doctype html>
         ['Sentinel delta', formatDecimal(program.sentinel_delta ?? bestCandidate.sentinel_delta)],
         ['Dependency preflight', dependencyPreflight.ok === false ? (dependencyPreflight.reason || 'Blocked') : (dependencyPreflight.ok ? 'OK' : '-')],
         ['Top rejection', ((experiment.top_gate_failures || [])[0] || []).join(': ') || '-'],
+        ['Worst period', autopsyEvidence.worst_quarter ? `${autopsyEvidence.worst_quarter.period}: ${formatDecimal(autopsyEvidence.worst_quarter.value)}` : (autopsyEvidence.worst_year ? `${autopsyEvidence.worst_year.period}: ${formatDecimal(autopsyEvidence.worst_year.value)}` : '-')],
         ['Budget left', formatNumber(((program.budgets || {}).max_total_runs ?? 0) - ((program.budgets || {}).runs_completed ?? 0))],
       ]);
       const runningRuns = formatNumber((experiment.counts || {}).RUNNING ?? 0);
