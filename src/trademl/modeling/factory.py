@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from trademl.features.equities import build_features
 from trademl.labels.returns import build_labels
@@ -19,6 +21,7 @@ DEFAULT_FEATURE_VERSION = "price_liquidity_v1"
 DEFAULT_LABEL_DEFINITION = "universe_relative_forward_return"
 DEFAULT_LABEL_VERSION = "universe_relative_forward_return_v1"
 DEFAULT_LABEL_HORIZONS = (1, 5, 20)
+FEATURE_SOURCE_CONTRACT_VERSION = "feature_source_contract_v1"
 
 
 def build_modeling_artifacts(
@@ -54,6 +57,20 @@ def build_modeling_artifacts(
     label_root = _labels_root(data_root=data_root, label_version=label_version)
     feature_partitions = _write_partitioned(frame=feature_frame, root=feature_root)
     label_partitions = _write_partitioned(frame=label_frame, root=label_root)
+    feature_groups = _feature_groups_for(feature_set=feature_set, feature_version=feature_version)
+    group_metadata = _feature_group_metadata(
+        frame=feature_frame,
+        data_root=data_root,
+        feature_set=feature_set,
+        feature_version=feature_version,
+    )
+    readiness = _feature_readiness(
+        frame=feature_frame,
+        group_metadata=group_metadata,
+        feature_set=feature_set,
+        feature_version=feature_version,
+    )
+    source_contract = _write_feature_source_contract(data_root=data_root)
     payload = {
         "feature_set": feature_set,
         "feature_version": feature_version,
@@ -68,12 +85,10 @@ def build_modeling_artifacts(
         "label_partitions": label_partitions,
         "feature_root": str(feature_root),
         "label_root": str(label_root),
-        "feature_groups": _feature_groups_for(feature_set=feature_set, feature_version=feature_version),
-        "feature_group_metadata": _feature_group_metadata(
-            frame=feature_frame,
-            feature_set=feature_set,
-            feature_version=feature_version,
-        ),
+        "feature_groups": feature_groups,
+        "feature_group_metadata": group_metadata,
+        "feature_readiness": readiness,
+        "source_contract": source_contract,
     }
     _write_registry(data_root=data_root, payload=payload)
     return payload
@@ -152,6 +167,17 @@ def feature_label_preflight(
             "label_version": label_version,
             "label_horizon": int(label_horizon),
         }
+    readiness = _metadata_feature_readiness(metadata=metadata, feature_version=feature_version)
+    if not readiness.get("ok", True):
+        return {
+            "ok": False,
+            "reason": str(readiness.get("reason") or "feature readiness failed"),
+            "feature_version": feature_version,
+            "label_version": label_version,
+            "label_horizon": int(label_horizon),
+            "rows": int(len(frame)),
+            "feature_readiness": readiness,
+        }
     label_col = f"label_{int(label_horizon)}d"
     sample = frame.dropna(subset=[label_col]).head(1)
     if sample.empty:
@@ -171,6 +197,7 @@ def feature_label_preflight(
         "rows": int(len(frame)),
         "sample_date": pd.Timestamp(sample["date"].iloc[0]).date().isoformat(),
         "data_revision": metadata.get("data_revision"),
+        "feature_readiness": readiness,
     }
 
 
@@ -220,7 +247,7 @@ def _feature_groups_for(*, feature_set: str, feature_version: str) -> list[str]:
     return groups
 
 
-def _feature_group_metadata(*, frame: pd.DataFrame, feature_set: str, feature_version: str) -> dict[str, Any]:
+def _feature_group_metadata(*, frame: pd.DataFrame, data_root: Path, feature_set: str, feature_version: str) -> dict[str, Any]:
     groups = _feature_groups_for(feature_set=feature_set, feature_version=feature_version)
     metadata: dict[str, Any] = {}
     for group in groups:
@@ -233,6 +260,8 @@ def _feature_group_metadata(*, frame: pd.DataFrame, feature_set: str, feature_ve
         metadata[group] = {
             "columns": present,
             "row_coverage": coverage,
+            "readiness_status": _feature_group_readiness_status(group=group, columns=present, row_coverage=coverage),
+            "sources": _source_readiness_for_group(data_root=data_root, group=group),
             **_feature_group_policy(group),
         }
     return metadata
@@ -278,7 +307,7 @@ def _feature_group_columns(group: str) -> list[str]:
 def _feature_group_policy(group: str) -> dict[str, Any]:
     if group == "fundamentals_sec":
         return {
-            "source_datasets": ["sec_filing_index", "fundamentals_daily"],
+            "source_datasets": ["sec_filings", "fundamentals_tiingo"],
             "feature_available_at_policy": "SEC accepted_at or reference last_verified must be <= modeling date",
             "safety_delay": "none",
         }
@@ -331,13 +360,291 @@ def _merge_feature_group(features: pd.DataFrame, group: pd.DataFrame) -> pd.Data
     return merged
 
 
-def _fundamental_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
-    path = data_root / "data" / "reference" / "fundamentals_daily.parquet"
-    if not path.exists():
+def _feature_source_contract(data_root: Path) -> dict[str, list[Path]]:
+    contract_path = _source_contract_path(data_root=data_root)
+    configured: dict[str, list[Path]] = {}
+    if contract_path.exists():
+        with contextlib.suppress(Exception):
+            payload = json.loads(contract_path.read_text(encoding="utf-8"))
+            for dataset, paths in dict(payload.get("datasets") or {}).items():
+                raw_paths = paths.get("paths") if isinstance(paths, dict) else paths
+                if isinstance(raw_paths, list):
+                    configured[str(dataset)] = [Path(str(path)) if Path(str(path)).is_absolute() else data_root / str(path) for path in raw_paths]
+    defaults = {
+        "sec_filings": [
+            data_root / "data" / "reference" / "sec_filings.parquet",
+            data_root / "data" / "reference" / "sec_filing_index.parquet",
+        ],
+        "fundamentals_tiingo": [
+            data_root / "data" / "reference" / "fundamentals_tiingo.parquet",
+            data_root / "data" / "reference" / "fundamentals_daily.parquet",
+        ],
+        "ticker_news": [data_root / "data" / "raw" / "ticker_news"],
+        "equities_minute": [data_root / "data" / "raw" / "equities_minute"],
+        "equities_ohlcv_adj": [data_root / "data" / "curated" / "equities_ohlcv_adj"],
+    }
+    merged: dict[str, list[Path]] = {}
+    for dataset, paths in defaults.items():
+        seen: set[str] = set()
+        merged[dataset] = []
+        for path in [*configured.get(dataset, []), *paths]:
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged[dataset].append(path)
+    return merged
+
+
+def _load_feature_source_frame(*, data_root: Path, dataset: str) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    sources = []
+    frames = []
+    for root in _feature_source_contract(data_root).get(dataset, []):
+        files = _source_files(root)
+        rows = 0
+        columns: list[str] = []
+        latest_partition: str | None = None
+        for path in files:
+            try:
+                frame = pd.read_parquet(path)
+            except Exception:  # noqa: BLE001
+                continue
+            if frame.empty:
+                rows += 0
+            else:
+                frames.append(frame)
+                rows += int(len(frame))
+                columns = sorted(set(columns).union(str(column) for column in frame.columns))
+            partition = path.parent.name.partition("=")[2] if path.parent.name.startswith("date=") else None
+            latest_partition = max([value for value in (latest_partition, partition) if value], default=latest_partition)
+        sources.append(
+            {
+                "dataset": dataset,
+                "path": str(root),
+                "exists": root.exists(),
+                "file_count": len(files),
+                "rows": rows,
+                "columns": columns,
+                "latest_partition": latest_partition,
+            }
+        )
+    if not frames:
+        return pd.DataFrame(), sources
+    return pd.concat(frames, ignore_index=True), sources
+
+
+def _source_files(root: Path) -> list[Path]:
+    if root.is_file():
+        return [root]
+    if not root.exists():
+        return []
+    files = sorted(root.glob("date=*/data.parquet"))
+    if files:
+        return files
+    return sorted(root.glob("*.parquet"))
+
+
+def _source_readiness_for_group(*, data_root: Path, group: str) -> dict[str, Any]:
+    return {
+        dataset: _source_summary(data_root=data_root, dataset=dataset)
+        for dataset in _feature_group_policy(group)["source_datasets"]
+    }
+
+
+def _source_summary(*, data_root: Path, dataset: str) -> dict[str, Any]:
+    sources = []
+    for root in _feature_source_contract(data_root).get(dataset, []):
+        files = _source_files(root)
+        rows = 0
+        columns: set[str] = set()
+        latest_partition: str | None = None
+        for path in files:
+            file_summary = _parquet_file_summary(path)
+            rows += int(file_summary.get("rows") or 0)
+            columns.update(str(column) for column in list(file_summary.get("columns") or []))
+            partition = path.parent.name.partition("=")[2] if path.parent.name.startswith("date=") else None
+            latest_partition = max([value for value in (latest_partition, partition) if value], default=latest_partition)
+        sources.append(
+            {
+                "dataset": dataset,
+                "path": str(root),
+                "exists": root.exists(),
+                "file_count": len(files),
+                "rows": rows,
+                "columns": sorted(columns),
+                "latest_partition": latest_partition,
+            }
+        )
+    rows = sum(int(source.get("rows") or 0) for source in sources)
+    existing = [source for source in sources if source.get("exists")]
+    latest_values = [str(source.get("latest_partition")) for source in sources if source.get("latest_partition")]
+    return {
+        "dataset": dataset,
+        "status": "available" if rows > 0 else "empty" if existing else "missing",
+        "rows": rows,
+        "paths": [str(source.get("path")) for source in sources],
+        "existing_paths": [str(source.get("path")) for source in existing],
+        "columns": sorted({column for source in sources for column in list(source.get("columns") or [])}),
+        "latest_partition": max(latest_values) if latest_values else None,
+    }
+
+
+def _parquet_file_summary(path: Path) -> dict[str, Any]:
+    try:
+        metadata = pq.ParquetFile(path)
+    except Exception:  # noqa: BLE001
+        return {"rows": 0, "columns": []}
+    return {
+        "rows": int(metadata.metadata.num_rows),
+        "columns": list(metadata.schema.names),
+    }
+
+
+def _feature_group_readiness_status(*, group: str, columns: list[str], row_coverage: float) -> str:
+    if group == "price_liquidity":
+        return "READY"
+    if not columns:
+        return "BLOCKED"
+    if row_coverage <= 0.0:
+        return "BLOCKED"
+    return "READY"
+
+
+def _feature_readiness(
+    *,
+    frame: pd.DataFrame,
+    group_metadata: dict[str, Any],
+    feature_set: str,
+    feature_version: str,
+) -> dict[str, Any]:
+    groups = _feature_groups_for(feature_set=feature_set, feature_version=feature_version)
+    optional_groups = [group for group in groups if group != "price_liquidity"]
+    blockers: list[str] = []
+    for group in optional_groups:
+        metadata = dict(group_metadata.get(group) or {})
+        if metadata.get("readiness_status") != "READY":
+            blockers.append(f"{group} has no usable source-backed feature coverage")
+    missing_cols = sorted({"date", "symbol", "feature_available_at", "feature_version", "data_revision"}.difference(frame.columns))
+    if missing_cols:
+        blockers.append(f"feature artifact missing columns: {missing_cols}")
+    if "feature_available_at" in frame.columns and "date" in frame.columns:
+        available = pd.to_datetime(frame["feature_available_at"], utc=True, errors="coerce")
+        dates = pd.to_datetime(frame["date"], errors="coerce")
+        if available.isna().any():
+            blockers.append("feature_available_at contains unparseable values")
+        elif (available.dt.tz_convert(None) > dates).any():
+            blockers.append("feature_available_at cannot be after the modeling date")
+    return {
+        "ok": not blockers,
+        "status": "READY" if not blockers else "BLOCKED",
+        "reason": "; ".join(blockers),
+        "required_groups": optional_groups,
+        "feature_groups": groups,
+        "group_status": {group: dict(group_metadata.get(group) or {}).get("readiness_status") for group in groups},
+    }
+
+
+def _metadata_feature_readiness(*, metadata: dict[str, Any], feature_version: str) -> dict[str, Any]:
+    readiness = dict(metadata.get("feature_readiness") or {})
+    if readiness and str(metadata.get("feature_version") or "") == feature_version:
+        return readiness
+    return {"ok": True, "status": "UNKNOWN", "reason": "feature readiness metadata is unavailable"}
+
+
+def _write_feature_source_contract(*, data_root: Path) -> dict[str, Any]:
+    datasets = {
+        dataset: {
+            "paths": [str(path.relative_to(data_root)) if path.is_relative_to(data_root) else str(path) for path in paths],
+            "summary": _source_summary(data_root=data_root, dataset=dataset),
+        }
+        for dataset, paths in _feature_source_contract(data_root).items()
+    }
+    payload = {
+        "version": FEATURE_SOURCE_CONTRACT_VERSION,
+        "generated_at": datetime.now(tz=UTC).isoformat(),
+        "datasets": datasets,
+    }
+    path = _source_contract_path(data_root=data_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    return payload
+
+
+def _normalize_fundamental_source(frame: pd.DataFrame) -> pd.DataFrame:
+    if {"symbol", "metric_date", "metric_name", "metric_value"}.issubset(frame.columns):
+        return frame.copy()
+    if not {"symbol", "date", "data"}.issubset(frame.columns):
         return pd.DataFrame()
-    frame = pd.read_parquet(path)
-    required = {"symbol", "metric_date", "metric_name", "metric_value"}
-    if not required.issubset(frame.columns):
+    rows: list[dict[str, Any]] = []
+    for record in frame.to_dict("records"):
+        raw_payload = record.get("data")
+        payload = raw_payload if isinstance(raw_payload, dict) else {}
+        if isinstance(raw_payload, str):
+            with contextlib.suppress(json.JSONDecodeError):
+                decoded = json.loads(raw_payload)
+                payload = decoded if isinstance(decoded, dict) else {}
+        for key, value in payload.items():
+            rows.append(
+                {
+                    "symbol": str(record.get("symbol")),
+                    "metric_date": record.get("date"),
+                    "metric_name": str(key),
+                    "metric_value": value,
+                    "last_verified": record.get("as_of_date") or record.get("date"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _normalize_sec_filing_source(*, data_root: Path, frame: pd.DataFrame) -> pd.DataFrame:
+    working = frame.copy()
+    if "symbol" not in working.columns:
+        cik_col = "cik" if "cik" in working.columns else "cik_str" if "cik_str" in working.columns else None
+        if cik_col is None:
+            return pd.DataFrame()
+        mapping = _cik_symbol_mapping(data_root=data_root)
+        if mapping.empty:
+            return pd.DataFrame()
+        working["_cik_key"] = pd.to_numeric(working[cik_col], errors="coerce").astype("Int64").astype(str)
+        working = working.merge(mapping, on="_cik_key", how="left")
+    if "form" not in working.columns or "symbol" not in working.columns:
+        return pd.DataFrame()
+    accepted_col = "accepted_at" if "accepted_at" in working.columns else "acceptanceDateTime" if "acceptanceDateTime" in working.columns else "filing_date" if "filing_date" in working.columns else "filingDate" if "filingDate" in working.columns else None
+    if accepted_col is None:
+        return pd.DataFrame()
+    working["available_at"] = pd.to_datetime(working[accepted_col], errors="coerce", utc=True).dt.tz_convert(None)
+    working["symbol"] = working["symbol"].astype(str).str.upper()
+    return working.dropna(subset=["symbol", "available_at"])
+
+
+def _cik_symbol_mapping(*, data_root: Path) -> pd.DataFrame:
+    frames = []
+    for path in [
+        data_root / "data" / "reference" / "sec_company_tickers.parquet",
+        data_root / "data" / "reference" / "universe.parquet",
+    ]:
+        if not path.exists():
+            continue
+        frame = pd.read_parquet(path)
+        cik_col = "cik_str" if "cik_str" in frame.columns else "cik" if "cik" in frame.columns else None
+        symbol_col = "ticker" if "ticker" in frame.columns else "symbol" if "symbol" in frame.columns else None
+        if cik_col is None or symbol_col is None:
+            continue
+        mapping = frame[[cik_col, symbol_col]].copy()
+        mapping["_cik_key"] = pd.to_numeric(mapping[cik_col], errors="coerce").astype("Int64").astype(str)
+        mapping["symbol"] = mapping[symbol_col].astype(str).str.upper()
+        frames.append(mapping[["_cik_key", "symbol"]])
+    if not frames:
+        return pd.DataFrame(columns=["_cik_key", "symbol"])
+    return pd.concat(frames, ignore_index=True).dropna().drop_duplicates("_cik_key")
+
+
+def _fundamental_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
+    frame, _sources = _load_feature_source_frame(data_root=data_root, dataset="fundamentals_tiingo")
+    if frame.empty:
+        return pd.DataFrame()
+    frame = _normalize_fundamental_source(frame)
+    if frame.empty:
         return pd.DataFrame()
     modeling_dates = pd.DataFrame({"date": sorted(pd.to_datetime(dates).dropna().unique())})
     frame = frame.copy()
@@ -369,16 +676,15 @@ def _fundamental_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
 
 
 def _sec_filing_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
-    path = data_root / "data" / "reference" / "sec_filing_index.parquet"
-    if not path.exists():
+    frame, _sources = _load_feature_source_frame(data_root=data_root, dataset="sec_filings")
+    if frame.empty:
         return pd.DataFrame()
-    frame = pd.read_parquet(path)
-    if not {"symbol", "form"}.issubset(frame.columns):
+    frame = _normalize_sec_filing_source(data_root=data_root, frame=frame)
+    if frame.empty:
         return pd.DataFrame()
     frame = frame.copy()
     frame["symbol"] = frame["symbol"].astype(str)
-    date_col = "accepted_at" if "accepted_at" in frame.columns else "filing_date"
-    frame["available_at"] = pd.to_datetime(frame.get(date_col), errors="coerce", utc=True).dt.tz_convert(None)
+    frame["available_at"] = pd.to_datetime(frame["available_at"], errors="coerce")
     frame = frame.dropna(subset=["available_at"])
     rows: list[dict[str, Any]] = []
     for date_value in sorted(pd.to_datetime(dates).dropna().unique()):
@@ -404,10 +710,9 @@ def _sec_filing_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
 
 
 def _news_event_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
-    files = sorted((data_root / "data" / "raw" / "ticker_news").glob("date=*/data.parquet"))
-    if not files:
+    frame, _sources = _load_feature_source_frame(data_root=data_root, dataset="ticker_news")
+    if frame.empty:
         return pd.DataFrame()
-    frame = pd.concat([pd.read_parquet(path) for path in files], ignore_index=True)
     ts_col = "published_at" if "published_at" in frame.columns else "vendor_ts" if "vendor_ts" in frame.columns else None
     if ts_col is None:
         return pd.DataFrame()
@@ -454,10 +759,9 @@ def _news_event_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
 
 
 def _minute_daily_features(*, data_root: Path, panel: pd.DataFrame) -> pd.DataFrame:
-    files = sorted((data_root / "data" / "raw" / "equities_minute").glob("date=*/data.parquet"))
-    if not files:
+    frame, _sources = _load_feature_source_frame(data_root=data_root, dataset="equities_minute")
+    if frame.empty:
         return pd.DataFrame()
-    frame = pd.concat([pd.read_parquet(path) for path in files], ignore_index=True)
     required = {"symbol", "timestamp", "open", "high", "low", "close"}
     if not required.issubset(frame.columns):
         return pd.DataFrame()
@@ -584,6 +888,10 @@ def _data_revision(*, data_root: Path) -> str:
     pieces = []
     for path in sorted(root.glob("date=*/data.parquet")):
         pieces.append(f"{path.parent.name}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
+    for dataset, paths in sorted(_feature_source_contract(data_root).items()):
+        for root_path in paths:
+            for path in _source_files(root_path):
+                pieces.append(f"{dataset}:{path.relative_to(data_root) if path.is_relative_to(data_root) else path}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
     return hashlib.sha1("|".join(pieces).encode("utf-8")).hexdigest()
 
 
@@ -597,3 +905,7 @@ def _labels_root(*, data_root: Path, label_version: str) -> Path:
 
 def _registry_path(*, data_root: Path) -> Path:
     return data_root / "control" / "cluster" / "state" / "research" / "feature_registry.json"
+
+
+def _source_contract_path(*, data_root: Path) -> Path:
+    return data_root / "control" / "cluster" / "state" / "research" / "feature_source_contract" / "latest.json"

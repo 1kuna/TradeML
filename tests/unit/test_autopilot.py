@@ -418,6 +418,43 @@ def test_observability_writes_collection_saturation_audit(tmp_path: Path) -> Non
     assert audit["rows"][0]["intentionally_idle"] is False
 
 
+def test_observability_reports_blocked_feature_source_readiness(tmp_path: Path) -> None:
+    data_root = tmp_path / "nas"
+    data_root.mkdir()
+    payload = build_fleet_observability(
+        snapshot={
+            "runtime": {"running": True},
+            "health": {
+                "research_program_summary": {
+                    "status": "RUNNING",
+                    "current_experiment_id": "exp-a",
+                    "feature_family_leaderboard": {
+                        "entries": [
+                            {
+                                "feature_version": "news_event_aggregates_v1",
+                                "readiness_status": "BLOCKED",
+                                "top_rejection_reason": "news_events has no usable source-backed feature coverage",
+                                "source_coverage": {
+                                    "news_events": {
+                                        "sources": {
+                                            "ticker_news": {"status": "missing"},
+                                        }
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            },
+        },
+        data_root=data_root,
+        now=datetime(2026, 4, 29, 12, 1, tzinfo=UTC),
+    )
+
+    kinds = {issue["kind"] for issue in payload["issues"]}
+    assert {"feature_source_blocked", "feature_source_missing"}.issubset(kinds)
+
+
 def test_fleet_watchdog_writes_current_state_and_repeated_issue_alert(tmp_path: Path, monkeypatch) -> None:
     data_root = tmp_path / "nas"
     issue = {

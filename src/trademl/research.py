@@ -1675,6 +1675,13 @@ def resume_research_program(
         state["status"] = "RUNNING"
         _write_program_state(local_state=local_state, program_id=program_id, payload=state)
         return state
+    launchd = _research_launchd_status(program_id)
+    if bool(launchd.get("loaded")):
+        state["status"] = "RUNNING" if str(launchd.get("state") or "").lower() in {"running", ""} else "LAUNCHD_LOADED"
+        state["launchd"] = launchd
+        state["resume_action"] = "launchd_already_loaded"
+        _write_program_state(local_state=local_state, program_id=program_id, payload=state)
+        return state
     return start_research_program(
         program_path=Path(str(state["spec_path"])),
         repo_root=repo_root,
@@ -2129,10 +2136,16 @@ def _feature_canary_leaderboard_entry(
         verdict = "rejected"
     else:
         verdict = "pending"
+    readiness = dict(build_payload.get("feature_readiness") or preflight.get("feature_readiness") or {})
+    group_metadata = dict(build_payload.get("feature_group_metadata") or {})
     return {
         "feature_version": feature_version,
         "feature_groups": list(build_payload.get("feature_groups") or []),
-        "feature_group_metadata": dict(build_payload.get("feature_group_metadata") or {}),
+        "feature_group_metadata": group_metadata,
+        "readiness_status": readiness.get("status") or ("READY" if bool(preflight.get("ok", False)) else "BLOCKED"),
+        "coverage_status": _feature_canary_coverage_status(group_metadata=group_metadata, readiness=readiness),
+        "source_coverage": _feature_canary_source_coverage(group_metadata),
+        "feature_readiness": readiness,
         "label_horizon": int(label_horizon),
         "label_version": build_payload.get("label_version") or preflight.get("label_version"),
         "data_revision": build_payload.get("data_revision") or preflight.get("data_revision"),
@@ -2153,6 +2166,31 @@ def _feature_canary_leaderboard_entry(
         "objective_policy_hash": _feature_canary_objective_hash(objective_policy),
         "recorded_at": datetime.now(tz=UTC).isoformat(),
     }
+
+
+def _feature_canary_coverage_status(*, group_metadata: dict[str, Any], readiness: dict[str, Any]) -> str:
+    if readiness.get("status") == "BLOCKED":
+        return "blocked"
+    optional = [dict(value) for key, value in group_metadata.items() if key != "price_liquidity"]
+    if not optional:
+        return "baseline"
+    if all(float(item.get("row_coverage") or 0.0) > 0.0 for item in optional):
+        return "covered"
+    if any(float(item.get("row_coverage") or 0.0) > 0.0 for item in optional):
+        return "limited"
+    return "missing"
+
+
+def _feature_canary_source_coverage(group_metadata: dict[str, Any]) -> dict[str, Any]:
+    coverage: dict[str, Any] = {}
+    for group, metadata in group_metadata.items():
+        coverage[str(group)] = {
+            "row_coverage": metadata.get("row_coverage"),
+            "columns": metadata.get("columns") or [],
+            "readiness_status": metadata.get("readiness_status"),
+            "sources": metadata.get("sources") or {},
+        }
+    return coverage
 
 
 def _negative_control_status(summary: dict[str, Any]) -> str:

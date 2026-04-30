@@ -236,6 +236,86 @@ def test_modeling_feature_factory_adds_multisource_pit_features(tmp_path) -> Non
     assert (pd.to_datetime(frame["feature_available_at"], utc=True).dt.tz_convert(None) <= pd.to_datetime(frame["date"])).all()
 
 
+def test_modeling_feature_factory_reads_live_sec_schema_and_empty_fundamentals(tmp_path) -> None:
+    data_root = tmp_path / "nas"
+    panel = _panel().loc[lambda frame: frame["date"] <= pd.Timestamp("2020-02-14")].copy()
+    for date_value, day_frame in panel.groupby(panel["date"].dt.strftime("%Y-%m-%d")):
+        partition = data_root / "data" / "curated" / "equities_ohlcv_adj" / f"date={date_value}"
+        partition.mkdir(parents=True)
+        day_frame.to_parquet(partition / "data.parquet", index=False)
+    reference = data_root / "data" / "reference"
+    reference.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "cik_str": [320193],
+            "ticker": ["AAPL"],
+            "title": ["Apple Inc."],
+        }
+    ).to_parquet(reference / "sec_company_tickers.parquet", index=False)
+    pd.DataFrame(
+        {
+            "accessionNumber": ["0000320193-20-000010"],
+            "filingDate": ["2020-01-28"],
+            "reportDate": ["2019-12-31"],
+            "acceptanceDateTime": ["2020-01-28T21:05:00Z"],
+            "form": ["10-Q"],
+            "cik": [320193],
+        }
+    ).to_parquet(reference / "sec_filings.parquet", index=False)
+    pd.DataFrame(columns=["symbol", "statement_type", "date", "as_of_date", "data"]).to_parquet(
+        reference / "fundamentals_tiingo.parquet",
+        index=False,
+    )
+
+    payload = build_modeling_artifacts(
+        data_root=data_root,
+        feature_config=_feature_config(),
+        feature_set="daily_price_liquidity_v1",
+        feature_version="sec_filing_events_v1",
+        label_horizons=[1, 5],
+    )
+    frame, _ = load_modeling_dataset(
+        data_root=data_root,
+        feature_version="sec_filing_events_v1",
+        label_version="universe_relative_forward_return_v1",
+        label_horizon=1,
+    )
+    apple = frame.loc[(frame["symbol"] == "AAPL") & (pd.to_datetime(frame["date"]) >= pd.Timestamp("2020-01-29"))]
+
+    assert payload["feature_readiness"]["ok"] is True
+    assert payload["feature_group_metadata"]["fundamentals_sec"]["sources"]["sec_filings"]["status"] == "available"
+    assert payload["feature_group_metadata"]["fundamentals_sec"]["sources"]["fundamentals_tiingo"]["status"] == "empty"
+    assert apple["sec_10q_90d"].max() >= 1
+
+
+def test_feature_preflight_blocks_zero_coverage_optional_feature_version(tmp_path) -> None:
+    data_root = tmp_path / "nas"
+    panel = _panel().loc[lambda frame: frame["date"] <= pd.Timestamp("2020-04-30")].copy()
+    for date_value, day_frame in panel.groupby(panel["date"].dt.strftime("%Y-%m-%d")):
+        partition = data_root / "data" / "curated" / "equities_ohlcv_adj" / f"date={date_value}"
+        partition.mkdir(parents=True)
+        day_frame.to_parquet(partition / "data.parquet", index=False)
+
+    payload = build_modeling_artifacts(
+        data_root=data_root,
+        feature_config=_feature_config(),
+        feature_set="daily_price_liquidity_v1",
+        feature_version="news_event_aggregates_v1",
+        label_horizons=[1, 5],
+    )
+    preflight = feature_label_preflight(
+        data_root=data_root,
+        feature_version="news_event_aggregates_v1",
+        label_version="universe_relative_forward_return_v1",
+        label_horizon=1,
+    )
+
+    assert payload["feature_readiness"]["ok"] is False
+    assert payload["feature_group_metadata"]["news_events"]["readiness_status"] == "BLOCKED"
+    assert preflight["ok"] is False
+    assert "news_events" in preflight["reason"]
+
+
 def test_feature_version_names_select_only_their_intended_optional_groups() -> None:
     assert _feature_groups_for(
         feature_set="daily_price_liquidity_v1",

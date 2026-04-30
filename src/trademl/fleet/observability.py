@@ -174,6 +174,34 @@ def collect_observability_issues(payload: dict[str, Any]) -> list[dict[str, Any]
                 "Inspect latest paper/shadow artifacts.",
             )
         )
+    leaderboard = dict(research.get("feature_family_leaderboard") or {})
+    for entry in list(leaderboard.get("entries") or []):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("readiness_status") or "").upper() == "BLOCKED":
+            issues.append(
+                _issue(
+                    "research",
+                    "warning",
+                    "feature_source_blocked",
+                    f"{entry.get('feature_version')} feature readiness is blocked: {entry.get('top_rejection_reason') or 'missing source coverage'}",
+                    "Inspect feature source contract and Pi-to-Mac NAS dataset coverage.",
+                )
+            )
+        for group, coverage in dict(entry.get("source_coverage") or {}).items():
+            if group == "price_liquidity":
+                continue
+            sources = dict(coverage.get("sources") or {})
+            if sources and all(str(source.get("status")) != "available" for source in sources.values() if isinstance(source, dict)):
+                issues.append(
+                    _issue(
+                        "data",
+                        "warning",
+                        "feature_source_missing",
+                        f"{entry.get('feature_version')} has no available source data for {group}",
+                        "Verify the Pi archive output path matches the Mac feature source contract.",
+                    )
+                )
     return issues
 
 
@@ -362,6 +390,7 @@ def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     autopsy = dict(program.get("candidate_autopsy") or best.get("candidate_autopsy") or experiment.get("candidate_autopsy") or {})
     paper_smoke = dict(program.get("latest_paper_account_smoke") or program.get("paper_account_smoke") or {})
     modeling = dict(program.get("modeling") or {})
+    leaderboard = dict(program.get("feature_family_leaderboard") or {})
     return {
         "status": str(program.get("status") or remote_research.get("status") or "UNKNOWN"),
         "current_experiment_id": program.get("current_experiment_id") or experiment.get("experiment_id") or remote_research.get("current_experiment_id"),
@@ -388,6 +417,7 @@ def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
         "last_canary": program.get("last_canary") or {},
         "paper_account_smoke": paper_smoke,
         "modeling": modeling,
+        "feature_family_leaderboard": leaderboard,
         "feature_version": modeling.get("feature_version") or experiment.get("feature_version"),
         "label_horizon": modeling.get("current_label_horizon") or experiment.get("label_horizon"),
         "portfolio_profile": modeling.get("current_portfolio_profile") or experiment.get("portfolio_profile"),
