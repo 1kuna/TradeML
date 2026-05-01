@@ -1204,8 +1204,19 @@ def research_health(
             "entries": [
                 {
                     "feature_version": entry.get("feature_version"),
+                    "feature_groups": entry.get("feature_groups") or [],
                     "verdict": entry.get("verdict"),
+                    "status": entry.get("status"),
+                    "canary_status": entry.get("canary_status"),
+                    "readiness_status": entry.get("readiness_status"),
+                    "coverage_status": entry.get("coverage_status"),
+                    "source_coverage": entry.get("source_coverage") or {},
+                    "blockers": entry.get("blockers") or entry.get("feature_readiness", {}).get("reason"),
+                    "feature_readiness": entry.get("feature_readiness") or {},
                     "best_objective_score": entry.get("best_objective_score"),
+                    "candidate_classification": entry.get("candidate_classification"),
+                    "negative_control_status": entry.get("negative_control_status"),
+                    "paper_evidence_status": entry.get("paper_evidence_status"),
                     "top_rejection_reason": entry.get("top_rejection_reason"),
                 }
                 for entry in list(feature_leaderboard.get("entries") or [])[:5]

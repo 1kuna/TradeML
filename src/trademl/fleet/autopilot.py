@@ -225,7 +225,7 @@ def collect_fleet_health(
         remote["pi"] = _ssh_service_health(pi, service_command="systemctl --user", service_name="trademl-node.service", heal=heal)
     if mac:
         remote["mac"] = _ssh_mac_health(mac, heal=heal)
-    summary_snapshot = {**local_snapshot, "fleet_remote": remote}
+    summary_snapshot = _merge_remote_pi_observability({**local_snapshot, "fleet_remote": remote}, remote=remote)
     observability = build_fleet_observability(
         snapshot=summary_snapshot,
         data_root=data_root,
@@ -287,6 +287,30 @@ def _pi_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
         "latest_raw_date": snapshot.get("latest_raw_date"),
         "repair_remaining_units": repair,
     }
+
+
+def _merge_remote_pi_observability(snapshot: dict[str, Any], *, remote: dict[str, Any]) -> dict[str, Any]:
+    pi_observability = dict(((remote.get("pi") or {}).get("node_state") or {}).get("node_observability") or {})
+    if not pi_observability:
+        return snapshot
+    merged = dict(snapshot)
+    for key in (
+        "scheduler_decisions",
+        "archive_write_telemetry",
+        "lane_health",
+        "vendor_attempts_summary",
+        "planner_task_summary",
+        "budget_summary",
+    ):
+        value = pi_observability.get(key)
+        if value:
+            merged[key] = value
+    if pi_observability.get("dataset_coverage"):
+        merged["dataset_coverage"] = {
+            **dict(snapshot.get("dataset_coverage") or {}),
+            **dict(pi_observability.get("dataset_coverage") or {}),
+        }
+    return merged
 
 
 def _mac_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -506,6 +530,7 @@ def _ssh_pi_node_state(target: dict[str, str]) -> dict[str, Any]:
         "root = pathlib.Path(os.environ['TRADEML_NODE_ROOT'])\n"
         "version_path = root / 'control' / 'deployed_version.json'\n"
         "db_path = root / 'control' / 'node.sqlite'\n"
+        "budget_path = root / 'control' / 'budget_state.json'\n"
         "required = {'scheduler_decisions', 'archive_write_telemetry', 'planner_tasks', 'vendor_attempts'}\n"
         "version = {}\n"
         "if version_path.exists():\n"
@@ -514,16 +539,75 @@ def _ssh_pi_node_state(target: dict[str, str]) -> dict[str, Any]:
         "    except Exception as exc:\n"
         "        version = {'error': str(exc)}\n"
         "schema = {'status': 'missing', 'missing_tables': sorted(required)}\n"
+        "node_observability = {}\n"
+        "def rows(conn, sql):\n"
+        "    return [dict(row) for row in conn.execute(sql).fetchall()]\n"
         "if db_path.exists():\n"
         "    try:\n"
         "        with sqlite3.connect(db_path) as conn:\n"
-        "            rows = conn.execute(\"SELECT name FROM sqlite_master WHERE type = 'table'\").fetchall()\n"
-        "        existing = {row[0] for row in rows}\n"
+        "            conn.row_factory = sqlite3.Row\n"
+        "            table_rows = conn.execute(\"SELECT name FROM sqlite_master WHERE type = 'table'\").fetchall()\n"
+        "            existing = {row[0] for row in table_rows}\n"
+        "            if required.issubset(existing):\n"
+        "                scheduler = rows(conn, \"\"\"\n"
+        "                    SELECT vendor, COALESCE(dataset, '') AS dataset, decision, COUNT(*) AS count,\n"
+        "                           MAX(created_at) AS latest_at, MAX(reason) AS latest_reason\n"
+        "                    FROM scheduler_decisions\n"
+        "                    WHERE created_at >= datetime('now', '-15 minutes')\n"
+        "                    GROUP BY vendor, COALESCE(dataset, ''), decision\n"
+        "                    ORDER BY count DESC, vendor ASC, dataset ASC, decision ASC\n"
+        "                    LIMIT 200\n"
+        "                \"\"\")\n"
+        "                archive = rows(conn, \"\"\"\n"
+        "                    SELECT output_name, status, COUNT(*) AS writes, SUM(rows_in) AS rows_in,\n"
+        "                           SUM(rows_written) AS rows_written, SUM(duplicates_dropped) AS duplicates_dropped,\n"
+        "                           SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) AS failures,\n"
+        "                           SUM(CASE WHEN schema_mismatch THEN 1 ELSE 0 END) AS schema_mismatches,\n"
+        "                           MAX(created_at) AS latest_at\n"
+        "                    FROM archive_write_telemetry\n"
+        "                    WHERE created_at >= datetime('now', '-60 minutes')\n"
+        "                    GROUP BY output_name, status\n"
+        "                    ORDER BY latest_at DESC\n"
+        "                    LIMIT 200\n"
+        "                \"\"\")\n"
+        "                lanes = rows(conn, \"SELECT vendor, dataset, state, cooldown_until, recent_outbound_requests, recent_success_units, recent_remote_429s, recent_local_budget_blocks, updated_at FROM vendor_lane_health ORDER BY updated_at DESC LIMIT 300\")\n"
+        "                attempts = rows(conn, \"\"\"\n"
+        "                    SELECT vendor, json_extract(payload_json, '$.dataset') AS dataset, status, COUNT(*) AS count,\n"
+        "                           MAX(updated_at) AS latest_at, MAX(last_error) AS latest_error\n"
+        "                    FROM vendor_attempts\n"
+        "                    WHERE updated_at >= datetime('now', '-60 minutes') OR status = 'LEASED'\n"
+        "                    GROUP BY vendor, json_extract(payload_json, '$.dataset'), status\n"
+        "                    ORDER BY latest_at DESC\n"
+        "                    LIMIT 200\n"
+        "                \"\"\")\n"
+        "                tasks = rows(conn, \"\"\"\n"
+        "                    SELECT dataset, task_family, status, COUNT(*) AS count, MAX(updated_at) AS latest_at, MAX(last_error) AS latest_error\n"
+        "                    FROM planner_tasks\n"
+        "                    WHERE updated_at >= datetime('now', '-24 hours') OR status IN ('PENDING', 'LEASED')\n"
+        "                    GROUP BY dataset, task_family, status\n"
+        "                    ORDER BY latest_at DESC\n"
+        "                    LIMIT 300\n"
+        "                \"\"\")\n"
+        "                node_observability = {\n"
+        "                    'scheduler_decisions': {'window_minutes': 15, 'rows': scheduler},\n"
+        "                    'archive_write_telemetry': {'window_minutes': 60, 'rows': archive},\n"
+        "                    'lane_health': {'rows': lanes},\n"
+        "                    'vendor_attempts_summary': {'window_minutes': 60, 'rows': attempts},\n"
+        "                    'planner_task_summary': {'window_hours': 24, 'rows': tasks},\n"
+        "                    'dataset_coverage': {row['output_name']: {'latest_date': row.get('latest_at'), 'rows_60m': row.get('rows_in')} for row in archive if row.get('latest_at')},\n"
+        "                }\n"
+        "                if budget_path.exists():\n"
+        "                    try:\n"
+        "                        budget = json.loads(budget_path.read_text())\n"
+        "                        if isinstance(budget, dict):\n"
+        "                            node_observability['budget_summary'] = budget\n"
+        "                    except Exception:\n"
+        "                        pass\n"
         "        missing = sorted(required - existing)\n"
         "        schema = {'status': 'ok' if not missing else 'missing_tables', 'missing_tables': missing}\n"
         "    except Exception as exc:\n"
         "        schema = {'status': 'invalid', 'missing_tables': sorted(required), 'error': str(exc)}\n"
-        "print(json.dumps({'deployed_version': version, 'db_schema': schema}))\n"
+        "print(json.dumps({'deployed_version': version, 'db_schema': schema, 'node_observability': node_observability}))\n"
         "PY"
     )
     result = _ssh_result_dict(_run_password_ssh(target, command))

@@ -25,6 +25,7 @@ def build_fleet_observability(
     current = now or datetime.now(tz=UTC)
     policy = _observability_policy(config or {})
     remote = remote or dict(snapshot.get("fleet_remote") or {})
+    snapshot = _snapshot_with_remote_pi_observability(snapshot, remote=remote)
     vendors = _vendor_observability(snapshot, policy=policy)
     scheduler = _scheduler_observability(snapshot)
     freshness = _freshness_observability(snapshot, policy=policy, now=current)
@@ -56,6 +57,26 @@ def build_fleet_observability(
     payload["issues"] = issues
     payload["verdict"] = _verdict_for_issues(issues)
     return payload
+
+
+def _snapshot_with_remote_pi_observability(snapshot: dict[str, Any], *, remote: dict[str, Any]) -> dict[str, Any]:
+    node_observability = dict(((remote.get("pi") or {}).get("node_state") or {}).get("node_observability") or {})
+    if not node_observability:
+        return snapshot
+    merged = dict(snapshot)
+    for key in (
+        "scheduler_decisions",
+        "archive_write_telemetry",
+        "lane_health",
+        "vendor_attempts_summary",
+        "planner_task_summary",
+        "budget_summary",
+    ):
+        if node_observability.get(key):
+            merged[key] = node_observability[key]
+    if node_observability.get("dataset_coverage"):
+        merged["dataset_coverage"] = {**dict(snapshot.get("dataset_coverage") or {}), **dict(node_observability["dataset_coverage"])}
+    return merged
 
 
 def write_fleet_observability(
@@ -202,6 +223,40 @@ def collect_observability_issues(payload: dict[str, Any]) -> list[dict[str, Any]
                         "Verify the Pi archive output path matches the Mac feature source contract.",
                     )
                 )
+            for dataset, source in sources.items():
+                if not isinstance(source, dict):
+                    continue
+                status = str(source.get("status") or "")
+                if status == "missing":
+                    issues.append(
+                        _issue(
+                            "data",
+                            "warning",
+                            "feature_source_path_missing",
+                            f"{entry.get('feature_version')} cannot see {dataset} at the configured source paths",
+                            "Verify the Pi-to-Mac data contract and NAS mount path.",
+                        )
+                    )
+                elif status == "invalid_schema":
+                    issues.append(
+                        _issue(
+                            "data",
+                            "warning",
+                            "feature_source_schema_mismatch",
+                            f"{entry.get('feature_version')} source {dataset} is missing required columns: {source.get('missing_required_columns')}",
+                            "Inspect the archive schema and feature source contract.",
+                        )
+                    )
+                elif status == "empty":
+                    issues.append(
+                        _issue(
+                            "data",
+                            "warning",
+                            "feature_source_zero_coverage",
+                            f"{entry.get('feature_version')} source {dataset} exists but has zero rows",
+                            "Inspect source archive freshness and feature readiness metadata.",
+                        )
+                    )
     return issues
 
 
@@ -223,26 +278,75 @@ def _vendor_observability(snapshot: dict[str, Any], *, policy: dict[str, Any]) -
     throughput_rows = {str(row.get("vendor")): dict(row) for row in list((snapshot.get("vendor_throughput") or {}).get("rows") or [])}
     lane_rows = list((snapshot.get("lane_health") or {}).get("rows") or [])
     scheduler_rows = list((snapshot.get("scheduler_decisions") or {}).get("rows") or [])
-    scheduler_by_vendor: dict[str, dict[str, int]] = {}
+    attempt_rows = list((snapshot.get("vendor_attempts_summary") or {}).get("rows") or [])
+    archive_rows = list((snapshot.get("archive_write_telemetry") or {}).get("rows") or [])
+    scheduler_by_lane: dict[tuple[str, str], dict[str, int]] = {}
     for row in scheduler_rows:
         vendor = str(row.get("vendor") or "")
+        dataset = str(row.get("dataset") or "all")
         decision = str(row.get("decision") or "unknown")
-        scheduler_by_vendor.setdefault(vendor, {})[decision] = scheduler_by_vendor.setdefault(vendor, {}).get(decision, 0) + int(row.get("count") or 0)
-    vendors = sorted(set(budget_rows) | set(throughput_rows) | {str(row.get("vendor")) for row in lane_rows if row.get("vendor")})
+        key = (vendor, dataset)
+        scheduler_by_lane.setdefault(key, {})[decision] = scheduler_by_lane.setdefault(key, {}).get(decision, 0) + int(row.get("count") or 0)
+    attempts_by_lane: dict[tuple[str, str], dict[str, int]] = {}
+    for row in attempt_rows:
+        key = (str(row.get("vendor") or ""), str(row.get("dataset") or "all"))
+        status = str(row.get("status") or "unknown")
+        attempts_by_lane.setdefault(key, {})[status] = attempts_by_lane.setdefault(key, {}).get(status, 0) + int(row.get("count") or 0)
+    archive_by_dataset: dict[str, dict[str, Any]] = {}
+    for row in archive_rows:
+        dataset = str(row.get("output_name") or row.get("dataset") or "")
+        if not dataset:
+            continue
+        current = archive_by_dataset.setdefault(dataset, {"rows_in": 0, "rows_written": 0, "writes": 0, "latest_at": None})
+        current["rows_in"] = int(current.get("rows_in") or 0) + int(row.get("rows_in") or 0)
+        current["rows_written"] = int(current.get("rows_written") or 0) + int(row.get("rows_written") or 0)
+        current["writes"] = int(current.get("writes") or 0) + int(row.get("writes") or row.get("count") or 0)
+        current["latest_at"] = max([value for value in (current.get("latest_at"), row.get("latest_at") or row.get("last_seen")) if value], default=current.get("latest_at"))
+    vendors = sorted(
+        set(budget_rows)
+        | set(throughput_rows)
+        | {str(row.get("vendor")) for row in lane_rows if row.get("vendor")}
+        | {vendor for vendor, _dataset in scheduler_by_lane if vendor}
+        | {vendor for vendor, _dataset in attempts_by_lane if vendor}
+    )
     rows: list[dict[str, Any]] = []
     target_utilization = float(policy["target_utilization"])
     for vendor in vendors:
         budget = budget_rows.get(vendor, {})
         throughput = throughput_rows.get(vendor, {})
         lane_matches = [dict(row) for row in lane_rows if str(row.get("vendor")) == vendor]
-        datasets = sorted({str(row.get("dataset") or "unknown") for row in lane_matches}) or ["all"]
+        datasets = sorted(
+            {str(row.get("dataset") or "unknown") for row in lane_matches}
+            | {dataset for lane_vendor, dataset in scheduler_by_lane if lane_vendor == vendor and dataset}
+            | {dataset for lane_vendor, dataset in attempts_by_lane if lane_vendor == vendor and dataset}
+        ) or ["all"]
         rpm_limit = int(budget.get("rpm_limit") or 0)
-        actual_rpm = float(budget.get("outbound_requests_60s") or throughput.get("outbound_requests_per_min") or 0.0)
         target_rpm = round(float(rpm_limit) * target_utilization, 3) if rpm_limit else 0.0
-        eligible_work = _vendor_has_eligible_work(snapshot, vendor=vendor, budget=budget, throughput=throughput)
-        blocked = _vendor_blocker(budget=budget, lane_matches=lane_matches)
-        underutilized = eligible_work and blocked is None and rpm_limit > 0 and actual_rpm == 0.0
         for dataset in datasets:
+            lane_key = (vendor, dataset)
+            lane_scheduler = scheduler_by_lane.get(lane_key, {})
+            lane_attempts = attempts_by_lane.get(lane_key, {})
+            actual_rpm = _lane_actual_rpm(
+                lane_scheduler=lane_scheduler,
+                lane_attempts=lane_attempts,
+                scheduler_window_minutes=int((snapshot.get("scheduler_decisions") or {}).get("window_minutes") or 15),
+                attempts_window_minutes=int((snapshot.get("vendor_attempts_summary") or {}).get("window_minutes") or 60),
+                fallback=float(budget.get("outbound_requests_60s") or throughput.get("outbound_requests_per_min") or 0.0),
+            )
+            lane_specific = [row for row in lane_matches if str(row.get("dataset") or "unknown") == dataset]
+            eligible_work = _lane_has_eligible_work(
+                snapshot,
+                vendor=vendor,
+                dataset=dataset,
+                budget=budget,
+                throughput=throughput,
+                scheduler_counts=lane_scheduler,
+                attempt_counts=lane_attempts,
+            )
+            blocked = _vendor_blocker(budget=budget, lane_matches=lane_specific or lane_matches)
+            active = actual_rpm > 0.0 or int(lane_scheduler.get("claimed") or 0) > 0 or int(lane_attempts.get("SUCCESS") or 0) > 0
+            underutilized = eligible_work and blocked is None and rpm_limit > 0 and not active
+            archive = (archive_by_dataset.get(dataset) or archive_by_dataset.get(_archive_output_for_dataset(dataset)) or {}) if active else {}
             rows.append(
                 {
                     "vendor": vendor,
@@ -254,13 +358,15 @@ def _vendor_observability(snapshot: dict[str, Any], *, policy: dict[str, Any]) -
                     "remaining_minute": max(0, rpm_limit - int(budget.get("rpm_used") or 0)),
                     "remaining_daily": int(budget.get("day_remaining") or 0),
                     "unused_capacity": max(0.0, round(target_rpm - actual_rpm, 3)),
-                    "in_flight_lanes": int((scheduler_by_vendor.get(vendor) or {}).get("claimed", 0)),
-                    "last_outbound_request": throughput.get("latest_update") or budget.get("checked_at"),
-                    "rows_per_request": _safe_ratio(float(throughput.get("rows_per_min") or 0.0), actual_rpm),
+                    "in_flight_lanes": int(lane_scheduler.get("claimed", 0)) + int(lane_attempts.get("LEASED", 0)),
+                    "last_outbound_request": archive.get("latest_at") or throughput.get("latest_update") or budget.get("checked_at"),
+                    "rows_per_request": _safe_ratio(float(archive.get("rows_in") or throughput.get("rows_per_min") or 0.0), max(actual_rpm, 1.0) if active else actual_rpm),
+                    "rows_written_current_window": int(archive.get("rows_written") or archive.get("rows_in") or 0),
                     "current_blocker": blocked,
-                    "next_eligible_at": _next_eligible_at(lane_matches),
-                    "scheduler_decisions": scheduler_by_vendor.get(vendor, {}),
-                    "utilization_verdict": "underutilized" if underutilized else "blocked" if blocked else "active" if actual_rpm > 0 else "idle",
+                    "next_eligible_at": _next_eligible_at(lane_specific or lane_matches),
+                    "scheduler_decisions": lane_scheduler,
+                    "vendor_attempts": lane_attempts,
+                    "utilization_verdict": "underutilized" if underutilized else "blocked" if blocked else "active" if active else "idle",
                 }
             )
     return {
@@ -285,6 +391,23 @@ def _scheduler_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _lane_actual_rpm(
+    *,
+    lane_scheduler: dict[str, int],
+    lane_attempts: dict[str, int],
+    scheduler_window_minutes: int,
+    attempts_window_minutes: int,
+    fallback: float,
+) -> float:
+    attempt_count = int(lane_attempts.get("SUCCESS") or 0) + int(lane_attempts.get("FAILED") or 0) + int(lane_attempts.get("LEASED") or 0)
+    if attempt_count > 0:
+        return round(attempt_count / max(1, attempts_window_minutes), 3)
+    request_count = int(lane_scheduler.get("claimed") or 0)
+    if request_count > 0:
+        return round(request_count / max(1, scheduler_window_minutes), 3)
+    return float(fallback or 0.0)
+
+
 def _collection_saturation_observability(vendors: dict[str, Any]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for row in list(vendors.get("rows") or []):
@@ -301,6 +424,7 @@ def _collection_saturation_observability(vendors: dict[str, Any]) -> dict[str, A
                 "budget_remaining_daily": row.get("remaining_daily"),
                 "calls_spent_current_window": row.get("actual_requests_per_minute"),
                 "rows_per_credit": row.get("rows_per_request"),
+                "rows_written_current_window": row.get("rows_written_current_window"),
                 "blocker": blocker,
                 "next_eligible_at": row.get("next_eligible_at"),
                 "intentionally_idle": intentionally_idle,
@@ -516,6 +640,41 @@ def _vendor_has_eligible_work(snapshot: dict[str, Any], *, vendor: str, budget: 
     if throughput.get("state") in {"backoff", "day_capped", "minute_capped"}:
         return False
     return bool(budget.get("minute_available", True) and budget.get("day_available", True))
+
+
+def _lane_has_eligible_work(
+    snapshot: dict[str, Any],
+    *,
+    vendor: str,
+    dataset: str,
+    budget: dict[str, Any],
+    throughput: dict[str, Any],
+    scheduler_counts: dict[str, int],
+    attempt_counts: dict[str, int],
+) -> bool:
+    if int(scheduler_counts.get("claimed") or 0) > 0 or int(attempt_counts.get("LEASED") or 0) > 0:
+        return True
+    if str(budget.get("state")) not in {"available", "no_data", ""}:
+        return False
+    if throughput.get("state") in {"backoff", "day_capped", "minute_capped"}:
+        return False
+    if not bool(budget.get("minute_available", True) and budget.get("day_available", True)):
+        return False
+    for row in list((snapshot.get("planner_task_summary") or {}).get("rows") or []):
+        if str(row.get("dataset") or "") != dataset:
+            continue
+        status = str(row.get("status") or "").upper()
+        if status in {"PENDING", "LEASED", "PARTIAL"} and int(row.get("count") or 0) > 0:
+            return True
+    return _vendor_has_eligible_work(snapshot, vendor=vendor, budget=budget, throughput=throughput)
+
+
+def _archive_output_for_dataset(dataset: str) -> str:
+    if dataset in {"stock_trades", "stock_quotes", "option_snapshots", "option_bars", "option_chain_reference"}:
+        return "alpaca_market_events"
+    if dataset in {"company_news", "news", "stock_news", "press_releases", "news_sentiment"}:
+        return "ticker_news"
+    return dataset
 
 
 def _vendor_blocker(*, budget: dict[str, Any], lane_matches: list[dict[str, Any]]) -> str | None:

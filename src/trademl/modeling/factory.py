@@ -23,6 +23,13 @@ DEFAULT_LABEL_DEFINITION = "universe_relative_forward_return"
 DEFAULT_LABEL_VERSION = "universe_relative_forward_return_v1"
 DEFAULT_LABEL_HORIZONS = (1, 5, 20)
 FEATURE_SOURCE_CONTRACT_VERSION = "feature_source_contract_v1"
+SOURCE_REQUIRED_COLUMNS = {
+    "ticker_news": ("symbol_or_symbols", "published_at_or_vendor_ts"),
+    "equities_minute": ("symbol", "timestamp", "open", "high", "low", "close"),
+    "sec_filings": ("form", "symbol_or_cik", "accepted_at_or_acceptanceDateTime_or_filingDate"),
+    "fundamentals_tiingo": ("symbol",),
+    "equities_ohlcv_adj": ("date", "symbol", "close"),
+}
 
 
 def build_modeling_artifacts(
@@ -397,6 +404,24 @@ def _feature_source_contract(data_root: Path) -> dict[str, list[Path]]:
     return merged
 
 
+def _configured_feature_source_paths(data_root: Path) -> dict[str, set[str]]:
+    contract_path = _source_contract_path(data_root=data_root)
+    configured: dict[str, set[str]] = {}
+    if not contract_path.exists():
+        return configured
+    with contextlib.suppress(Exception):
+        payload = json.loads(contract_path.read_text(encoding="utf-8"))
+        for dataset, paths in dict(payload.get("datasets") or {}).items():
+            raw_paths = paths.get("paths") if isinstance(paths, dict) else paths
+            if not isinstance(raw_paths, list):
+                continue
+            configured[str(dataset)] = {
+                str(Path(str(path)) if Path(str(path)).is_absolute() else data_root / str(path))
+                for path in raw_paths
+            }
+    return configured
+
+
 def _load_feature_source_frame(*, data_root: Path, dataset: str) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     sources = []
     frames = []
@@ -454,6 +479,7 @@ def _source_readiness_for_group(*, data_root: Path, group: str) -> dict[str, Any
 
 def _source_summary(*, data_root: Path, dataset: str) -> dict[str, Any]:
     sources = []
+    configured = _configured_feature_source_paths(data_root).get(dataset, set())
     for root in _feature_source_contract(data_root).get(dataset, []):
         files = _source_files(root)
         rows = 0
@@ -465,29 +491,69 @@ def _source_summary(*, data_root: Path, dataset: str) -> dict[str, Any]:
             columns.update(str(column) for column in list(file_summary.get("columns") or []))
             partition = path.parent.name.partition("=")[2] if path.parent.name.startswith("date=") else None
             latest_partition = max([value for value in (latest_partition, partition) if value], default=latest_partition)
+        missing_required = _missing_required_source_columns(dataset=dataset, columns=columns)
+        status = "missing"
+        if root.exists() and rows <= 0:
+            status = "empty"
+        elif rows > 0 and missing_required:
+            status = "invalid_schema"
+        elif rows > 0:
+            status = "available"
         sources.append(
             {
                 "dataset": dataset,
                 "path": str(root),
                 "exists": root.exists(),
+                "source_status": "contract" if str(root) in configured else "default_unverified",
                 "file_count": len(files),
                 "rows": rows,
                 "columns": sorted(columns),
+                "required_columns": list(SOURCE_REQUIRED_COLUMNS.get(dataset, ())),
+                "missing_required_columns": missing_required,
+                "status": status,
                 "latest_partition": latest_partition,
             }
         )
     rows = sum(int(source.get("rows") or 0) for source in sources)
     existing = [source for source in sources if source.get("exists")]
     latest_values = [str(source.get("latest_partition")) for source in sources if source.get("latest_partition")]
+    available = [source for source in sources if source.get("status") == "available"]
+    invalid = [source for source in sources if source.get("status") == "invalid_schema"]
+    source_status = "available" if available else "invalid_schema" if invalid else "empty" if existing else "missing"
     return {
         "dataset": dataset,
-        "status": "available" if rows > 0 else "empty" if existing else "missing",
+        "status": source_status,
         "rows": rows,
         "paths": [str(source.get("path")) for source in sources],
         "existing_paths": [str(source.get("path")) for source in existing],
         "columns": sorted({column for source in sources for column in list(source.get("columns") or [])}),
+        "required_columns": list(SOURCE_REQUIRED_COLUMNS.get(dataset, ())),
+        "missing_required_columns": sorted({column for source in sources for column in list(source.get("missing_required_columns") or [])}) if not available else [],
         "latest_partition": max(latest_values) if latest_values else None,
+        "sources": sources,
     }
+
+
+def _missing_required_source_columns(*, dataset: str, columns: set[str]) -> list[str]:
+    if not columns:
+        return list(SOURCE_REQUIRED_COLUMNS.get(dataset, ()))
+    if dataset == "ticker_news":
+        missing = []
+        if not ({"symbol", "symbols"} & columns):
+            missing.append("symbol_or_symbols")
+        if not ({"published_at", "vendor_ts"} & columns):
+            missing.append("published_at_or_vendor_ts")
+        return missing
+    if dataset == "sec_filings":
+        missing = []
+        if "form" not in columns:
+            missing.append("form")
+        if not ({"symbol", "cik", "cik_str"} & columns):
+            missing.append("symbol_or_cik")
+        if not ({"accepted_at", "acceptanceDateTime", "filing_date", "filingDate"} & columns):
+            missing.append("accepted_at_or_acceptanceDateTime_or_filingDate")
+        return missing
+    return sorted(set(SOURCE_REQUIRED_COLUMNS.get(dataset, ())).difference(columns))
 
 
 def _parquet_file_summary(path: Path) -> dict[str, Any]:

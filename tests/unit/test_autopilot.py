@@ -354,6 +354,74 @@ def test_observability_snapshot_reports_vendor_underutilization_and_pending_pnl(
     assert payload["issues"][0]["kind"] == "vendor_underutilized"
 
 
+def test_observability_uses_remote_pi_dataset_level_activity(tmp_path: Path) -> None:
+    data_root = tmp_path / "nas"
+    data_root.mkdir()
+    payload = build_fleet_observability(
+        snapshot={
+            "runtime": {"running": False},
+            "fleet_remote": {
+                "pi": {
+                    "status": "online",
+                    "node_state": {
+                        "node_observability": {
+                            "budget_summary": {
+                                "rows": [
+                                    {
+                                        "vendor": "alpaca",
+                                        "state": "available",
+                                        "rpm_limit": 200,
+                                        "rpm_used": 10,
+                                        "day_remaining": 1000,
+                                        "minute_available": True,
+                                        "day_available": True,
+                                    }
+                                ]
+                            },
+                            "scheduler_decisions": {
+                                "window_minutes": 15,
+                                "rows": [
+                                    {"vendor": "alpaca", "dataset": "stock_trades", "decision": "claimed", "count": 30},
+                                    {"vendor": "finnhub", "dataset": "company_news", "decision": "claimed", "count": 15},
+                                ],
+                            },
+                            "archive_write_telemetry": {
+                                "window_minutes": 60,
+                                "rows": [
+                                    {
+                                        "output_name": "ticker_news",
+                                        "status": "success",
+                                        "writes": 8,
+                                        "rows_in": 1200,
+                                        "rows_written": 1200,
+                                        "latest_at": "2026-04-29T12:00:00+00:00",
+                                    }
+                                ],
+                            },
+                            "lane_health": {
+                                "rows": [
+                                    {"vendor": "alpaca", "dataset": "stock_trades", "state": "HEALTHY"},
+                                    {"vendor": "finnhub", "dataset": "company_news", "state": "HEALTHY"},
+                                ]
+                            },
+                        }
+                    },
+                }
+            },
+            "budget_summary": {"rows": []},
+        },
+        data_root=data_root,
+        now=datetime(2026, 4, 29, 12, 1, tzinfo=UTC),
+    )
+
+    rows = {(row["vendor"], row["dataset"]): row for row in payload["vendors"]["rows"]}
+    assert rows[("alpaca", "stock_trades")]["utilization_verdict"] == "active"
+    assert rows[("alpaca", "stock_trades")]["actual_requests_per_minute"] == 2.0
+    assert rows[("finnhub", "company_news")]["rows_written_current_window"] == 1200
+    assert payload["collection_saturation"]["summary"]["active"] == 2
+    assert payload["vendors"]["underutilized_count"] == 0
+
+
 def test_observability_treats_disabled_lane_as_blocked_not_underutilized(tmp_path: Path) -> None:
     data_root = tmp_path / "nas"
     data_root.mkdir()
@@ -461,7 +529,49 @@ def test_observability_reports_blocked_feature_source_readiness(tmp_path: Path) 
     )
 
     kinds = {issue["kind"] for issue in payload["issues"]}
-    assert {"feature_source_blocked", "feature_source_missing"}.issubset(kinds)
+    assert {"feature_source_blocked", "feature_source_missing", "feature_source_path_missing"}.issubset(kinds)
+
+
+def test_fleet_health_merges_remote_pi_observability_before_building_snapshot(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "nas"
+    data_root.mkdir()
+    observed = {}
+
+    def fake_service_health(*args, **kwargs):  # noqa: ANN002, ANN003
+        return {
+            "status": "online",
+            "node_state": {
+                "db_schema": {"status": "ok", "missing_tables": []},
+                "deployed_version": {"commit": "abc123"},
+                "node_observability": {
+                    "scheduler_decisions": {
+                        "window_minutes": 15,
+                        "rows": [{"vendor": "alpaca", "dataset": "stock_trades", "decision": "claimed", "count": 3}],
+                    },
+                    "lane_health": {"rows": [{"vendor": "alpaca", "dataset": "stock_trades", "state": "HEALTHY"}]},
+                },
+            },
+        }
+
+    def fake_build(*, snapshot, **kwargs):  # noqa: ANN001, ANN003
+        observed.update(snapshot)
+        return {"verdict": "OK", "vendors": {"rows": [], "underutilized_count": 0}, "issues": []}
+
+    monkeypatch.setattr("trademl.fleet.autopilot._ssh_service_health", fake_service_health)
+    monkeypatch.setattr("trademl.fleet.autopilot.build_fleet_observability", fake_build)
+
+    payload = collect_fleet_health(
+        local_snapshot={
+            "health": {"research_program_summary": {"status": "RUNNING", "current_experiment_id": "exp-a"}},
+        },
+        data_root=data_root,
+        pi={"host": "pi", "user": "zach"},
+        mac=None,
+    )
+
+    assert "verdict" in payload
+    assert observed["scheduler_decisions"]["rows"][0]["dataset"] == "stock_trades"
+    assert observed["lane_health"]["rows"][0]["vendor"] == "alpaca"
 
 
 def test_fleet_watchdog_writes_current_state_and_repeated_issue_alert(tmp_path: Path, monkeypatch) -> None:

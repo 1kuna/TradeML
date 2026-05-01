@@ -236,6 +236,73 @@ def test_modeling_feature_factory_adds_multisource_pit_features(tmp_path) -> Non
     assert (pd.to_datetime(frame["feature_available_at"], utc=True).dt.tz_convert(None) <= pd.to_datetime(frame["date"])).all()
 
 
+def test_feature_source_contract_paths_override_defaults(tmp_path) -> None:
+    data_root = tmp_path / "nas"
+    panel = _panel().loc[lambda frame: frame["date"] <= pd.Timestamp("2020-02-14")].copy()
+    for date_value, day_frame in panel.groupby(panel["date"].dt.strftime("%Y-%m-%d")):
+        partition = data_root / "data" / "curated" / "equities_ohlcv_adj" / f"date={date_value}"
+        partition.mkdir(parents=True)
+        day_frame.to_parquet(partition / "data.parquet", index=False)
+    custom_news = data_root / "pi_archive" / "ticker_news" / "date=2020-01-20"
+    custom_news.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "symbol": ["AAPL"],
+            "published_at": ["2020-01-20T15:00:00Z"],
+            "source": ["finnhub"],
+            "headline": ["contract path"],
+        }
+    ).to_parquet(custom_news / "data.parquet", index=False)
+    contract = data_root / "control" / "cluster" / "state" / "research" / "feature_source_contract" / "latest.json"
+    contract.parent.mkdir(parents=True)
+    contract.write_text(
+        '{"datasets":{"ticker_news":{"paths":["pi_archive/ticker_news"]}}}',
+        encoding="utf-8",
+    )
+
+    payload = build_modeling_artifacts(
+        data_root=data_root,
+        feature_config=_feature_config(),
+        feature_set="daily_price_liquidity_v1",
+        feature_version="news_event_aggregates_v1",
+        label_horizons=[1, 5],
+    )
+
+    source = payload["feature_group_metadata"]["news_events"]["sources"]["ticker_news"]
+    assert source["status"] == "available"
+    assert source["sources"][0]["source_status"] == "contract"
+    assert source["sources"][0]["rows"] == 1
+    assert payload["feature_readiness"]["ok"] is True
+
+
+def test_feature_source_contract_reports_missing_required_columns(tmp_path) -> None:
+    data_root = tmp_path / "nas"
+    panel = _panel().loc[lambda frame: frame["date"] <= pd.Timestamp("2020-02-14")].copy()
+    for date_value, day_frame in panel.groupby(panel["date"].dt.strftime("%Y-%m-%d")):
+        partition = data_root / "data" / "curated" / "equities_ohlcv_adj" / f"date={date_value}"
+        partition.mkdir(parents=True)
+        day_frame.to_parquet(partition / "data.parquet", index=False)
+    bad_minute = data_root / "data" / "raw" / "equities_minute" / "date=2020-01-21"
+    bad_minute.mkdir(parents=True)
+    pd.DataFrame({"symbol": ["AAPL"], "timestamp": ["2020-01-21T14:30:00Z"], "close": [100.0]}).to_parquet(
+        bad_minute / "data.parquet",
+        index=False,
+    )
+
+    payload = build_modeling_artifacts(
+        data_root=data_root,
+        feature_config=_feature_config(),
+        feature_set="daily_price_liquidity_v1",
+        feature_version="minute_daily_aggregates_v1",
+        label_horizons=[1, 5],
+    )
+
+    source = payload["feature_group_metadata"]["minute_daily"]["sources"]["equities_minute"]
+    assert source["status"] == "invalid_schema"
+    assert {"open", "high", "low"}.issubset(set(source["missing_required_columns"]))
+    assert payload["feature_readiness"]["ok"] is False
+
+
 def test_modeling_feature_factory_reads_live_sec_schema_and_empty_fundamentals(tmp_path) -> None:
     data_root = tmp_path / "nas"
     panel = _panel().loc[lambda frame: frame["date"] <= pd.Timestamp("2020-02-14")].copy()
