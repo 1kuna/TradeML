@@ -126,6 +126,7 @@ def write_fleet_observability(
 def collect_observability_issues(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Return current actionable issues from one observability payload."""
     issues: list[dict[str, Any]] = []
+    known_unavailable_sources = _known_unavailable_sources(payload)
     for row in list((payload.get("vendors") or {}).get("rows") or []):
         if str(row.get("utilization_verdict")) == "underutilized":
             issues.append(
@@ -240,7 +241,10 @@ def collect_observability_issues(payload: dict[str, Any]) -> list[dict[str, Any]
     for entry in list(leaderboard.get("entries") or []):
         if not isinstance(entry, dict):
             continue
-        if str(entry.get("readiness_status") or "").upper() == "BLOCKED" and _entry_has_actionable_source_blocker(entry):
+        if str(entry.get("readiness_status") or "").upper() == "BLOCKED" and _entry_has_actionable_source_blocker(
+            entry,
+            known_unavailable_sources=known_unavailable_sources,
+        ):
             issues.append(
                 _issue(
                     "research",
@@ -269,6 +273,8 @@ def collect_observability_issues(payload: dict[str, Any]) -> list[dict[str, Any]
                 )
             for dataset, source in sources.items():
                 if not isinstance(source, dict):
+                    continue
+                if str(dataset) in known_unavailable_sources:
                     continue
                 if not _source_is_actionable(source):
                     continue
@@ -900,11 +906,26 @@ def _source_is_actionable(source: dict[str, Any]) -> bool:
     return str(source.get("status") or "") in {"missing", "empty", "invalid_schema"}
 
 
-def _entry_has_actionable_source_blocker(entry: dict[str, Any]) -> bool:
+def _known_unavailable_sources(payload: dict[str, Any]) -> set[str]:
+    datasets = dict((payload.get("source_availability") or {}).get("datasets") or {})
+    known: set[str] = set()
+    for dataset, source in datasets.items():
+        if not isinstance(source, dict):
+            continue
+        state = str(source.get("source_state") or source.get("lifecycle_state") or source.get("state") or "")
+        if bool(source.get("known_unavailable")) or state in {"ENTITLEMENT_UNAVAILABLE", "DISABLED_BY_POLICY"}:
+            known.add(str(dataset))
+    return known
+
+
+def _entry_has_actionable_source_blocker(entry: dict[str, Any], *, known_unavailable_sources: set[str] | None = None) -> bool:
+    known_unavailable_sources = known_unavailable_sources or set()
     for coverage in dict(entry.get("source_coverage") or {}).values():
         if not isinstance(coverage, dict):
             continue
-        for source in dict(coverage.get("sources") or {}).values():
+        for dataset, source in dict(coverage.get("sources") or {}).items():
+            if str(dataset) in known_unavailable_sources:
+                continue
             if isinstance(source, dict) and _source_is_actionable(source):
                 return True
     return not entry.get("source_coverage")

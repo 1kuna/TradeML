@@ -596,9 +596,6 @@ def test_observability_does_not_degrade_for_known_unavailable_free_plan_source(t
                                         "sources": {
                                             "fundamentals_tiingo": {
                                                 "status": "empty",
-                                                "source_state": "ENTITLEMENT_UNAVAILABLE",
-                                                "known_unavailable": True,
-                                                "actionable": False,
                                             }
                                         }
                                     }
