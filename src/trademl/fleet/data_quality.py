@@ -34,13 +34,28 @@ QUALITY_REQUIRED_COLUMNS = {
     "macros_fred": ("series_id", "observation_date", "value"),
 }
 
-DUPLICATE_KEYS = {
-    "equities_minute": ("source_name", "symbol", "vendor_ts"),
-    "ticker_news": ("source_name", "symbol", "vendor_ts"),
-    "stock_trades": ("source_name", "symbol", "vendor_ts"),
-    "stock_quotes": ("source_name", "symbol", "vendor_ts"),
-    "fundamentals_daily": ("symbol", "metric_date", "metric_name"),
-    "equities_ohlcv_adj": ("date", "symbol"),
+DUPLICATE_KEY_CANDIDATES = {
+    "equities_minute": (
+        ("source_name", "symbol", "vendor_ts"),
+        ("source_name", "symbol", "timestamp"),
+    ),
+    "ticker_news": (
+        ("source_name", "news_id", "symbol"),
+        ("source_name", "url", "symbol"),
+        ("source_name", "headline", "published_at", "symbol"),
+    ),
+    "stock_trades": (
+        ("source_name", "symbol", "vendor_ts"),
+        ("source_name", "symbol", "timestamp"),
+        ("source_name", "symbol", "event_id"),
+    ),
+    "stock_quotes": (
+        ("source_name", "symbol", "vendor_ts"),
+        ("source_name", "symbol", "timestamp"),
+        ("source_name", "symbol", "event_id"),
+    ),
+    "fundamentals_daily": (("symbol", "metric_date", "metric_name"),),
+    "equities_ohlcv_adj": (("date", "symbol"),),
 }
 
 
@@ -147,6 +162,7 @@ def _quality_row(*, data_root: Path, dataset: str, source_availability: dict[str
     missing = _missing_required_columns(dataset=dataset, columns=columns)
     latest_frame = _read_latest_sample(files)
     duplicate_count = _duplicate_count(dataset=dataset, frame=latest_frame)
+    duplicate_rate = _safe_rate(duplicate_count, len(latest_frame))
     null_rate_max = _max_null_rate(dataset=dataset, frame=latest_frame)
     timestamp_violations = _timestamp_violations(latest_frame)
     pit_violations = _pit_violations(latest_frame)
@@ -169,10 +185,13 @@ def _quality_row(*, data_root: Path, dataset: str, source_availability: dict[str
         verdict = "CRITICAL"
         status = "timestamp_violation"
         reason = "timestamp/PIT sanity check failed"
-    elif duplicate_count:
+    elif duplicate_rate > 0.01:
         verdict = "WARNING"
         status = "duplicate_keys"
-        reason = "duplicate keys detected in latest sample"
+        reason = "duplicate key rate exceeded 1% in latest sample"
+    elif duplicate_count:
+        status = "ok_minor_duplicates"
+        reason = "minor duplicate key count below warning threshold"
     return {
         "dataset": dataset,
         "verdict": verdict,
@@ -185,6 +204,7 @@ def _quality_row(*, data_root: Path, dataset: str, source_availability: dict[str
         "columns": sorted(columns),
         "missing_required_columns": missing,
         "duplicate_key_count": duplicate_count,
+        "duplicate_key_rate": duplicate_rate,
         "null_rate_max": null_rate_max,
         "timestamp_violation_count": timestamp_violations,
         "pit_violation_count": pit_violations,
@@ -294,10 +314,24 @@ def _missing_required_columns(*, dataset: str, columns: set[str]) -> list[str]:
 
 
 def _duplicate_count(*, dataset: str, frame: pd.DataFrame) -> int:
-    keys = [key for key in DUPLICATE_KEYS.get(dataset, ()) if key in frame.columns]
-    if not keys or frame.empty:
+    if frame.empty:
         return 0
-    return int(frame.duplicated(keys, keep=False).sum())
+    candidates = DUPLICATE_KEY_CANDIDATES.get(dataset, ())
+    for candidate in candidates:
+        keys = [key for key in candidate if key in frame.columns]
+        if len(keys) != len(candidate):
+            continue
+        keyed = frame.dropna(subset=keys)
+        if keyed.empty:
+            continue
+        return int(keyed.duplicated(keys, keep=False).sum())
+    return 0
+
+
+def _safe_rate(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return float(numerator) / float(denominator)
 
 
 def _max_null_rate(*, dataset: str, frame: pd.DataFrame) -> float | None:

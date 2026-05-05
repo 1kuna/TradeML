@@ -34,6 +34,7 @@ class _SchedulerService:
         self._actionable = actionable
         self._reason = reason
         self._canonical_runtime = SimpleNamespace(_backfill_lane_widths=lambda: {})
+        self.width_calls: list[dict[str, object]] = []
 
     def _ensure_planner_backlog_seeded(self, **kwargs) -> None:  # noqa: ANN003
         return None
@@ -51,6 +52,7 @@ class _SchedulerService:
         return 0
 
     def _aux_lane_widths(self, **kwargs) -> dict[str, int]:  # noqa: ANN003
+        self.width_calls.append(dict(kwargs))
         return {} if self._stop_event.is_set() else {"twelve_data": 1}
 
     def _auxiliary_vendor_has_eligible_work(self, vendor: str) -> bool:
@@ -92,3 +94,14 @@ def test_scheduler_records_actionable_stall(caplog) -> None:  # noqa: ANN001
     messages = [record.getMessage() for record in caplog.records]
     assert any("planner_queue_stalled" in message and "pending_lane_exceeded_wait_window" in message for message in messages)
     assert service.db.decisions[0]["decision"] == "stalled"
+
+
+def test_scheduler_passes_active_aux_widths_into_width_controller() -> None:
+    service = _SchedulerService(actionable=False, reason="active_vendor_attempt")
+
+    PlannerLaneScheduler(service).process_planner_queue(lane_stall_seconds=0.01)
+
+    assert any(
+        (call.get("active_widths") or {}).get("twelve_data") == 1
+        for call in service.width_calls
+    )

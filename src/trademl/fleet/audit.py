@@ -75,11 +75,14 @@ def run_fleet_audit(
     )
     codex_feed_paths = write_codex_feed(data_root=data_root, payload=codex_feed, now=current)
     audit_latest = data_root / "control" / "cluster" / "state" / "autopilot" / "audit" / "latest.json"
+    systems = dict((fleet.get("current_state") or {}).get("systems") or {})
+    if mac is None:
+        systems["mac"] = _local_mac_system_from_research(research)
     payload = {
         "version": "fleet_audit_v1",
         "generated_at": current.isoformat(),
         "verdict": _verdict_for_issues([issue for issue in list(bucket.get("issues") or issues) if str(issue.get("status") or "open") == "open"]),
-        "systems": (fleet.get("current_state") or {}).get("systems") or {},
+        "systems": systems,
         "collection": {
             "saturation": observability.get("collection_saturation") or {},
             "controller": observability.get("controller") or {},
@@ -190,6 +193,33 @@ def _safe_research_audit(**kwargs: Any) -> dict[str, Any]:
                 }
             ],
         }
+
+
+def _local_mac_system_from_research(research: dict[str, Any]) -> dict[str, Any]:
+    status = str(research.get("status") or "").upper()
+    launchd = dict(research.get("launchd") or {})
+    if status in {"RUNNING", "FEATURE_CANARY_RUNNING"}:
+        return {
+            "status": "online",
+            "headline": "Research running",
+            "detail": str(research.get("current_experiment_id") or "-"),
+            "launchd": launchd,
+        }
+    if status in {"INFRA_BLOCKED", "WAITING_FOR_DATA"}:
+        return {
+            "status": "degraded",
+            "headline": status.replace("_", " ").title(),
+            "detail": str(research.get("wait_reason") or research.get("pivot_reason") or "-"),
+            "launchd": launchd,
+        }
+    if status:
+        return {
+            "status": "degraded",
+            "headline": status.replace("_", " ").title(),
+            "detail": str(research.get("current_experiment_id") or "-"),
+            "launchd": launchd,
+        }
+    return {"status": "unknown", "headline": "Unknown", "detail": "-", "launchd": launchd}
 
 
 def _audit_issues(

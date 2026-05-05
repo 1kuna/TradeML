@@ -488,10 +488,15 @@ class AuxiliaryRuntime:
         return not set(default_macro_series()).issubset(available_macro)
 
     def _aux_lane_widths(
-        self, *, task_kinds: set[str], canonical_pressure: bool | None = None
+        self,
+        *,
+        task_kinds: set[str],
+        canonical_pressure: bool | None = None,
+        active_widths: dict[str, int] | None = None,
     ) -> dict[str, int]:
         widths: dict[str, int] = {}
         _ = canonical_pressure
+        active_by_vendor = dict(active_widths or {})
         controller = SaturationControllerV2.from_environment()
         resource_state = local_resource_state(data_root=self.paths.root)
         per_vendor_budget = self._budget_snapshot_by_vendor()
@@ -514,7 +519,7 @@ class AuxiliaryRuntime:
                     dataset=job.dataset,
                     base_width=int(job.lane_width or 1),
                     eligible_tasks=eligible_tasks,
-                    active_width=0,
+                    active_width=int(active_by_vendor.get(job.vendor, 0) or 0),
                     rpm=int(budget.get("rpm") or 60),
                     remaining_minute=int(budget.get("remaining_window_requests") or 60),
                     remaining_daily=int(budget.get("remaining_daily_units") or 999999),

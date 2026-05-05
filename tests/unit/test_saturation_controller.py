@@ -163,3 +163,61 @@ def test_data_quality_checks_sibling_nas_alias_for_archive_sources(tmp_path: Pat
 
     assert rows["stock_trades"]["verdict"] == "OK"
     assert rows["stock_quotes"]["verdict"] == "OK"
+
+
+def test_data_quality_uses_article_identity_for_ticker_news_duplicates(tmp_path: Path) -> None:
+    data_root = tmp_path / "nas"
+    partition = data_root / "data" / "raw" / "ticker_news" / "date=2026-05-05"
+    partition.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "source_name": "finnhub",
+                "symbol": "AAPL",
+                "news_id": "1",
+                "published_at": "2026-05-05T14:00:00Z",
+                "headline": "first",
+                "url": "https://example.test/1",
+            },
+            {
+                "source_name": "finnhub",
+                "symbol": "AAPL",
+                "news_id": "2",
+                "published_at": "2026-05-05T15:00:00Z",
+                "headline": "second",
+                "url": "https://example.test/2",
+            },
+        ]
+    ).to_parquet(partition / "data.parquet", index=False)
+
+    payload = run_data_quality_audit(data_root=data_root, datasets=["ticker_news"])
+    row = payload["rows"][0]
+
+    assert row["verdict"] == "OK"
+    assert row["duplicate_key_count"] == 0
+
+
+def test_data_quality_allows_minor_duplicate_keys_below_warning_threshold(tmp_path: Path) -> None:
+    data_root = tmp_path / "nas"
+    partition = data_root / "data" / "raw" / "ticker_news" / "date=2026-05-05"
+    partition.mkdir(parents=True)
+    rows = [
+        {
+            "source_name": "finnhub",
+            "symbol": f"SYM{i}",
+            "news_id": str(i),
+            "published_at": "2026-05-05T14:00:00Z",
+            "headline": f"article {i}",
+            "url": f"https://example.test/{i}",
+        }
+        for i in range(200)
+    ]
+    rows.append(rows[-1].copy())
+    pd.DataFrame(rows).to_parquet(partition / "data.parquet", index=False)
+
+    payload = run_data_quality_audit(data_root=data_root, datasets=["ticker_news"])
+    row = payload["rows"][0]
+
+    assert row["verdict"] == "OK"
+    assert row["status"] == "ok_minor_duplicates"
+    assert 0 < row["duplicate_key_rate"] < 0.01

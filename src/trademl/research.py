@@ -245,6 +245,17 @@ def supervise_research_program(
     state["stop_reason"] = None
     state["completed_at"] = None
     _write_program_state(local_state=local_state, program_id=program_id, payload=state)
+    record_research_progression_event(
+        data_root=data_root,
+        program_id=program_id,
+        event="supervisor_started",
+        payload={
+            "pid": os.getpid(),
+            "poll_seconds": resolved_poll,
+            "current_experiment_id": state.get("current_experiment_id"),
+            "architecture_lane": state.get("architecture_lane"),
+        },
+    )
 
     while True:
         state = read_research_program_state(local_state=local_state, program_id=program_id)
@@ -384,6 +395,16 @@ def supervise_research_program(
                 "action": "recover_family",
                 "reason": f"restarting stalled experiment supervisor for {active_experiment}",
             }
+            record_research_progression_event(
+                data_root=data_root,
+                program_id=program_id,
+                event="experiment_supervisor_recovered",
+                payload={
+                    "experiment_id": active_experiment,
+                    "reason": state["last_transition"]["reason"],
+                    "supervisor_status": recovered.get("status"),
+                },
+            )
             _write_program_state(local_state=local_state, program_id=program_id, payload=state)
             time.sleep(max(1, resolved_poll))
             continue
@@ -407,6 +428,24 @@ def supervise_research_program(
         )
         state["best_candidate_summary"] = _program_best_candidate(frontier=frontier, experiment_summary=experiment_summary)
         state["last_transition"] = decision
+        record_research_progression_event(
+            data_root=data_root,
+            program_id=program_id,
+            event="decision_selected",
+            payload={
+                "action": decision.get("action"),
+                "reason": decision.get("reason"),
+                "current_experiment_id": active_experiment,
+                "next_experiment_id": (decision.get("next_spec") or {}).get("experiment_id"),
+                "family_signature": decision.get("family_signature"),
+                "novelty_score": decision.get("novelty_score"),
+                "top_rejection": (experiment_summary.get("top_gate_failures") or [[None]])[0][0]
+                if experiment_summary.get("top_gate_failures")
+                else None,
+                "architecture_lane": (decision.get("next_spec") or {}).get("architecture_lane"),
+                "next_lane": (decision.get("next_spec") or {}).get("next_lane"),
+            },
+        )
         packet = None
         if decision["action"] in {"advance_phase", "stop", "pause"} or _review_packet_due(state=state, spec=spec):
             packet = write_research_review_packet(
@@ -1188,6 +1227,7 @@ def research_health(
         "status": state.get("status"),
         "wait_reason": state.get("wait_reason"),
         "current_experiment_id": current_experiment_id,
+        "active_run": active_run,
         "completed_runs_24h": throughput["completed_runs_24h"],
         "completed_runs_7d": throughput["completed_runs_7d"],
         "failed_runs_24h": throughput["failed_runs_24h"],
@@ -1309,6 +1349,52 @@ def _research_throughput_summary(*, local_state: Path, now: datetime | None = No
         "top_rejection_reasons": top_rejection_reasons,
         "latest_finished_at": latest_finished_at,
     }
+
+
+def record_research_progression_event(
+    *,
+    data_root: Path,
+    program_id: str,
+    event: str,
+    payload: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Append one durable research-progression event for audit reconstruction."""
+    current = now or datetime.now(tz=UTC)
+    record = {
+        "version": "research_progression_event_v1",
+        "program_id": program_id,
+        "event": event,
+        "created_at": current.isoformat(),
+        **dict(payload or {}),
+    }
+    root = _shared_research_root(data_root=data_root) / "progression_events"
+    root.mkdir(parents=True, exist_ok=True)
+    log_path = root / f"{program_id}.jsonl"
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+    latest = root / "latest.json"
+    _atomic_write_json(latest, {"latest_event": record, "log_path": str(log_path)})
+    return {**record, "path": str(log_path)}
+
+
+def read_research_progression_events(
+    *,
+    data_root: Path,
+    program_id: str,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Read recent durable research-progression events."""
+    path = _shared_research_root(data_root=data_root) / "progression_events" / f"{program_id}.jsonl"
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with contextlib.suppress(OSError):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for line in lines[-max(1, int(limit)) :]:
+            with contextlib.suppress(json.JSONDecodeError):
+                rows.append(json.loads(line))
+    return rows
 
 
 def _research_run_finished_at(*, manifest: dict[str, Any], path: Path) -> datetime | None:
@@ -4343,6 +4429,17 @@ def _launch_program_family(
         python_executable=python_executable,
     )
     if not bool(preflight.get("ok", False)):
+        record_research_progression_event(
+            data_root=data_root,
+            program_id=program_id,
+            event="family_preflight_blocked",
+            payload={
+                "experiment_id": next_spec.get("experiment_id"),
+                "architecture_lane": next_spec.get("architecture_lane"),
+                "reason": preflight.get("reason"),
+                "preflight": preflight,
+            },
+        )
         return {
             "status": "INFRA_BLOCKED",
             "wait_reason": f"research preflight failed: {preflight.get('reason')}",
@@ -4362,6 +4459,21 @@ def _launch_program_family(
         python_executable=python_executable,
         poll_seconds=poll_seconds,
         detach=detach,
+    )
+    record_research_progression_event(
+        data_root=data_root,
+        program_id=program_id,
+        event="family_launched",
+        payload={
+            "experiment_id": next_spec["experiment_id"],
+            "architecture_lane": next_spec.get("architecture_lane"),
+            "next_lane": next_spec.get("next_lane"),
+            "model_suites": list((next_spec.get("matrix") or {}).get("model_suite") or []),
+            "feature_version": (next_spec.get("modeling") or {}).get("feature_version"),
+            "label_horizon": (next_spec.get("modeling") or {}).get("label_horizon"),
+            "supervisor_status": payload.get("status"),
+            "detach": detach,
+        },
     )
     return {
         "current_experiment_id": next_spec["experiment_id"],

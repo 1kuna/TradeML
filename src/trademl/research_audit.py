@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from trademl.research import (
+    read_research_progression_events,
     read_feature_family_leaderboard,
     read_research_program_state,
     research_health,
@@ -40,6 +41,7 @@ def run_research_progression_audit(
     state = read_research_program_state(local_state=local_state, program_id=program_id)
     leaderboard = read_feature_family_leaderboard(data_root=data_root)
     evidence = _latest_candidate_evidence(data_root=data_root, limit=20)
+    recorded_events = read_research_progression_events(data_root=data_root, program_id=program_id, limit=50)
     events = _progression_events(
         health=health_payload,
         state=state,
@@ -67,6 +69,7 @@ def run_research_progression_audit(
         "completed_runs_24h": health_payload.get("completed_runs_24h"),
         "top_rejection_reasons": health_payload.get("top_rejection_reasons") or [],
         "frontier": health_payload.get("frontier_architecture") or {},
+        "launchd": health_payload.get("launchd") or {},
         "feature_leaderboard": {
             "updated_at": leaderboard.get("updated_at"),
             "best_feature_version": leaderboard.get("best_feature_version"),
@@ -78,7 +81,13 @@ def run_research_progression_audit(
             "smoke": health_payload.get("latest_paper_account_smoke") or {},
             "pnl": health_payload.get("latest_paper_pnl") or {},
         },
-        "events": events,
+        "active_run": health_payload.get("active_run") or {},
+        "latest_finished_age_seconds": _age_seconds(
+            value=(health_payload.get("research_throughput") or {}).get("latest_finished_at"),
+            now=current,
+        ),
+        "recorded_events": recorded_events,
+        "events": [*recorded_events[-25:], *events],
         "issues": issues,
         "verdict": _verdict_for_issues(issues),
     }
@@ -286,6 +295,13 @@ def _parse_utc_datetime(value: str) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _age_seconds(*, value: str | None, now: datetime) -> float | None:
+    parsed = _parse_utc_datetime(str(value or ""))
+    if parsed is None:
+        return None
+    return max(0.0, (now - parsed).total_seconds())
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:

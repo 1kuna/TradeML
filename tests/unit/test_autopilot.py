@@ -144,6 +144,47 @@ def test_fleet_audit_resolves_stale_data_quality_issues_after_current_ok(tmp_pat
     assert Path(payload["codex_feed_path"]).exists()
 
 
+def test_fleet_audit_marks_local_mac_online_from_research_audit(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "nas"
+    data_root.mkdir()
+
+    monkeypatch.setattr(
+        "trademl.fleet.audit.run_data_quality_audit",
+        lambda **kwargs: {"rows": [], "summary": {"ok": 0, "warning": 0, "critical": 0, "info": 0}},  # noqa: ARG005
+    )
+    monkeypatch.setattr(
+        "trademl.fleet.audit.collect_fleet_health",
+        lambda **kwargs: {  # noqa: ARG005
+            "current_state": {"systems": {"mac": {"status": "unknown", "headline": "Unknown"}}},
+            "current_issues": [],
+            "issue_bucket": {"issues": []},
+            "observability": {"issues": [], "paper_pnl": {}},
+        },
+    )
+    monkeypatch.setattr(
+        "trademl.fleet.audit._safe_research_audit",
+        lambda **kwargs: {  # noqa: ARG005
+            "verdict": "OK",
+            "status": "RUNNING",
+            "current_experiment_id": "perpetual-macmini-p1-f621",
+            "issues": [],
+        },
+    )
+
+    payload = run_fleet_audit(
+        local_snapshot={},
+        data_root=data_root,
+        repo_root=tmp_path,
+        local_state=tmp_path / "control",
+        targets_config_path=tmp_path / "targets.yml",
+        python_executable="python",
+        now=datetime(2026, 4, 28, 11, tzinfo=UTC),
+    )
+
+    assert payload["systems"]["mac"]["status"] == "online"
+    assert payload["systems"]["mac"]["detail"] == "perpetual-macmini-p1-f621"
+
+
 def test_codex_issue_bucket_reports_missing_data_root_without_creating_it(tmp_path: Path) -> None:
     data_root = tmp_path / "missing-nas"
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import inspect
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import UTC, datetime
@@ -41,13 +42,19 @@ class PlannerLaneScheduler:
         service._terminalize_unservable_canonical_repairs()  # noqa: SLF001
         changed_dates: list[str] = []
         futures: dict[object, str] = {}
+        aux_active: dict[str, int] = defaultdict(int)
+        canonical_active: dict[str, int] = defaultdict(int)
+        aux_submitted: dict[str, int] = defaultdict(int)
+        canonical_submitted: dict[str, int] = defaultdict(int)
         canonical_lane_widths = service._canonical_runtime._backfill_lane_widths()  # noqa: SLF001
         canonical_backlog_active = service.db.has_pending_planner_tasks(
             task_families=("canonical_bars", "canonical_repair")
         )
-        aux_lane_widths = service._aux_lane_widths(  # noqa: SLF001
+        aux_lane_widths = _aux_lane_widths(  # noqa: SLF001
+            service,
             task_kinds={"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"},
             canonical_pressure=canonical_backlog_active,
+            active_widths=dict(aux_active),
         )
         configured_lanes = len(canonical_lane_widths) + len(aux_lane_widths)
         max_workers = max(
@@ -58,10 +65,6 @@ class PlannerLaneScheduler:
         )
         executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
-            aux_active: dict[str, int] = defaultdict(int)
-            canonical_active: dict[str, int] = defaultdict(int)
-            aux_submitted: dict[str, int] = defaultdict(int)
-            canonical_submitted: dict[str, int] = defaultdict(int)
             future_started_at: dict[object, float] = {}
             aux_submit_cap = {
                 vendor: max(1, int(width)) * 32
@@ -102,9 +105,11 @@ class PlannerLaneScheduler:
                     task_families=("canonical_bars", "canonical_repair")
                 )
                 aux_lane_widths.update(
-                    service._aux_lane_widths(  # noqa: SLF001
+                    _aux_lane_widths(  # noqa: SLF001
+                        service,
                         task_kinds={"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"},
                         canonical_pressure=canonical_active_backlog,
+                        active_widths=dict(aux_active),
                     )
                 )
                 for vendor, width in aux_lane_widths.items():
@@ -130,6 +135,17 @@ class PlannerLaneScheduler:
                         and service._auxiliary_vendor_has_eligible_work(vendor)  # noqa: SLF001
                     ):
                         submit_auxiliary_lane(vendor)
+                if any(count > 0 for count in aux_active.values()):
+                    aux_lane_widths.update(
+                        _aux_lane_widths(  # noqa: SLF001
+                            service,
+                            task_kinds={"REFERENCE", "EVENT", "MACRO", "RESEARCH_ONLY"},
+                            canonical_pressure=service.db.has_pending_planner_tasks(
+                                task_families=("canonical_bars", "canonical_repair")
+                            ),
+                            active_widths=dict(aux_active),
+                        )
+                    )
 
             def pending_lane_summary(now: float) -> tuple[dict[str, int], str, float, dict[str, object]]:
                 lane_counts: dict[str, int] = {}
@@ -290,3 +306,25 @@ class PlannerLaneScheduler:
         finally:
             executor.shutdown(wait=True, cancel_futures=False)
         return sorted(set(changed_dates))
+
+
+def _aux_lane_widths(
+    service: Any,
+    *,
+    task_kinds: set[str],
+    canonical_pressure: bool | None,
+    active_widths: dict[str, int],
+) -> dict[str, int]:
+    """Call the service lane-width hook while preserving older test doubles."""
+    hook = service._aux_lane_widths  # noqa: SLF001
+    signature = inspect.signature(hook)
+    if "active_widths" in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return hook(
+            task_kinds=task_kinds,
+            canonical_pressure=canonical_pressure,
+            active_widths=active_widths,
+        )
+    return hook(task_kinds=task_kinds, canonical_pressure=canonical_pressure)

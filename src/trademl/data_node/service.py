@@ -2540,8 +2540,14 @@ class DataNodeService:
         )
 
     def _aux_lane_widths(
-        self, *, task_kinds: set[str], canonical_pressure: bool | None = None
+        self,
+        *,
+        task_kinds: set[str],
+        canonical_pressure: bool | None = None,
+        active_widths: dict[str, int] | None = None,
     ) -> dict[str, int]:
         return self._auxiliary_runtime._aux_lane_widths(
-            task_kinds=task_kinds, canonical_pressure=canonical_pressure
+            task_kinds=task_kinds,
+            canonical_pressure=canonical_pressure,
+            active_widths=active_widths,
         )
