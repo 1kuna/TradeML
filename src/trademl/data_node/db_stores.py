@@ -168,6 +168,96 @@ class RuntimeStore(_Store):
             )
         return int(cursor.rowcount)
 
+    def record_controller_decision(
+        self,
+        *,
+        vendor: str,
+        dataset: str,
+        eligible_tasks: int,
+        target_width: int,
+        active_width: int = 0,
+        budget_remaining_minute: int = 0,
+        budget_remaining_daily: int = 0,
+        latency_ms: float | None = None,
+        rows_per_credit: float | None = None,
+        action: str,
+        reason: str | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        """Persist one saturation-controller decision for a vendor/dataset lane."""
+        timestamp = created_at or self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO controller_decisions (
+                  vendor, dataset, eligible_tasks, target_width, active_width,
+                  budget_remaining_minute, budget_remaining_daily, latency_ms,
+                  rows_per_credit, action, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(vendor),
+                    str(dataset),
+                    int(eligible_tasks),
+                    int(target_width),
+                    int(active_width),
+                    int(budget_remaining_minute),
+                    int(budget_remaining_daily),
+                    float(latency_ms) if latency_ms is not None else None,
+                    float(rows_per_credit) if rows_per_credit is not None else None,
+                    str(action),
+                    str(reason) if reason is not None else None,
+                    timestamp,
+                ),
+            )
+
+    def summarize_controller_decisions(
+        self, *, minutes: int = 15, limit: int | None = None
+    ) -> dict[str, Any]:
+        """Return recent saturation-controller decisions by vendor/dataset/action."""
+        window_minutes = max(1, int(minutes))
+        since = (self._now() - timedelta(minutes=window_minutes)).isoformat()
+        params: list[object] = [since]
+        query = """
+            SELECT vendor,
+                   dataset,
+                   action,
+                   COUNT(*) AS count,
+                   MAX(target_width) AS target_width,
+                   MAX(active_width) AS active_width,
+                   MAX(eligible_tasks) AS eligible_tasks,
+                   MAX(budget_remaining_minute) AS budget_remaining_minute,
+                   MAX(budget_remaining_daily) AS budget_remaining_daily,
+                   MAX(latency_ms) AS latency_ms,
+                   AVG(rows_per_credit) AS rows_per_credit,
+                   MAX(reason) AS latest_reason,
+                   MAX(created_at) AS latest_at
+            FROM controller_decisions
+            WHERE created_at >= ?
+            GROUP BY vendor, dataset, action
+            ORDER BY latest_at DESC, count DESC, vendor ASC, dataset ASC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return {
+            "window_minutes": window_minutes,
+            "checked_at": self._now().isoformat(),
+            "rows": [dict(row) for row in rows],
+        }
+
+    def prune_controller_decisions(self, *, retention_hours: int = 24) -> int:
+        """Delete old controller decision telemetry."""
+        cutoff = (self._now() - timedelta(hours=max(1, int(retention_hours)))).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM controller_decisions WHERE created_at < ?",
+                (cutoff,),
+            )
+        return int(cursor.rowcount)
+
     def record_archive_write_telemetry(
         self,
         *,
@@ -225,6 +315,8 @@ class RuntimeStore(_Store):
                    SUM(rows_written) AS rows_written,
                    SUM(duplicates_dropped) AS duplicates_dropped,
                    SUM(schema_mismatch) AS schema_mismatches,
+                   AVG(duration_ms) AS avg_duration_ms,
+                   MAX(duration_ms) AS max_duration_ms,
                    MAX(created_at) AS latest_at,
                    MAX(error) AS latest_error
             FROM archive_write_telemetry
@@ -351,6 +443,104 @@ class RuntimeStore(_Store):
         with self._connect() as connection:
             cursor = connection.execute(
                 "DELETE FROM ingestion_ledger WHERE created_at < ?",
+                (cutoff,),
+            )
+        return int(cursor.rowcount)
+
+    def record_data_quality_check(
+        self,
+        *,
+        dataset: str,
+        check_name: str,
+        verdict: str,
+        status: str,
+        source_path: str | None = None,
+        rows_checked: int = 0,
+        partitions_checked: int = 0,
+        required_columns_missing: list[str] | tuple[str, ...] | None = None,
+        duplicate_key_count: int = 0,
+        null_rate_max: float | None = None,
+        timestamp_violation_count: int = 0,
+        pit_violation_count: int = 0,
+        readable: bool = True,
+        reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        """Persist one data-quality audit result."""
+        timestamp = created_at or self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO data_quality_checks (
+                  dataset, check_name, verdict, status, source_path, rows_checked,
+                  partitions_checked, required_columns_missing_json, duplicate_key_count,
+                  null_rate_max, timestamp_violation_count, pit_violation_count,
+                  readable, reason, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(dataset),
+                    str(check_name),
+                    str(verdict),
+                    str(status),
+                    str(source_path) if source_path is not None else None,
+                    int(rows_checked),
+                    int(partitions_checked),
+                    json.dumps(sorted({str(value) for value in (required_columns_missing or [])})),
+                    int(duplicate_key_count),
+                    float(null_rate_max) if null_rate_max is not None else None,
+                    int(timestamp_violation_count),
+                    int(pit_violation_count),
+                    1 if readable else 0,
+                    str(reason) if reason is not None else None,
+                    json.dumps(metadata or {}, sort_keys=True, default=str),
+                    timestamp,
+                ),
+            )
+
+    def summarize_data_quality_checks(
+        self, *, hours: int = 24, limit: int | None = None
+    ) -> dict[str, Any]:
+        """Return recent data-quality checks grouped by dataset/verdict/status."""
+        window_hours = max(1, int(hours))
+        since = (self._now() - timedelta(hours=window_hours)).isoformat()
+        params: list[object] = [since]
+        query = """
+            SELECT dataset,
+                   verdict,
+                   status,
+                   COUNT(*) AS checks,
+                   SUM(rows_checked) AS rows_checked,
+                   SUM(partitions_checked) AS partitions_checked,
+                   SUM(duplicate_key_count) AS duplicate_key_count,
+                   SUM(timestamp_violation_count) AS timestamp_violation_count,
+                   SUM(pit_violation_count) AS pit_violation_count,
+                   MAX(required_columns_missing_json) AS required_columns_missing_json,
+                   MAX(reason) AS latest_reason,
+                   MAX(created_at) AS latest_at
+            FROM data_quality_checks
+            WHERE created_at >= ?
+            GROUP BY dataset, verdict, status
+            ORDER BY latest_at DESC, dataset ASC, verdict ASC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return {
+            "window_hours": window_hours,
+            "checked_at": self._now().isoformat(),
+            "rows": [dict(row) for row in rows],
+        }
+
+    def prune_data_quality_checks(self, *, retention_hours: int = 168) -> int:
+        """Delete old data-quality check rows after shared rollups have aged out."""
+        cutoff = (self._now() - timedelta(hours=max(1, int(retention_hours)))).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM data_quality_checks WHERE created_at < ?",
                 (cutoff,),
             )
         return int(cursor.rowcount)

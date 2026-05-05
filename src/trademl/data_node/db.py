@@ -55,8 +55,10 @@ class DataNodeDB:
             "raw_partition_manifest",
             "vendor_lane_health",
             "scheduler_decisions",
+            "controller_decisions",
             "archive_write_telemetry",
             "ingestion_ledger",
+            "data_quality_checks",
         }
     )
 
@@ -301,6 +303,31 @@ class DataNodeDB:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS controller_decisions (
+                  id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                  vendor                  TEXT NOT NULL,
+                  dataset                 TEXT NOT NULL,
+                  eligible_tasks          INTEGER NOT NULL DEFAULT 0,
+                  target_width            INTEGER NOT NULL DEFAULT 0,
+                  active_width            INTEGER NOT NULL DEFAULT 0,
+                  budget_remaining_minute INTEGER NOT NULL DEFAULT 0,
+                  budget_remaining_daily  INTEGER NOT NULL DEFAULT 0,
+                  latency_ms              REAL,
+                  rows_per_credit         REAL,
+                  action                  TEXT NOT NULL,
+                  reason                  TEXT,
+                  created_at              TIMESTAMP NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_controller_decisions_created
+                ON controller_decisions(created_at, vendor, dataset, action)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS archive_write_telemetry (
                   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                   output_name         TEXT NOT NULL,
@@ -351,6 +378,35 @@ class DataNodeDB:
                 """
                 CREATE INDEX IF NOT EXISTS idx_ingestion_ledger_created
                 ON ingestion_ledger(created_at, dataset, output_name, partition_date, status)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS data_quality_checks (
+                  id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+                  dataset                         TEXT NOT NULL,
+                  check_name                      TEXT NOT NULL,
+                  verdict                         TEXT NOT NULL,
+                  status                          TEXT NOT NULL,
+                  source_path                     TEXT,
+                  rows_checked                    INTEGER NOT NULL DEFAULT 0,
+                  partitions_checked              INTEGER NOT NULL DEFAULT 0,
+                  required_columns_missing_json   TEXT,
+                  duplicate_key_count             INTEGER NOT NULL DEFAULT 0,
+                  null_rate_max                   REAL,
+                  timestamp_violation_count       INTEGER NOT NULL DEFAULT 0,
+                  pit_violation_count             INTEGER NOT NULL DEFAULT 0,
+                  readable                        INTEGER NOT NULL DEFAULT 1,
+                  reason                          TEXT,
+                  metadata_json                   TEXT,
+                  created_at                      TIMESTAMP NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_data_quality_checks_created
+                ON data_quality_checks(created_at, dataset, verdict, status)
                 """
             )
         self._validate_schema()

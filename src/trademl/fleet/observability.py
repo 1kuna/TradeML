@@ -38,7 +38,9 @@ def build_fleet_observability(
     )
     archive_schema = _archive_schema_observability(snapshot)
     ingestion_ledger = _ingestion_ledger_observability(snapshot)
+    controller = _controller_observability(snapshot)
     source_availability = _source_availability_observability(data_root=data_root)
+    data_quality = _data_quality_observability(data_root=data_root, snapshot=snapshot)
     compaction = _compaction_observability(data_root=data_root)
     research = _research_observability(snapshot)
     paper_pnl = _paper_pnl_observability(snapshot)
@@ -52,6 +54,8 @@ def build_fleet_observability(
         "resources": resources,
         "archive_schema": archive_schema,
         "ingestion_ledger": ingestion_ledger,
+        "controller": controller,
+        "data_quality": data_quality,
         "source_availability": source_availability,
         "compaction": compaction,
         "research": research,
@@ -78,6 +82,8 @@ def _snapshot_with_remote_pi_observability(snapshot: dict[str, Any], *, remote: 
         "planner_task_summary",
         "budget_summary",
         "ingestion_ledger",
+        "controller_decisions",
+        "data_quality_checks",
     ):
         if node_observability.get(key):
             merged[key] = node_observability[key]
@@ -194,6 +200,35 @@ def collect_observability_issues(payload: dict[str, Any]) -> list[dict[str, Any]
                 "Inspect control/cluster/state/data/compaction/latest.json.",
             )
         )
+    for row in list((payload.get("controller") or {}).get("rows") or []):
+        if (
+            str(row.get("action")) in {"intentional_idle", "budget_blocked", "backoff", "paced", "hold", "scale_up"}
+            and int(row.get("eligible_tasks") or 0) > 0
+            and int(row.get("budget_remaining_minute") or 0) > 0
+            and int(row.get("target_width") or 0) <= 0
+            and str(row.get("action")) != "budget_blocked"
+        ):
+            issues.append(
+                _issue(
+                    "pi",
+                    "warning",
+                    "collection_controller_zero_width",
+                    f"{row.get('vendor')}:{row.get('dataset')} has eligible work but controller target width is zero",
+                    "Inspect controller_decisions and lane-health state.",
+                )
+            )
+    for row in list((payload.get("data_quality") or {}).get("rows") or []):
+        verdict = str(row.get("verdict") or "")
+        if verdict in {"WARNING", "CRITICAL"}:
+            issues.append(
+                _issue(
+                    "data",
+                    "critical" if verdict == "CRITICAL" else "warning",
+                    "data_quality_failure",
+                    f"{row.get('dataset')} quality check is {row.get('status')}: {row.get('reason') or '-'}",
+                    "Inspect control/cluster/state/data/quality/latest.json.",
+                )
+            )
     resources = dict(payload.get("resources") or {})
     if resources.get("nas_status") != "online":
         issues.append(
@@ -579,6 +614,23 @@ def _ingestion_ledger_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _controller_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
+    summary = dict(snapshot.get("controller_decisions") or {})
+    rows = list(summary.get("rows") or [])
+    action_counts: dict[str, int] = {}
+    for row in rows:
+        action = str(row.get("action") or "unknown")
+        action_counts[action] = action_counts.get(action, 0) + int(row.get("count") or 1)
+    return {
+        "window_minutes": summary.get("window_minutes"),
+        "checked_at": summary.get("checked_at"),
+        "rows": rows,
+        "action_counts": action_counts,
+        "scaled_lanes": sum(1 for row in rows if str(row.get("action")) == "scale_up"),
+        "backoff_lanes": sum(1 for row in rows if str(row.get("action")) == "backoff"),
+    }
+
+
 def _source_availability_observability(*, data_root: Path) -> dict[str, Any]:
     path = data_root / "control" / "cluster" / "state" / "data" / "source_availability" / "latest.json"
     payload = _read_json(path)
@@ -590,6 +642,33 @@ def _source_availability_observability(*, data_root: Path) -> dict[str, Any]:
         "generated_at": payload.get("generated_at"),
         "state_counts": dict(payload.get("state_counts") or {}),
         "datasets": dict(payload.get("datasets") or {}),
+    }
+
+
+def _data_quality_observability(*, data_root: Path, snapshot: dict[str, Any]) -> dict[str, Any]:
+    path = data_root / "control" / "cluster" / "state" / "data" / "quality" / "latest.json"
+    payload = _read_json(path)
+    if payload:
+        return {
+            "status": "available",
+            "path": str(path),
+            "generated_at": payload.get("generated_at"),
+            "summary": dict(payload.get("summary") or {}),
+            "rows": list(payload.get("rows") or []),
+        }
+    summary = dict(snapshot.get("data_quality_checks") or {})
+    rows = list(summary.get("rows") or [])
+    return {
+        "status": "sqlite_summary" if rows else "missing",
+        "path": str(path),
+        "window_hours": summary.get("window_hours"),
+        "checked_at": summary.get("checked_at"),
+        "summary": {
+            "critical": sum(1 for row in rows if str(row.get("verdict")) == "CRITICAL"),
+            "warning": sum(1 for row in rows if str(row.get("verdict")) == "WARNING"),
+            "ok": sum(1 for row in rows if str(row.get("verdict")) == "OK"),
+        },
+        "rows": rows,
     }
 
 

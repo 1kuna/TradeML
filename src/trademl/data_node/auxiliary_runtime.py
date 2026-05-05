@@ -35,6 +35,11 @@ from trademl.data_node.capabilities import (
 )
 from trademl.data_node.db import DataNodeDB, PlannerTask
 from trademl.data_node.planner import plan_auxiliary_tasks
+from trademl.data_node.saturation import (
+    LaneControlInput,
+    SaturationControllerV2,
+    local_resource_state,
+)
 from trademl.fleet.cluster import ClusterCoordinator
 from trademl.reference.security_master import (
     build_sec_companyfacts_fundamentals,
@@ -487,6 +492,11 @@ class AuxiliaryRuntime:
     ) -> dict[str, int]:
         widths: dict[str, int] = {}
         _ = canonical_pressure
+        controller = SaturationControllerV2.from_environment()
+        resource_state = local_resource_state(data_root=self.paths.root)
+        per_vendor_budget = self._budget_snapshot_by_vendor()
+        archive_latency = self._archive_latency_by_dataset()
+        rows_per_credit = self._rows_per_credit_by_dataset()
         for job in auxiliary_capabilities(
             connectors=self.connectors,
             audit_state=self.capability_audit_state,
@@ -494,9 +504,54 @@ class AuxiliaryRuntime:
         ):
             if job.task_kind not in task_kinds:
                 continue
-            width = self._adaptive_vendor_lane_width(
-                vendor=job.vendor, base_width=int(job.lane_width or 1)
+            budget = per_vendor_budget.get(job.vendor, {})
+            eligible_tasks = self._eligible_auxiliary_task_count(
+                vendor=job.vendor, dataset=job.dataset
             )
+            decision = controller.decide(
+                LaneControlInput(
+                    vendor=job.vendor,
+                    dataset=job.dataset,
+                    base_width=int(job.lane_width or 1),
+                    eligible_tasks=eligible_tasks,
+                    active_width=0,
+                    rpm=int(budget.get("rpm") or 60),
+                    remaining_minute=int(budget.get("remaining_window_requests") or 60),
+                    remaining_daily=int(budget.get("remaining_daily_units") or 999999),
+                    recent_429s=int(
+                        ((budget.get("telemetry") or {}).get("window_counts") or {}).get(
+                            "remote_rate_limits", 0
+                        )
+                        or 0
+                    ),
+                    p95_latency_ms=archive_latency.get(job.dataset),
+                    rows_per_credit=rows_per_credit.get(job.dataset),
+                ),
+                resource_state=resource_state,
+            )
+            self.db.record_controller_decision(
+                vendor=decision.vendor,
+                dataset=decision.dataset,
+                eligible_tasks=decision.eligible_tasks,
+                target_width=decision.target_width,
+                active_width=decision.active_width,
+                budget_remaining_minute=decision.budget_remaining["minute"],
+                budget_remaining_daily=decision.budget_remaining["daily"],
+                latency_ms=decision.latency_ms,
+                rows_per_credit=decision.rows_per_credit,
+                action=decision.action,
+                reason=decision.reason,
+            )
+            width = decision.target_width
+            if width <= 0 and decision.action == "intentional_idle":
+                # Keep the scheduler's vendor capacity map populated for parity with
+                # the old lane-width contract; actual submission still requires
+                # _auxiliary_vendor_has_eligible_work to pass.
+                width = self._adaptive_vendor_lane_width(
+                    vendor=job.vendor, base_width=int(job.lane_width or 1)
+                )
+            if width <= 0:
+                continue
             widths[job.vendor] = max(widths.get(job.vendor, 0), width)
         if self.db.has_pending_planner_tasks(
             task_families=("events_filings",), datasets=("companyfacts",)
@@ -535,6 +590,77 @@ class AuxiliaryRuntime:
         adaptive = max(1, target_requests // 25)
         cap = 8 if vendor == "alpaca" else 4 if vendor == "tiingo" else 1
         return max(1, min(cap, remaining_window, max(int(base_width), adaptive)))
+
+    def _budget_snapshot_by_vendor(self) -> dict[str, dict[str, object]]:
+        """Return current BudgetManager vendor snapshots for controller inputs."""
+        for connector in self.connectors.values():
+            budget_manager = getattr(connector, "budget_manager", None)
+            if budget_manager is None:
+                continue
+            snapshot = budget_manager.snapshot()
+            vendors = snapshot.get("vendors") if isinstance(snapshot, dict) else {}
+            if isinstance(vendors, dict):
+                return {str(vendor): dict(payload) for vendor, payload in vendors.items() if isinstance(payload, dict)}
+        return {}
+
+    def _eligible_auxiliary_task_count(self, *, vendor: str, dataset: str) -> int:
+        """Return a bounded count of runnable-looking auxiliary tasks for a lane."""
+        now_iso = datetime.now(tz=UTC).isoformat()
+        count = 0
+        tasks = self.db.fetch_planner_tasks(
+            task_families=(
+                "security_master",
+                "corp_actions",
+                "events_filings",
+                "macro",
+                "supplemental_research",
+            ),
+            statuses=("PENDING", "PARTIAL", "FAILED", "LEASED"),
+            vendor=vendor,
+            datasets=(dataset,),
+            limit=512,
+        )
+        for task in tasks:
+            if task.status == "LEASED" and task.lease_expires_at and task.lease_expires_at > now_iso:
+                continue
+            if task.next_eligible_at and task.next_eligible_at > now_iso:
+                continue
+            if _looks_like_entitlement_failure(str(task.last_error or "")):
+                continue
+            lane = self.db.get_vendor_lane_health(vendor=vendor, dataset=dataset)
+            if lane is not None and lane.state == "ENTITLEMENT_BLOCKED":
+                continue
+            if self.db.get_active_vendor_lane_cooldown(vendor=vendor, dataset=dataset) is not None:
+                continue
+            count += 1
+        return count
+
+    def _archive_latency_by_dataset(self) -> dict[str, float]:
+        """Return recent max write duration per output dataset as a p95 proxy."""
+        summary = self.db.summarize_archive_write_telemetry(minutes=60)
+        result: dict[str, float] = {}
+        for row in summary.get("rows") or []:
+            dataset = str(row.get("output_name") or "")
+            if not dataset:
+                continue
+            value = row.get("max_duration_ms") or row.get("avg_duration_ms")
+            if value is None:
+                continue
+            result[dataset] = max(float(result.get(dataset, 0.0)), float(value))
+        return result
+
+    def _rows_per_credit_by_dataset(self) -> dict[str, float]:
+        """Return recent rows written per ingestion event as a rows/credit proxy."""
+        summary = self.db.summarize_ingestion_ledger(minutes=60)
+        result: dict[str, float] = {}
+        for row in summary.get("rows") or []:
+            dataset = str(row.get("dataset") or row.get("output_name") or "")
+            events = int(row.get("events") or 0)
+            if not dataset or events <= 0:
+                continue
+            ratio = float(row.get("rows_written") or row.get("rows_normalized") or 0) / float(events)
+            result[dataset] = max(float(result.get(dataset, 0.0)), ratio)
+        return result
 
     def _vendor_has_canonical_pressure(self, vendor: str) -> bool:
         """Return whether a vendor is currently needed by canonical work."""

@@ -285,6 +285,25 @@ def _apply_collection_runtime_env(config: dict[str, object]) -> None:
     collection = config.get("collection", {}) or {}
     if not isinstance(collection, dict):
         return
+    saturation = collection.get("saturation_controller_v2", {}) or {}
+    if isinstance(saturation, dict):
+        enabled = saturation.get("enabled")
+        if enabled is not None:
+            os.environ.setdefault(
+                "TRADEML_SATURATION_CONTROLLER_V2_ENABLED", str(enabled)
+            )
+        target = saturation.get("target_utilization")
+        if target is not None:
+            os.environ.setdefault(
+                "TRADEML_SATURATION_CONTROLLER_V2_TARGET_UTILIZATION",
+                str(target),
+            )
+        multiplier = saturation.get("global_worker_multiplier")
+        if multiplier is not None:
+            os.environ.setdefault(
+                "TRADEML_SATURATION_CONTROLLER_V2_GLOBAL_WORKER_MULTIPLIER",
+                str(multiplier),
+            )
     watermark = collection.get("storage_watermark", {}) or {}
     if not isinstance(watermark, dict):
         return

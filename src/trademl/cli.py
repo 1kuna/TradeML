@@ -44,8 +44,11 @@ from trademl.dashboard.controller import (
     write_deployed_version,
 )
 from trademl.data_node.compaction import compact_archive_partitions
+from trademl.data_node.db import DataNodeDB
 from trademl.env import load_dotenv
+from trademl.fleet.audit import run_fleet_audit
 from trademl.fleet.autopilot import collect_fleet_health
+from trademl.fleet.data_quality import run_data_quality_audit
 from trademl.fleet.observability import build_fleet_observability, write_fleet_observability
 from trademl.fleet.watchdog import run_fleet_watchdog_once
 from trademl.experiments import (
@@ -83,6 +86,7 @@ from trademl.research import (
     write_research_feature_source_contract,
     write_research_review_packet,
 )
+from trademl.research_audit import run_research_progression_audit
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -174,6 +178,12 @@ def main(argv: list[str] | None = None) -> int:
     node_subparsers.add_parser("repair-status", help="Show current repair lane health.")
     lane_health_parser = node_subparsers.add_parser("lane-health", help="Show current vendor lane health.")
     lane_health_parser.add_argument("--dataset", default="equities_eod")
+    controller_status_parser = node_subparsers.add_parser("controller-status", help="Show recent saturation-controller decisions.")
+    controller_status_parser.add_argument("--minutes", type=int, default=15)
+    controller_status_parser.add_argument("--json", action="store_true")
+    data_quality_parser = node_subparsers.add_parser("data-quality", help="Run and persist data-quality checks for high-value datasets.")
+    data_quality_parser.add_argument("--dataset", action="append", default=None)
+    data_quality_parser.add_argument("--json", action="store_true")
     show_leases_parser = node_subparsers.add_parser("show-leases", help="Show current leased planner work.")
     show_leases_parser.add_argument("--family", default=None, choices=["canonical_bars", "canonical_repair"])
 
@@ -279,6 +289,9 @@ def main(argv: list[str] | None = None) -> int:
     research_review.add_argument("--program-id", required=True)
     research_health_parser = research_subparsers.add_parser("health", help="Show hardened research health.")
     research_health_parser.add_argument("--program-id", required=True)
+    research_audit_parser = research_subparsers.add_parser("audit", help="Write and print the research progression audit.")
+    research_audit_parser.add_argument("--program-id", required=True)
+    research_audit_parser.add_argument("--json", action="store_true")
     research_incumbent = research_subparsers.add_parser("incumbent", help="Show the current research incumbent.")
     research_incumbent.add_argument("--program-id", required=True)
     research_alerts = research_subparsers.add_parser("alerts", help="Show recent research alerts.")
@@ -327,6 +340,16 @@ def main(argv: list[str] | None = None) -> int:
     fleet_watchdog.add_argument("--mac-password-env", default="TRADEML_MAC_PASSWORD")
     fleet_watchdog.add_argument("--heal", action="store_true")
     fleet_watchdog.add_argument("--json", action="store_true")
+    fleet_audit = fleet_subparsers.add_parser("audit", help="Run a full fleet audit and write the Codex curation feed.")
+    fleet_audit.add_argument("--data-root", default=None)
+    fleet_audit.add_argument("--pi-host", default=None)
+    fleet_audit.add_argument("--pi-user", default="zach")
+    fleet_audit.add_argument("--pi-password-env", default="TRADEML_PI_PASSWORD")
+    fleet_audit.add_argument("--mac-host", default=None)
+    fleet_audit.add_argument("--mac-user", default="openclaw")
+    fleet_audit.add_argument("--mac-password-env", default="TRADEML_MAC_PASSWORD")
+    fleet_audit.add_argument("--program-id", default="perpetual-macmini")
+    fleet_audit.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
     if args.command == "dashboard":
@@ -479,6 +502,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.node_command == "lane-health":
         print(json.dumps(lane_health(settings, dataset=args.dataset), indent=2, default=str))
         return 0
+    if args.node_command == "controller-status":
+        payload = DataNodeDB(settings.db_path).summarize_controller_decisions(
+            minutes=int(args.minutes)
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.node_command == "data-quality":
+        payload = run_data_quality_audit(
+            data_root=settings.nas_mount,
+            db=DataNodeDB(settings.db_path),
+            datasets=args.dataset,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
     if args.node_command == "show-leases":
         print(json.dumps(show_leases(settings, family=args.family), indent=2, default=str))
         return 0
@@ -568,6 +605,36 @@ def _dispatch_fleet(args: argparse.Namespace) -> int:
             mac=mac,
             heal=bool(args.heal),
             policy=(config.get("fleet") or {}).get("watchdog") if isinstance(config, dict) else None,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.fleet_command == "audit":
+        snapshot = _collect_fleet_local_snapshot(settings)
+        data_root = Path(args.data_root).expanduser() if args.data_root else settings.nas_mount
+        pi_host = args.pi_host or os.getenv("TRADEML_PI_HOST") or os.getenv("TRADEML_PI_TAILSCALE_HOST")
+        mac_host = args.mac_host or os.getenv("TRADEML_MAC_HOST") or os.getenv("TRADEML_MAC_TAILSCALE_HOST")
+        pi = (
+            {"host": pi_host, "user": os.getenv("TRADEML_PI_USER") or args.pi_user, "password_env": args.pi_password_env}
+            if pi_host
+            else None
+        )
+        mac = (
+            {"host": mac_host, "user": os.getenv("TRADEML_MAC_USER") or args.mac_user, "password_env": args.mac_password_env}
+            if mac_host
+            else None
+        )
+        config = yaml.safe_load(settings.config_path.read_text(encoding="utf-8")) or {}
+        payload = run_fleet_audit(
+            local_snapshot=snapshot,
+            data_root=data_root,
+            repo_root=settings.repo_root,
+            local_state=settings.local_state,
+            targets_config_path=settings.config_path,
+            python_executable=sys.executable,
+            program_id=args.program_id,
+            pi=pi,
+            mac=mac,
+            config=config if isinstance(config, dict) else {},
         )
         print(json.dumps(payload, indent=2, default=str))
         return 0
@@ -936,6 +1003,17 @@ def _dispatch_research(args: argparse.Namespace) -> int:
         return 0
     if args.research_command == "health":
         payload = research_health(
+            program_id=args.program_id,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "audit":
+        payload = run_research_progression_audit(
             program_id=args.program_id,
             local_state=local_state,
             repo_root=repo_root,

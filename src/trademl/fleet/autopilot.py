@@ -268,7 +268,14 @@ def collect_fleet_health(
     bucket = write_codex_issue_bucket(data_root=data_root, issues=issues)
     bucket_issues = list(bucket.get("issues") or read_codex_issue_bucket(data_root=data_root)["issues"])
     current_state = build_current_state_summary(summary_snapshot, issues=bucket_issues)
-    return {"verdict": current_state["verdict"], "current_state": current_state, "remote": remote, "issue_bucket": bucket, "observability": observability}
+    return {
+        "verdict": current_state["verdict"],
+        "current_state": current_state,
+        "current_issues": issues,
+        "remote": remote,
+        "issue_bucket": bucket,
+        "observability": observability,
+    }
 
 
 def _pi_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -296,12 +303,14 @@ def _merge_remote_pi_observability(snapshot: dict[str, Any], *, remote: dict[str
     merged = dict(snapshot)
     for key in (
         "scheduler_decisions",
+        "controller_decisions",
         "archive_write_telemetry",
         "lane_health",
         "vendor_attempts_summary",
         "planner_task_summary",
         "budget_summary",
         "ingestion_ledger",
+        "data_quality_checks",
     ):
         value = pi_observability.get(key)
         if value:
@@ -532,7 +541,7 @@ def _ssh_pi_node_state(target: dict[str, str]) -> dict[str, Any]:
         "version_path = root / 'control' / 'deployed_version.json'\n"
         "db_path = root / 'control' / 'node.sqlite'\n"
         "budget_path = root / 'control' / 'budget_state.json'\n"
-        "required = {'scheduler_decisions', 'archive_write_telemetry', 'planner_tasks', 'vendor_attempts', 'ingestion_ledger'}\n"
+        "required = {'scheduler_decisions', 'controller_decisions', 'archive_write_telemetry', 'planner_tasks', 'vendor_attempts', 'ingestion_ledger', 'data_quality_checks'}\n"
         "version = {}\n"
         "if version_path.exists():\n"
         "    try:\n"
@@ -571,6 +580,20 @@ def _ssh_pi_node_state(target: dict[str, str]) -> dict[str, Any]:
         "                    ORDER BY latest_at DESC\n"
         "                    LIMIT 200\n"
         "                \"\"\")\n"
+        "                controller = rows(conn, \"\"\"\n"
+        "                    SELECT vendor, dataset, action, COUNT(*) AS count,\n"
+        "                           MAX(target_width) AS target_width, MAX(active_width) AS active_width,\n"
+        "                           MAX(eligible_tasks) AS eligible_tasks,\n"
+        "                           MAX(budget_remaining_minute) AS budget_remaining_minute,\n"
+        "                           MAX(budget_remaining_daily) AS budget_remaining_daily,\n"
+        "                           MAX(latency_ms) AS latency_ms, AVG(rows_per_credit) AS rows_per_credit,\n"
+        "                           MAX(reason) AS latest_reason, MAX(created_at) AS latest_at\n"
+        "                    FROM controller_decisions\n"
+        "                    WHERE created_at >= datetime('now', '-15 minutes')\n"
+        "                    GROUP BY vendor, dataset, action\n"
+        "                    ORDER BY latest_at DESC\n"
+        "                    LIMIT 300\n"
+        "                \"\"\")\n"
         "                lanes = rows(conn, \"SELECT vendor, dataset, state, cooldown_until, recent_outbound_requests, recent_success_units, recent_remote_429s, recent_local_budget_blocks, updated_at FROM vendor_lane_health ORDER BY updated_at DESC LIMIT 300\")\n"
         "                attempts = rows(conn, \"\"\"\n"
         "                    SELECT vendor, json_extract(payload_json, '$.dataset') AS dataset, status, COUNT(*) AS count,\n"
@@ -602,13 +625,30 @@ def _ssh_pi_node_state(target: dict[str, str]) -> dict[str, Any]:
         "                    ORDER BY latest_at DESC\n"
         "                    LIMIT 200\n"
         "                \"\"\")\n"
+        "                quality = rows(conn, \"\"\"\n"
+        "                    SELECT dataset, verdict, status, COUNT(*) AS checks,\n"
+        "                           SUM(rows_checked) AS rows_checked,\n"
+        "                           SUM(partitions_checked) AS partitions_checked,\n"
+        "                           SUM(duplicate_key_count) AS duplicate_key_count,\n"
+        "                           SUM(timestamp_violation_count) AS timestamp_violation_count,\n"
+        "                           SUM(pit_violation_count) AS pit_violation_count,\n"
+        "                           MAX(required_columns_missing_json) AS required_columns_missing_json,\n"
+        "                           MAX(reason) AS latest_reason, MAX(created_at) AS latest_at\n"
+        "                    FROM data_quality_checks\n"
+        "                    WHERE created_at >= datetime('now', '-24 hours')\n"
+        "                    GROUP BY dataset, verdict, status\n"
+        "                    ORDER BY latest_at DESC\n"
+        "                    LIMIT 300\n"
+        "                \"\"\")\n"
         "                node_observability = {\n"
         "                    'scheduler_decisions': {'window_minutes': 15, 'rows': scheduler},\n"
+        "                    'controller_decisions': {'window_minutes': 15, 'rows': controller},\n"
         "                    'archive_write_telemetry': {'window_minutes': 60, 'rows': archive},\n"
         "                    'lane_health': {'rows': lanes},\n"
         "                    'vendor_attempts_summary': {'window_minutes': 60, 'rows': attempts},\n"
         "                    'planner_task_summary': {'window_hours': 24, 'rows': tasks},\n"
         "                    'ingestion_ledger': {'window_minutes': 60, 'rows': ingestion},\n"
+        "                    'data_quality_checks': {'window_hours': 24, 'rows': quality},\n"
         "                    'dataset_coverage': {row['output_name']: {'latest_date': row.get('latest_at'), 'rows_60m': row.get('rows_in')} for row in archive if row.get('latest_at')},\n"
         "                }\n"
         "                if budget_path.exists():\n"

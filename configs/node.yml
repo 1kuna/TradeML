@@ -34,6 +34,12 @@ collection:
   saturation:
     enabled: true
     target_utilization: 0.98
+  saturation_controller_v2:
+    enabled: true
+    target_utilization: 0.98
+    global_worker_multiplier: 4
+    idle_issue_after_minutes: 15
+    idle_escalate_after_minutes: 60
   observability:
     enabled: true
     vendor_underutilized_after_minutes: 10
@@ -52,6 +58,18 @@ collection:
       - SCHEMA_MISMATCH
     known_unavailable_sources:
       fundamentals_tiingo: free_plan_empty_source
+  data_quality_policy:
+    enabled: true
+    high_value_datasets:
+      - equities_minute
+      - ticker_news
+      - stock_trades
+      - stock_quotes
+      - sec_filings
+      - sec_companyfacts
+      - fundamentals_daily
+      - equities_ohlcv_adj
+      - macros_fred
   freshness_policy:
     dataset_stale_after_minutes:
       ticker_news: 720
@@ -71,6 +89,20 @@ collection:
   storage_watermark:
     warn_percent: 85
     pause_low_priority_percent: 92
+fleet:
+  codex_feed_policy:
+    enabled: true
+    priority_order:
+      - blocked_collection_capacity
+      - data_quality_failures
+      - research_no_progress
+      - paper_evidence_failures
+      - cleanup_maintenance
+research:
+  progression_audit_policy:
+    enabled: true
+    no_completed_runs_while_runnable_hours: 2
+    stale_paper_smoke_hours: 24
 vendors:
   alpaca:
     rpm: 200

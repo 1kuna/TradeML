@@ -11,6 +11,7 @@ from trademl.fleet.autopilot import (
     read_codex_issue_bucket,
     write_codex_issue_bucket,
 )
+from trademl.fleet.audit import run_fleet_audit
 from trademl.fleet.observability import build_fleet_observability
 from trademl.fleet.watchdog import run_fleet_watchdog_once
 
@@ -86,6 +87,61 @@ def test_codex_issue_bucket_resolves_absent_current_issues(tmp_path: Path) -> No
     assert payload["summary"]["critical_count"] == 0
     assert bucket["issues"][0]["status"] == "resolved"
     assert bucket["issues"][0]["resolved_at"] == "2026-04-28T11:00:00+00:00"
+
+
+def test_fleet_audit_resolves_stale_data_quality_issues_after_current_ok(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "nas"
+    data_root.mkdir()
+    stale_issue = {
+        "source": "data",
+        "severity": "warning",
+        "kind": "data_quality_failure",
+        "message": "stock_trades quality check is source_unavailable: no readable parquet files found at expected source paths",
+        "suggested_codex_action": "inspect",
+    }
+    write_codex_issue_bucket(
+        data_root=data_root,
+        issues=[stale_issue],
+        now=datetime(2026, 4, 28, 10, tzinfo=UTC),
+    )
+
+    monkeypatch.setattr(
+        "trademl.fleet.audit.run_data_quality_audit",
+        lambda **kwargs: {  # noqa: ARG005
+            "rows": [{"dataset": "stock_trades", "verdict": "OK", "status": "ok"}],
+            "summary": {"ok": 1, "warning": 0, "critical": 0, "info": 0},
+        },
+    )
+    monkeypatch.setattr(
+        "trademl.fleet.audit.collect_fleet_health",
+        lambda **kwargs: {  # noqa: ARG005
+            "current_state": {"systems": {}},
+            "current_issues": [],
+            "issue_bucket": {"issues": [stale_issue]},
+            "observability": {"issues": [], "paper_pnl": {}},
+        },
+    )
+    monkeypatch.setattr(
+        "trademl.fleet.audit._safe_research_audit",
+        lambda **kwargs: {"verdict": "OK", "status": "RUNNING", "issues": []},  # noqa: ARG005
+    )
+
+    payload = run_fleet_audit(
+        local_snapshot={},
+        data_root=data_root,
+        repo_root=tmp_path,
+        local_state=tmp_path / "control",
+        targets_config_path=tmp_path / "targets.yml",
+        python_executable="python",
+        now=datetime(2026, 4, 28, 11, tzinfo=UTC),
+    )
+    bucket = read_codex_issue_bucket(data_root=data_root)
+
+    assert bucket["summary"]["open_count"] == 0
+    assert bucket["issues"][0]["status"] == "resolved"
+    assert payload["suggested_codex_actions"] == []
+    assert Path(payload["artifact_path"]).exists()
+    assert Path(payload["codex_feed_path"]).exists()
 
 
 def test_codex_issue_bucket_reports_missing_data_root_without_creating_it(tmp_path: Path) -> None:
@@ -632,10 +688,26 @@ def test_fleet_health_merges_remote_pi_observability_before_building_snapshot(tm
                         "window_minutes": 15,
                         "rows": [{"vendor": "alpaca", "dataset": "stock_trades", "decision": "claimed", "count": 3}],
                     },
+                    "controller_decisions": {
+                        "window_minutes": 15,
+                        "rows": [
+                            {
+                                "vendor": "alpaca",
+                                "dataset": "stock_trades",
+                                "action": "scale_up",
+                                "count": 1,
+                                "target_width": 8,
+                            }
+                        ],
+                    },
                     "lane_health": {"rows": [{"vendor": "alpaca", "dataset": "stock_trades", "state": "HEALTHY"}]},
                     "ingestion_ledger": {
                         "window_minutes": 60,
                         "rows": [{"vendor": "alpaca", "dataset": "stock_trades", "output_name": "alpaca_market_events", "status": "success", "events": 1}],
+                    },
+                    "data_quality_checks": {
+                        "window_hours": 24,
+                        "rows": [{"dataset": "stock_trades", "verdict": "OK", "status": "ok", "checks": 1}],
                     },
                 },
             },
@@ -659,8 +731,10 @@ def test_fleet_health_merges_remote_pi_observability_before_building_snapshot(tm
 
     assert "verdict" in payload
     assert observed["scheduler_decisions"]["rows"][0]["dataset"] == "stock_trades"
+    assert observed["controller_decisions"]["rows"][0]["target_width"] == 8
     assert observed["lane_health"]["rows"][0]["vendor"] == "alpaca"
     assert observed["ingestion_ledger"]["rows"][0]["dataset"] == "stock_trades"
+    assert observed["data_quality_checks"]["rows"][0]["verdict"] == "OK"
 
 
 def test_fleet_watchdog_writes_current_state_and_repeated_issue_alert(tmp_path: Path, monkeypatch) -> None:
