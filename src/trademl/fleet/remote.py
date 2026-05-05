@@ -47,6 +47,7 @@ def run_password_ssh(
             stderr="missing host/user",
             command=[],
         )
+    force_password_auth = bool(password_env and os.environ.get(password_env))
     return run_ssh_command(
         host=host,
         user=user,
@@ -54,7 +55,7 @@ def run_password_ssh(
         port=int(target.get("port") or 22),
         password_env=password_env,
         timeout_seconds=timeout_seconds,
-        force_password_auth=True,
+        force_password_auth=force_password_auth,
         strict_host_key_checking=False,
     )
 
@@ -108,6 +109,13 @@ def run_ssh_command(
             stderr=f"remote command timed out after {timeout_seconds:.1f}s",
             command=ssh,
             timed_out=True,
+        )
+    except FileNotFoundError as exc:
+        return RemoteCommandResult(
+            returncode=127,
+            stdout="",
+            stderr=f"missing remote command dependency: {exc.filename}",
+            command=ssh,
         )
     return RemoteCommandResult(
         returncode=result.returncode,
@@ -163,6 +171,13 @@ def copy_file_to_remote(
             stderr=f"remote copy timed out after {timeout_seconds:.1f}s",
             command=scp,
             timed_out=True,
+        )
+    except FileNotFoundError as exc:
+        return RemoteCommandResult(
+            returncode=127,
+            stdout="",
+            stderr=f"missing remote copy dependency: {exc.filename}",
+            command=scp,
         )
     return RemoteCommandResult(
         returncode=result.returncode,
