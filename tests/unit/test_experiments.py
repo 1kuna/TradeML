@@ -1635,6 +1635,70 @@ def test_stop_experiment_supervisor_stops_active_training_runs(tmp_path: Path, m
     assert stopped[0]["runtime_name"] == "runtime-a"
 
 
+def test_stop_experiment_supervisor_can_requeue_active_runs_for_reload(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    experiment_id = "phase1-baselines"
+    supervisor_path = local_state / "experiment_supervisors" / f"{experiment_id}.json"
+    run_root = local_state / "experiments" / experiment_id / "runs"
+    supervisor_path.parent.mkdir(parents=True, exist_ok=True)
+    run_root.mkdir(parents=True)
+    supervisor_path.write_text(
+        json.dumps(
+            {
+                "pid": 4321,
+                "status": "RUNNING",
+                "active_run_ids": ["run-a"],
+                "stop_requested": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_root / "run-a.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-a",
+                "experiment_id": experiment_id,
+                "phase": 1,
+                "target": "local",
+                "runtime_name": "runtime-a",
+                "status": "RUNNING",
+                "runtime": {"pid": 5151, "status": "running"},
+                "last_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(experiments, "_is_local_process_running", lambda pid: True)
+    monkeypatch.setattr(experiments.os, "kill", lambda pid, signal: None)
+    monkeypatch.setattr(
+        experiments,
+        "stop_training_process",
+        lambda **kwargs: {"stopped": True, "runtime": {"status": "stopped"}},
+    )
+
+    payload = experiments.stop_experiment_supervisor(
+        local_state=local_state,
+        experiment_id=experiment_id,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+        requeue_active=True,
+        restartable=True,
+        stop_reason="reload_requested",
+    )
+
+    manifest = json.loads((run_root / "run-a.json").read_text(encoding="utf-8"))
+    stored_supervisor = json.loads(supervisor_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "STOPPED"
+    assert payload["stop_requested"] is False
+    assert stored_supervisor["stop_requested"] is False
+    assert manifest["status"] == "PLANNED"
+    assert manifest["runtime"] == {}
+    assert manifest["last_error"] is None
+    assert manifest["supervisor_history"][-1]["event"] == "interrupted_for_reload"
+
+
 def _matrix_size(matrix: dict[str, list[object]]) -> int:
     size = 1
     for values in matrix.values():

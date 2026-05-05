@@ -899,6 +899,9 @@ def stop_experiment_supervisor(
     data_root: Path | None = None,
     targets_config_path: Path | None = None,
     python_executable: str = sys.executable,
+    requeue_active: bool = False,
+    restartable: bool = False,
+    stop_reason: str | None = None,
 ) -> dict[str, Any]:
     """Request supervisor shutdown and terminate the local process when present."""
     state = read_experiment_supervisor_state(local_state=local_state, experiment_id=experiment_id)
@@ -906,6 +909,7 @@ def stop_experiment_supervisor(
         raise ValueError(f"no supervisor state for experiment {experiment_id!r}")
     state["stop_requested"] = True
     state["status"] = "STOPPING"
+    state["stop_reason"] = stop_reason or state.get("stop_reason")
     _write_supervisor_state(local_state=local_state, experiment_id=experiment_id, payload=state)
     pid = state.get("pid")
     if isinstance(pid, int):
@@ -919,7 +923,13 @@ def stop_experiment_supervisor(
         data_root=data_root,
         targets_config_path=targets_config_path,
         python_executable=python_executable,
+        requeue=requeue_active,
+        reason=stop_reason or "experiment_supervisor_stopped",
     )
+    if restartable:
+        state["status"] = "STOPPED"
+        state["stop_requested"] = False
+        state["active_run_ids"] = []
     _write_supervisor_state(local_state=local_state, experiment_id=experiment_id, payload=state)
     return state
 
@@ -2530,6 +2540,8 @@ def _stop_active_training_runs(
     data_root: Path | None,
     targets_config_path: Path | None,
     python_executable: str,
+    requeue: bool = False,
+    reason: str = "experiment_supervisor_stopped",
 ) -> list[dict[str, Any]]:
     """Stop active training processes owned by an experiment supervisor."""
     if not run_ids or repo_root is None or data_root is None:
@@ -2552,10 +2564,49 @@ def _stop_active_training_runs(
                 python_executable=python_executable,
                 runtime_name=str(manifest.get("runtime_name") or f"{experiment_id}-{run_id}"),
             )
+            if requeue and bool(result.get("stopped")):
+                _requeue_interrupted_run(
+                    local_state=local_state,
+                    experiment_id=experiment_id,
+                    run_id=run_id,
+                    reason=reason,
+                    stop_result=result,
+                )
             stopped.append({"run_id": run_id, **result})
         except Exception as exc:  # noqa: BLE001
             stopped.append({"run_id": run_id, "stopped": False, "reason": str(exc)})
     return stopped
+
+
+def _requeue_interrupted_run(
+    *,
+    local_state: Path,
+    experiment_id: str,
+    run_id: str,
+    reason: str,
+    stop_result: dict[str, Any],
+) -> None:
+    manifest_path = local_state / "experiments" / experiment_id / "runs" / f"{run_id}.json"
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    _append_supervisor_event(
+        manifest,
+        event="interrupted_for_reload",
+        payload={
+            "reason": reason,
+            "previous_status": manifest.get("status"),
+            "runtime_status": (stop_result.get("runtime") or {}).get("status"),
+        },
+    )
+    manifest["status"] = "PLANNED"
+    manifest["runtime"] = {}
+    manifest["log_tail"] = ""
+    manifest["last_error"] = None
+    manifest["failure_kind"] = None
+    manifest["interrupted_for_reload_at"] = datetime.now(tz=UTC).isoformat()
+    manifest["interrupted_for_reload_reason"] = reason
+    _write_run_manifest(local_state=local_state, experiment_id=experiment_id, manifest=manifest)
 
 
 def _supervisor_state_path(*, local_state: Path, experiment_id: str) -> Path:

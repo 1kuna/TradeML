@@ -97,3 +97,20 @@ def test_unload_launch_agent_bootouts_current_gui_label(monkeypatch) -> None:
 
     assert payload["ok"] is True
     assert calls == [["launchctl", "bootout", "gui/501/com.trademl.research.perpetual"]]
+
+
+def test_kickstart_launch_agent_restarts_current_gui_label(monkeypatch) -> None:
+    monkeypatch.setattr(launchd.os, "uname", lambda: type("Uname", (), {"sysname": "Darwin"})())
+    monkeypatch.setattr(launchd.os, "getuid", lambda: 501)
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(launchd.subprocess, "run", fake_run)
+
+    payload = launchd.kickstart_launch_agent("com.trademl.research.perpetual")
+
+    assert payload["ok"] is True
+    assert calls == [["launchctl", "kickstart", "-k", "gui/501/com.trademl.research.perpetual"]]

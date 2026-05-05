@@ -75,6 +75,7 @@ from trademl.research import (
     read_research_incumbent,
     read_research_program_state,
     research_health,
+    reload_research_program,
     resume_research_program,
     run_and_persist_paper_account_smoke,
     run_feature_version_canary_batch,
@@ -281,6 +282,12 @@ def main(argv: list[str] | None = None) -> int:
     research_pause.add_argument("--program-id", required=True)
     research_resume = research_subparsers.add_parser("resume", help="Resume a research program.")
     research_resume.add_argument("--program-id", required=True)
+    research_reload = research_subparsers.add_parser("reload", help="Reload a research supervisor after code/config updates.")
+    research_reload.add_argument("--program-id", required=True)
+    research_reload.add_argument("--program", default=None)
+    research_reload.add_argument("--label", default=None)
+    research_reload.add_argument("--no-interrupt-active", action="store_true")
+    research_reload.add_argument("--no-requeue-interrupted", action="store_true")
     research_stop = research_subparsers.add_parser("stop", help="Stop a research program.")
     research_stop.add_argument("--program-id", required=True)
     research_frontier = research_subparsers.add_parser("frontier", help="Show the current program frontier summary.")
@@ -968,6 +975,22 @@ def _dispatch_research(args: argparse.Namespace) -> int:
             env_path=env_path,
             targets_config_path=targets_config_path,
             python_executable=sys.executable,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "reload":
+        payload = reload_research_program(
+            program_id=args.program_id,
+            local_state=local_state,
+            repo_root=repo_root,
+            data_root=data_root,
+            env_path=env_path,
+            targets_config_path=targets_config_path,
+            python_executable=sys.executable,
+            program_path=Path(args.program).expanduser() if args.program else None,
+            label=args.label,
+            interrupt_active=not bool(args.no_interrupt_active),
+            requeue_interrupted=not bool(args.no_requeue_interrupted),
         )
         print(json.dumps(payload, indent=2, default=str))
         return 0

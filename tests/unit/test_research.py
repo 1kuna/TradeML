@@ -1051,6 +1051,55 @@ def test_resume_research_program_uses_loaded_launchagent_as_single_owner(tmp_pat
     assert "secret" not in json.dumps(state).lower()
 
 
+def test_reload_research_program_requeues_active_work_and_kickstarts_launchagent(tmp_path: Path, monkeypatch) -> None:
+    program_path = _program_spec(tmp_path)
+    local_state = tmp_path / "local"
+    spec = research._load_research_program_spec(program_path)  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=program_path, poll_seconds=1)  # noqa: SLF001
+    state["pid"] = 1234
+    state["status"] = "RUNNING"
+    state["current_experiment_id"] = "perpetual-macmini-p1-f001"
+    research._write_program_state(local_state=local_state, program_id="perpetual-macmini", payload=state)  # noqa: SLF001
+    stopped: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        research,
+        "read_experiment_supervisor_state",
+        lambda **kwargs: {"status": "RUNNING", "active_run_ids": ["run-a"]},  # noqa: ARG005
+    )
+
+    def fake_stop_experiment_supervisor(**kwargs):  # noqa: ANN001
+        stopped.append(kwargs)
+        return {"status": "STOPPED", "stop_requested": False, "stopped_training_runs": [{"run_id": "run-a", "stopped": True}]}
+
+    monkeypatch.setattr(research, "stop_experiment_supervisor", fake_stop_experiment_supervisor)
+    monkeypatch.setattr(
+        research,
+        "_research_launchd_status",
+        lambda program_id, label=None: {"loaded": True, "state": "running", "pid": 1234, "label": label},  # noqa: ARG005
+    )
+    monkeypatch.setattr(research, "kickstart_launch_agent", lambda label: {"ok": True, "label": label})
+
+    payload = research.reload_research_program(
+        program_id="perpetual-macmini",
+        local_state=local_state,
+        repo_root=tmp_path / "repo",
+        data_root=tmp_path / "nas",
+        env_path=tmp_path / ".env",
+        targets_config_path=tmp_path / "targets.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert payload["status"] == "RELOADING"
+    assert payload["action"]["mode"] == "launchd_kickstart"
+    assert payload["action"]["kickstart"]["ok"] is True
+    assert stopped[0]["requeue_active"] is True
+    assert stopped[0]["restartable"] is True
+    persisted = research.read_research_program_state(local_state=local_state, program_id="perpetual-macmini")
+    assert persisted["reload"]["experiment_reload"]["stopped_training_runs"][0]["run_id"] == "run-a"
+    assert persisted["stop_requested"] is False
+    assert persisted["paused"] is False
+
+
 def test_refresh_last_canary_status_uses_summary_when_stale_running(tmp_path: Path) -> None:
     local_state = tmp_path / "local"
     program_id = "perpetual-macmini"

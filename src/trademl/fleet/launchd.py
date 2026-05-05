@@ -142,6 +142,21 @@ def unload_launch_agent(label: str) -> dict[str, Any]:
     }
 
 
+def kickstart_launch_agent(label: str) -> dict[str, Any]:
+    """Restart a loaded LaunchAgent by label for the current GUI user."""
+    if os.uname().sysname != "Darwin":
+        return {"ok": False, "label": label, "reason": "launchd is only supported on macOS"}
+    target = f"gui/{os.getuid()}/{label}"
+    result = subprocess.run(["launchctl", "kickstart", "-k", target], capture_output=True, text=True, check=False)
+    return {
+        "ok": result.returncode == 0,
+        "label": label,
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
 def launch_agent_status(label: str) -> dict[str, Any]:
     """Return launchd status for one LaunchAgent label."""
     if os.uname().sysname != "Darwin":

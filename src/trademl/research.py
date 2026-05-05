@@ -28,12 +28,13 @@ from trademl.experiments import (
     _supervision_policy,
     compare_experiment,
     latest_experiment_summary,
+    pause_experiment_supervisor,
     propose_next_experiment_family,
     read_experiment_supervisor_state,
     stop_experiment_supervisor,
     supervise_experiment,
 )
-from trademl.fleet.launchd import launch_agent_status
+from trademl.fleet.launchd import kickstart_launch_agent, launch_agent_status
 from trademl.data_node.training_control import (
     _resolve_default_report_date,
     resolve_training_target,
@@ -1800,9 +1801,9 @@ def list_research_alerts(*, local_state: Path, program_id: str, limit: int = 20)
     }
 
 
-def _research_launchd_status(program_id: str) -> dict[str, Any]:
+def _research_launchd_status(program_id: str, label: str | None = None) -> dict[str, Any]:
     """Return launchd status for the conventional research LaunchAgent label."""
-    status = dict(launch_agent_status(f"com.trademl.research.{program_id}"))
+    status = dict(launch_agent_status(label or f"com.trademl.research.{program_id}"))
     status.pop("stdout", None)
     status.pop("stderr", None)
     return status
@@ -1956,6 +1957,128 @@ def resume_research_program(
         poll_seconds=int(state.get("poll_seconds") or 30),
         detach=True,
     )
+
+
+def reload_research_program(
+    *,
+    program_id: str,
+    local_state: Path,
+    repo_root: Path,
+    data_root: Path,
+    env_path: Path,
+    targets_config_path: Path,
+    python_executable: str,
+    program_path: Path | None = None,
+    label: str | None = None,
+    interrupt_active: bool = True,
+    requeue_interrupted: bool = True,
+) -> dict[str, Any]:
+    """Interrupt short active work, requeue it, and reload the LaunchAgent-owned supervisor."""
+    state = read_research_program_state(local_state=local_state, program_id=program_id)
+    if not state:
+        raise ValueError(f"no research program state for {program_id!r}")
+    program_path_value = program_path or state.get("spec_path")
+    if not program_path_value:
+        raise ValueError("research reload requires a program path in state or --program")
+    resolved_program_path = Path(str(program_path_value)).expanduser()
+    now = datetime.now(tz=UTC).isoformat()
+    reload_record: dict[str, Any] = {
+        "requested_at": now,
+        "program_id": program_id,
+        "reason": "code_reload",
+        "interrupt_active": bool(interrupt_active),
+        "requeue_interrupted": bool(requeue_interrupted),
+    }
+    state["status"] = "RELOADING"
+    state["paused"] = False
+    state["stop_requested"] = False
+    state["reload"] = reload_record
+    _write_program_state(local_state=local_state, program_id=program_id, payload=state)
+
+    experiment_reload: dict[str, Any] = {}
+    active_experiment = str(state.get("current_experiment_id") or "")
+    if active_experiment:
+        supervisor = read_experiment_supervisor_state(local_state=local_state, experiment_id=active_experiment)
+        if supervisor and str(supervisor.get("status") or "").upper() not in {"COMPLETED", "STOPPED"}:
+            if interrupt_active:
+                experiment_reload = stop_experiment_supervisor(
+                    local_state=local_state,
+                    experiment_id=active_experiment,
+                    repo_root=repo_root,
+                    data_root=data_root,
+                    targets_config_path=targets_config_path,
+                    python_executable=python_executable,
+                    requeue_active=requeue_interrupted,
+                    restartable=True,
+                    stop_reason="reload_requested",
+                )
+            else:
+                experiment_reload = pause_experiment_supervisor(local_state=local_state, experiment_id=active_experiment)
+
+    resolved_label = label or f"com.trademl.research.{program_id}"
+    launchd = _research_launchd_status(program_id, label=resolved_label)
+    action: dict[str, Any]
+    if bool(launchd.get("loaded")):
+        action = {
+            "mode": "launchd_kickstart",
+            "launchd_before": launchd,
+            "kickstart": kickstart_launch_agent(resolved_label),
+        }
+    else:
+        pid = state.get("pid")
+        killed_pid = None
+        if isinstance(pid, int) and _is_local_process_running(pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGTERM)
+                killed_pid = pid
+        action = {
+            "mode": "detached_restart",
+            "killed_pid": killed_pid,
+            "spawned": start_research_program(
+                program_path=resolved_program_path,
+                repo_root=repo_root,
+                data_root=data_root,
+                local_state=local_state,
+                env_path=env_path,
+                targets_config_path=targets_config_path,
+                python_executable=python_executable,
+                poll_seconds=int(state.get("poll_seconds") or 30),
+                detach=True,
+            ),
+        }
+
+    latest = read_research_program_state(local_state=local_state, program_id=program_id)
+    latest["reload"] = {
+        **reload_record,
+        "completed_at": datetime.now(tz=UTC).isoformat(),
+        "active_experiment_id": active_experiment or None,
+        "experiment_reload": experiment_reload,
+        "action": action,
+    }
+    latest["paused"] = False
+    latest["stop_requested"] = False
+    if not bool(launchd.get("loaded")):
+        latest["status"] = "RUNNING"
+    _write_program_state(local_state=local_state, program_id=program_id, payload=latest)
+    record_research_progression_event(
+        data_root=data_root,
+        program_id=program_id,
+        event="supervisor_reload_requested",
+        payload={
+            "active_experiment_id": active_experiment or None,
+            "interrupt_active": bool(interrupt_active),
+            "requeue_interrupted": bool(requeue_interrupted),
+            "action": action.get("mode"),
+        },
+    )
+    return {
+        "program_id": program_id,
+        "status": "RELOADING" if bool(launchd.get("loaded")) else "RUNNING",
+        "active_experiment_id": active_experiment or None,
+        "experiment_reload": experiment_reload,
+        "action": action,
+        "state": latest,
+    }
 
 
 def steer_research_program(
