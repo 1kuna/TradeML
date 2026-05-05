@@ -25,10 +25,16 @@ DEFAULT_LABEL_HORIZONS = (1, 5, 20)
 FEATURE_SOURCE_CONTRACT_VERSION = "feature_source_contract_v1"
 SOURCE_REQUIRED_COLUMNS = {
     "ticker_news": ("symbol_or_symbols", "published_at_or_vendor_ts"),
-    "equities_minute": ("symbol", "timestamp", "open", "high", "low", "close"),
+    "equities_minute": ("symbol", "timestamp_or_vendor_ts", "open", "high", "low", "close"),
     "sec_filings": ("form", "symbol_or_cik", "accepted_at_or_acceptanceDateTime_or_filingDate"),
     "fundamentals_tiingo": ("symbol",),
     "equities_ohlcv_adj": ("date", "symbol", "close"),
+}
+SOURCE_ROOT_DATASET_PATHS = {
+    "sec_filings": ("data/reference/sec_filings.parquet", "data/reference/sec_filing_index.parquet"),
+    "fundamentals_tiingo": ("data/reference/fundamentals_tiingo.parquet", "data/reference/fundamentals_daily.parquet"),
+    "ticker_news": ("data/raw/ticker_news",),
+    "equities_minute": ("data/raw/equities_minute",),
 }
 
 
@@ -368,7 +374,28 @@ def _merge_feature_group(features: pd.DataFrame, group: pd.DataFrame) -> pd.Data
     return merged
 
 
-def _feature_source_contract(data_root: Path) -> dict[str, list[Path]]:
+def write_feature_source_contract(
+    *,
+    data_root: Path,
+    source_root: Path | None = None,
+    dataset_paths: dict[str, Iterable[Path | str]] | None = None,
+) -> dict[str, Any]:
+    """Write an explicit feature source contract for modeling source adapters."""
+    existing = _read_configured_feature_source_paths(data_root=data_root)
+    overrides: dict[str, list[Path]] = {dataset: list(paths) for dataset, paths in existing.items()}
+    if source_root is not None:
+        root = source_root.expanduser()
+        for dataset, rel_paths in SOURCE_ROOT_DATASET_PATHS.items():
+            overrides[dataset] = [root / rel_path for rel_path in rel_paths]
+    for dataset, paths in dict(dataset_paths or {}).items():
+        overrides[str(dataset)] = [
+            path.expanduser() if isinstance(path, Path) else Path(str(path)).expanduser()
+            for path in paths
+        ]
+    return _write_feature_source_contract(data_root=data_root, configured_paths=overrides)
+
+
+def _read_configured_feature_source_paths(*, data_root: Path) -> dict[str, list[Path]]:
     contract_path = _source_contract_path(data_root=data_root)
     configured: dict[str, list[Path]] = {}
     if contract_path.exists():
@@ -378,6 +405,11 @@ def _feature_source_contract(data_root: Path) -> dict[str, list[Path]]:
                 raw_paths = paths.get("paths") if isinstance(paths, dict) else paths
                 if isinstance(raw_paths, list):
                     configured[str(dataset)] = [Path(str(path)) if Path(str(path)).is_absolute() else data_root / str(path) for path in raw_paths]
+    return configured
+
+
+def _feature_source_contract(data_root: Path, configured_paths: dict[str, list[Path]] | None = None) -> dict[str, list[Path]]:
+    configured = configured_paths if configured_paths is not None else _read_configured_feature_source_paths(data_root=data_root)
     defaults = {
         "sec_filings": [
             data_root / "data" / "reference" / "sec_filings.parquet",
@@ -404,7 +436,12 @@ def _feature_source_contract(data_root: Path) -> dict[str, list[Path]]:
     return merged
 
 
-def _configured_feature_source_paths(data_root: Path) -> dict[str, set[str]]:
+def _configured_feature_source_paths(
+    data_root: Path,
+    configured_paths: dict[str, list[Path]] | None = None,
+) -> dict[str, set[str]]:
+    if configured_paths is not None:
+        return {dataset: {str(path) for path in paths} for dataset, paths in configured_paths.items()}
     contract_path = _source_contract_path(data_root=data_root)
     configured: dict[str, set[str]] = {}
     if not contract_path.exists():
@@ -422,17 +459,26 @@ def _configured_feature_source_paths(data_root: Path) -> dict[str, set[str]]:
     return configured
 
 
-def _load_feature_source_frame(*, data_root: Path, dataset: str) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+def _load_feature_source_frame(
+    *,
+    data_root: Path,
+    dataset: str,
+    start_date: pd.Timestamp | str | None = None,
+    end_date: pd.Timestamp | str | None = None,
+    columns: Iterable[str] | None = None,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     sources = []
     frames = []
+    requested_columns = [str(column) for column in columns or []]
     for root in _feature_source_contract(data_root).get(dataset, []):
-        files = _source_files(root)
+        files = _source_files(root, start_date=start_date, end_date=end_date)
         rows = 0
         columns: list[str] = []
         latest_partition: str | None = None
         for path in files:
             try:
-                frame = pd.read_parquet(path)
+                read_columns = _readable_parquet_columns(path=path, requested=requested_columns)
+                frame = pd.read_parquet(path, columns=read_columns or None)
             except Exception:  # noqa: BLE001
                 continue
             if frame.empty:
@@ -441,7 +487,7 @@ def _load_feature_source_frame(*, data_root: Path, dataset: str) -> tuple[pd.Dat
                 frames.append(frame)
                 rows += int(len(frame))
                 columns = sorted(set(columns).union(str(column) for column in frame.columns))
-            partition = path.parent.name.partition("=")[2] if path.parent.name.startswith("date=") else None
+            partition = _partition_date_value(path)
             latest_partition = max([value for value in (latest_partition, partition) if value], default=latest_partition)
         sources.append(
             {
@@ -459,15 +505,45 @@ def _load_feature_source_frame(*, data_root: Path, dataset: str) -> tuple[pd.Dat
     return pd.concat(frames, ignore_index=True), sources
 
 
-def _source_files(root: Path) -> list[Path]:
+def _source_files(
+    root: Path,
+    start_date: pd.Timestamp | str | None = None,
+    end_date: pd.Timestamp | str | None = None,
+) -> list[Path]:
     if root.is_file():
         return [root]
     if not root.exists():
         return []
+    start = pd.Timestamp(start_date).strftime("%Y-%m-%d") if start_date is not None else None
+    end = pd.Timestamp(end_date).strftime("%Y-%m-%d") if end_date is not None else None
     files = sorted(root.glob("date=*/data.parquet"))
+    if start or end:
+        files = [
+            path
+            for path in files
+            if (
+                (partition := _partition_date_value(path)) is not None
+                and (start is None or partition >= start)
+                and (end is None or partition <= end)
+            )
+        ]
     if files:
         return files
     return sorted(root.glob("*.parquet"))
+
+
+def _partition_date_value(path: Path) -> str | None:
+    return path.parent.name.partition("=")[2] if path.parent.name.startswith("date=") else None
+
+
+def _readable_parquet_columns(*, path: Path, requested: list[str]) -> list[str]:
+    if not requested:
+        return []
+    try:
+        names = set(pq.ParquetFile(path).schema.names)
+    except Exception:  # noqa: BLE001
+        return []
+    return [column for column in requested if column in names]
 
 
 def _source_readiness_for_group(*, data_root: Path, group: str) -> dict[str, Any]:
@@ -477,10 +553,15 @@ def _source_readiness_for_group(*, data_root: Path, group: str) -> dict[str, Any
     }
 
 
-def _source_summary(*, data_root: Path, dataset: str) -> dict[str, Any]:
+def _source_summary(
+    *,
+    data_root: Path,
+    dataset: str,
+    configured_paths: dict[str, list[Path]] | None = None,
+) -> dict[str, Any]:
     sources = []
-    configured = _configured_feature_source_paths(data_root).get(dataset, set())
-    for root in _feature_source_contract(data_root).get(dataset, []):
+    configured = _configured_feature_source_paths(data_root, configured_paths=configured_paths).get(dataset, set())
+    for root in _feature_source_contract(data_root, configured_paths=configured_paths).get(dataset, []):
         files = _source_files(root)
         rows = 0
         columns: set[str] = set()
@@ -553,6 +634,11 @@ def _missing_required_source_columns(*, dataset: str, columns: set[str]) -> list
         if not ({"accepted_at", "acceptanceDateTime", "filing_date", "filingDate"} & columns):
             missing.append("accepted_at_or_acceptanceDateTime_or_filingDate")
         return missing
+    if dataset == "equities_minute":
+        missing = sorted({"symbol", "open", "high", "low", "close"}.difference(columns))
+        if not ({"timestamp", "vendor_ts"} & columns):
+            missing.append("timestamp_or_vendor_ts")
+        return missing
     return sorted(set(SOURCE_REQUIRED_COLUMNS.get(dataset, ())).difference(columns))
 
 
@@ -618,13 +704,13 @@ def _metadata_feature_readiness(*, metadata: dict[str, Any], feature_version: st
     return {"ok": True, "status": "UNKNOWN", "reason": "feature readiness metadata is unavailable"}
 
 
-def _write_feature_source_contract(*, data_root: Path) -> dict[str, Any]:
+def _write_feature_source_contract(*, data_root: Path, configured_paths: dict[str, list[Path]] | None = None) -> dict[str, Any]:
     datasets = {
         dataset: {
             "paths": [str(path.relative_to(data_root)) if path.is_relative_to(data_root) else str(path) for path in paths],
-            "summary": _source_summary(data_root=data_root, dataset=dataset),
+            "summary": _source_summary(data_root=data_root, dataset=dataset, configured_paths=configured_paths),
         }
-        for dataset, paths in _feature_source_contract(data_root).items()
+        for dataset, paths in _feature_source_contract(data_root, configured_paths=configured_paths).items()
     }
     payload = {
         "version": FEATURE_SOURCE_CONTRACT_VERSION,
@@ -788,7 +874,15 @@ def _sec_filing_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
 
 
 def _news_event_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
-    frame, _sources = _load_feature_source_frame(data_root=data_root, dataset="ticker_news")
+    modeling_dates = sorted(pd.to_datetime(dates).dropna().unique())
+    if not modeling_dates:
+        return pd.DataFrame()
+    frame, _sources = _load_feature_source_frame(
+        data_root=data_root,
+        dataset="ticker_news",
+        end_date=pd.Timestamp(modeling_dates[-1]),
+        columns=["symbol", "symbols", "published_at", "vendor_ts", "source", "vendor", "source_name", "headline", "title"],
+    )
     if frame.empty:
         return pd.DataFrame()
     ts_col = "published_at" if "published_at" in frame.columns else "vendor_ts" if "vendor_ts" in frame.columns else None
@@ -802,33 +896,49 @@ def _news_event_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
         return pd.DataFrame()
     frame["symbol"] = frame["symbol"].astype(str)
     frame = frame.dropna(subset=["available_at"])
+    frame = frame.sort_values(["symbol", "available_at"]).reset_index(drop=True)
     source_col = "source" if "source" in frame.columns else "vendor" if "vendor" in frame.columns else None
+    vendor_col = "vendor" if "vendor" in frame.columns else "source_name" if "source_name" in frame.columns else source_col
+    headline_col = "headline" if "headline" in frame.columns else "title" if "title" in frame.columns else None
     rows: list[dict[str, Any]] = []
-    for date_value in sorted(pd.to_datetime(dates).dropna().unique()):
-        current = pd.Timestamp(date_value)
-        eligible = frame[frame["available_at"] <= current]
-        if eligible.empty:
-            continue
-        for symbol, group in eligible.groupby("symbol"):
-            last_age = (current - group["available_at"].max()).days
-            recent_1d = group[group["available_at"] >= current - pd.Timedelta(days=1)]
-            recent_7d = group[group["available_at"] >= current - pd.Timedelta(days=7)]
-            prior_30d = group[(group["available_at"] < current - pd.Timedelta(days=7)) & (group["available_at"] >= current - pd.Timedelta(days=37))]
-            source_count = recent_7d[source_col].nunique() if source_col else 0
-            vendor_col = "vendor" if "vendor" in group.columns else "source_name" if "source_name" in group.columns else source_col
-            vendor_count = recent_7d[vendor_col].nunique() if vendor_col else 0
-            baseline = max(float(len(prior_30d)) / 30.0 * 7.0, 1.0)
-            headline_col = "headline" if "headline" in group.columns else "title" if "title" in group.columns else None
-            novelty = float(recent_7d[headline_col].astype(str).nunique()) / max(1.0, float(len(recent_7d))) if headline_col and not recent_7d.empty else 0.0
+    date_values = np.array([np.datetime64(pd.Timestamp(date_value), "ns") for date_value in modeling_dates])
+    one_day = np.timedelta64(1, "D")
+    seven_days = np.timedelta64(7, "D")
+    thirty_seven_days = np.timedelta64(37, "D")
+    for symbol, group in frame.groupby("symbol", sort=True):
+        times = np.array(pd.to_datetime(group["available_at"]).to_numpy(dtype="datetime64[ns]"))
+        sources = group[source_col].astype(str).to_numpy() if source_col else None
+        vendors = group[vendor_col].astype(str).to_numpy() if vendor_col else None
+        headlines = group[headline_col].astype(str).to_numpy() if headline_col else None
+        for current_np in date_values:
+            end = int(np.searchsorted(times, current_np, side="right"))
+            if end <= 0:
+                continue
+            start_1d = int(np.searchsorted(times, current_np - one_day, side="left"))
+            start_7d = int(np.searchsorted(times, current_np - seven_days, side="left"))
+            start_37d = int(np.searchsorted(times, current_np - thirty_seven_days, side="left"))
+            recent_1d_count = end - start_1d
+            recent_7d_count = end - start_7d
+            prior_30d_count = max(start_7d - start_37d, 0)
+            source_count = len(set(sources[start_7d:end])) if sources is not None and recent_7d_count > 0 else 0
+            vendor_count = len(set(vendors[start_7d:end])) if vendors is not None and recent_7d_count > 0 else 0
+            baseline = max(float(prior_30d_count) / 30.0 * 7.0, 1.0)
+            novelty = (
+                float(len(set(headlines[start_7d:end]))) / max(1.0, float(recent_7d_count))
+                if headlines is not None and recent_7d_count > 0
+                else 0.0
+            )
+            current = pd.Timestamp(current_np)
+            last_age = (current - pd.Timestamp(times[end - 1])).days
             rows.append(
                 {
                     "date": current,
                     "symbol": str(symbol),
-                    "news_count_1d": float(len(recent_1d)),
-                    "news_count_7d": float(len(recent_7d)),
+                    "news_count_1d": float(recent_1d_count),
+                    "news_count_7d": float(recent_7d_count),
                     "news_source_count_7d": float(source_count),
                     "news_vendor_count_7d": float(vendor_count),
-                    "news_abnormal_volume_7d": float(len(recent_7d)) / baseline,
+                    "news_abnormal_volume_7d": float(recent_7d_count) / baseline,
                     "news_novelty_proxy_7d": novelty,
                     "news_days_since_last": float(max(last_age, 0)),
                 }
@@ -837,14 +947,26 @@ def _news_event_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
 
 
 def _minute_daily_features(*, data_root: Path, panel: pd.DataFrame) -> pd.DataFrame:
-    frame, _sources = _load_feature_source_frame(data_root=data_root, dataset="equities_minute")
+    calendar = sorted(pd.to_datetime(panel["date"]).dropna().unique())
+    if not calendar:
+        return pd.DataFrame()
+    frame, _sources = _load_feature_source_frame(
+        data_root=data_root,
+        dataset="equities_minute",
+        start_date=pd.Timestamp(calendar[0]) - pd.Timedelta(days=7),
+        end_date=pd.Timestamp(calendar[-1]),
+        columns=["symbol", "timestamp", "vendor_ts", "open", "high", "low", "close", "volume"],
+    )
     if frame.empty:
         return pd.DataFrame()
-    required = {"symbol", "timestamp", "open", "high", "low", "close"}
+    timestamp_col = "timestamp" if "timestamp" in frame.columns else "vendor_ts" if "vendor_ts" in frame.columns else None
+    required = {"symbol", "open", "high", "low", "close"}
     if not required.issubset(frame.columns):
         return pd.DataFrame()
+    if timestamp_col is None:
+        return pd.DataFrame()
     frame = frame.copy()
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True)
+    frame["timestamp"] = pd.to_datetime(frame[timestamp_col], errors="coerce", utc=True)
     frame = frame.dropna(subset=["timestamp"])
     frame["source_date"] = frame["timestamp"].dt.tz_convert(None).dt.normalize()
     rows: list[dict[str, Any]] = []
@@ -878,7 +1000,6 @@ def _minute_daily_features(*, data_root: Path, panel: pd.DataFrame) -> pd.DataFr
         / minute.groupby("symbol")["minute_volume_sum"].transform(lambda series: series.rolling(20, min_periods=1).mean()).replace(0.0, pd.NA)
     ).fillna(0.0)
     minute["minute_close_imbalance_proxy"] = minute["minute_last_30m_return"] * minute["minute_volume_ratio"]
-    calendar = sorted(pd.to_datetime(panel["date"]).dropna().unique())
     next_dates = {pd.Timestamp(calendar[idx - 1]): pd.Timestamp(calendar[idx]) for idx in range(1, len(calendar))}
     minute["date"] = minute["source_date"].map(next_dates)
     minute = minute.dropna(subset=["date"]).drop(columns=["source_date"])

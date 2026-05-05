@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from trademl.features.equities import build_features
-from trademl.modeling import build_modeling_artifacts, feature_label_preflight, load_modeling_dataset
+from trademl.modeling import build_modeling_artifacts, feature_label_preflight, load_modeling_dataset, write_feature_source_contract
 from trademl.modeling.factory import _feature_groups_for
 
 
@@ -275,6 +275,43 @@ def test_feature_source_contract_paths_override_defaults(tmp_path) -> None:
     assert payload["feature_readiness"]["ok"] is True
 
 
+def test_feature_source_contract_source_root_maps_external_pi_archives(tmp_path) -> None:
+    data_root = tmp_path / "mac_state"
+    source_root = tmp_path / "nas_share"
+    panel = _panel().loc[lambda frame: frame["date"] <= pd.Timestamp("2020-02-14")].copy()
+    for date_value, day_frame in panel.groupby(panel["date"].dt.strftime("%Y-%m-%d")):
+        partition = data_root / "data" / "curated" / "equities_ohlcv_adj" / f"date={date_value}"
+        partition.mkdir(parents=True)
+        day_frame.to_parquet(partition / "data.parquet", index=False)
+    news_partition = source_root / "data" / "raw" / "ticker_news" / "date=2020-01-20"
+    news_partition.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "symbol": ["AAPL"],
+            "published_at": ["2020-01-20T15:00:00Z"],
+            "source": ["alpaca"],
+            "headline": ["external contract root"],
+        }
+    ).to_parquet(news_partition / "data.parquet", index=False)
+
+    contract = write_feature_source_contract(data_root=data_root, source_root=source_root)
+    assert str(source_root / "data" / "raw" / "ticker_news") in contract["datasets"]["ticker_news"]["paths"]
+
+    payload = build_modeling_artifacts(
+        data_root=data_root,
+        feature_config=_feature_config(),
+        feature_set="daily_price_liquidity_v1",
+        feature_version="news_event_aggregates_v1",
+        label_horizons=[1, 5],
+    )
+
+    source = payload["feature_group_metadata"]["news_events"]["sources"]["ticker_news"]
+    assert source["status"] == "available"
+    assert source["sources"][0]["source_status"] == "contract"
+    assert source["sources"][0]["rows"] == 1
+    assert payload["feature_readiness"]["ok"] is True
+
+
 def test_feature_source_contract_reports_missing_required_columns(tmp_path) -> None:
     data_root = tmp_path / "nas"
     panel = _panel().loc[lambda frame: frame["date"] <= pd.Timestamp("2020-02-14")].copy()
@@ -301,6 +338,49 @@ def test_feature_source_contract_reports_missing_required_columns(tmp_path) -> N
     assert source["status"] == "invalid_schema"
     assert {"open", "high", "low"}.issubset(set(source["missing_required_columns"]))
     assert payload["feature_readiness"]["ok"] is False
+
+
+def test_minute_feature_source_accepts_vendor_ts_archive_schema(tmp_path) -> None:
+    data_root = tmp_path / "nas"
+    panel = _panel().loc[lambda frame: frame["date"] <= pd.Timestamp("2020-02-14")].copy()
+    for date_value, day_frame in panel.groupby(panel["date"].dt.strftime("%Y-%m-%d")):
+        partition = data_root / "data" / "curated" / "equities_ohlcv_adj" / f"date={date_value}"
+        partition.mkdir(parents=True)
+        day_frame.to_parquet(partition / "data.parquet", index=False)
+    minute_partition = data_root / "data" / "raw" / "equities_minute" / "date=2020-01-21"
+    minute_partition.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "vendor_ts": ["2020-01-21T14:30:00Z", "2020-01-21T15:00:00Z"],
+            "open": [100.0, 100.5],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [1000, 1500],
+        }
+    ).to_parquet(minute_partition / "data.parquet", index=False)
+
+    payload = build_modeling_artifacts(
+        data_root=data_root,
+        feature_config=_feature_config(),
+        feature_set="daily_price_liquidity_v1",
+        feature_version="minute_daily_aggregates_v1",
+        label_horizons=[1, 5],
+    )
+
+    source = payload["feature_group_metadata"]["minute_daily"]["sources"]["equities_minute"]
+    assert source["status"] == "available"
+    assert source["missing_required_columns"] == []
+    assert payload["feature_readiness"]["ok"] is True
+    frame = load_modeling_dataset(
+        data_root=data_root,
+        feature_version="minute_daily_aggregates_v1",
+        label_version="universe_relative_forward_return_v1",
+        label_horizon=1,
+    )[0]
+    assert "minute_intraday_return" in frame.columns
+    assert frame["minute_intraday_return"].max() > 0
 
 
 def test_modeling_feature_factory_reads_live_sec_schema_and_empty_fundamentals(tmp_path) -> None:

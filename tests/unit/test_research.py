@@ -2157,6 +2157,59 @@ def test_research_health_reports_active_run_modeling_metadata(tmp_path: Path, mo
     assert payload["feature_family_leaderboard"]["entries"][0]["top_rejection_reason"] == "not all yearly IC positive"
 
 
+def test_research_health_reconciles_stale_feature_preflight_from_latest_registry(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    data_root = tmp_path / "nas"
+    program_path = _program_spec(tmp_path)
+    state = research._initial_program_state(  # noqa: SLF001
+        spec=research._load_research_program_spec(program_path),  # noqa: SLF001
+        program_path=program_path,
+        poll_seconds=30,
+    )
+    state["last_infra_preflight"] = {
+        "ok": False,
+        "status": "INFRA_BLOCKED",
+        "reason": "news_events has no usable source-backed feature coverage",
+        "dependencies": {"ok": True},
+        "feature_label": {
+            "ok": False,
+            "feature_version": "multi_source_daily_v1",
+            "reason": "news_events has no usable source-backed feature coverage",
+        },
+    }
+    research._write_program_state(local_state=local_state, program_id="perpetual-macmini", payload=state)  # noqa: SLF001
+
+    monkeypatch.setattr(research, "sweep_stale_experiment_runs", lambda **kwargs: {"checked": 0, "reconciled": 0})
+    monkeypatch.setattr(research, "evaluate_research_drift", lambda **kwargs: [])
+    monkeypatch.setattr(research, "launch_agent_status", lambda label: {"loaded": True, "state": "running", "pid": 42, "label": label})
+    monkeypatch.setattr(
+        research,
+        "modeling_artifact_metadata",
+        lambda **kwargs: {
+            "feature_version": "multi_source_daily_v1",
+            "feature_set": "daily_price_liquidity_v1",
+            "label_version": "universe_relative_forward_return_v1",
+            "label_horizons": [1, 5, 20],
+            "data_revision": "abc123",
+            "feature_readiness": {"ok": True, "status": "READY", "reason": ""},
+        },
+    )
+
+    payload = research.research_health(
+        program_id="perpetual-macmini",
+        local_state=local_state,
+        repo_root=tmp_path / "repo",
+        data_root=data_root,
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert payload["infra_blocker"]["ok"] is True
+    assert payload["infra_blocker"]["status"] == "OK"
+    assert payload["feature_label_readiness"]["ok"] is True
+    assert payload["feature_label_readiness"]["source"] == "latest_modeling_registry"
+
+
 def test_update_research_incumbent_promotes_only_fully_gated_candidate(tmp_path: Path) -> None:
     local_state = tmp_path / "local"
     data_root = tmp_path / "nas"

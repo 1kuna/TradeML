@@ -7,6 +7,7 @@ from trademl.modeling.factory import (
     feature_label_preflight,
     load_modeling_dataset,
     modeling_artifact_metadata,
+    write_feature_source_contract,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "feature_label_preflight",
     "load_modeling_dataset",
     "modeling_artifact_metadata",
+    "write_feature_source_contract",
 ]

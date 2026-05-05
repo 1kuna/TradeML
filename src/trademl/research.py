@@ -46,6 +46,7 @@ from trademl.modeling import (
     build_modeling_artifacts,
     feature_label_preflight,
     modeling_artifact_metadata,
+    write_feature_source_contract,
 )
 from trademl.portfolio.build import build_portfolio
 from trademl.research_architecture import (
@@ -1172,6 +1173,7 @@ def research_health(
     latest_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=current_experiment_id) if current_experiment_id else {}
     active_run = _active_experiment_run_summary(latest_summary)
     modeling_metadata = modeling_artifact_metadata(data_root=data_root)
+    current_infra_preflight = _current_infra_preflight(state=state, modeling_metadata=modeling_metadata)
     feature_leaderboard = read_feature_family_leaderboard(data_root=data_root)
     alerts = evaluate_research_drift(
         program_id=program_id,
@@ -1223,7 +1225,7 @@ def research_health(
                 if isinstance(entry, dict)
             ],
         },
-        "infra_blocker": state.get("last_infra_preflight", {}),
+        "infra_blocker": current_infra_preflight,
         "launchd": _research_launchd_status(program_id),
         "frontier_architecture": _frontier_architecture_status(spec=spec, state=state, frontier=dict(state.get("frontier") or {}), experiment_summary=latest_summary) if spec else {},
         "architecture_lane": state.get("architecture_lane"),
@@ -1233,20 +1235,49 @@ def research_health(
         "next_lane": state.get("next_lane") or (state.get("frontier") or {}).get("next_lane"),
         "sentinel_delta": state.get("sentinel_delta") or (state.get("frontier") or {}).get("sentinel_delta"),
         "autonomous_progression": state.get("autonomous_progression", {}),
-        "dependency_preflight": (state.get("last_infra_preflight") or {}).get("dependencies", {}),
-        "feature_label_readiness": (state.get("last_infra_preflight") or {}).get("feature_label", {}),
+        "dependency_preflight": current_infra_preflight.get("dependencies", {}),
+        "feature_label_readiness": current_infra_preflight.get("feature_label", {}),
         "modeling": {
             "feature_version": modeling_metadata.get("feature_version"),
             "feature_set": modeling_metadata.get("feature_set"),
             "label_version": modeling_metadata.get("label_version"),
             "label_horizons": modeling_metadata.get("label_horizons"),
             "data_revision": modeling_metadata.get("data_revision"),
+            "feature_readiness": modeling_metadata.get("feature_readiness", {}),
             "current_label_horizon": latest_summary.get("label_horizon") or active_run.get("label_horizon"),
             "current_feature_version": latest_summary.get("feature_version") or active_run.get("feature_version"),
             "current_portfolio_profile": latest_summary.get("portfolio_profile") or active_run.get("portfolio_profile"),
         },
         "paths": _research_path_summary(local_state=local_state, data_root=data_root),
     }
+
+
+def _current_infra_preflight(*, state: dict[str, Any], modeling_metadata: dict[str, Any]) -> dict[str, Any]:
+    """Return infra preflight with stale feature-readiness blockers reconciled."""
+    infra = dict(state.get("last_infra_preflight") or {})
+    feature_label = dict(infra.get("feature_label") or {})
+    readiness = dict(modeling_metadata.get("feature_readiness") or {})
+    if not feature_label or bool(feature_label.get("ok", False)) or not bool(readiness.get("ok", False)):
+        return infra
+    feature_version = str(feature_label.get("feature_version") or modeling_metadata.get("feature_version") or "")
+    reconciled = {
+        **feature_label,
+        "ok": True,
+        "status": "READY",
+        "reason": None,
+        "feature_version": feature_version,
+        "label_version": modeling_metadata.get("label_version"),
+        "source": "latest_modeling_registry",
+        "feature_readiness": readiness,
+    }
+    infra["feature_label"] = reconciled
+    dependencies = dict(infra.get("dependencies") or {})
+    if bool(dependencies.get("ok", True)):
+        infra["ok"] = True
+        infra["status"] = "OK"
+        if infra.get("reason") == feature_label.get("reason"):
+            infra["reason"] = None
+    return infra
 
 
 def _active_experiment_run_summary(summary: dict[str, Any]) -> dict[str, Any]:
@@ -1286,6 +1317,20 @@ def build_research_features(
         label_version=str(modeling.get("label_version") or DEFAULT_LABEL_VERSION),
         label_horizons=[int(item) for item in list(modeling.get("label_horizons") or [1, 5, 20])],
         report_date=report_date,
+    )
+
+
+def write_research_feature_source_contract(
+    *,
+    data_root: Path,
+    source_root: Path | None = None,
+    dataset_paths: dict[str, list[Path | str]] | None = None,
+) -> dict[str, Any]:
+    """Write the research feature source contract used by modeling adapters."""
+    return write_feature_source_contract(
+        data_root=data_root,
+        source_root=source_root,
+        dataset_paths=dataset_paths,
     )
 
 

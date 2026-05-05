@@ -79,6 +79,7 @@ from trademl.research import (
     steer_research_program,
     stop_research_program,
     submit_paper_orders,
+    write_research_feature_source_contract,
     write_research_review_packet,
 )
 
@@ -225,6 +226,15 @@ def main(argv: list[str] | None = None) -> int:
     research_build_features.add_argument("--program", default="configs/research/perpetual_macmini.yml")
     research_build_features.add_argument("--feature-version", default=None)
     research_build_features.add_argument("--report-date", default=None)
+    research_source_contract = research_subparsers.add_parser("source-contract", help="Write feature source contract paths.")
+    research_source_contract.add_argument("--source-root", default=None)
+    research_source_contract.add_argument(
+        "--dataset-path",
+        action="append",
+        default=None,
+        metavar="DATASET=PATH",
+        help="Override one dataset source path; repeat for multiple paths/datasets.",
+    )
     research_feature_canary = research_subparsers.add_parser("feature-canary", help="Build and canary configured modeling feature versions.")
     research_feature_canary.add_argument("--program", default="configs/research/perpetual_macmini.yml")
     research_feature_canary.add_argument("--poll-seconds", type=int, default=None)
@@ -788,6 +798,20 @@ def _dispatch_research(args: argparse.Namespace) -> int:
             data_root=data_root,
             feature_version=args.feature_version,
             report_date=args.report_date,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "source-contract":
+        dataset_paths: dict[str, list[Path | str]] = {}
+        for raw_item in list(args.dataset_path or []):
+            if "=" not in str(raw_item):
+                raise SystemExit(f"--dataset-path must be DATASET=PATH, got {raw_item!r}")
+            dataset, raw_path = str(raw_item).split("=", 1)
+            dataset_paths.setdefault(dataset, []).append(Path(raw_path).expanduser())
+        payload = write_research_feature_source_contract(
+            data_root=data_root,
+            source_root=Path(args.source_root).expanduser() if args.source_root else None,
+            dataset_paths=dataset_paths or None,
         )
         print(json.dumps(payload, indent=2, default=str))
         return 0
