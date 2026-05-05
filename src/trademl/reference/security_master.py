@@ -15,6 +15,43 @@ import pyarrow.parquet as pq
 from trademl.reference.universe import build_time_varying_universe
 
 
+SEC_COMPANYFACTS_FUNDAMENTAL_CONCEPTS: frozenset[str] = frozenset(
+    {
+        "AccountsPayableCurrent",
+        "AccountsReceivableNetCurrent",
+        "Assets",
+        "AssetsCurrent",
+        "CashAndCashEquivalentsAtCarryingValue",
+        "CommonStockSharesOutstanding",
+        "CostOfRevenue",
+        "EarningsPerShareBasic",
+        "EarningsPerShareDiluted",
+        "GrossProfit",
+        "InventoryNet",
+        "Liabilities",
+        "LiabilitiesAndStockholdersEquity",
+        "LiabilitiesCurrent",
+        "LongTermDebt",
+        "NetCashProvidedByUsedInFinancingActivities",
+        "NetCashProvidedByUsedInInvestingActivities",
+        "NetCashProvidedByUsedInOperatingActivities",
+        "NetIncomeLoss",
+        "OperatingIncomeLoss",
+        "OperatingLeaseLiability",
+        "PropertyPlantAndEquipmentNet",
+        "ResearchAndDevelopmentExpense",
+        "RetainedEarningsAccumulatedDeficit",
+        "Revenue",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "Revenues",
+        "SellingGeneralAndAdministrativeExpense",
+        "StockholdersEquity",
+        "WeightedAverageNumberOfDilutedSharesOutstanding",
+        "WeightedAverageNumberOfSharesOutstandingBasic",
+    }
+)
+
+
 def build_listing_history(
     *,
     listings: pd.DataFrame,
@@ -425,11 +462,13 @@ def build_sec_companyfacts_fundamentals(
     companyfacts_index: pd.DataFrame,
     sec_company_tickers: pd.DataFrame | None = None,
     reference_root: Path | None = None,
+    concept_allowlist: set[str] | frozenset[str] | None = SEC_COMPANYFACTS_FUNDAMENTAL_CONCEPTS,
 ) -> pd.DataFrame:
     """Normalize streamed SEC companyfacts payloads into PIT-safe long-form fundamentals."""
     if companyfacts_index.empty:
         return pd.DataFrame(columns=_fundamentals_daily_columns())
     ticker_by_cik = _ticker_by_cik(sec_company_tickers)
+    allowed_concepts = {str(value) for value in concept_allowlist} if concept_allowlist is not None else None
     rows: list[dict[str, object]] = []
     for item in companyfacts_index.to_dict("records"):
         path = _resolve_companyfacts_path(item, reference_root=reference_root)
@@ -455,6 +494,9 @@ def build_sec_companyfacts_fundamentals(
             for concept, concept_payload in sorted(
                 namespace_payload.items(), key=lambda pair: str(pair[0])
             ):
+                concept_name = str(concept)
+                if allowed_concepts is not None and concept_name not in allowed_concepts:
+                    continue
                 units = concept_payload.get("units") if isinstance(concept_payload, dict) else {}
                 if not isinstance(units, dict):
                     continue
@@ -480,7 +522,7 @@ def build_sec_companyfacts_fundamentals(
                             {
                                 "symbol": symbol,
                                 "metric_date": metric_date.normalize(),
-                                "metric_name": f"{namespace}:{concept}:{unit}",
+                                "metric_name": f"{namespace}:{concept_name}:{unit}",
                                 "metric_value": str(value),
                                 "source": "sec_edgar_companyfacts",
                                 "last_verified": last_verified,

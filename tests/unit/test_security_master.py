@@ -89,6 +89,18 @@ def test_build_sec_companyfacts_fundamentals_normalizes_gzip_payload(tmp_path: P
                             }
                         ]
                     }
+                },
+                "HighlySpecificDisclosureTextBlock": {
+                    "units": {
+                        "text": [
+                            {
+                                "end": "2024-09-28",
+                                "filed": "2024-11-01",
+                                "val": "huge raw disclosure that belongs in the gzip archive only",
+                                "form": "10-K",
+                            }
+                        ]
+                    }
                 }
             }
         },
