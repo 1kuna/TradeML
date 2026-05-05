@@ -650,7 +650,7 @@ def _ssh_mac_research_status(target: dict[str, str]) -> dict[str, Any]:
     command = (
         f"cd {repo} && .venv/bin/python -m trademl.cli research "
         f"--data-root {data_root} --local-state {local_state} --env-file {env_file} "
-        f"status --program-id {program_id}"
+        f"health --program-id {program_id}"
     )
     result = _ssh_result_dict(_run_password_ssh(target, command))
     if result.get("returncode") != 0:
@@ -664,6 +664,12 @@ def _ssh_mac_research_status(target: dict[str, str]) -> dict[str, Any]:
         "status",
         "wait_reason",
         "current_experiment_id",
+        "completed_runs_24h",
+        "completed_runs_7d",
+        "failed_runs_24h",
+        "infra_blocked_runs_24h",
+        "top_rejection_reasons",
+        "research_throughput",
         "latest_paper_outputs",
         "latest_shadow_paper_outputs",
         "latest_paper_pnl",

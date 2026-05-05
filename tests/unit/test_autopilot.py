@@ -133,12 +133,22 @@ def test_observability_uses_remote_mac_research_when_local_summary_missing(tmp_p
     payload = build_fleet_observability(
         snapshot={
             "runtime": {"running": True},
+            "health": {
+                "research_program_summary": {
+                    "status": "UNKNOWN",
+                    "current_experiment_id": "stale-local",
+                    "completed_runs_24h": 0,
+                    "completed_runs_7d": 0,
+                }
+            },
             "fleet_remote": {
                 "mac": {
                     "status": "online",
                     "research": {
                         "status": "RUNNING",
                         "current_experiment_id": "perpetual-macmini-p1-f188",
+                        "completed_runs_24h": 12,
+                        "completed_runs_7d": 42,
                         "wait_reason": None,
                         "latest_paper_account_smoke": {
                             "status": "ok",
@@ -169,6 +179,8 @@ def test_observability_uses_remote_mac_research_when_local_summary_missing(tmp_p
     assert payload["research"]["status"] == "RUNNING"
     assert payload["research"]["current_experiment_id"] == "perpetual-macmini-p1-f188"
     assert payload["research"]["supervisor_running"] is True
+    assert payload["research"]["completed_runs_24h"] == 12
+    assert payload["research"]["completed_runs_7d"] == 42
     assert payload["research"]["paper_account_smoke"]["status"] == "ok"
     assert payload["research"]["feature_family_leaderboard"]["entries"][0]["feature_version"] == "news_event_aggregates_v1"
     assert payload["paper_pnl"]["status"] == "available"
@@ -209,8 +221,10 @@ def test_fleet_health_records_remote_failures_without_healing_active_services(tm
 def test_fleet_health_uses_remote_mac_status_when_local_program_state_is_absent(tmp_path: Path, monkeypatch) -> None:
     data_root = tmp_path / "nas"
     data_root.mkdir()
+    calls: list[str] = []
 
     def fake_ssh(target, command):  # noqa: ANN001
+        calls.append(command)
         if "research --data-root" in command:
             return {
                 "returncode": 0,
@@ -219,6 +233,11 @@ def test_fleet_health_uses_remote_mac_status_when_local_program_state_is_absent(
                         "status": "RUNNING",
                         "program_id": "perpetual-macmini",
                         "current_experiment_id": "exp-remote",
+                        "completed_runs_24h": 7,
+                        "completed_runs_7d": 21,
+                        "failed_runs_24h": 1,
+                        "infra_blocked_runs_24h": 1,
+                        "top_rejection_reasons": [{"reason": "not all yearly IC values are positive", "count": 3}],
                         "latest_paper_account_smoke": {"status": "ok", "read_only": True},
                     }
                 ),
@@ -234,10 +253,16 @@ def test_fleet_health_uses_remote_mac_status_when_local_program_state_is_absent(
         mac={"host": "mac", "user": "openclaw", "password_env": "MAC_PASS"},
     )
 
+    assert any("health --program-id" in call for call in calls)
     assert payload["current_state"]["mac"]["status"] == "online"
     assert payload["current_state"]["mac"]["headline"] == "Research running"
     assert payload["current_state"]["mac"]["detail"] == "exp-remote"
     assert payload["observability"]["research"]["paper_account_smoke"]["status"] == "ok"
+    assert payload["observability"]["research"]["completed_runs_24h"] == 7
+    assert payload["observability"]["research"]["completed_runs_7d"] == 21
+    assert payload["observability"]["research"]["failed_runs_24h"] == 1
+    assert payload["observability"]["research"]["infra_blocked_runs_24h"] == 1
+    assert payload["observability"]["research"]["top_rejection_reasons"][0]["count"] == 3
 
 
 def test_current_state_distinguishes_running_research_without_promotable_candidate() -> None:

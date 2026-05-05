@@ -1172,6 +1172,7 @@ def research_health(
     )
     latest_summary = _read_experiment_summary_direct(local_state=local_state, experiment_id=current_experiment_id) if current_experiment_id else {}
     active_run = _active_experiment_run_summary(latest_summary)
+    throughput = _research_throughput_summary(local_state=local_state)
     modeling_metadata = modeling_artifact_metadata(data_root=data_root)
     current_infra_preflight = _current_infra_preflight(state=state, modeling_metadata=modeling_metadata)
     feature_leaderboard = read_feature_family_leaderboard(data_root=data_root)
@@ -1187,6 +1188,12 @@ def research_health(
         "status": state.get("status"),
         "wait_reason": state.get("wait_reason"),
         "current_experiment_id": current_experiment_id,
+        "completed_runs_24h": throughput["completed_runs_24h"],
+        "completed_runs_7d": throughput["completed_runs_7d"],
+        "failed_runs_24h": throughput["failed_runs_24h"],
+        "infra_blocked_runs_24h": throughput["infra_blocked_runs_24h"],
+        "top_rejection_reasons": throughput["top_rejection_reasons"],
+        "research_throughput": throughput,
         "stale_run_sweep": sweep,
         "incumbent": incumbent,
         "alerts": alerts,
@@ -1249,7 +1256,109 @@ def research_health(
             "current_portfolio_profile": latest_summary.get("portfolio_profile") or active_run.get("portfolio_profile"),
         },
         "paths": _research_path_summary(local_state=local_state, data_root=data_root),
+}
+
+
+def _research_throughput_summary(*, local_state: Path, now: datetime | None = None) -> dict[str, Any]:
+    """Summarize recently finished research run manifests for operator health."""
+    resolved_now = now or datetime.now(tz=UTC)
+    cutoff_24h = resolved_now - timedelta(hours=24)
+    cutoff_7d = resolved_now - timedelta(days=7)
+    completed_24h = 0
+    completed_7d = 0
+    failed_24h = 0
+    infra_blocked_24h = 0
+    rejection_reasons: dict[str, int] = {}
+    latest_finished_at: str | None = None
+
+    runs_root = local_state / "experiments"
+    for path in runs_root.glob("*/runs/*.json"):
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        finished_at = _research_run_finished_at(manifest=manifest, path=path)
+        if finished_at is None:
+            continue
+        if latest_finished_at is None or finished_at.isoformat() > latest_finished_at:
+            latest_finished_at = finished_at.isoformat()
+        status = str(manifest.get("status") or "").upper()
+        if status == "COMPLETED":
+            if finished_at >= cutoff_7d:
+                completed_7d += 1
+            if finished_at >= cutoff_24h:
+                completed_24h += 1
+                reason = _research_rejection_reason(manifest)
+                if reason:
+                    rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+        elif status in {"FAILED", "INFRA_BLOCKED", "PERMANENT_FAILED"} and finished_at >= cutoff_24h:
+            failed_24h += 1
+            failure_kind = str(manifest.get("failure_kind") or manifest.get("last_error_kind") or "")
+            if status == "INFRA_BLOCKED" or failure_kind.upper() in {"INFRA", "INFRA_BLOCKED"}:
+                infra_blocked_24h += 1
+
+    top_rejection_reasons = [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(rejection_reasons.items(), key=lambda item: (-item[1], item[0]))[:5]
+    ]
+    return {
+        "completed_runs_24h": completed_24h,
+        "completed_runs_7d": completed_7d,
+        "failed_runs_24h": failed_24h,
+        "infra_blocked_runs_24h": infra_blocked_24h,
+        "top_rejection_reasons": top_rejection_reasons,
+        "latest_finished_at": latest_finished_at,
     }
+
+
+def _research_run_finished_at(*, manifest: dict[str, Any], path: Path) -> datetime | None:
+    runtime = dict(manifest.get("runtime") or {})
+    raw = (
+        runtime.get("finished_at")
+        or manifest.get("finished_at")
+        or manifest.get("completed_at")
+        or manifest.get("updated_at")
+    )
+    if raw:
+        parsed = _parse_utc_datetime(str(raw))
+        if parsed is not None:
+            return parsed
+    status = str(manifest.get("status") or "").upper()
+    if status in {"COMPLETED", "FAILED", "INFRA_BLOCKED", "PERMANENT_FAILED"}:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    return None
+
+
+def _parse_utc_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _research_rejection_reason(manifest: dict[str, Any]) -> str | None:
+    objective = dict(manifest.get("objective_verdict") or {})
+    grouped = dict(objective.get("gate_failures_by_objective") or manifest.get("gate_failures_by_objective") or {})
+    if grouped:
+        parts = []
+        for key in sorted(grouped):
+            values = [str(item) for item in list(grouped.get(key) or []) if item]
+            if values:
+                parts.append(f"{key}: {', '.join(values[:3])}")
+        if parts:
+            return "; ".join(parts)
+    failures = [str(item) for item in list(manifest.get("gate_failures") or []) if item]
+    if failures:
+        return "; ".join(failures[:5])
+    assessment = dict(manifest.get("assessment") or {})
+    reason = assessment.get("reason")
+    if reason:
+        return str(reason)
+    stage = str(manifest.get("evaluation_stage") or "")
+    return stage if stage and stage != "PLANNED" else None
 
 
 def _current_infra_preflight(*, state: dict[str, Any], modeling_metadata: dict[str, Any]) -> dict[str, Any]:

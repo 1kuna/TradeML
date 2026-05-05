@@ -505,8 +505,8 @@ def _archive_schema_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
 def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     remote_research = dict(((snapshot.get("fleet_remote") or {}).get("mac") or {}).get("research") or {})
     program = {
-        **remote_research,
         **dict((snapshot.get("health") or {}).get("research_program_summary") or {}),
+        **remote_research,
     }
     experiment = dict(snapshot.get("experiment_summary") or {})
     best = dict(program.get("best_candidate_summary") or {})
@@ -553,8 +553,8 @@ def _research_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
 def _paper_pnl_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
     remote_research = dict(((snapshot.get("fleet_remote") or {}).get("mac") or {}).get("research") or {})
     program = {
-        **remote_research,
         **dict((snapshot.get("health") or {}).get("research_program_summary") or {}),
+        **remote_research,
     }
     paper = dict(program.get("latest_paper_outputs") or program.get("paper_outputs") or {})
     shadow = dict(program.get("latest_shadow_paper_outputs") or {})

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2155,6 +2155,77 @@ def test_research_health_reports_active_run_modeling_metadata(tmp_path: Path, mo
     assert payload["modeling"]["current_portfolio_profile"] == "cost_aware_long_only_v1"
     assert payload["feature_family_leaderboard"]["best_feature_version"] == "multi_source_daily_v1"
     assert payload["feature_family_leaderboard"]["entries"][0]["top_rejection_reason"] == "not all yearly IC positive"
+
+
+def test_research_health_counts_recent_run_throughput(tmp_path: Path, monkeypatch) -> None:
+    local_state = tmp_path / "local"
+    data_root = tmp_path / "nas"
+    program_path = _program_spec(tmp_path)
+    state = research._initial_program_state(  # noqa: SLF001
+        spec=research._load_research_program_spec(program_path),  # noqa: SLF001
+        program_path=program_path,
+        poll_seconds=30,
+    )
+    state["current_experiment_id"] = "exp-a"
+    research._write_program_state(local_state=local_state, program_id="perpetual-macmini", payload=state)  # noqa: SLF001
+    summary_path = local_state / "experiments" / "exp-a" / "summary.json"
+    summary_path.parent.mkdir(parents=True)
+    summary_path.write_text(json.dumps({"experiment_id": "exp-a", "runs": []}), encoding="utf-8")
+    runs_root = local_state / "experiments" / "exp-a" / "runs"
+    runs_root.mkdir(parents=True)
+    now = datetime.now(tz=UTC)
+    recent_completed = {
+        "run_id": "run-a",
+        "status": "COMPLETED",
+        "runtime": {"finished_at": (now - timedelta(hours=2)).isoformat()},
+        "objective_verdict": {
+            "gate_failures_by_objective": {
+                "stability": ["not all yearly IC values are positive"],
+                "leakage": ["future_news_leak_sentinel_ic>0.1"],
+            }
+        },
+    }
+    old_completed = {
+        "run_id": "run-old",
+        "status": "COMPLETED",
+        "runtime": {"finished_at": (now - timedelta(days=2)).isoformat()},
+        "assessment": {"reason": "old rejection"},
+    }
+    failed = {
+        "run_id": "run-failed",
+        "status": "FAILED",
+        "failure_kind": "INFRA_BLOCKED",
+        "runtime": {"finished_at": (now - timedelta(hours=1)).isoformat()},
+    }
+    for payload in [recent_completed, old_completed, failed]:
+        (runs_root / f"{payload['run_id']}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(research, "sweep_stale_experiment_runs", lambda **kwargs: {"checked": 0, "reconciled": 0})
+    monkeypatch.setattr(research, "evaluate_research_drift", lambda **kwargs: [])
+    monkeypatch.setattr(research, "launch_agent_status", lambda label: {"loaded": True, "state": "running", "pid": 42, "label": label})
+    monkeypatch.setattr(research, "modeling_artifact_metadata", lambda **kwargs: {})
+    monkeypatch.setattr(research, "read_feature_family_leaderboard", lambda **kwargs: {})
+
+    payload = research.research_health(
+        program_id="perpetual-macmini",
+        local_state=local_state,
+        repo_root=tmp_path / "repo",
+        data_root=data_root,
+        targets_config_path=tmp_path / "repo" / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert payload["completed_runs_24h"] == 1
+    assert payload["completed_runs_7d"] == 2
+    assert payload["failed_runs_24h"] == 1
+    assert payload["infra_blocked_runs_24h"] == 1
+    assert payload["research_throughput"]["latest_finished_at"]
+    assert payload["top_rejection_reasons"] == [
+        {
+            "count": 1,
+            "reason": "leakage: future_news_leak_sentinel_ic>0.1; stability: not all yearly IC values are positive",
+        }
+    ]
 
 
 def test_research_health_reconciles_stale_feature_preflight_from_latest_registry(tmp_path: Path, monkeypatch) -> None:
