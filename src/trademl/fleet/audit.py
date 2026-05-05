@@ -66,8 +66,9 @@ def run_fleet_audit(
         config=config or {},
     )
     bucket = write_codex_issue_bucket(data_root=data_root, issues=issues, now=current)
+    open_bucket_issues = _open_issues(list(bucket.get("issues") or issues))
     codex_feed = build_codex_feed(
-        issues=list(bucket.get("issues") or issues),
+        issues=open_bucket_issues,
         data_quality=data_quality,
         research=research,
         observability=observability,
@@ -81,7 +82,7 @@ def run_fleet_audit(
     payload = {
         "version": "fleet_audit_v1",
         "generated_at": current.isoformat(),
-        "verdict": _verdict_for_issues([issue for issue in list(bucket.get("issues") or issues) if str(issue.get("status") or "open") == "open"]),
+        "verdict": _verdict_for_issues(open_bucket_issues),
         "systems": systems,
         "collection": {
             "saturation": observability.get("collection_saturation") or {},
@@ -91,7 +92,7 @@ def run_fleet_audit(
         "data_quality": data_quality,
         "research_intelligence": research,
         "paper": paper,
-        "issues": list(bucket.get("issues") or issues),
+        "issues": open_bucket_issues,
         "suggested_codex_actions": codex_feed.get("ranked_actions") or [],
         "codex_feed": codex_feed,
         "artifact_path": str(audit_latest),
@@ -99,6 +100,11 @@ def run_fleet_audit(
     }
     write_fleet_audit(data_root=data_root, payload=payload, now=current)
     return payload
+
+
+def _open_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only current unresolved issues from an issue-bucket read."""
+    return [issue for issue in issues if str(issue.get("status") or "open") == "open"]
 
 
 def build_codex_feed(

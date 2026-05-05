@@ -139,6 +139,8 @@ def test_fleet_audit_resolves_stale_data_quality_issues_after_current_ok(tmp_pat
 
     assert bucket["summary"]["open_count"] == 0
     assert bucket["issues"][0]["status"] == "resolved"
+    assert payload["issues"] == []
+    assert payload["verdict"] == "OK"
     assert payload["suggested_codex_actions"] == []
     assert Path(payload["artifact_path"]).exists()
     assert Path(payload["codex_feed_path"]).exists()
