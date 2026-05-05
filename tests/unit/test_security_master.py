@@ -10,6 +10,7 @@ from trademl.reference.security_master import (
     build_sec_companyfacts_fundamentals,
     build_ticker_changes,
     rebuild_derived_references,
+    write_sec_companyfacts_fundamentals,
 )
 
 
@@ -115,6 +116,61 @@ def test_build_sec_companyfacts_fundamentals_normalizes_gzip_payload(tmp_path: P
         }
     ]
     assert fundamentals.iloc[0]["last_verified"] == pd.Timestamp("2024-11-02")
+
+
+def test_write_sec_companyfacts_fundamentals_streams_chunks(tmp_path: Path) -> None:
+    reference_root = tmp_path / "reference"
+    reference_root.mkdir()
+    index_rows = []
+    for cik, symbol, value in [("320193", "AAPL", 100), ("789019", "MSFT", 200)]:
+        normalized = str(cik).zfill(10)
+        facts_path = reference_root / "sec_companyfacts" / f"cik={normalized}" / "companyfacts.json.gz"
+        facts_path.parent.mkdir(parents=True)
+        payload = {
+            "cik": normalized,
+            "facts": {
+                "us-gaap": {
+                    "Assets": {
+                        "units": {
+                            "USD": [
+                                {
+                                    "end": "2024-12-31",
+                                    "filed": "2025-02-01",
+                                    "val": value,
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+        }
+        import gzip
+        import json
+
+        with gzip.open(facts_path, "wt", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        index_rows.append(
+            {
+                "cik": normalized,
+                "facts_relative_path": str(facts_path.relative_to(reference_root)),
+                "captured_at": "2025-02-02",
+            }
+        )
+    pd.DataFrame(index_rows).to_parquet(reference_root / "sec_companyfacts.parquet", index=False)
+    pd.DataFrame(
+        [
+            {"cik_str": "320193", "ticker": "AAPL"},
+            {"cik_str": "789019", "ticker": "MSFT"},
+        ]
+    ).to_parquet(reference_root / "sec_company_tickers.parquet", index=False)
+
+    result = write_sec_companyfacts_fundamentals(reference_root=reference_root, chunk_size=1)
+
+    output = pd.read_parquet(reference_root / "fundamentals_daily.parquet")
+    assert result["rows"] == 2
+    assert result["chunks"] == 2
+    assert output["symbol"].tolist() == ["AAPL", "MSFT"]
+    assert output["metric_value"].tolist() == ["100", "200"]
 
 
 def test_rebuild_derived_references_writes_listing_and_ticker_change_outputs(tmp_path: Path) -> None:

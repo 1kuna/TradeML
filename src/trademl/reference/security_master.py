@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from trademl.reference.universe import build_time_varying_universe
 
@@ -494,6 +496,68 @@ def build_sec_companyfacts_fundamentals(
         keep="last",
     )
     return frame.sort_values(["metric_date", "symbol", "metric_name"]).reset_index(drop=True)
+
+
+def write_sec_companyfacts_fundamentals(
+    *,
+    reference_root: Path,
+    output: Path | None = None,
+    chunk_size: int = 25,
+) -> dict[str, object]:
+    """Write SEC companyfacts fundamentals with bounded per-chunk memory."""
+    index_path = reference_root / "sec_companyfacts.parquet"
+    ticker_path = reference_root / "sec_company_tickers.parquet"
+    output_path = output or reference_root / "fundamentals_daily.parquet"
+    companyfacts_index = _read_optional_parquet(index_path)
+    sec_company_tickers = _read_optional_parquet(ticker_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    writer: pq.ParquetWriter | None = None
+    rows = 0
+    chunks = 0
+    try:
+        if companyfacts_index.empty:
+            empty = pd.DataFrame(columns=_fundamentals_daily_columns())
+            empty.to_parquet(tmp_path, index=False)
+        else:
+            step = max(1, int(chunk_size))
+            for start in range(0, len(companyfacts_index), step):
+                chunk = companyfacts_index.iloc[start : start + step].copy()
+                frame = build_sec_companyfacts_fundamentals(
+                    companyfacts_index=chunk,
+                    sec_company_tickers=sec_company_tickers,
+                    reference_root=reference_root,
+                )
+                if frame.empty:
+                    continue
+                table = pa.Table.from_pandas(frame, preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(tmp_path, table.schema)
+                writer.write_table(table.cast(writer.schema))
+                rows += int(len(frame))
+                chunks += 1
+            if writer is None:
+                pd.DataFrame(columns=_fundamentals_daily_columns()).to_parquet(
+                    tmp_path,
+                    index=False,
+                )
+        if writer is not None:
+            writer.close()
+            writer = None
+        tmp_path.replace(output_path)
+    finally:
+        if writer is not None:
+            writer.close()
+        if tmp_path.exists() and not output_path.exists():
+            tmp_path.unlink()
+    return {
+        "output": str(output_path),
+        "rows": rows,
+        "chunks": chunks,
+        "input_rows": int(len(companyfacts_index)),
+    }
 
 
 def build_sec_filing_index(*, filing_index: pd.DataFrame, sec_company_tickers: pd.DataFrame | None = None) -> pd.DataFrame:
