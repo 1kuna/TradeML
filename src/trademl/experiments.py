@@ -53,6 +53,15 @@ SPECIAL_MATRIX_DIMENSIONS = {
     "portfolio_profile",
 }
 
+EXPERIMENT_CONFIG_SECTIONS = {
+    "data",
+    "features",
+    "modeling",
+    "portfolio",
+    "preprocessing",
+    "validation",
+}
+
 
 def _atomic_write_json(path: Path, payload: Any) -> None:
     """Atomically write JSON so concurrent readers never observe partial state."""
@@ -154,6 +163,7 @@ def plan_experiment(
     spec = _load_spec(spec_path)
     base_config_path = Path(str(spec.get("base_config") or (repo_root / "configs" / "equities_xs.yml"))).expanduser()
     base_config = yaml.safe_load(base_config_path.read_text(encoding="utf-8"))
+    experiment_config = _merge_experiment_config(base_config=base_config, spec=spec)
     experiment_id = str(spec["experiment_id"])
     phase = int(spec.get("phase", 1))
     available_targets = resolve_training_targets(
@@ -186,7 +196,7 @@ def plan_experiment(
     for row in matrix:
         run_id = _run_id(row)
         runtime_name = f"experiment_{experiment_id}__{run_id}"
-        run_config = _apply_overrides(base_config, row.get("config_overrides", {}))
+        run_config = _apply_overrides(experiment_config, row.get("config_overrides", {}))
         modeling = _run_modeling_metadata(data_root=target.data_root, run_config=run_config)
         config_path = configs_dir / f"{run_id}.yml"
         config_path.write_text(yaml.safe_dump(run_config, sort_keys=False), encoding="utf-8")
@@ -1226,6 +1236,26 @@ def _apply_overrides(base_config: dict[str, Any], overrides: dict[str, Any]) -> 
             cursor = cursor.setdefault(part, {})
         cursor[parts[-1]] = value
     return payload
+
+
+def _merge_experiment_config(*, base_config: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+    """Merge config-shaped experiment sections over the base training config."""
+    payload = json.loads(json.dumps(base_config or {}))
+    for section in sorted(EXPERIMENT_CONFIG_SECTIONS):
+        value = spec.get(section)
+        if isinstance(value, dict):
+            payload[section] = _deep_merge_dicts(dict(payload.get(section) or {}), value)
+    return payload
+
+
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = json.loads(json.dumps(base or {}))
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(dict(merged[key]), value)
+        else:
+            merged[key] = json.loads(json.dumps(value))
+    return merged
 
 
 def _predictive_gate(spec: dict[str, Any]) -> dict[str, Any]:

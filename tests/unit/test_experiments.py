@@ -65,6 +65,79 @@ def test_plan_experiment_materializes_deterministic_runs(tmp_path: Path, monkeyp
     assert manifest["report_path"].endswith(f"/experiments/phase1-baselines/runs/{manifest['run_id']}/reports/daily/2026-04-02.json")
 
 
+def test_plan_experiment_merges_program_modeling_config_into_run_config(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    data_root = tmp_path / "nas"
+    local_state = tmp_path / "local"
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    (repo_root / "configs").mkdir(parents=True, exist_ok=True)
+    (repo_root / "configs" / "equities_xs.yml").write_text(
+        yaml.safe_dump(
+            {
+                "modeling": {
+                    "feature_store": {"enabled": True},
+                    "feature_version": "price_liquidity_v1",
+                    "label_version": "universe_relative_forward_return_v1",
+                    "primary_label_horizon": 5,
+                },
+                "validation": {
+                    "primary": "expanding_walk_forward",
+                    "negative_controls": {"max_abs_negative_control_ic": 0.10},
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (repo_root / "configs" / "node.yml").write_text("", encoding="utf-8")
+    spec_path = tmp_path / "phase1.yml"
+    spec_path.write_text(
+        yaml.safe_dump(
+            {
+                "experiment_id": "phase1-news",
+                "phase": 1,
+                "modeling": {
+                    "feature_store": {"enabled": True},
+                    "feature_version": "news_event_aggregates_v1",
+                    "label_version": "universe_relative_forward_return_v1",
+                    "primary_label_horizon": 5,
+                },
+                "validation": {"negative_controls": {"max_abs_future_news_leak_ic": 0.05}},
+                "matrix": {
+                    "architecture_family": ["advanced_challenger"],
+                    "label_horizon": [5],
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(experiments, "_resolve_default_report_date", lambda **kwargs: "2026-04-02")
+
+    summary = experiments.plan_experiment(
+        spec_path=spec_path,
+        repo_root=repo_root,
+        data_root=data_root,
+        local_state=local_state,
+        env_path=env_path,
+        targets_config_path=repo_root / "configs" / "node.yml",
+        python_executable="/usr/bin/python3",
+    )
+
+    manifest = json.loads(
+        next((local_state / "experiments" / "phase1-news" / "runs").glob("*.json")).read_text(encoding="utf-8")
+    )
+    run_config = yaml.safe_load(Path(str(manifest["config_path"])).read_text(encoding="utf-8"))
+    assert summary["runs"][0]["feature_version"] == "news_event_aggregates_v1"
+    assert manifest["feature_version"] == "news_event_aggregates_v1"
+    assert run_config["modeling"]["feature_version"] == "news_event_aggregates_v1"
+    assert run_config["modeling"]["label_horizon"] == 5
+    assert run_config["validation"]["primary"] == "expanding_walk_forward"
+    assert run_config["validation"]["negative_controls"]["max_abs_negative_control_ic"] == 0.10
+    assert run_config["validation"]["negative_controls"]["max_abs_future_news_leak_ic"] == 0.05
+
+
 def test_plan_experiment_resolves_remote_report_date_from_target(tmp_path: Path, monkeypatch) -> None:
     repo_root = tmp_path / "repo"
     data_root = tmp_path / "nas"

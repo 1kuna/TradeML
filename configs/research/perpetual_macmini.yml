@@ -57,7 +57,7 @@ modeling:
   feature_store:
     enabled: true
   feature_set: daily_price_liquidity_v1
-  feature_version: price_liquidity_v1
+  feature_version: news_event_aggregates_v1
   feature_versions:
     - price_liquidity_v1
     - sec_filing_events_v1
