@@ -188,4 +188,5 @@ vendors:
     daily_cap_source: sec_fair_access_10_requests_per_second
     datasets:
     - filing_index
+    - companyfacts
     role: authoritative_events

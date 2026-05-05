@@ -33,6 +33,7 @@ def test_plan_auxiliary_tasks_includes_macro_and_reference_chunks(
     datasets = {task.dataset for task in tasks}
     assert "listings" in datasets
     assert "filing_index" in datasets
+    assert "companyfacts" in datasets
     assert "macros_treasury" in datasets
     assert "vintagedates" in datasets
     macro_tasks = [task for task in tasks if task.dataset == "macros_treasury"]

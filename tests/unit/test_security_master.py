@@ -5,7 +5,12 @@ from pathlib import Path
 import pandas as pd
 
 import trademl.reference.security_master as security_master
-from trademl.reference.security_master import build_listing_history, build_ticker_changes, rebuild_derived_references
+from trademl.reference.security_master import (
+    build_listing_history,
+    build_sec_companyfacts_fundamentals,
+    build_ticker_changes,
+    rebuild_derived_references,
+)
 
 
 def test_build_listing_history_merges_free_sources() -> None:
@@ -64,6 +69,52 @@ def test_build_ticker_changes_normalizes_symbol_change_history() -> None:
     assert changes.iloc[0]["old_symbol"] == "FB"
     assert changes.iloc[0]["new_symbol"] == "META"
     assert str(changes.iloc[0]["change_date"].date()) == "2022-06-09"
+
+
+def test_build_sec_companyfacts_fundamentals_normalizes_gzip_payload(tmp_path: Path) -> None:
+    facts_path = tmp_path / "companyfacts.json.gz"
+    payload = {
+        "cik": "320193",
+        "facts": {
+            "us-gaap": {
+                "Assets": {
+                    "units": {
+                        "USD": [
+                            {
+                                "end": "2024-09-28",
+                                "filed": "2024-11-01",
+                                "val": 364980000000,
+                                "form": "10-K",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    import gzip
+    import json
+
+    with gzip.open(facts_path, "wt", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    index = pd.DataFrame([{"cik": "0000320193", "facts_path": str(facts_path), "captured_at": "2026-04-01"}])
+    tickers = pd.DataFrame([{"cik_str": "320193", "ticker": "AAPL"}])
+
+    fundamentals = build_sec_companyfacts_fundamentals(
+        companyfacts_index=index,
+        sec_company_tickers=tickers,
+    )
+
+    assert fundamentals[["symbol", "metric_date", "metric_name", "metric_value", "source"]].to_dict("records") == [
+        {
+            "symbol": "AAPL",
+            "metric_date": pd.Timestamp("2024-09-28"),
+            "metric_name": "us-gaap:Assets:USD",
+            "metric_value": "364980000000",
+            "source": "sec_edgar_companyfacts",
+        }
+    ]
+    assert fundamentals.iloc[0]["last_verified"] == pd.Timestamp("2024-11-02")
 
 
 def test_rebuild_derived_references_writes_listing_and_ticker_change_outputs(tmp_path: Path) -> None:

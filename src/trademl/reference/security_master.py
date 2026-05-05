@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -417,6 +418,84 @@ def build_fundamentals_daily(
     return frame.sort_values(["metric_date", "symbol", "metric_name"]).reset_index(drop=True)
 
 
+def build_sec_companyfacts_fundamentals(
+    *,
+    companyfacts_index: pd.DataFrame,
+    sec_company_tickers: pd.DataFrame | None = None,
+    reference_root: Path | None = None,
+) -> pd.DataFrame:
+    """Normalize streamed SEC companyfacts payloads into PIT-safe long-form fundamentals."""
+    if companyfacts_index.empty:
+        return pd.DataFrame(columns=_fundamentals_daily_columns())
+    ticker_by_cik = _ticker_by_cik(sec_company_tickers)
+    rows: list[dict[str, object]] = []
+    for item in companyfacts_index.to_dict("records"):
+        path = _resolve_companyfacts_path(item, reference_root=reference_root)
+        if path is None or not path.exists():
+            continue
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError, EOFError):
+            continue
+        cik = _normalize_cik(item.get("cik") or payload.get("cik"))
+        symbol = str(item.get("symbol") or ticker_by_cik.get(cik, "")).strip().upper()
+        if not symbol:
+            continue
+        facts = payload.get("facts") if isinstance(payload, dict) else {}
+        if not isinstance(facts, dict):
+            continue
+        for namespace, namespace_payload in sorted(
+            facts.items(), key=lambda pair: str(pair[0])
+        ):
+            if not isinstance(namespace_payload, dict):
+                continue
+            for concept, concept_payload in sorted(
+                namespace_payload.items(), key=lambda pair: str(pair[0])
+            ):
+                units = concept_payload.get("units") if isinstance(concept_payload, dict) else {}
+                if not isinstance(units, dict):
+                    continue
+                for unit, values in sorted(units.items(), key=lambda pair: str(pair[0])):
+                    if not isinstance(values, list):
+                        continue
+                    for fact in values:
+                        if not isinstance(fact, dict):
+                            continue
+                        value = fact.get("val")
+                        metric_date = pd.to_datetime(fact.get("end"), errors="coerce")
+                        filed_date = pd.to_datetime(fact.get("filed"), errors="coerce")
+                        if value in (None, "") or pd.isna(metric_date):
+                            continue
+                        # Companyfacts has filing dates, not acceptance timestamps. Use next day
+                        # availability so daily modeling cannot see same-day after-close facts.
+                        last_verified = (
+                            filed_date.normalize() + pd.Timedelta(days=1)
+                            if pd.notna(filed_date)
+                            else pd.to_datetime(item.get("captured_at"), errors="coerce")
+                        )
+                        rows.append(
+                            {
+                                "symbol": symbol,
+                                "metric_date": metric_date.normalize(),
+                                "metric_name": f"{namespace}:{concept}:{unit}",
+                                "metric_value": str(value),
+                                "source": "sec_edgar_companyfacts",
+                                "last_verified": last_verified,
+                            }
+                        )
+    if not rows:
+        return pd.DataFrame(columns=_fundamentals_daily_columns())
+    frame = pd.DataFrame(rows, columns=_fundamentals_daily_columns()).dropna(
+        subset=["symbol", "metric_date", "metric_name", "last_verified"]
+    )
+    frame = frame.drop_duplicates(
+        subset=["symbol", "metric_date", "metric_name", "source"],
+        keep="last",
+    )
+    return frame.sort_values(["metric_date", "symbol", "metric_name"]).reset_index(drop=True)
+
+
 def build_sec_filing_index(*, filing_index: pd.DataFrame, sec_company_tickers: pd.DataFrame | None = None) -> pd.DataFrame:
     """Normalize SEC filings into a symbol-aware filing index."""
     if filing_index.empty:
@@ -576,13 +655,18 @@ def rebuild_derived_references(reference_root: Path) -> list[Path]:
 
     company_profiles = _read_optional_parquet(reference_root / "company_profiles.parquet")
     companyfacts = _read_optional_parquet(reference_root / "sec_companyfacts.parquet")
+    sec_companyfacts_fundamentals = build_sec_companyfacts_fundamentals(
+        companyfacts_index=companyfacts,
+        sec_company_tickers=sec_company_tickers,
+        reference_root=reference_root,
+    )
     financial_statements = _read_optional_parquet(reference_root / "financial_statements_twelve_data.parquet")
-    if any(not frame.empty for frame in (company_profiles, companyfacts, financial_statements)):
+    if any(not frame.empty for frame in (company_profiles, sec_companyfacts_fundamentals, financial_statements)):
         output = reference_root / "fundamentals_daily.parquet"
         output.parent.mkdir(parents=True, exist_ok=True)
         build_fundamentals_daily(
             company_profiles=company_profiles,
-            companyfacts=companyfacts,
+            companyfacts=sec_companyfacts_fundamentals,
             financial_statements=financial_statements,
         ).to_parquet(output, index=False)
         outputs.append(output)
@@ -799,6 +883,62 @@ def _earnings_calendar_columns() -> list[str]:
 
 def _fundamentals_daily_columns() -> list[str]:
     return ["symbol", "metric_date", "metric_name", "metric_value", "source", "last_verified"]
+
+
+def _ticker_by_cik(sec_company_tickers: pd.DataFrame | None) -> dict[str, str]:
+    if sec_company_tickers is None or sec_company_tickers.empty:
+        return {}
+    cik_col = (
+        "cik_str"
+        if "cik_str" in sec_company_tickers.columns
+        else "cik"
+        if "cik" in sec_company_tickers.columns
+        else None
+    )
+    ticker_col = (
+        "ticker"
+        if "ticker" in sec_company_tickers.columns
+        else "symbol"
+        if "symbol" in sec_company_tickers.columns
+        else None
+    )
+    if cik_col is None or ticker_col is None:
+        return {}
+    mapping: dict[str, str] = {}
+    for item in sec_company_tickers[[cik_col, ticker_col]].dropna().to_dict("records"):
+        cik = _normalize_cik(item.get(cik_col))
+        symbol = str(item.get(ticker_col) or "").strip().upper()
+        if cik and symbol:
+            mapping[cik] = symbol
+    return mapping
+
+
+def _normalize_cik(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    numeric = pd.to_numeric(pd.Series([text]), errors="coerce").iloc[0]
+    if pd.notna(numeric):
+        return str(int(numeric)).zfill(10)
+    return text.zfill(10)
+
+
+def _resolve_companyfacts_path(item: dict[str, object], *, reference_root: Path | None) -> Path | None:
+    relative = str(item.get("facts_relative_path") or "").strip()
+    if relative and reference_root is not None:
+        return reference_root / relative
+    raw_path = str(item.get("facts_path") or "").strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if path.exists():
+        return path
+    if reference_root is not None:
+        marker = "sec_companyfacts/"
+        normalized = raw_path.replace("\\", "/")
+        if marker in normalized:
+            return reference_root / marker / normalized.split(marker, 1)[1]
+    return path
 
 
 def _sec_filing_index_columns() -> list[str]:

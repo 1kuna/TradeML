@@ -36,7 +36,10 @@ from trademl.data_node.capabilities import (
 from trademl.data_node.db import DataNodeDB, PlannerTask
 from trademl.data_node.planner import plan_auxiliary_tasks
 from trademl.fleet.cluster import ClusterCoordinator
-from trademl.reference.security_master import rebuild_derived_references
+from trademl.reference.security_master import (
+    build_sec_companyfacts_fundamentals,
+    rebuild_derived_references,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1008,6 +1011,7 @@ class AuxiliaryRuntime:
                 {
                     "cik": normalized_cik,
                     "facts_path": str(output),
+                    "facts_relative_path": str(output.relative_to(self.paths.reference_root)),
                     "raw_bytes": int(metadata.get("raw_bytes", 0) or 0),
                     "captured_at": captured_at,
                     "source": "sec_edgar",
@@ -1016,8 +1020,18 @@ class AuxiliaryRuntime:
             rows_returned += 1
         if index_rows:
             index_path = self.paths.reference_root / "sec_companyfacts.parquet"
-            self._append_sec_companyfacts_index(index_path, pd.DataFrame(index_rows))
+            index_frame = pd.DataFrame(index_rows)
+            self._append_sec_companyfacts_index(index_path, index_frame)
             output_paths.append(index_path)
+            fundamentals = build_sec_companyfacts_fundamentals(
+                companyfacts_index=index_frame,
+                sec_company_tickers=self._read_sec_company_tickers(),
+                reference_root=self.paths.reference_root,
+            )
+            if not fundamentals.empty:
+                fundamentals_path = self.paths.reference_root / "fundamentals_daily.parquet"
+                self._append_reference_frame(fundamentals_path, fundamentals)
+                output_paths.append(fundamentals_path)
         if missing_rows:
             missing_path = (
                 self.paths.reference_root / "sec_companyfacts_missing.parquet"
@@ -1039,6 +1053,16 @@ class AuxiliaryRuntime:
                 "outputs": [str(path) for path in output_paths],
             },
         )
+
+    def _read_sec_company_tickers(self) -> pd.DataFrame:
+        """Read the current SEC CIK-to-symbol map if it is available."""
+        path = self.paths.reference_root / "sec_company_tickers.parquet"
+        if not path.exists():
+            return pd.DataFrame()
+        try:
+            return pd.read_parquet(path)
+        except Exception:  # noqa: BLE001
+            return pd.DataFrame()
 
     def _append_sec_companyfacts_index(self, output: Path, frame: pd.DataFrame) -> None:
         """Append compact SEC companyfacts index rows without loading raw facts."""

@@ -80,6 +80,7 @@ def test_reference_jobs_only_include_enabled_verified_lanes() -> None:
     assert all(job["dataset"] != "price_target" for job in jobs)
     assert any(job["dataset"] == "company_profile" for job in jobs)
     assert any(job["dataset"] == "filing_index" for job in jobs)
+    assert any(job["dataset"] == "companyfacts" for job in jobs)
 
 
 def test_effective_capabilities_include_live_verified_research_lanes_only_when_requested() -> None:

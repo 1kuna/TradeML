@@ -27,12 +27,16 @@ SOURCE_REQUIRED_COLUMNS = {
     "ticker_news": ("symbol_or_symbols", "published_at_or_vendor_ts"),
     "equities_minute": ("symbol", "timestamp_or_vendor_ts", "open", "high", "low", "close"),
     "sec_filings": ("form", "symbol_or_cik", "accepted_at_or_acceptanceDateTime_or_filingDate"),
+    "sec_companyfacts": ("cik", "facts_path_or_relative_path"),
+    "fundamentals_daily": ("symbol", "metric_date", "metric_name", "metric_value"),
     "fundamentals_tiingo": ("symbol",),
     "equities_ohlcv_adj": ("date", "symbol", "close"),
 }
 SOURCE_ROOT_DATASET_PATHS = {
     "sec_filings": ("data/reference/sec_filings.parquet", "data/reference/sec_filing_index.parquet"),
-    "fundamentals_tiingo": ("data/reference/fundamentals_tiingo.parquet", "data/reference/fundamentals_daily.parquet"),
+    "sec_companyfacts": ("data/reference/sec_companyfacts.parquet",),
+    "fundamentals_daily": ("data/reference/fundamentals_daily.parquet",),
+    "fundamentals_tiingo": ("data/reference/fundamentals_tiingo.parquet",),
     "ticker_news": ("data/raw/ticker_news",),
     "equities_minute": ("data/raw/equities_minute",),
 }
@@ -343,7 +347,7 @@ def _feature_group_columns(group: str) -> list[str]:
 def _feature_group_policy(group: str) -> dict[str, Any]:
     if group == "fundamentals_sec":
         return {
-            "source_datasets": ["sec_filings", "fundamentals_tiingo"],
+            "source_datasets": ["sec_filings", "sec_companyfacts", "fundamentals_daily", "fundamentals_tiingo"],
             "feature_available_at_policy": "SEC accepted_at or reference last_verified must be <= modeling date",
             "safety_delay": "none",
         }
@@ -437,9 +441,10 @@ def _feature_source_contract(data_root: Path, configured_paths: dict[str, list[P
             data_root / "data" / "reference" / "sec_filings.parquet",
             data_root / "data" / "reference" / "sec_filing_index.parquet",
         ],
+        "sec_companyfacts": [data_root / "data" / "reference" / "sec_companyfacts.parquet"],
+        "fundamentals_daily": [data_root / "data" / "reference" / "fundamentals_daily.parquet"],
         "fundamentals_tiingo": [
             data_root / "data" / "reference" / "fundamentals_tiingo.parquet",
-            data_root / "data" / "reference" / "fundamentals_daily.parquet",
         ],
         "ticker_news": [data_root / "data" / "raw" / "ticker_news"],
         "equities_minute": [data_root / "data" / "raw" / "equities_minute"],
@@ -636,13 +641,18 @@ def _source_summary(
     invalid = [source for source in sources if source.get("status") == "invalid_schema"]
     source_status = "available" if available else "invalid_schema" if invalid else "empty" if existing else "missing"
     source_state = _aggregate_source_state(sources)
-    reasons = [str(source.get("reason")) for source in sources if source.get("reason")]
+    if source_state == SOURCE_STATE_AVAILABLE:
+        reasons: list[str] = []
+    elif source_state in {SOURCE_STATE_ENTITLEMENT_UNAVAILABLE, SOURCE_STATE_DISABLED_BY_POLICY}:
+        reasons = [str(source.get("reason")) for source in sources if source.get("known_unavailable") and source.get("reason")]
+    else:
+        reasons = [str(source.get("reason")) for source in sources if source.get("reason")]
     return {
         "dataset": dataset,
         "status": source_status,
         "source_state": source_state,
         "lifecycle_state": source_state,
-        "actionable": False if source_state in {SOURCE_STATE_ENTITLEMENT_UNAVAILABLE, SOURCE_STATE_DISABLED_BY_POLICY} else any(bool(source.get("actionable")) for source in sources),
+        "actionable": False if source_state in {SOURCE_STATE_AVAILABLE, SOURCE_STATE_ENTITLEMENT_UNAVAILABLE, SOURCE_STATE_DISABLED_BY_POLICY} else any(bool(source.get("actionable")) for source in sources),
         "known_unavailable": any(bool(source.get("known_unavailable")) for source in sources),
         "reason": "; ".join(dict.fromkeys(reasons)),
         "rows": rows,
@@ -736,6 +746,13 @@ def _missing_required_source_columns(*, dataset: str, columns: set[str]) -> list
             missing.append("symbol_or_cik")
         if not ({"accepted_at", "acceptanceDateTime", "filing_date", "filingDate"} & columns):
             missing.append("accepted_at_or_acceptanceDateTime_or_filingDate")
+        return missing
+    if dataset == "sec_companyfacts":
+        missing = []
+        if "cik" not in columns:
+            missing.append("cik")
+        if not ({"facts_path", "facts_relative_path"} & columns):
+            missing.append("facts_path_or_relative_path")
         return missing
     if dataset == "equities_minute":
         missing = sorted({"symbol", "open", "high", "low", "close"}.difference(columns))
@@ -930,7 +947,9 @@ def _cik_symbol_mapping(*, data_root: Path) -> pd.DataFrame:
 
 
 def _fundamental_features(*, data_root: Path, dates: pd.Series) -> pd.DataFrame:
-    frame, _sources = _load_feature_source_frame(data_root=data_root, dataset="fundamentals_tiingo")
+    frame, _sources = _load_feature_source_frame(data_root=data_root, dataset="fundamentals_daily")
+    if frame.empty:
+        frame, _sources = _load_feature_source_frame(data_root=data_root, dataset="fundamentals_tiingo")
     if frame.empty:
         return pd.DataFrame()
     frame = _normalize_fundamental_source(frame)

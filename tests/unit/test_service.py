@@ -195,7 +195,22 @@ class _SecCompanyfactsConnector:
         output.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "cik": normalized_cik,
-            "facts": {"us-gaap": {"Revenue": {"units": {"USD": []}}}},
+            "facts": {
+                "us-gaap": {
+                    "Revenue": {
+                        "units": {
+                            "USD": [
+                                {
+                                    "end": "2024-09-28",
+                                    "filed": "2024-11-01",
+                                    "val": 391035000000,
+                                    "form": "10-K",
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
         }
         with gzip.open(output, "wt", encoding="utf-8") as handle:
             json.dump(payload, handle)
@@ -6179,6 +6194,14 @@ def test_process_auxiliary_planner_task_marks_reference_success_and_deferred_con
 def test_process_companyfacts_planner_task_streams_per_cik(tmp_path: Path) -> None:
     db = DataNodeDB(tmp_path / "control" / "node.sqlite")
     connector = _SecCompanyfactsConnector()
+    reference_root = tmp_path / "data" / "reference"
+    reference_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {"ticker": "AAPL", "cik_str": "320193"},
+            {"ticker": "MSFT", "cik_str": "789019"},
+        ]
+    ).to_parquet(reference_root / "sec_company_tickers.parquet", index=False)
     service = DataNodeService(
         db=db,
         connectors={"sec_edgar": connector},
@@ -6218,6 +6241,12 @@ def test_process_companyfacts_planner_task_streams_per_cik(tmp_path: Path) -> No
         tmp_path / "data" / "reference" / "sec_companyfacts.parquet"
     )
     assert set(index["cik"]) == {"0000320193", "0000789019", "0001018724"}
+    fundamentals = pd.read_parquet(
+        tmp_path / "data" / "reference" / "fundamentals_daily.parquet"
+    )
+    assert set(fundamentals["symbol"]) == {"AAPL", "MSFT"}
+    assert set(fundamentals["metric_name"]) == {"us-gaap:Revenue:USD"}
+    assert set(fundamentals["source"]) == {"sec_edgar_companyfacts"}
     raw_path = (
         tmp_path
         / "data"
@@ -6228,7 +6257,7 @@ def test_process_companyfacts_planner_task_streams_per_cik(tmp_path: Path) -> No
     )
     with gzip.open(raw_path, "rt", encoding="utf-8") as handle:
         payload = json.load(handle)
-    assert payload["facts"]["us-gaap"]["Revenue"]["units"]["USD"] == []
+    assert payload["facts"]["us-gaap"]["Revenue"]["units"]["USD"][0]["val"] == 391035000000
 
 
 def test_process_companyfacts_planner_task_records_missing_cik_and_continues(

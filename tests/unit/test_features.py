@@ -415,6 +415,28 @@ def test_modeling_feature_factory_reads_live_sec_schema_and_empty_fundamentals(t
         reference / "fundamentals_tiingo.parquet",
         index=False,
     )
+    pd.DataFrame(
+        [
+            {
+                "symbol": "AAPL",
+                "metric_date": "2019-12-31",
+                "metric_name": "us-gaap:Assets:USD",
+                "metric_value": "100",
+                "source": "sec_edgar_companyfacts",
+                "last_verified": "2020-01-29",
+            }
+        ]
+    ).to_parquet(reference / "fundamentals_daily.parquet", index=False)
+    pd.DataFrame(
+        [
+            {
+                "cik": "0000320193",
+                "facts_relative_path": "sec_companyfacts/cik=0000320193/companyfacts.json.gz",
+                "captured_at": "2020-01-29",
+                "source": "sec_edgar",
+            }
+        ]
+    ).to_parquet(reference / "sec_companyfacts.parquet", index=False)
 
     payload = build_modeling_artifacts(
         data_root=data_root,
@@ -433,6 +455,8 @@ def test_modeling_feature_factory_reads_live_sec_schema_and_empty_fundamentals(t
 
     assert payload["feature_readiness"]["ok"] is True
     assert payload["feature_group_metadata"]["fundamentals_sec"]["sources"]["sec_filings"]["status"] == "available"
+    assert payload["feature_group_metadata"]["fundamentals_sec"]["sources"]["sec_companyfacts"]["status"] == "available"
+    assert payload["feature_group_metadata"]["fundamentals_sec"]["sources"]["fundamentals_daily"]["status"] == "available"
     assert payload["feature_group_metadata"]["fundamentals_sec"]["sources"]["fundamentals_tiingo"]["status"] == "empty"
     fundamentals = payload["feature_group_metadata"]["fundamentals_sec"]["sources"]["fundamentals_tiingo"]
     assert fundamentals["source_state"] == "ENTITLEMENT_UNAVAILABLE"
@@ -440,7 +464,10 @@ def test_modeling_feature_factory_reads_live_sec_schema_and_empty_fundamentals(t
     availability_path = data_root / "control" / "cluster" / "state" / "data" / "source_availability" / "latest.json"
     availability = json.loads(availability_path.read_text(encoding="utf-8"))
     assert availability["datasets"]["fundamentals_tiingo"]["state"] == "ENTITLEMENT_UNAVAILABLE"
+    assert availability["datasets"]["fundamentals_daily"]["state"] == "AVAILABLE"
+    assert availability["datasets"]["sec_companyfacts"]["state"] == "AVAILABLE"
     assert apple["sec_10q_90d"].max() >= 1
+    assert apple["fundamental_metric_count"].max() >= 1
 
 
 def test_feature_preflight_blocks_zero_coverage_optional_feature_version(tmp_path) -> None:
