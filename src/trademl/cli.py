@@ -463,7 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             json.dumps(
                 compact_archive_partitions(
-                    data_root=Path(settings.paths.root),
+                    data_root=settings.nas_mount,
                     datasets=args.dataset,
                     max_partitions=args.max_partitions,
                     dry_run=bool(args.dry_run),

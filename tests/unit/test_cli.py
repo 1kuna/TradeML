@@ -435,6 +435,61 @@ def test_node_health_cli_dispatches(tmp_path: Path, monkeypatch, capsys) -> None
     assert json.loads(capsys.readouterr().out)["family"] == "canonical_repair"
 
 
+def test_compact_archives_cli_uses_node_nas_mount(tmp_path: Path, monkeypatch, capsys) -> None:
+    workspace = tmp_path / "workspace"
+    nas_root = tmp_path / "nas"
+    workspace.mkdir(parents=True, exist_ok=True)
+    config_path = workspace / "node.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "node": {
+                    "nas_mount": str(nas_root),
+                    "nas_share": "//nas/trademl",
+                    "local_state": str(workspace / "control"),
+                    "collection_time_et": "16:30",
+                    "maintenance_hour_local": 2,
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_compact_archive_partitions(**kwargs):  # noqa: ANN003, ANN202
+        seen.update(kwargs)
+        return {"action": "compact", "data_root": str(kwargs["data_root"])}
+
+    monkeypatch.setattr(cli, "compact_archive_partitions", fake_compact_archive_partitions)
+
+    assert (
+        cli.main(
+            [
+                "node",
+                "--workspace-root",
+                str(workspace),
+                "--config",
+                str(config_path),
+                "compact-archives",
+                "--dataset",
+                "ticker_news",
+                "--max-partitions",
+                "2",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"action": "compact", "data_root": str(nas_root)}
+    assert seen["data_root"] == nas_root
+    assert seen["datasets"] == ["ticker_news"]
+    assert seen["max_partitions"] == 2
+    assert seen["dry_run"] is True
+
+
 def test_train_start_and_status_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     data_root = tmp_path / "nas"
     local_state = tmp_path / "train-state"
