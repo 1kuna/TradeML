@@ -94,6 +94,37 @@ FEATURE_FAMILY_PRESETS: dict[str, dict[str, Any]] = {
             "features.liquidity.amihud": [],
         }
     },
+    "volatility_removed": {
+        "config_overrides": {
+            "features.volatility.realized": [],
+            "features.volatility.idiosyncratic": [],
+        }
+    },
+    "news_aggregates_only": {
+        "config_overrides": {
+            "modeling.feature_version": "news_event_aggregates_v1",
+            "features.price.momentum": [],
+            "features.price.reversal": [],
+            "features.price.drawdown": [],
+            "features.volatility.realized": [],
+            "features.volatility.idiosyncratic": [],
+            "features.liquidity.adv_dollar": [],
+            "features.liquidity.amihud": [],
+            "features.controls.log_price": False,
+        }
+    },
+    "price_plus_news": {
+        "config_overrides": {
+            "modeling.feature_version": "news_event_aggregates_v1",
+        }
+    },
+    "price_plus_news_no_fragile": {
+        "config_overrides": {
+            "modeling.feature_version": "news_event_aggregates_v1",
+            "features.volatility.realized": [],
+            "features.volatility.idiosyncratic": [],
+        }
+    },
 }
 
 DATA_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
@@ -521,9 +552,11 @@ def evaluate_experiment(
             continue
         evaluation_paths = _write_evaluation_artifacts(
             local_state=local_state,
+            data_root=data_root,
             experiment_id=experiment_id,
             run_id=str(manifest["run_id"]),
             evaluation=evaluation,
+            manifest=manifest,
         )
         manifest["evaluation_stage"] = evaluation["evaluation_stage"]
         manifest["gate_failures"] = evaluation["gate_failures"]
@@ -1428,6 +1461,7 @@ def _summary_run_row(manifest: dict[str, Any]) -> dict[str, Any]:
         "shared_runtime_path": manifest.get("shared_runtime_path"),
         "output_root": manifest.get("output_root"),
         "report_path": manifest.get("report_path"),
+        "evaluation_paths": manifest.get("evaluation_paths", {}),
         "evaluation_stage": manifest.get("evaluation_stage"),
         "failure_kind": manifest.get("failure_kind"),
         "last_error": manifest.get("last_error"),
@@ -1822,7 +1856,15 @@ def _evaluate_report(*, manifest: dict[str, Any], report: dict[str, Any], gate: 
     }
 
 
-def _write_evaluation_artifacts(*, local_state: Path, experiment_id: str, run_id: str, evaluation: dict[str, Any]) -> dict[str, str]:
+def _write_evaluation_artifacts(
+    *,
+    local_state: Path,
+    data_root: Path | None = None,
+    experiment_id: str,
+    run_id: str,
+    evaluation: dict[str, Any],
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, str]:
     root = _local_experiment_root(local_state, experiment_id) / "evaluations"
     root.mkdir(parents=True, exist_ok=True)
     json_path = root / f"{run_id}.evaluation.json"
@@ -1844,7 +1886,84 @@ def _write_evaluation_artifacts(*, local_state: Path, experiment_id: str, run_id
         ),
         encoding="utf-8",
     )
-    return {"json_path": str(json_path), "markdown_path": str(md_path)}
+    paths = {"json_path": str(json_path), "markdown_path": str(md_path)}
+    if data_root is not None:
+        evidence_path = _write_candidate_evidence_artifact(
+            data_root=data_root,
+            experiment_id=experiment_id,
+            run_id=run_id,
+            evaluation=evaluation,
+            manifest=manifest or {},
+        )
+        paths["candidate_evidence_path"] = str(evidence_path)
+    return paths
+
+
+def _write_candidate_evidence_artifact(
+    *,
+    data_root: Path,
+    experiment_id: str,
+    run_id: str,
+    evaluation: dict[str, Any],
+    manifest: dict[str, Any],
+) -> Path:
+    evidence = _candidate_evidence_payload(
+        experiment_id=experiment_id,
+        run_id=run_id,
+        evaluation=evaluation,
+        manifest=manifest,
+    )
+    path = data_root / "control" / "cluster" / "state" / "research" / "candidate_evidence" / experiment_id / f"{run_id}.json"
+    _atomic_write_json(path, evidence)
+    return path
+
+
+def _candidate_evidence_payload(
+    *,
+    experiment_id: str,
+    run_id: str,
+    evaluation: dict[str, Any],
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    autopsy = dict(evaluation.get("candidate_autopsy") or {})
+    evidence = dict(autopsy.get("evidence") or {})
+    objective = dict(evaluation.get("objective_verdict") or {})
+    return {
+        "version": "candidate_evidence_v1",
+        "generated_at": datetime.now(tz=UTC).isoformat(),
+        "experiment_id": experiment_id,
+        "run_id": run_id,
+        "status": str(manifest.get("status") or ""),
+        "feature_version": manifest.get("feature_version"),
+        "label_version": manifest.get("label_version"),
+        "label_horizon": manifest.get("label_horizon") or dict(manifest.get("matrix_values") or {}).get("label_horizon"),
+        "data_revision": manifest.get("data_revision"),
+        "architecture_lane": dict(manifest.get("matrix_values") or {}).get("architecture_family"),
+        "model_suite": manifest.get("model_suite"),
+        "portfolio_profile": manifest.get("portfolio_profile") or dict(manifest.get("matrix_values") or {}).get("portfolio_profile"),
+        "objective_verdict": objective,
+        "evaluation_stage": evaluation.get("evaluation_stage"),
+        "survived_predictive": bool(evaluation.get("survived_predictive")),
+        "primary_rank_ic": evaluation.get("primary_rank_ic"),
+        "rejection_class": autopsy.get("classification"),
+        "root_failure_mode": autopsy.get("root_failure_mode"),
+        "gate_failures": list(evaluation.get("gate_failures") or []),
+        "gate_failures_by_objective": dict(evaluation.get("gate_failures_by_objective") or {}),
+        "regime_diagnostics": evidence.get("regime_diagnostics") or {},
+        "ic_by_year": evidence.get("ic_by_year") or {},
+        "ic_by_quarter": evidence.get("ic_by_quarter") or {},
+        "fold_rank_ic": evidence.get("fold_rank_ic") or [],
+        "negative_controls": evaluation.get("negative_controls") or evidence.get("negative_controls") or {},
+        "feature_ablation": evidence.get("feature_ablation") or {},
+        "backtest_evidence": {
+            "cost_stress_net_return": evidence.get("cost_stress_net_return"),
+            "pbo": evidence.get("pbo"),
+            "cpcv_mean_oos_score": evidence.get("cpcv_mean_oos_score"),
+        },
+        "paper_evidence": manifest.get("paper_evidence") or manifest.get("latest_paper_evidence") or {},
+        "recommended_next_action": autopsy.get("recommended_follow_up") or {},
+        "candidate_autopsy": autopsy,
+    }
 
 
 def _run_backtest_for_manifest(
@@ -1979,20 +2098,47 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
         base_spec=base_spec,
         current_architecture_families=current_architecture_families,
     )
-    strong_unstable = _best_classified_row(rows=rows, classification="strong_unstable")
-    if strong_unstable is not None:
-        horizon_values = list(dict.fromkeys([int((strong_unstable.get("matrix_values") or {}).get("label_horizon") or strong_unstable.get("label_horizon") or 5), 1, 5, 20]))
+    diagnostic_classes = ("strong_unstable", "strong_robustness_failed", "strong_overfit_risk", "strong_cost_failed")
+    diagnostic_row = next((row for classification in diagnostic_classes if (row := _best_classified_row(rows=rows, classification=classification)) is not None), None)
+    if diagnostic_row is not None:
+        classification = str((diagnostic_row.get("candidate_autopsy") or {}).get("classification") or "strong_unstable")
+        current_horizon = int((diagnostic_row.get("matrix_values") or {}).get("label_horizon") or diagnostic_row.get("label_horizon") or 5)
+        horizon_values = list(dict.fromkeys([current_horizon, 1, 5, 20]))
+        if classification == "strong_robustness_failed":
+            architecture_families = ["linear_baseline", "tree_challenger", "advanced_challenger"]
+            feature_families = ["price_core", "volatility_removed", "price_plus_news", "price_plus_news_no_fragile"]
+            data_profiles = ["phase1_default"]
+            initial_years = [int((diagnostic_row.get("matrix_values") or {}).get("validation.initial_train_years", 2) or 2)]
+            horizon_values = [current_horizon]
+        elif classification == "strong_overfit_risk":
+            train_year = int((diagnostic_row.get("matrix_values") or {}).get("validation.initial_train_years", 2) or 2)
+            architecture_families = ["linear_baseline", "tree_challenger"]
+            feature_families = ["price_core", "volatility_removed", _feature_family_for_row(diagnostic_row)]
+            data_profiles = ["phase1_short_window", "phase1_default"]
+            initial_years = sorted({max(2, train_year - 1), train_year})
+            horizon_values = [current_horizon]
+        elif classification == "strong_cost_failed":
+            architecture_families = ["tree_challenger", "linear_baseline"]
+            feature_families = [_feature_family_for_row(diagnostic_row)]
+            data_profiles = ["phase1_default"]
+            initial_years = [int((diagnostic_row.get("matrix_values") or {}).get("validation.initial_train_years", 2) or 2)]
+            horizon_values = [current_horizon]
+        else:
+            architecture_families = ["advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"]
+            feature_families = [_feature_family_for_row(diagnostic_row)]
+            data_profiles = ["phase1_short_window", "phase1_default", "phase1_long_window"]
+            initial_years = sorted({int((diagnostic_row.get("matrix_values") or {}).get("validation.initial_train_years", 2) or 2), 2, 3, 4})
         next_matrix = _bounded_matrix(
             allowed_dimensions=allowed_dimensions,
             architecture_families=[
                 family
-                for family in ["advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"]
+                for family in architecture_families
                 if family in ARCHITECTURE_FAMILY_PRESETS
             ],
-            initial_years=sorted({int((strong_unstable.get("matrix_values") or {}).get("validation.initial_train_years", 2) or 2), 2, 3, 4}),
-            feature_families=[_feature_family_for_row(strong_unstable)],
-            data_families=[_data_family_for_row(strong_unstable)],
-            data_profiles=["phase1_short_window", "phase1_default", "phase1_long_window"],
+            initial_years=initial_years,
+            feature_families=feature_families,
+            data_families=[_data_family_for_row(diagnostic_row)],
+            data_profiles=data_profiles,
             family_size_cap=policy["family_size_cap"],
         )
         if "label_horizon" in allowed_dimensions:
@@ -2001,6 +2147,7 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
             next_matrix,
             family_size_cap=policy["family_size_cap"],
             expansion_order=[
+                "feature_family",
                 "architecture_family",
                 "label_horizon",
                 "validation.initial_train_years",
@@ -2008,17 +2155,17 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
             ],
         )
         next_spec["matrix"] = next_matrix
-        next_spec["diagnostic_mode"] = "strong_unstable"
-        next_spec["follow_up_of_run_id"] = strong_unstable.get("run_id")
-        next_spec["follow_up_reason"] = "strong rejected candidate failed stability gates"
+        next_spec["diagnostic_mode"] = classification
+        next_spec["follow_up_of_run_id"] = diagnostic_row.get("run_id")
+        next_spec["follow_up_reason"] = str((diagnostic_row.get("candidate_autopsy") or {}).get("root_failure_mode") or "strong rejected candidate needs targeted diagnostics")
         next_spec["diagnostic_family_signature"] = diagnostic_family_signature(
             {
-                "run_id": strong_unstable.get("run_id"),
-                "feature_version": strong_unstable.get("feature_version"),
-                "label_version": strong_unstable.get("label_version"),
-                "data_revision": strong_unstable.get("data_revision"),
+                "run_id": diagnostic_row.get("run_id"),
+                "feature_version": diagnostic_row.get("feature_version"),
+                "label_version": diagnostic_row.get("label_version"),
+                "data_revision": diagnostic_row.get("data_revision"),
                 "objective_policy": base_spec.get("objective_policy"),
-                "diagnostic_mode": "strong_unstable",
+                "diagnostic_mode": classification,
                 "matrix": next_matrix,
             }
         )
@@ -2032,8 +2179,8 @@ def _build_next_family_proposal(*, experiment_id: str, base_spec: dict[str, Any]
             "next_spec": next_spec,
             "chain_allowed": current_generation < policy["max_generations"],
             "generation": next_generation,
-            "follow_up_of_run_id": strong_unstable.get("run_id"),
-            "diagnostic_mode": "strong_unstable",
+            "follow_up_of_run_id": diagnostic_row.get("run_id"),
+            "diagnostic_mode": classification,
         }
 
     architecture_scores = {

@@ -1094,9 +1094,25 @@ def test_scheduler_decision_and_archive_telemetry_summaries(tmp_path: Path) -> N
         duplicates_dropped=1,
         coerced_columns=["news_id", "published_at"],
     )
+    database.record_ingestion_ledger(
+        vendor="alpaca",
+        dataset="ticker_news",
+        output_name="ticker_news",
+        partition_date="2026-04-29",
+        status="success",
+        rows_in=3,
+        rows_normalized=3,
+        rows_written=2,
+        duplicates_dropped=1,
+        schema_version="ticker_news_v1",
+        payload_hash="abc123",
+        partition_path="/nas/data/raw/ticker_news/date=2026-04-29/data.parquet",
+        feature_visibility={"visible_to_mac": True},
+    )
 
     scheduler = database.summarize_scheduler_decisions(minutes=15)
     archive = database.summarize_archive_write_telemetry(minutes=60)
+    ingestion = database.summarize_ingestion_ledger(minutes=60)
 
     assert {row["decision"] for row in scheduler["rows"]} == {
         "claimed",
@@ -1105,6 +1121,8 @@ def test_scheduler_decision_and_archive_telemetry_summaries(tmp_path: Path) -> N
     assert archive["rows"][0]["output_name"] == "ticker_news"
     assert archive["rows"][0]["rows_in"] == 3
     assert archive["rows"][0]["duplicates_dropped"] == 1
+    assert ingestion["rows"][0]["dataset"] == "ticker_news"
+    assert ingestion["rows"][0]["rows_written"] == 2
 
 
 def test_existing_pi_db_initialization_adds_scheduler_decisions_table(tmp_path: Path) -> None:
@@ -1140,6 +1158,7 @@ def test_existing_pi_db_initialization_adds_scheduler_decisions_table(tmp_path: 
 
     database = DataNodeDB(db_path)
     database.record_scheduler_decision(vendor="alpaca", decision="claimed")
+    database.record_ingestion_ledger(dataset="ticker_news", output_name="ticker_news", status="success")
 
     with sqlite3.connect(db_path) as connection:
         tables = {
@@ -1149,3 +1168,4 @@ def test_existing_pi_db_initialization_adds_scheduler_decisions_table(tmp_path: 
             ).fetchall()
         }
     assert "scheduler_decisions" in tables
+    assert "ingestion_ledger" in tables

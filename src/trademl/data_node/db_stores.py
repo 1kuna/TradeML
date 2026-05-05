@@ -253,6 +253,108 @@ class RuntimeStore(_Store):
             )
         return int(cursor.rowcount)
 
+    def record_ingestion_ledger(
+        self,
+        *,
+        dataset: str,
+        output_name: str,
+        status: str,
+        vendor: str | None = None,
+        partition_date: str | None = None,
+        task_key: str | None = None,
+        attempt_id: str | None = None,
+        rows_in: int = 0,
+        rows_normalized: int = 0,
+        rows_written: int = 0,
+        duplicates_dropped: int = 0,
+        schema_version: str | None = None,
+        payload_hash: str | None = None,
+        partition_path: str | None = None,
+        feature_visibility: dict[str, Any] | None = None,
+        error: str | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        """Persist one ingestion event from collection through archive visibility."""
+        timestamp = created_at or self._now().isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ingestion_ledger (
+                  vendor, dataset, output_name, partition_date, task_key, attempt_id,
+                  status, rows_in, rows_normalized, rows_written, duplicates_dropped,
+                  schema_version, payload_hash, partition_path, feature_visibility_json,
+                  error, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(vendor) if vendor is not None else None,
+                    str(dataset),
+                    str(output_name),
+                    str(partition_date) if partition_date is not None else None,
+                    str(task_key) if task_key is not None else None,
+                    str(attempt_id) if attempt_id is not None else None,
+                    str(status),
+                    int(rows_in),
+                    int(rows_normalized),
+                    int(rows_written),
+                    int(duplicates_dropped),
+                    str(schema_version) if schema_version is not None else None,
+                    str(payload_hash) if payload_hash is not None else None,
+                    str(partition_path) if partition_path is not None else None,
+                    json.dumps(feature_visibility or {}, sort_keys=True),
+                    str(error) if error is not None else None,
+                    timestamp,
+                ),
+            )
+
+    def summarize_ingestion_ledger(
+        self, *, minutes: int = 60, limit: int | None = None
+    ) -> dict[str, Any]:
+        """Return recent ingestion events grouped by dataset/output/status."""
+        window_minutes = max(1, int(minutes))
+        since = (self._now() - timedelta(minutes=window_minutes)).isoformat()
+        params: list[object] = [since]
+        query = """
+            SELECT COALESCE(vendor, '') AS vendor,
+                   dataset,
+                   output_name,
+                   status,
+                   COUNT(*) AS events,
+                   SUM(rows_in) AS rows_in,
+                   SUM(rows_normalized) AS rows_normalized,
+                   SUM(rows_written) AS rows_written,
+                   SUM(duplicates_dropped) AS duplicates_dropped,
+                   MAX(partition_date) AS latest_partition_date,
+                   MAX(partition_path) AS latest_partition_path,
+                   MAX(payload_hash) AS latest_payload_hash,
+                   MAX(error) AS latest_error,
+                   MAX(created_at) AS latest_at
+            FROM ingestion_ledger
+            WHERE created_at >= ?
+            GROUP BY COALESCE(vendor, ''), dataset, output_name, status
+            ORDER BY latest_at DESC, events DESC, dataset ASC, output_name ASC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return {
+            "window_minutes": window_minutes,
+            "checked_at": self._now().isoformat(),
+            "rows": [dict(row) for row in rows],
+        }
+
+    def prune_ingestion_ledger(self, *, retention_hours: int = 168) -> int:
+        """Delete old ingestion ledger rows after shared rollups have aged out."""
+        cutoff = (self._now() - timedelta(hours=max(1, int(retention_hours)))).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM ingestion_ledger WHERE created_at < ?",
+                (cutoff,),
+            )
+        return int(cursor.rowcount)
+
 
 
 

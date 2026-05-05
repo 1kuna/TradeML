@@ -536,6 +536,8 @@ def test_strong_unstable_candidate_gets_autopsy_classification() -> None:
     assert autopsy["classification"] == "strong_unstable"
     assert autopsy["recommended_follow_up"]["diagnostic_mode"] == "strong_unstable"
     assert autopsy["evidence"]["worst_quarter"] == {"period": "2025Q2", "value": -0.29}
+    worst_periods = {row["period"] for row in autopsy["evidence"]["regime_diagnostics"]["worst_periods"]}
+    assert "fold_1" in worst_periods
     assert "cpcv_mean_oos_score<0" in autopsy["evidence"]["overfit_evidence"]
 
 
@@ -826,6 +828,11 @@ def test_evaluate_experiment_marks_predictive_rejections(tmp_path: Path) -> None
     assert payload["evaluated"][0]["evaluation_stage"] == "REJECTED_PREDICTIVE"
     assert manifest["evaluation_stage"] == "REJECTED_PREDICTIVE"
     assert manifest["gate_failures"]
+    evidence_path = tmp_path / "control" / "cluster" / "state" / "research" / "candidate_evidence" / "phase1-baselines" / "run-a.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["run_id"] == "run-a"
+    assert evidence["rejection_class"] == manifest["candidate_autopsy"]["classification"]
+    assert manifest["evaluation_paths"]["candidate_evidence_path"] == str(evidence_path)
 
 
 def test_propose_next_experiment_family_writes_bounded_spec(tmp_path: Path) -> None:

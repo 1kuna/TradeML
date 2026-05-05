@@ -307,6 +307,12 @@ def build_candidate_autopsy(
             "ic_by_year": ic_by_year,
             "ic_by_quarter": ic_by_quarter,
             "fold_rank_ic": fold_ic,
+            "regime_diagnostics": _regime_diagnostics(
+                diagnostics=diagnostics,
+                ic_by_year=ic_by_year,
+                ic_by_quarter=ic_by_quarter,
+                fold_ic=fold_ic,
+            ),
             "worst_year": _min_item(ic_by_year),
             "worst_quarter": _min_item(ic_by_quarter),
             "worst_fold_rank_ic": min(fold_ic) if fold_ic else None,
@@ -463,6 +469,48 @@ def _root_failure_mode(*, classification: str, gate_failures: list[str], overfit
     return gate_failures[0] if gate_failures else "candidate did not produce a strong actionable signal"
 
 
+def _regime_diagnostics(
+    *,
+    diagnostics: dict[str, Any],
+    ic_by_year: dict[str, float],
+    ic_by_quarter: dict[str, float],
+    fold_ic: list[float],
+) -> dict[str, Any]:
+    volatility = diagnostics.get("ic_by_volatility_regime") or diagnostics.get("volatility_regime_ic")
+    trend = diagnostics.get("ic_by_market_trend_regime") or diagnostics.get("market_trend_regime_ic")
+    fold_payload = {
+        f"fold_{idx + 1}": value
+        for idx, value in enumerate(fold_ic)
+    }
+    candidates: list[dict[str, Any]] = []
+    for family, values in (
+        ("year", ic_by_year),
+        ("quarter", ic_by_quarter),
+        ("fold", fold_payload),
+        ("volatility_regime", _string_float_map(volatility)),
+        ("market_trend_regime", _string_float_map(trend)),
+    ):
+        for period, value in values.items():
+            candidates.append({"family": family, "period": period, "rank_ic": value})
+    worst = sorted(candidates, key=lambda row: float(row["rank_ic"]))[:5]
+    return {
+        "by_year": ic_by_year,
+        "by_quarter": ic_by_quarter,
+        "by_fold": fold_payload,
+        "by_volatility_regime": _string_float_map(volatility),
+        "by_market_trend_regime": _string_float_map(trend),
+        "missing_regime_inputs": [
+            name
+            for name, values in (
+                ("volatility_regime", volatility),
+                ("market_trend_regime", trend),
+            )
+            if not isinstance(values, dict)
+        ],
+        "worst_periods": worst,
+    }
+
+
 def _recommended_follow_up(classification: str) -> dict[str, Any]:
     if classification == "strong_unstable":
         return {
@@ -473,19 +521,19 @@ def _recommended_follow_up(classification: str) -> dict[str, Any]:
     if classification == "strong_overfit_risk":
         return {
             "diagnostic_mode": "overfit_risk",
-            "actions": ["cpcv_replay", "feature_ablation", "lower_complexity_sentinel"],
+            "actions": ["cpcv_replay", "feature_ablation", "lower_complexity_sentinel", "tighter_feature_set"],
             "next_lane": "tree_challenger",
         }
     if classification == "strong_robustness_failed":
         return {
             "diagnostic_mode": "robustness_failure",
-            "actions": ["negative_control_replay", "feature_ablation", "leakage_audit"],
+            "actions": ["leakage_audit", "negative_control_replay", "feature_ablation", "lower_complexity_sentinel", "feature_group_isolation"],
             "next_lane": "linear_baseline",
         }
     if classification == "strong_cost_failed":
         return {
             "diagnostic_mode": "cost_failure",
-            "actions": ["cost_stress_replay", "turnover_constrained_profile"],
+            "actions": ["cost_stress_replay", "lower_turnover_portfolio_profile", "liquidity_guard_replay"],
             "next_lane": "tree_challenger",
         }
     return {"diagnostic_mode": "none", "actions": [], "next_lane": None}

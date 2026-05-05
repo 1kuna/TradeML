@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -432,6 +434,12 @@ def test_modeling_feature_factory_reads_live_sec_schema_and_empty_fundamentals(t
     assert payload["feature_readiness"]["ok"] is True
     assert payload["feature_group_metadata"]["fundamentals_sec"]["sources"]["sec_filings"]["status"] == "available"
     assert payload["feature_group_metadata"]["fundamentals_sec"]["sources"]["fundamentals_tiingo"]["status"] == "empty"
+    fundamentals = payload["feature_group_metadata"]["fundamentals_sec"]["sources"]["fundamentals_tiingo"]
+    assert fundamentals["source_state"] == "ENTITLEMENT_UNAVAILABLE"
+    assert fundamentals["known_unavailable"] is True
+    availability_path = data_root / "control" / "cluster" / "state" / "data" / "source_availability" / "latest.json"
+    availability = json.loads(availability_path.read_text(encoding="utf-8"))
+    assert availability["datasets"]["fundamentals_tiingo"]["state"] == "ENTITLEMENT_UNAVAILABLE"
     assert apple["sec_10q_90d"].max() >= 1
 
 

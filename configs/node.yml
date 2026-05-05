@@ -41,6 +41,31 @@ collection:
     scheduler_decision_retention_hours: 24
     resource_warn_thresholds:
       disk_percent: 90
+  source_policy:
+    states:
+      - AVAILABLE
+      - STALE
+      - ZERO_COVERAGE
+      - ENTITLEMENT_UNAVAILABLE
+      - SOURCE_UNAVAILABLE
+      - DISABLED_BY_POLICY
+      - SCHEMA_MISMATCH
+    known_unavailable_sources:
+      fundamentals_tiingo: free_plan_empty_source
+  freshness_policy:
+    dataset_stale_after_minutes:
+      ticker_news: 720
+      equities_minute: 120
+      alpaca_market_events: 240
+      sec_filings: 2880
+      fundamentals_tiingo: 10080
+  compaction_policy:
+    enabled: true
+    max_partitions_per_run: 10
+    datasets:
+      - ticker_news
+      - equities_minute
+      - alpaca_market_events
   universe_policy: tiered_expansion
   retention_policy: watermarked_indefinite
   storage_watermark:

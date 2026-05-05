@@ -557,6 +557,68 @@ def test_observability_reports_blocked_feature_source_readiness(tmp_path: Path) 
     assert {"feature_source_blocked", "feature_source_missing", "feature_source_path_missing"}.issubset(kinds)
 
 
+def test_observability_does_not_degrade_for_known_unavailable_free_plan_source(tmp_path: Path) -> None:
+    data_root = tmp_path / "nas"
+    source_root = data_root / "control" / "cluster" / "state" / "data" / "source_availability"
+    source_root.mkdir(parents=True)
+    (source_root / "latest.json").write_text(
+        json.dumps(
+            {
+                "datasets": {
+                    "fundamentals_tiingo": {
+                        "state": "ENTITLEMENT_UNAVAILABLE",
+                        "status": "empty",
+                        "known_unavailable": True,
+                        "actionable": False,
+                        "rows": 0,
+                        "reason": "free-plan source unavailable",
+                    }
+                },
+                "state_counts": {"ENTITLEMENT_UNAVAILABLE": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = build_fleet_observability(
+        snapshot={
+            "runtime": {"running": True},
+            "health": {
+                "research_program_summary": {
+                    "status": "RUNNING",
+                    "feature_family_leaderboard": {
+                        "entries": [
+                            {
+                                "feature_version": "sec_filing_events_v1",
+                                "readiness_status": "BLOCKED",
+                                "source_coverage": {
+                                    "fundamentals_sec": {
+                                        "sources": {
+                                            "fundamentals_tiingo": {
+                                                "status": "empty",
+                                                "source_state": "ENTITLEMENT_UNAVAILABLE",
+                                                "known_unavailable": True,
+                                                "actionable": False,
+                                            }
+                                        }
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            },
+        },
+        data_root=data_root,
+        now=datetime(2026, 4, 29, 12, 1, tzinfo=UTC),
+    )
+
+    kinds = {issue["kind"] for issue in payload["issues"]}
+    assert "feature_source_zero_coverage" not in kinds
+    assert "feature_source_blocked" not in kinds
+    assert "source_availability_actionable" not in kinds
+
+
 def test_fleet_health_merges_remote_pi_observability_before_building_snapshot(tmp_path: Path, monkeypatch) -> None:
     data_root = tmp_path / "nas"
     data_root.mkdir()
@@ -574,6 +636,10 @@ def test_fleet_health_merges_remote_pi_observability_before_building_snapshot(tm
                         "rows": [{"vendor": "alpaca", "dataset": "stock_trades", "decision": "claimed", "count": 3}],
                     },
                     "lane_health": {"rows": [{"vendor": "alpaca", "dataset": "stock_trades", "state": "HEALTHY"}]},
+                    "ingestion_ledger": {
+                        "window_minutes": 60,
+                        "rows": [{"vendor": "alpaca", "dataset": "stock_trades", "output_name": "alpaca_market_events", "status": "success", "events": 1}],
+                    },
                 },
             },
         }
@@ -597,6 +663,7 @@ def test_fleet_health_merges_remote_pi_observability_before_building_snapshot(tm
     assert "verdict" in payload
     assert observed["scheduler_decisions"]["rows"][0]["dataset"] == "stock_trades"
     assert observed["lane_health"]["rows"][0]["vendor"] == "alpaca"
+    assert observed["ingestion_ledger"]["rows"][0]["dataset"] == "stock_trades"
 
 
 def test_fleet_watchdog_writes_current_state_and_repeated_issue_alert(tmp_path: Path, monkeypatch) -> None:

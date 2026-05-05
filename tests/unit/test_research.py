@@ -626,6 +626,53 @@ def test_strong_unstable_candidate_launches_diagnostic_follow_up_before_frontier
     assert _matrix_size(decision["next_spec"]["matrix"]) <= decision["next_spec"]["proposal_policy"]["family_size_cap"]
 
 
+def test_strong_robustness_failed_candidate_launches_feature_group_isolation_follow_up(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 200
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=research._empty_frontier(),  # noqa: SLF001
+        experiment_summary={
+            "experiment_id": "perpetual-macmini-p1-f607",
+            "best_run_id": "leaky-strong",
+            "best_primary_score": 0.064,
+            "shortlist_count": 0,
+            "candidate_autopsy": {
+                "classification": "strong_robustness_failed",
+                "root_failure_mode": "strong signal fails robustness or leakage controls",
+            },
+            "runs": [
+                {
+                    "run_id": "leaky-strong",
+                    "feature_version": "news_event_aggregates_v1",
+                    "label_version": "universe_relative_forward_return_v1",
+                    "data_revision": "rev-news",
+                    "label_horizon": 5,
+                    "portfolio_profile": "cost_aware_long_only_v1",
+                    "matrix_values": {
+                        "architecture_family": "advanced_challenger",
+                        "feature_family": "price_plus_news",
+                        "data_family": "price_plus_liquidity",
+                        "label_horizon": 5,
+                        "validation.initial_train_years": 3,
+                    },
+                }
+            ],
+        },
+        proposal={},
+    )
+
+    assert decision["action"] == "launch_family"
+    matrix = decision["next_spec"]["matrix"]
+    assert decision["next_spec"]["diagnostic_mode"] == "strong_robustness_failed"
+    assert matrix["architecture_family"][0] == "linear_baseline"
+    assert "price_plus_news_no_fragile" in matrix["feature_family"]
+    assert matrix["label_horizon"] == [5]
+
+
 def test_research_canary_preflight_blocks_without_creating_doomed_manifests(tmp_path: Path, monkeypatch) -> None:
     program_path = _program_spec(tmp_path)
     calls = {"supervise": 0}

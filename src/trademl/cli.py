@@ -43,6 +43,7 @@ from trademl.dashboard.controller import (
     verify_recent_canonical_dates,
     write_deployed_version,
 )
+from trademl.data_node.compaction import compact_archive_partitions
 from trademl.env import load_dotenv
 from trademl.fleet.autopilot import collect_fleet_health
 from trademl.fleet.observability import build_fleet_observability, write_fleet_observability
@@ -166,6 +167,10 @@ def main(argv: list[str] | None = None) -> int:
     verify_recent_parser.add_argument("--days", type=int, default=7)
     verify_recent_parser.add_argument("--dataset", default="equities_eod")
     verify_recent_parser.add_argument("--verify-only", action="store_true")
+    compact_parser = node_subparsers.add_parser("compact-archives", help="Compact bounded raw/archive parquet partitions.")
+    compact_parser.add_argument("--dataset", action="append", default=None)
+    compact_parser.add_argument("--max-partitions", type=int, default=10)
+    compact_parser.add_argument("--dry-run", action="store_true")
     node_subparsers.add_parser("repair-status", help="Show current repair lane health.")
     lane_health_parser = node_subparsers.add_parser("lane-health", help="Show current vendor lane health.")
     lane_health_parser.add_argument("--dataset", default="equities_eod")
@@ -448,6 +453,20 @@ def main(argv: list[str] | None = None) -> int:
                     days=args.days,
                     dataset=args.dataset,
                     verify_only=args.verify_only,
+                ),
+                indent=2,
+                default=str,
+            )
+        )
+        return 0
+    if args.node_command == "compact-archives":
+        print(
+            json.dumps(
+                compact_archive_partitions(
+                    data_root=Path(settings.paths.root),
+                    datasets=args.dataset,
+                    max_partitions=args.max_partitions,
+                    dry_run=bool(args.dry_run),
                 ),
                 indent=2,
                 default=str,

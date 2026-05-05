@@ -3143,9 +3143,10 @@ def _strong_rejected_follow_up_spec(
     frontier: dict[str, Any],
     experiment_summary: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Build a diagnostic family for the strongest unstable rejected candidate."""
+    """Build a diagnostic family for the strongest rejected candidate."""
     best_autopsy = dict(experiment_summary.get("candidate_autopsy") or {})
-    if str(best_autopsy.get("classification") or "") != "strong_unstable":
+    classification = str(best_autopsy.get("classification") or "")
+    if classification not in {"strong_unstable", "strong_robustness_failed", "strong_overfit_risk", "strong_cost_failed"}:
         return None
     best_run_id = experiment_summary.get("best_run_id")
     if not best_run_id:
@@ -3163,26 +3164,29 @@ def _strong_rejected_follow_up_spec(
     best_run = _best_run_from_summary(experiment_summary)
     matrix_values = dict(best_run.get("matrix_values") or {})
     modeling = dict(spec.get("modeling") or {})
-    horizons = list(dict.fromkeys([int(best_run.get("label_horizon") or matrix_values.get("label_horizon") or 5), 1, 5, 20]))
+    current_horizon = int(best_run.get("label_horizon") or matrix_values.get("label_horizon") or 5)
+    horizons = list(dict.fromkeys([current_horizon, 1, 5, 20]))
     feature_family = str(matrix_values.get("feature_family") or "price_liquidity")
     data_family = str(matrix_values.get("data_family") or "price_plus_liquidity")
     train_year = int(matrix_values.get("validation.initial_train_years") or 2)
-    next_spec["matrix"] = {
-        "architecture_family": ["advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"],
-        "feature_family": [feature_family],
-        "data_family": [data_family],
-        "label_horizon": horizons,
-        "portfolio_profile": [str(best_run.get("portfolio_profile") or "cost_aware_long_only_v1")],
-        "data_profile": ["phase1_short_window", "phase1_default", "phase1_long_window"],
-        "validation.initial_train_years": sorted({train_year, 2, 3, 4}),
-    }
-    next_spec["diagnostic_mode"] = "strong_unstable"
+    diagnostic_matrix = _diagnostic_follow_up_matrix(
+        classification=classification,
+        feature_family=feature_family,
+        data_family=data_family,
+        horizons=horizons,
+        current_horizon=current_horizon,
+        portfolio_profile=str(best_run.get("portfolio_profile") or "cost_aware_long_only_v1"),
+        train_year=train_year,
+    )
+    next_spec["matrix"] = diagnostic_matrix
+    next_spec["diagnostic_mode"] = classification
     next_spec["follow_up_of_run_id"] = str(best_run_id)
     next_spec["follow_up_reason"] = str(best_autopsy.get("root_failure_mode") or "strong rejected candidate failed stability gates")
     next_spec["matrix"] = _cap_matrix_combinations(
         next_spec["matrix"],
         family_size_cap=int(next_spec["proposal_policy"].get("family_size_cap") or 6),
         expansion_order=[
+            "feature_family",
             "architecture_family",
             "label_horizon",
             "validation.initial_train_years",
@@ -3200,7 +3204,7 @@ def _strong_rejected_follow_up_spec(
         "label_version": best_run.get("label_version") or modeling.get("label_version"),
         "data_revision": best_run.get("data_revision") or experiment_summary.get("data_revision"),
         "objective_policy": _objective_policy(spec),
-        "diagnostic_mode": "strong_unstable",
+        "diagnostic_mode": classification,
         "matrix": next_spec["matrix"],
     }
     next_spec["diagnostic_family_signature"] = diagnostic_family_signature(seed)
@@ -3208,6 +3212,57 @@ def _strong_rejected_follow_up_spec(
     if _family_signature(next_spec) in set(frontier.get("tried_family_signatures") or []):
         return None
     return next_spec
+
+
+def _diagnostic_follow_up_matrix(
+    *,
+    classification: str,
+    feature_family: str,
+    data_family: str,
+    horizons: list[int],
+    current_horizon: int,
+    portfolio_profile: str,
+    train_year: int,
+) -> dict[str, list[Any]]:
+    if classification == "strong_robustness_failed":
+        return {
+            "architecture_family": ["linear_baseline", "tree_challenger", "advanced_challenger"],
+            "feature_family": ["price_core", "volatility_removed", "price_plus_news", "price_plus_news_no_fragile"],
+            "data_family": [data_family],
+            "label_horizon": [current_horizon],
+            "portfolio_profile": [portfolio_profile],
+            "data_profile": ["phase1_default"],
+            "validation.initial_train_years": [train_year],
+        }
+    if classification == "strong_overfit_risk":
+        return {
+            "architecture_family": ["linear_baseline", "tree_challenger"],
+            "feature_family": ["price_core", "volatility_removed", feature_family],
+            "data_family": [data_family],
+            "label_horizon": [current_horizon],
+            "portfolio_profile": [portfolio_profile],
+            "data_profile": ["phase1_short_window", "phase1_default"],
+            "validation.initial_train_years": sorted({max(2, train_year - 1), train_year}),
+        }
+    if classification == "strong_cost_failed":
+        return {
+            "architecture_family": ["tree_challenger", "linear_baseline"],
+            "feature_family": [feature_family],
+            "data_family": [data_family],
+            "label_horizon": [current_horizon],
+            "portfolio_profile": ["cost_aware_long_only_v1"],
+            "data_profile": ["phase1_default"],
+            "validation.initial_train_years": [train_year],
+        }
+    return {
+        "architecture_family": ["advanced_challenger", "ensemble_meta", "tree_challenger", "linear_baseline"],
+        "feature_family": [feature_family],
+        "data_family": [data_family],
+        "label_horizon": horizons,
+        "portfolio_profile": [portfolio_profile],
+        "data_profile": ["phase1_short_window", "phase1_default", "phase1_long_window"],
+        "validation.initial_train_years": sorted({train_year, 2, 3, 4}),
+    }
 
 
 def _best_run_from_summary(experiment_summary: dict[str, Any]) -> dict[str, Any]:

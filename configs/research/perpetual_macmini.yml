@@ -99,6 +99,26 @@ autonomous_progression_policy:
     - sequence_transformer
     - gnn
     - foundation_forecaster
+diagnostic_planner_policy:
+  enabled: true
+  strong_rejected_classes:
+    - strong_robustness_failed
+    - strong_unstable
+    - strong_overfit_risk
+    - strong_cost_failed
+  suppress_duplicates_on:
+    - feature_version
+    - label_version
+    - data_revision
+    - objective_policy
+feature_group_isolation_policy:
+  enabled: true
+  families:
+    - price_core
+    - volatility_removed
+    - news_aggregates_only
+    - price_plus_news
+    - price_plus_news_no_fragile
 frontier_architecture_policy:
   enabled: true
   allow_phase1_advanced: true

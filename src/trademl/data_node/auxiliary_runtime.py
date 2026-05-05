@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -1198,6 +1199,24 @@ class AuxiliaryRuntime:
                     schema_mismatch=False,
                     duration_ms=round((perf_counter() - started) * 1000.0, 3),
                 )
+                self.db.record_ingestion_ledger(
+                    vendor="auxiliary",
+                    dataset=output_name,
+                    output_name=output_name,
+                    partition_date=day_key,
+                    status="success",
+                    rows_in=rows_in,
+                    rows_normalized=int(len(day_frame)),
+                    rows_written=int(len(combined)),
+                    duplicates_dropped=duplicates_dropped,
+                    schema_version=self._archive_schema_version(output_name),
+                    payload_hash=self._archive_payload_hash(combined),
+                    partition_path=str(output),
+                    feature_visibility={
+                        "partition_exists": True,
+                        "archive_root": str(archive_root),
+                    },
+                )
                 written.append(output)
             except Exception as exc:
                 self.db.record_archive_write_telemetry(
@@ -1212,6 +1231,24 @@ class AuxiliaryRuntime:
                     error=str(exc),
                     duration_ms=round((perf_counter() - started) * 1000.0, 3),
                 )
+                self.db.record_ingestion_ledger(
+                    vendor="auxiliary",
+                    dataset=output_name,
+                    output_name=output_name,
+                    partition_date=day_key,
+                    status="failed",
+                    rows_in=rows_in,
+                    rows_normalized=int(len(day_frame)),
+                    rows_written=0,
+                    duplicates_dropped=0,
+                    schema_version=self._archive_schema_version(output_name),
+                    partition_path=str(output),
+                    feature_visibility={
+                        "partition_exists": bool(output.exists()),
+                        "archive_root": str(archive_root),
+                    },
+                    error=str(exc),
+                )
                 raise
             finally:
                 with contextlib.suppress(OSError):
@@ -1225,6 +1262,26 @@ class AuxiliaryRuntime:
             return []
         expected = set(schema.string_columns) | set(schema.timestamp_columns) | {schema.date_column}
         return sorted(column for column in frame.columns if column in expected)
+
+    @staticmethod
+    def _archive_schema_version(output_name: str) -> str:
+        schema = ARCHIVE_SCHEMAS.get(output_name)
+        if schema is None:
+            return "archive_schema_default_v1"
+        pieces = [
+            ",".join(schema.string_columns),
+            ",".join(schema.timestamp_columns),
+            schema.date_column,
+        ]
+        return "archive_schema_" + hashlib.sha1("|".join(pieces).encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _archive_payload_hash(frame: pd.DataFrame) -> str:
+        if frame.empty:
+            return hashlib.sha1(b"empty").hexdigest()
+        normalized = frame.sort_index(axis=1).reset_index(drop=True).astype(str)
+        values = pd.util.hash_pandas_object(normalized, index=True).values.tobytes()
+        return hashlib.sha1(values).hexdigest()
 
     @staticmethod
     def _acquire_file_lock(path: Path, *, stale_after_seconds: int = 15) -> None:

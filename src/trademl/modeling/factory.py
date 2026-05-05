@@ -36,6 +36,28 @@ SOURCE_ROOT_DATASET_PATHS = {
     "ticker_news": ("data/raw/ticker_news",),
     "equities_minute": ("data/raw/equities_minute",),
 }
+SOURCE_STATE_AVAILABLE = "AVAILABLE"
+SOURCE_STATE_STALE = "STALE"
+SOURCE_STATE_ZERO_COVERAGE = "ZERO_COVERAGE"
+SOURCE_STATE_ENTITLEMENT_UNAVAILABLE = "ENTITLEMENT_UNAVAILABLE"
+SOURCE_STATE_SOURCE_UNAVAILABLE = "SOURCE_UNAVAILABLE"
+SOURCE_STATE_DISABLED_BY_POLICY = "DISABLED_BY_POLICY"
+SOURCE_STATE_SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
+SOURCE_STATE_PRIORITY = {
+    SOURCE_STATE_SCHEMA_MISMATCH: 6,
+    SOURCE_STATE_SOURCE_UNAVAILABLE: 5,
+    SOURCE_STATE_ZERO_COVERAGE: 4,
+    SOURCE_STATE_STALE: 3,
+    SOURCE_STATE_ENTITLEMENT_UNAVAILABLE: 2,
+    SOURCE_STATE_DISABLED_BY_POLICY: 1,
+    SOURCE_STATE_AVAILABLE: 0,
+}
+KNOWN_UNAVAILABLE_SOURCES = {
+    "fundamentals_tiingo": {
+        "state": SOURCE_STATE_ENTITLEMENT_UNAVAILABLE,
+        "reason": "fundamentals_tiingo currently has zero usable rows under the free-plan/source entitlement",
+    }
+}
 
 
 def build_modeling_artifacts(
@@ -580,6 +602,13 @@ def _source_summary(
             status = "invalid_schema"
         elif rows > 0:
             status = "available"
+        lifecycle = _source_lifecycle_state(
+            dataset=dataset,
+            status=status,
+            rows=rows,
+            missing_required=missing_required,
+            exists=root.exists(),
+        )
         sources.append(
             {
                 "dataset": dataset,
@@ -592,6 +621,11 @@ def _source_summary(
                 "required_columns": list(SOURCE_REQUIRED_COLUMNS.get(dataset, ())),
                 "missing_required_columns": missing_required,
                 "status": status,
+                "source_state": lifecycle["state"],
+                "lifecycle_state": lifecycle["state"],
+                "actionable": lifecycle["actionable"],
+                "known_unavailable": lifecycle["known_unavailable"],
+                "reason": lifecycle["reason"],
                 "latest_partition": latest_partition,
             }
         )
@@ -601,9 +635,16 @@ def _source_summary(
     available = [source for source in sources if source.get("status") == "available"]
     invalid = [source for source in sources if source.get("status") == "invalid_schema"]
     source_status = "available" if available else "invalid_schema" if invalid else "empty" if existing else "missing"
+    source_state = _aggregate_source_state(sources)
+    reasons = [str(source.get("reason")) for source in sources if source.get("reason")]
     return {
         "dataset": dataset,
         "status": source_status,
+        "source_state": source_state,
+        "lifecycle_state": source_state,
+        "actionable": False if source_state in {SOURCE_STATE_ENTITLEMENT_UNAVAILABLE, SOURCE_STATE_DISABLED_BY_POLICY} else any(bool(source.get("actionable")) for source in sources),
+        "known_unavailable": any(bool(source.get("known_unavailable")) for source in sources),
+        "reason": "; ".join(dict.fromkeys(reasons)),
         "rows": rows,
         "paths": [str(source.get("path")) for source in sources],
         "existing_paths": [str(source.get("path")) for source in existing],
@@ -613,6 +654,68 @@ def _source_summary(
         "latest_partition": max(latest_values) if latest_values else None,
         "sources": sources,
     }
+
+
+def _source_lifecycle_state(
+    *,
+    dataset: str,
+    status: str,
+    rows: int,
+    missing_required: list[str],
+    exists: bool,
+) -> dict[str, Any]:
+    """Map a source adapter status to the auditable lifecycle state contract."""
+    known = dict(KNOWN_UNAVAILABLE_SOURCES.get(dataset) or {})
+    if status == "available":
+        return {
+            "state": SOURCE_STATE_AVAILABLE,
+            "actionable": False,
+            "known_unavailable": False,
+            "reason": "",
+        }
+    if not exists:
+        return {
+            "state": SOURCE_STATE_SOURCE_UNAVAILABLE,
+            "actionable": True,
+            "known_unavailable": False,
+            "reason": "source path is missing",
+        }
+    if status == "invalid_schema" or missing_required:
+        return {
+            "state": SOURCE_STATE_SCHEMA_MISMATCH,
+            "actionable": True,
+            "known_unavailable": False,
+            "reason": f"missing required columns: {missing_required}",
+        }
+    if known and rows <= 0:
+        return {
+            "state": str(known.get("state") or SOURCE_STATE_ENTITLEMENT_UNAVAILABLE),
+            "actionable": False,
+            "known_unavailable": True,
+            "reason": str(known.get("reason") or "source is unavailable by current entitlement/policy"),
+        }
+    return {
+        "state": SOURCE_STATE_ZERO_COVERAGE,
+        "actionable": True,
+        "known_unavailable": False,
+        "reason": "source exists but has zero usable rows",
+    }
+
+
+def _aggregate_source_state(sources: list[dict[str, Any]]) -> str:
+    if not sources:
+        return SOURCE_STATE_SOURCE_UNAVAILABLE
+    if any(str(source.get("source_state")) == SOURCE_STATE_AVAILABLE for source in sources):
+        return SOURCE_STATE_AVAILABLE
+    if any(str(source.get("source_state")) == SOURCE_STATE_SCHEMA_MISMATCH for source in sources):
+        return SOURCE_STATE_SCHEMA_MISMATCH
+    if any(bool(source.get("known_unavailable")) for source in sources):
+        states = [str(source.get("source_state")) for source in sources if bool(source.get("known_unavailable"))]
+        return states[0] if states else SOURCE_STATE_ENTITLEMENT_UNAVAILABLE
+    return max(
+        (str(source.get("source_state") or SOURCE_STATE_SOURCE_UNAVAILABLE) for source in sources),
+        key=lambda state: SOURCE_STATE_PRIORITY.get(state, 0),
+    )
 
 
 def _missing_required_source_columns(*, dataset: str, columns: set[str]) -> list[str]:
@@ -718,6 +821,40 @@ def _write_feature_source_contract(*, data_root: Path, configured_paths: dict[st
         "datasets": datasets,
     }
     path = _source_contract_path(data_root=data_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    _write_source_availability(data_root=data_root, source_contract=payload)
+    return payload
+
+
+def _write_source_availability(*, data_root: Path, source_contract: dict[str, Any]) -> dict[str, Any]:
+    datasets = {}
+    state_counts: dict[str, int] = {}
+    for dataset, entry in dict(source_contract.get("datasets") or {}).items():
+        summary = dict(entry.get("summary") or {})
+        state = str(summary.get("source_state") or summary.get("lifecycle_state") or SOURCE_STATE_SOURCE_UNAVAILABLE)
+        state_counts[state] = state_counts.get(state, 0) + 1
+        datasets[str(dataset)] = {
+            "dataset": str(dataset),
+            "state": state,
+            "status": summary.get("status"),
+            "actionable": bool(summary.get("actionable")),
+            "known_unavailable": bool(summary.get("known_unavailable")),
+            "rows": int(summary.get("rows") or 0),
+            "latest_partition": summary.get("latest_partition"),
+            "reason": summary.get("reason"),
+            "paths": list(summary.get("paths") or []),
+            "existing_paths": list(summary.get("existing_paths") or []),
+            "missing_required_columns": list(summary.get("missing_required_columns") or []),
+            "sources": list(summary.get("sources") or []),
+        }
+    payload = {
+        "version": "source_availability_v1",
+        "generated_at": datetime.now(tz=UTC).isoformat(),
+        "state_counts": state_counts,
+        "datasets": datasets,
+    }
+    path = _source_availability_path(data_root=data_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
     return payload
@@ -1108,3 +1245,7 @@ def _registry_path(*, data_root: Path) -> Path:
 
 def _source_contract_path(*, data_root: Path) -> Path:
     return data_root / "control" / "cluster" / "state" / "research" / "feature_source_contract" / "latest.json"
+
+
+def _source_availability_path(*, data_root: Path) -> Path:
+    return data_root / "control" / "cluster" / "state" / "data" / "source_availability" / "latest.json"

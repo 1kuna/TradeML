@@ -56,6 +56,7 @@ class DataNodeDB:
             "vendor_lane_health",
             "scheduler_decisions",
             "archive_write_telemetry",
+            "ingestion_ledger",
         }
     )
 
@@ -320,6 +321,36 @@ class DataNodeDB:
                 """
                 CREATE INDEX IF NOT EXISTS idx_archive_write_telemetry_created
                 ON archive_write_telemetry(created_at, output_name, partition_date, status)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ingestion_ledger (
+                  id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                  vendor                  TEXT,
+                  dataset                 TEXT NOT NULL,
+                  output_name             TEXT NOT NULL,
+                  partition_date          DATE,
+                  task_key                TEXT,
+                  attempt_id              TEXT,
+                  status                  TEXT NOT NULL,
+                  rows_in                 INTEGER NOT NULL DEFAULT 0,
+                  rows_normalized         INTEGER NOT NULL DEFAULT 0,
+                  rows_written            INTEGER NOT NULL DEFAULT 0,
+                  duplicates_dropped      INTEGER NOT NULL DEFAULT 0,
+                  schema_version          TEXT,
+                  payload_hash            TEXT,
+                  partition_path          TEXT,
+                  feature_visibility_json TEXT,
+                  error                   TEXT,
+                  created_at              TIMESTAMP NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ingestion_ledger_created
+                ON ingestion_ledger(created_at, dataset, output_name, partition_date, status)
                 """
             )
         self._validate_schema()

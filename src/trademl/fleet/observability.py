@@ -37,6 +37,9 @@ def build_fleet_observability(
         now=current,
     )
     archive_schema = _archive_schema_observability(snapshot)
+    ingestion_ledger = _ingestion_ledger_observability(snapshot)
+    source_availability = _source_availability_observability(data_root=data_root)
+    compaction = _compaction_observability(data_root=data_root)
     research = _research_observability(snapshot)
     paper_pnl = _paper_pnl_observability(snapshot)
     collection_saturation = _collection_saturation_observability(vendors)
@@ -48,6 +51,9 @@ def build_fleet_observability(
         "freshness": freshness,
         "resources": resources,
         "archive_schema": archive_schema,
+        "ingestion_ledger": ingestion_ledger,
+        "source_availability": source_availability,
+        "compaction": compaction,
         "research": research,
         "paper_pnl": paper_pnl,
         "issues": [],
@@ -71,6 +77,7 @@ def _snapshot_with_remote_pi_observability(snapshot: dict[str, Any], *, remote: 
         "vendor_attempts_summary",
         "planner_task_summary",
         "budget_summary",
+        "ingestion_ledger",
     ):
         if node_observability.get(key):
             merged[key] = node_observability[key]
@@ -152,6 +159,40 @@ def collect_observability_issues(payload: dict[str, Any]) -> list[dict[str, Any]
                     "Inspect archive write telemetry and latest task errors.",
                 )
             )
+    for row in list((payload.get("ingestion_ledger") or {}).get("rows") or []):
+        if str(row.get("status")).lower() == "failed":
+            issues.append(
+                _issue(
+                    "pi",
+                    "warning",
+                    "ingestion_ledger_failure",
+                    f"{row.get('dataset')} ingestion failed: {row.get('latest_error') or '-'}",
+                    "Inspect the Pi ingestion ledger and archive write telemetry.",
+                )
+            )
+    for dataset, row in dict((payload.get("source_availability") or {}).get("datasets") or {}).items():
+        if isinstance(row, dict) and _source_is_actionable(row):
+            issues.append(
+                _issue(
+                    "data",
+                    "warning",
+                    "source_availability_actionable",
+                    f"{dataset} source state is {row.get('state')}: {row.get('reason') or row.get('status') or '-'}",
+                    "Inspect source availability and the Pi-to-Mac feature source contract.",
+                )
+            )
+    compaction = dict(payload.get("compaction") or {})
+    compaction_failures = int((compaction.get("summary") or {}).get("failures") or 0)
+    if compaction_failures > 0:
+        issues.append(
+            _issue(
+                "data",
+                "warning",
+                "archive_compaction_failed",
+                f"{compaction_failures} archive compaction partition(s) failed",
+                "Inspect control/cluster/state/data/compaction/latest.json.",
+            )
+        )
     resources = dict(payload.get("resources") or {})
     if resources.get("nas_status") != "online":
         issues.append(
@@ -199,7 +240,7 @@ def collect_observability_issues(payload: dict[str, Any]) -> list[dict[str, Any]
     for entry in list(leaderboard.get("entries") or []):
         if not isinstance(entry, dict):
             continue
-        if str(entry.get("readiness_status") or "").upper() == "BLOCKED":
+        if str(entry.get("readiness_status") or "").upper() == "BLOCKED" and _entry_has_actionable_source_blocker(entry):
             issues.append(
                 _issue(
                     "research",
@@ -213,7 +254,10 @@ def collect_observability_issues(payload: dict[str, Any]) -> list[dict[str, Any]
             if group == "price_liquidity":
                 continue
             sources = dict(coverage.get("sources") or {})
-            if sources and all(str(source.get("status")) != "available" for source in sources.values() if isinstance(source, dict)):
+            actionable_sources = [
+                source for source in sources.values() if isinstance(source, dict) and _source_is_actionable(source)
+            ]
+            if actionable_sources and all(str(source.get("status")) != "available" for source in sources.values() if isinstance(source, dict)):
                 issues.append(
                     _issue(
                         "data",
@@ -225,6 +269,8 @@ def collect_observability_issues(payload: dict[str, Any]) -> list[dict[str, Any]
                 )
             for dataset, source in sources.items():
                 if not isinstance(source, dict):
+                    continue
+                if not _source_is_actionable(source):
                     continue
                 status = str(source.get("status") or "")
                 if status == "missing":
@@ -264,10 +310,12 @@ def _observability_policy(config: dict[str, Any]) -> dict[str, Any]:
     collection = dict(config.get("collection") or {})
     saturation = dict(collection.get("saturation") or {})
     observability = dict(collection.get("observability") or {})
+    freshness = dict(collection.get("freshness_policy") or {})
     return {
         "target_utilization": float(saturation.get("target_utilization") or 0.98),
         "vendor_underutilized_after_minutes": int(observability.get("vendor_underutilized_after_minutes") or 10),
         "dataset_stale_after_minutes": int(observability.get("dataset_stale_after_minutes") or 1440),
+        "dataset_stale_after_by_dataset": dict(freshness.get("dataset_stale_after_minutes") or freshness.get("datasets") or {}),
         "scheduler_decision_retention_hours": int(observability.get("scheduler_decision_retention_hours") or 24),
         "disk_warn_percent": float((observability.get("resource_warn_thresholds") or {}).get("disk_percent") or 90.0),
     }
@@ -446,17 +494,28 @@ def _collection_saturation_observability(vendors: dict[str, Any]) -> dict[str, A
 def _freshness_observability(snapshot: dict[str, Any], *, policy: dict[str, Any], now: datetime) -> dict[str, Any]:
     stale_after = int(policy["dataset_stale_after_minutes"])
     datasets = [
-        _freshness_row("raw_equities", snapshot.get("latest_raw_date"), stale_after=stale_after, now=now),
-        _freshness_row("curated_equities", snapshot.get("latest_curated_date"), stale_after=stale_after, now=now),
+        _freshness_row("raw_equities", snapshot.get("latest_raw_date"), stale_after=_stale_after_for_dataset(policy, "raw_equities", stale_after), now=now),
+        _freshness_row("curated_equities", snapshot.get("latest_curated_date"), stale_after=_stale_after_for_dataset(policy, "curated_equities", stale_after), now=now),
     ]
     for name, payload in sorted(dict(snapshot.get("dataset_coverage") or {}).items()):
         if isinstance(payload, dict) and payload.get("latest_date"):
-            datasets.append(_freshness_row(str(name), payload.get("latest_date"), stale_after=stale_after, now=now))
+            datasets.append(_freshness_row(str(name), payload.get("latest_date"), stale_after=_stale_after_for_dataset(policy, str(name), stale_after), now=now))
     return {
         "dataset_stale_after_minutes": stale_after,
+        "dataset_stale_after_by_dataset": dict(policy.get("dataset_stale_after_by_dataset") or {}),
         "datasets": datasets,
         "stale_count": sum(1 for row in datasets if row["status"] == "stale"),
     }
+
+
+def _stale_after_for_dataset(policy: dict[str, Any], dataset: str, default: int) -> int:
+    raw = dict(policy.get("dataset_stale_after_by_dataset") or {}).get(dataset)
+    if isinstance(raw, dict):
+        raw = raw.get("stale_after_minutes") or raw.get("expected_cadence_minutes")
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _resource_observability(
@@ -499,6 +558,48 @@ def _archive_schema_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
         "rows": rows,
         "failure_count": sum(int(row.get("failures") or 0) for row in rows),
         "schema_mismatch_count": sum(int(row.get("schema_mismatches") or 0) for row in rows),
+    }
+
+
+def _ingestion_ledger_observability(snapshot: dict[str, Any]) -> dict[str, Any]:
+    summary = dict(snapshot.get("ingestion_ledger") or {})
+    rows = list(summary.get("rows") or [])
+    return {
+        "window_minutes": summary.get("window_minutes"),
+        "checked_at": summary.get("checked_at"),
+        "rows": rows,
+        "failure_count": sum(int(row.get("events") or 0) for row in rows if str(row.get("status")) == "failed"),
+        "rows_written": sum(int(row.get("rows_written") or 0) for row in rows),
+    }
+
+
+def _source_availability_observability(*, data_root: Path) -> dict[str, Any]:
+    path = data_root / "control" / "cluster" / "state" / "data" / "source_availability" / "latest.json"
+    payload = _read_json(path)
+    if not payload:
+        return {"status": "missing", "path": str(path), "datasets": {}, "state_counts": {}}
+    return {
+        "status": "available",
+        "path": str(path),
+        "generated_at": payload.get("generated_at"),
+        "state_counts": dict(payload.get("state_counts") or {}),
+        "datasets": dict(payload.get("datasets") or {}),
+    }
+
+
+def _compaction_observability(*, data_root: Path) -> dict[str, Any]:
+    path = data_root / "control" / "cluster" / "state" / "data" / "compaction" / "latest.json"
+    payload = _read_json(path)
+    if not payload:
+        return {"status": "missing", "path": str(path), "rows": [], "summary": {"failures": 0}}
+    summary = dict(payload.get("summary") or {})
+    return {
+        "status": "available",
+        "path": str(path),
+        "generated_at": payload.get("generated_at"),
+        "dry_run": bool(payload.get("dry_run", False)),
+        "summary": summary,
+        "rows": list(payload.get("rows") or []),
     }
 
 
@@ -777,6 +878,36 @@ def _issue(source: str, severity: str, kind: str, message: str, suggested_action
         "message": message,
         "suggested_codex_action": suggested_action,
     }
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _source_is_actionable(source: dict[str, Any]) -> bool:
+    if bool(source.get("known_unavailable")):
+        return False
+    state = str(source.get("source_state") or source.get("lifecycle_state") or source.get("state") or "")
+    if state in {"ENTITLEMENT_UNAVAILABLE", "DISABLED_BY_POLICY", "AVAILABLE"}:
+        return False
+    if source.get("actionable") is not None:
+        return bool(source.get("actionable"))
+    return str(source.get("status") or "") in {"missing", "empty", "invalid_schema"}
+
+
+def _entry_has_actionable_source_blocker(entry: dict[str, Any]) -> bool:
+    for coverage in dict(entry.get("source_coverage") or {}).values():
+        if not isinstance(coverage, dict):
+            continue
+        for source in dict(coverage.get("sources") or {}).values():
+            if isinstance(source, dict) and _source_is_actionable(source):
+                return True
+    return not entry.get("source_coverage")
 
 
 def _verdict_for_issues(issues: list[dict[str, Any]]) -> str:

@@ -301,6 +301,7 @@ def _merge_remote_pi_observability(snapshot: dict[str, Any], *, remote: dict[str
         "vendor_attempts_summary",
         "planner_task_summary",
         "budget_summary",
+        "ingestion_ledger",
     ):
         value = pi_observability.get(key)
         if value:
@@ -531,7 +532,7 @@ def _ssh_pi_node_state(target: dict[str, str]) -> dict[str, Any]:
         "version_path = root / 'control' / 'deployed_version.json'\n"
         "db_path = root / 'control' / 'node.sqlite'\n"
         "budget_path = root / 'control' / 'budget_state.json'\n"
-        "required = {'scheduler_decisions', 'archive_write_telemetry', 'planner_tasks', 'vendor_attempts'}\n"
+        "required = {'scheduler_decisions', 'archive_write_telemetry', 'planner_tasks', 'vendor_attempts', 'ingestion_ledger'}\n"
         "version = {}\n"
         "if version_path.exists():\n"
         "    try:\n"
@@ -588,12 +589,26 @@ def _ssh_pi_node_state(target: dict[str, str]) -> dict[str, Any]:
         "                    ORDER BY latest_at DESC\n"
         "                    LIMIT 300\n"
         "                \"\"\")\n"
+        "                ingestion = rows(conn, \"\"\"\n"
+        "                    SELECT COALESCE(vendor, '') AS vendor, dataset, output_name, status, COUNT(*) AS events,\n"
+        "                           SUM(rows_in) AS rows_in, SUM(rows_normalized) AS rows_normalized,\n"
+        "                           SUM(rows_written) AS rows_written, SUM(duplicates_dropped) AS duplicates_dropped,\n"
+        "                           MAX(partition_date) AS latest_partition_date, MAX(partition_path) AS latest_partition_path,\n"
+        "                           MAX(payload_hash) AS latest_payload_hash, MAX(error) AS latest_error,\n"
+        "                           MAX(created_at) AS latest_at\n"
+        "                    FROM ingestion_ledger\n"
+        "                    WHERE created_at >= datetime('now', '-60 minutes')\n"
+        "                    GROUP BY COALESCE(vendor, ''), dataset, output_name, status\n"
+        "                    ORDER BY latest_at DESC\n"
+        "                    LIMIT 200\n"
+        "                \"\"\")\n"
         "                node_observability = {\n"
         "                    'scheduler_decisions': {'window_minutes': 15, 'rows': scheduler},\n"
         "                    'archive_write_telemetry': {'window_minutes': 60, 'rows': archive},\n"
         "                    'lane_health': {'rows': lanes},\n"
         "                    'vendor_attempts_summary': {'window_minutes': 60, 'rows': attempts},\n"
         "                    'planner_task_summary': {'window_hours': 24, 'rows': tasks},\n"
+        "                    'ingestion_ledger': {'window_minutes': 60, 'rows': ingestion},\n"
         "                    'dataset_coverage': {row['output_name']: {'latest_date': row.get('latest_at'), 'rows_60m': row.get('rows_in')} for row in archive if row.get('latest_at')},\n"
         "                }\n"
         "                if budget_path.exists():\n"
