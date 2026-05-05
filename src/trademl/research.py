@@ -157,6 +157,17 @@ DEFAULT_AUTONOMOUS_PROGRESSION_POLICY = {
     "enabled": True,
     "disabled_future_lanes": ["rl_policy", "sequence_transformer", "gnn", "foundation_forecaster"],
 }
+DEFAULT_DIAGNOSTIC_PLANNER_POLICY = {
+    "enabled": True,
+    "strong_rejected_classes": ["strong_robustness_failed", "strong_unstable", "strong_overfit_risk", "strong_cost_failed"],
+    "weak_plateau_min_rejections": 10,
+    "weak_plateau_mode": "weak_rejection_plateau",
+    "weak_plateau_architectures": ["linear_baseline", "tree_challenger", "advanced_challenger"],
+    "weak_plateau_feature_families": ["price_core", "volatility_removed", "price_plus_news"],
+    "weak_plateau_data_profiles": ["phase1_short_window", "phase1_default", "phase1_long_window"],
+    "weak_plateau_horizons": [1, 5, 20],
+    "suppress_duplicates_on": ["feature_version", "label_version", "data_revision", "objective_policy"],
+}
 
 
 def start_research_program(
@@ -440,11 +451,13 @@ def supervise_research_program(
                 "next_experiment_id": (decision.get("next_spec") or {}).get("experiment_id"),
                 "family_signature": decision.get("family_signature"),
                 "novelty_score": decision.get("novelty_score"),
-                "top_rejection": (experiment_summary.get("top_gate_failures") or [[None]])[0][0]
-                if experiment_summary.get("top_gate_failures")
-                else None,
+                "top_rejection": _top_rejection_signature(experiment_summary)[0] or None,
                 "architecture_lane": (decision.get("next_spec") or {}).get("architecture_lane"),
                 "next_lane": (decision.get("next_spec") or {}).get("next_lane"),
+                "diagnostic_mode": (decision.get("next_spec") or {}).get("diagnostic_mode"),
+                "follow_up_of_run_id": (decision.get("next_spec") or {}).get("follow_up_of_run_id"),
+                "follow_up_reason": (decision.get("next_spec") or {}).get("follow_up_reason"),
+                "rejection_signature": (decision.get("next_spec") or {}).get("rejection_signature"),
             },
         )
         packet = None
@@ -1281,6 +1294,11 @@ def research_health(
         "objective_verdict": state.get("objective_verdict", {}),
         "pivot_reason": (state.get("last_transition") or {}).get("reason"),
         "next_lane": state.get("next_lane") or (state.get("frontier") or {}).get("next_lane"),
+        "diagnostic_mode": state.get("diagnostic_mode") or latest_summary.get("diagnostic_mode"),
+        "follow_up_of_run_id": state.get("follow_up_of_run_id") or latest_summary.get("follow_up_of_run_id"),
+        "follow_up_reason": state.get("follow_up_reason") or latest_summary.get("follow_up_reason"),
+        "rejection_signature": state.get("rejection_signature") or latest_summary.get("rejection_signature"),
+        "diagnostic_family_signature": state.get("diagnostic_family_signature") or latest_summary.get("diagnostic_family_signature"),
         "sentinel_delta": state.get("sentinel_delta") or (state.get("frontier") or {}).get("sentinel_delta"),
         "autonomous_progression": state.get("autonomous_progression", {}),
         "dependency_preflight": current_infra_preflight.get("dependencies", {}),
@@ -2246,8 +2264,11 @@ def write_research_review_packet(
         "next_lane": state.get("next_lane") or (state.get("frontier") or {}).get("next_lane"),
         "sentinel_delta": state.get("sentinel_delta") or (state.get("frontier") or {}).get("sentinel_delta"),
         "autonomous_progression": state.get("autonomous_progression", {}),
-        "diagnostic_mode": experiment_summary.get("diagnostic_mode"),
-        "follow_up_of_run_id": experiment_summary.get("follow_up_of_run_id"),
+        "diagnostic_mode": state.get("diagnostic_mode") or experiment_summary.get("diagnostic_mode"),
+        "follow_up_of_run_id": state.get("follow_up_of_run_id") or experiment_summary.get("follow_up_of_run_id"),
+        "follow_up_reason": state.get("follow_up_reason") or experiment_summary.get("follow_up_reason"),
+        "rejection_signature": state.get("rejection_signature") or experiment_summary.get("rejection_signature"),
+        "diagnostic_family_signature": state.get("diagnostic_family_signature") or experiment_summary.get("diagnostic_family_signature"),
         "frontier": state.get("frontier", {}),
         "budgets": state.get("budgets", {}),
         "last_transition": state.get("last_transition", {}),
@@ -3147,6 +3168,22 @@ def _determine_program_transition(
             "novelty_score": _novelty_score(frontier=frontier, next_spec=diagnostic_spec),
         }
 
+    weak_plateau_spec = _weak_rejection_plateau_follow_up_spec(
+        spec=spec,
+        state=state,
+        phase_policy=phase_policy,
+        frontier=frontier,
+        experiment_summary=experiment_summary,
+    )
+    if weak_plateau_spec is not None:
+        return {
+            "action": "launch_family",
+            "reason": "repeated weak rejection signature plateaued; launching root-cause diagnostic follow-up",
+            "next_spec": weak_plateau_spec,
+            "family_signature": _family_signature(weak_plateau_spec),
+            "novelty_score": _novelty_score(frontier=frontier, next_spec=weak_plateau_spec),
+        }
+
     frontier_spec = _frontier_architecture_spec(spec=spec, state=state, phase_policy=phase_policy, frontier=frontier, experiment_summary=experiment_summary)
     if frontier_spec is not None:
         return {
@@ -3296,6 +3333,23 @@ def _autonomous_progression_policy(spec: dict[str, Any]) -> dict[str, Any]:
     return {**DEFAULT_AUTONOMOUS_PROGRESSION_POLICY, **dict(spec.get("autonomous_progression_policy") or {})}
 
 
+def _diagnostic_planner_policy(spec: dict[str, Any]) -> dict[str, Any]:
+    policy = deepcopy(DEFAULT_DIAGNOSTIC_PLANNER_POLICY)
+    incoming = dict(spec.get("diagnostic_planner_policy") or {})
+    policy.update(incoming)
+    for key in (
+        "strong_rejected_classes",
+        "weak_plateau_architectures",
+        "weak_plateau_feature_families",
+        "weak_plateau_data_profiles",
+        "weak_plateau_horizons",
+        "suppress_duplicates_on",
+    ):
+        if key in incoming:
+            policy[key] = list(incoming.get(key) or [])
+    return policy
+
+
 def _decorate_autonomous_experiment_spec(*, next_spec: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
     matrix = dict(next_spec.get("matrix") or {})
     architectures = [str(item) for item in matrix.get("architecture_family") or []]
@@ -3315,6 +3369,7 @@ def _decorate_autonomous_experiment_spec(*, next_spec: dict[str, Any], spec: dic
     next_spec["architecture_registry"] = architecture_registry_payload()
     next_spec["objective_registry"] = objective_registry_payload()
     next_spec["objective_policy"] = _objective_policy(spec)
+    next_spec["diagnostic_planner_policy"] = _diagnostic_planner_policy(spec)
     next_spec["architecture_lane"] = primary_lane
     next_spec["complexity_tier"] = int(entry["complexity_tier"])
     next_spec["autonomous_progression"] = _autonomous_progression_policy(spec)
@@ -3353,9 +3408,12 @@ def _strong_rejected_follow_up_spec(
     experiment_summary: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Build a diagnostic family for the strongest rejected candidate."""
+    policy = _diagnostic_planner_policy(spec)
+    if not bool(policy.get("enabled", True)):
+        return None
     best_autopsy = dict(experiment_summary.get("candidate_autopsy") or {})
     classification = str(best_autopsy.get("classification") or "")
-    if classification not in {"strong_unstable", "strong_robustness_failed", "strong_overfit_risk", "strong_cost_failed"}:
+    if classification not in set(policy.get("strong_rejected_classes") or []):
         return None
     best_run_id = experiment_summary.get("best_run_id")
     if not best_run_id:
@@ -3414,6 +3472,102 @@ def _strong_rejected_follow_up_spec(
         "data_revision": best_run.get("data_revision") or experiment_summary.get("data_revision"),
         "objective_policy": _objective_policy(spec),
         "diagnostic_mode": classification,
+        "matrix": next_spec["matrix"],
+    }
+    next_spec["diagnostic_family_signature"] = diagnostic_family_signature(seed)
+    next_spec = _decorate_autonomous_experiment_spec(next_spec=next_spec, spec=spec)
+    if _family_signature(next_spec) in set(frontier.get("tried_family_signatures") or []):
+        return None
+    return next_spec
+
+
+def _weak_rejection_plateau_follow_up_spec(
+    *,
+    spec: dict[str, Any],
+    state: dict[str, Any],
+    phase_policy: dict[str, Any],
+    frontier: dict[str, Any],
+    experiment_summary: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Build a bounded diagnostic family when one weak rejection dominates."""
+    policy = _diagnostic_planner_policy(spec)
+    if not bool(policy.get("enabled", True)):
+        return None
+    top_reason, top_count = _top_rejection_signature(experiment_summary)
+    top_count = max(top_count, _frontier_rejection_signature_count(frontier=frontier, rejection_signature=top_reason))
+    diagnostic_signature = _weak_rejection_diagnostic_signature(experiment_summary) or top_reason
+    threshold = int(policy.get("weak_plateau_min_rejections") or 10)
+    if not top_reason or top_count < threshold:
+        return None
+    best_autopsy = dict(experiment_summary.get("candidate_autopsy") or {})
+    if str(best_autopsy.get("classification") or "") != "weak_rejected":
+        return None
+    best_run = _best_run_from_summary(experiment_summary)
+    if not best_run:
+        return None
+    diagnostic_mode = str(policy.get("weak_plateau_mode") or "weak_rejection_plateau")
+    if _weak_plateau_already_tried(frontier=frontier, rejection_signature=diagnostic_signature, diagnostic_mode=diagnostic_mode):
+        return None
+    phase = _current_ssot_phase(state=state, spec=spec)
+    next_spec = _make_experiment_spec_from_phase_policy(
+        spec=spec,
+        program_state=state,
+        phase_policy=phase_policy,
+        experiment_id=_next_experiment_id(program_state=state, spec=spec, phase=phase),
+        generation=int(state.get("current_generation", 0) or 0) + 1,
+    )
+    matrix_values = dict(best_run.get("matrix_values") or {})
+    feature_family = str(matrix_values.get("feature_family") or "price_core")
+    data_family = str(matrix_values.get("data_family") or "price_only")
+    portfolio_profile = str(best_run.get("portfolio_profile") or "cost_aware_long_only_v1")
+    current_horizon = int(best_run.get("label_horizon") or matrix_values.get("label_horizon") or 5)
+    train_year = int(matrix_values.get("validation.initial_train_years") or 2)
+    weak_matrix = {
+        "architecture_family": _ordered_unique([
+            *list(policy.get("weak_plateau_architectures") or []),
+            str(matrix_values.get("architecture_family") or "linear_baseline"),
+        ]),
+        "feature_family": _ordered_unique([
+            *list(policy.get("weak_plateau_feature_families") or []),
+            feature_family,
+        ]),
+        "data_family": [data_family],
+        "label_horizon": _ordered_unique([current_horizon, *list(policy.get("weak_plateau_horizons") or [])]),
+        "portfolio_profile": [portfolio_profile],
+        "data_profile": _ordered_unique([
+            str(matrix_values.get("data_profile") or "phase1_default"),
+            *list(policy.get("weak_plateau_data_profiles") or []),
+        ]),
+        "validation.initial_train_years": sorted({train_year, 2, 3}),
+    }
+    next_spec["matrix"] = _cap_matrix_combinations(
+        weak_matrix,
+        family_size_cap=int(next_spec["proposal_policy"].get("family_size_cap") or 6),
+        expansion_order=[
+            "architecture_family",
+            "feature_family",
+            "label_horizon",
+            "data_profile",
+            "validation.initial_train_years",
+        ],
+    )
+    next_spec["diagnostic_mode"] = diagnostic_mode
+    next_spec["follow_up_of_run_id"] = str(best_run.get("run_id") or experiment_summary.get("best_run_id") or "")
+    next_spec["follow_up_reason"] = f"weak rejection plateau: {diagnostic_signature}"
+    next_spec["rejection_signature"] = diagnostic_signature
+    next_spec["supervision"] = {
+        **dict(next_spec.get("supervision") or {}),
+        "auto_backtest_survivors": True,
+        "auto_propose_next_family": False,
+    }
+    seed = {
+        "run_id": next_spec["follow_up_of_run_id"],
+        "feature_version": best_run.get("feature_version") or (spec.get("modeling") or {}).get("feature_version"),
+        "label_version": best_run.get("label_version") or (spec.get("modeling") or {}).get("label_version"),
+        "data_revision": best_run.get("data_revision") or experiment_summary.get("data_revision"),
+        "objective_policy": _objective_policy(spec),
+        "diagnostic_mode": diagnostic_mode,
+        "rejection_signature": diagnostic_signature,
         "matrix": next_spec["matrix"],
     }
     next_spec["diagnostic_family_signature"] = diagnostic_family_signature(seed)
@@ -3482,6 +3636,78 @@ def _best_run_from_summary(experiment_summary: dict[str, Any]) -> dict[str, Any]
     return {}
 
 
+def _top_rejection_signature(experiment_summary: dict[str, Any]) -> tuple[str, int]:
+    failures = list(experiment_summary.get("top_gate_failures") or [])
+    if not failures:
+        reason = str(experiment_summary.get("best_decision_reason") or "").strip()
+        return (reason, 1) if reason else ("", 0)
+    first = failures[0]
+    if isinstance(first, dict):
+        reason = str(first.get("reason") or first.get("gate") or first.get("message") or "").strip()
+        count = int(first.get("count") or 1)
+        return reason, count
+    if isinstance(first, (list, tuple)) and first:
+        reason = str(first[0] or "").strip()
+        count = int(first[1] if len(first) > 1 and first[1] is not None else 1)
+        return reason, count
+    return str(first or "").strip(), 1
+
+
+def _frontier_rejection_signature_count(*, frontier: dict[str, Any], rejection_signature: str) -> int:
+    if not rejection_signature:
+        return 0
+    total = 0
+    for item in list(frontier.get("family_history") or []):
+        if not isinstance(item, dict):
+            continue
+        reason, count = _top_rejection_signature(item)
+        if reason == rejection_signature:
+            total += max(1, count)
+    return total
+
+
+def _weak_rejection_diagnostic_signature(experiment_summary: dict[str, Any]) -> str:
+    autopsy = dict(experiment_summary.get("candidate_autopsy") or {})
+    evidence = dict(autopsy.get("evidence") or {})
+    failures = [str(item).strip() for item in list(evidence.get("gate_failures") or []) if str(item).strip()]
+    if not failures:
+        failures = [
+            reason
+            for reason, _count in (_gate_failure_tuple(item) for item in list(experiment_summary.get("top_gate_failures") or [])[:5])
+            if reason
+        ]
+    root = str(autopsy.get("root_failure_mode") or "").strip()
+    if root and root not in failures:
+        failures.append(root)
+    return "; ".join(sorted(dict.fromkeys(failures)))
+
+
+def _gate_failure_tuple(item: Any) -> tuple[str, int]:
+    if isinstance(item, dict):
+        reason = str(item.get("reason") or item.get("gate") or item.get("message") or "").strip()
+        count = int(item.get("count") or 1)
+        return reason, count
+    if isinstance(item, (list, tuple)) and item:
+        reason = str(item[0] or "").strip()
+        count = int(item[1] if len(item) > 1 and item[1] is not None else 1)
+        return reason, count
+    return str(item or "").strip(), 1
+
+
+def _ordered_unique(values: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    result: list[Any] = []
+    for value in values:
+        if value is None:
+            continue
+        key = str(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
 def _cap_matrix_combinations(
     matrix: dict[str, list[Any]],
     *,
@@ -3515,6 +3741,18 @@ def _matrix_combination_count(matrix: dict[str, list[Any]]) -> int:
 def _diagnostic_follow_up_already_tried(*, frontier: dict[str, Any], run_id: str) -> bool:
     history = [item for item in list(frontier.get("family_history") or []) if isinstance(item, dict)]
     return any(str(item.get("follow_up_of_run_id") or "") == run_id for item in history)
+
+
+def _weak_plateau_already_tried(*, frontier: dict[str, Any], rejection_signature: str, diagnostic_mode: str) -> bool:
+    history = [item for item in list(frontier.get("family_history") or []) if isinstance(item, dict)]
+    return any(
+        str(item.get("diagnostic_mode") or "") == diagnostic_mode
+        and (
+            str(item.get("rejection_signature") or "") == rejection_signature
+            or str(item.get("follow_up_reason") or "").endswith(rejection_signature)
+        )
+        for item in history
+    )
 
 
 def _frontier_architecture_spec(
@@ -4034,8 +4272,10 @@ def _update_frontier_memory(*, state: dict[str, Any], experiment_summary: dict[s
             "top_gate_failures": top_failures,
             "candidate_autopsy": experiment_summary.get("candidate_autopsy") or {},
             "follow_up_of_run_id": experiment_summary.get("follow_up_of_run_id"),
+            "follow_up_reason": experiment_summary.get("follow_up_reason"),
             "diagnostic_mode": experiment_summary.get("diagnostic_mode"),
             "diagnostic_family_signature": experiment_summary.get("diagnostic_family_signature"),
+            "rejection_signature": experiment_summary.get("rejection_signature"),
         }
     )
     frontier["family_history"] = family_history[-50:]
@@ -4591,6 +4831,10 @@ def _launch_program_family(
             "experiment_id": next_spec["experiment_id"],
             "architecture_lane": next_spec.get("architecture_lane"),
             "next_lane": next_spec.get("next_lane"),
+            "diagnostic_mode": next_spec.get("diagnostic_mode"),
+            "follow_up_of_run_id": next_spec.get("follow_up_of_run_id"),
+            "follow_up_reason": next_spec.get("follow_up_reason"),
+            "rejection_signature": next_spec.get("rejection_signature"),
             "model_suites": list((next_spec.get("matrix") or {}).get("model_suite") or []),
             "feature_version": (next_spec.get("modeling") or {}).get("feature_version"),
             "label_horizon": (next_spec.get("modeling") or {}).get("label_horizon"),
@@ -4613,6 +4857,11 @@ def _launch_program_family(
         "objective_policy": next_spec.get("objective_policy", {}),
         "objective_verdict": next_spec.get("objective_verdict", {}),
         "next_lane": next_spec.get("next_lane"),
+        "diagnostic_mode": next_spec.get("diagnostic_mode"),
+        "follow_up_of_run_id": next_spec.get("follow_up_of_run_id"),
+        "follow_up_reason": next_spec.get("follow_up_reason"),
+        "rejection_signature": next_spec.get("rejection_signature"),
+        "diagnostic_family_signature": next_spec.get("diagnostic_family_signature"),
         "autonomous_progression": next_spec.get("autonomous_progression", {}),
         "active_experiment_supervisor": payload,
         "wait_reason": None,
@@ -4829,6 +5078,11 @@ def _ensure_program_state(*, local_state: Path, program_id: str, payload: dict[s
         "objective_policy",
         "objective_verdict",
         "next_lane",
+        "diagnostic_mode",
+        "follow_up_of_run_id",
+        "follow_up_reason",
+        "rejection_signature",
+        "diagnostic_family_signature",
         "sentinel_delta",
         "autonomous_progression",
         "feature_canary_batch_active",

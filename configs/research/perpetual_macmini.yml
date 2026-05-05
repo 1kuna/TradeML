@@ -101,6 +101,24 @@ autonomous_progression_policy:
     - foundation_forecaster
 diagnostic_planner_policy:
   enabled: true
+  weak_plateau_min_rejections: 10
+  weak_plateau_mode: weak_rejection_plateau
+  weak_plateau_architectures:
+    - linear_baseline
+    - tree_challenger
+    - advanced_challenger
+  weak_plateau_feature_families:
+    - price_core
+    - volatility_removed
+    - price_plus_news
+  weak_plateau_data_profiles:
+    - phase1_short_window
+    - phase1_default
+    - phase1_long_window
+  weak_plateau_horizons:
+    - 1
+    - 5
+    - 20
   strong_rejected_classes:
     - strong_robustness_failed
     - strong_unstable

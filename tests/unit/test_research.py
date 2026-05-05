@@ -673,6 +673,86 @@ def test_strong_robustness_failed_candidate_launches_feature_group_isolation_fol
     assert matrix["label_horizon"] == [5]
 
 
+def test_repeated_weak_rejections_launch_plateau_diagnostic_before_frontier(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    spec["frontier_architecture_policy"] = {
+        "enabled": True,
+        "allow_phase1_advanced": True,
+        "trigger_min_completed_runs": 100,
+        "advanced_first": True,
+    }
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    state["budgets"]["runs_completed"] = 293
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=research._empty_frontier(),  # noqa: SLF001
+        experiment_summary=_weak_plateau_summary(),
+        proposal={},
+    )
+
+    assert decision["action"] == "launch_family"
+    assert "weak rejection" in decision["reason"]
+    next_spec = decision["next_spec"]
+    assert next_spec["diagnostic_mode"] == "weak_rejection_plateau"
+    assert next_spec["follow_up_of_run_id"] == "weak-run"
+    assert "rank_ic<0.01 and assessment.decision != GO" in next_spec["rejection_signature"]
+    assert "signal too weak to clear predictive gates" in next_spec["rejection_signature"]
+    assert next_spec["matrix"]["architecture_family"] == ["linear_baseline", "tree_challenger", "advanced_challenger"]
+    assert next_spec["matrix"]["label_horizon"] == [5]
+    assert _matrix_size(next_spec["matrix"]) <= next_spec["proposal_policy"]["family_size_cap"]
+
+
+def test_weak_plateau_uses_frontier_history_not_only_current_family_count(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    frontier = research._empty_frontier()  # noqa: SLF001
+    reason = "rank_ic<0.01 and assessment.decision != GO"
+    frontier["family_history"] = [
+        {"experiment_id": f"past-{idx}", "top_gate_failures": [(reason, 2)]}
+        for idx in range(5)
+    ]
+    summary = deepcopy(_weak_plateau_summary())
+    summary["top_gate_failures"] = [(reason, 2)]
+
+    decision = research._determine_program_transition(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        frontier=frontier,
+        experiment_summary=summary,
+        proposal={},
+    )
+
+    assert decision["action"] == "launch_family"
+    assert decision["next_spec"]["diagnostic_mode"] == "weak_rejection_plateau"
+
+
+def test_weak_plateau_diagnostic_is_not_relaunched_for_same_signature(tmp_path: Path) -> None:
+    spec = research._load_research_program_spec(_program_spec(tmp_path))  # noqa: SLF001
+    state = research._initial_program_state(spec=spec, program_path=_program_spec(tmp_path), poll_seconds=30)  # noqa: SLF001
+    phase_policy = research._phase_policy(spec=spec, phase=1)  # noqa: SLF001
+    assert phase_policy is not None
+    frontier = research._empty_frontier()  # noqa: SLF001
+    frontier["family_history"] = [
+        {
+            "experiment_id": "perpetual-macmini-p1-f123",
+            "diagnostic_mode": "weak_rejection_plateau",
+            "rejection_signature": "rank_ic<0.01 and assessment.decision != GO; signal too weak to clear predictive gates",
+        }
+    ]
+
+    next_spec = research._weak_rejection_plateau_follow_up_spec(  # noqa: SLF001
+        spec=spec,
+        state=state,
+        phase_policy=phase_policy,
+        frontier=frontier,
+        experiment_summary=_weak_plateau_summary(),
+    )
+
+    assert next_spec is None
+
+
 def test_research_canary_preflight_blocks_without_creating_doomed_manifests(tmp_path: Path, monkeypatch) -> None:
     program_path = _program_spec(tmp_path)
     calls = {"supervise": 0}
@@ -2829,6 +2909,38 @@ def _write_price_partition(data_root: Path, date: str, closes: dict[str, float])
             "close": list(closes.values()),
         }
     ).to_parquet(root / "data.parquet", index=False)
+
+
+def _weak_plateau_summary() -> dict[str, object]:
+    return {
+        "experiment_id": "perpetual-macmini-p1-f293",
+        "best_run_id": "weak-run",
+        "best_primary_score": 0.003,
+        "shortlist_count": 0,
+        "top_gate_failures": [("rank_ic<0.01 and assessment.decision != GO", 73)],
+        "candidate_autopsy": {
+            "classification": "weak_rejected",
+            "root_failure_mode": "signal too weak to clear predictive gates",
+        },
+        "runs": [
+            {
+                "run_id": "weak-run",
+                "feature_version": "multi_source_daily_v1",
+                "label_version": "universe_relative_forward_return_v1",
+                "data_revision": "rev-weak",
+                "label_horizon": 5,
+                "portfolio_profile": "cost_aware_long_only_v1",
+                "matrix_values": {
+                    "architecture_family": "advanced_challenger",
+                    "feature_family": "price_plus_news",
+                    "data_family": "price_plus_liquidity",
+                    "label_horizon": 5,
+                    "data_profile": "phase1_default",
+                    "validation.initial_train_years": 2,
+                },
+            }
+        ],
+    }
 
 
 def _matrix_size(matrix: dict[str, list[object]]) -> int:

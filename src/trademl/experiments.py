@@ -261,6 +261,7 @@ def plan_experiment(
             "follow_up_reason": spec.get("follow_up_reason"),
             "diagnostic_mode": spec.get("diagnostic_mode"),
             "diagnostic_family_signature": spec.get("diagnostic_family_signature"),
+            "rejection_signature": spec.get("rejection_signature"),
             "config_overrides": row.get("config_overrides", {}),
             "config_path": str(config_path),
             "config_hash": hashlib.sha1(config_path.read_bytes()).hexdigest(),
@@ -303,6 +304,7 @@ def plan_experiment(
         "follow_up_reason": spec.get("follow_up_reason"),
         "diagnostic_mode": spec.get("diagnostic_mode"),
         "diagnostic_family_signature": spec.get("diagnostic_family_signature"),
+        "rejection_signature": spec.get("rejection_signature"),
         "supervision": _supervision_policy(spec),
         "max_concurrent": max_concurrent,
         "run_count": len(runs),
@@ -1431,7 +1433,9 @@ def _dashboard_summary_payload(summary: dict[str, Any], *, recent_limit: int = 1
         "candidate_autopsy": summary.get("candidate_autopsy") or {},
         "candidate_classifications": summary.get("candidate_classifications") or {},
         "follow_up_of_run_id": summary.get("follow_up_of_run_id"),
+        "follow_up_reason": summary.get("follow_up_reason"),
         "diagnostic_mode": summary.get("diagnostic_mode"),
+        "rejection_signature": summary.get("rejection_signature"),
         "shortlist_count": summary.get("shortlist_count"),
         "recent_runs": recent_runs,
     }
@@ -1464,6 +1468,7 @@ def _summary_run_row(manifest: dict[str, Any]) -> dict[str, Any]:
         "follow_up_reason": manifest.get("follow_up_reason"),
         "diagnostic_mode": manifest.get("diagnostic_mode"),
         "diagnostic_family_signature": manifest.get("diagnostic_family_signature"),
+        "rejection_signature": manifest.get("rejection_signature"),
         "config_overrides": manifest.get("config_overrides", {}),
         "config_path": manifest.get("config_path"),
         "runtime_name": manifest.get("runtime_name"),
@@ -1530,6 +1535,7 @@ def _preserved_manifest_state(existing: dict[str, Any]) -> dict[str, Any]:
             "follow_up_reason",
             "diagnostic_mode",
             "diagnostic_family_signature",
+            "rejection_signature",
         ]
         if key in existing
     }
@@ -1664,6 +1670,7 @@ def _refresh_experiment_summary(
         "follow_up_reason": summary.get("follow_up_reason") or existing.get("follow_up_reason"),
         "diagnostic_mode": summary.get("diagnostic_mode") or existing.get("diagnostic_mode"),
         "diagnostic_family_signature": summary.get("diagnostic_family_signature") or existing.get("diagnostic_family_signature"),
+        "rejection_signature": summary.get("rejection_signature") or existing.get("rejection_signature"),
         "top_gate_failures": sorted(gate_failures.items(), key=lambda item: (-item[1], item[0]))[:5],
         "supervisor": supervisor,
         "proposal_summary": summary.get("proposal_summary") or proposal_summary,

@@ -62,6 +62,88 @@ def test_research_audit_flags_no_progress_without_degrading_missing_incumbent(
     assert (data_root / "control" / "cluster" / "state" / "research" / "progression_audit" / "latest.json").exists()
 
 
+def test_research_audit_surfaces_weak_rejection_plateau_for_codex(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "trademl.research_audit.research_health",
+        lambda **kwargs: {
+            "program_id": "perpetual-macmini",
+            "status": "RUNNING",
+            "current_experiment_id": "exp-weak",
+            "research_throughput": {"latest_finished_at": datetime(2026, 5, 5, 11, 58, tzinfo=UTC).isoformat()},
+            "top_rejection_reasons": [{"reason": "rank_ic<0.01 and assessment.decision != GO", "count": 73}],
+            "latest_paper_account_smoke": {},
+        },
+    )
+    monkeypatch.setattr(
+        "trademl.research_audit.read_research_program_state",
+        lambda **kwargs: {"status": "RUNNING", "frontier": {"family_history": []}},
+    )
+    monkeypatch.setattr("trademl.research_audit.read_feature_family_leaderboard", lambda **kwargs: {"entries": []})
+    monkeypatch.setattr(
+        "trademl.research_audit._latest_candidate_evidence",
+        lambda **kwargs: [{"candidate_autopsy": {"classification": "weak_rejected"}}],
+    )
+
+    payload = run_research_progression_audit(
+        program_id="perpetual-macmini",
+        local_state=tmp_path / "state",
+        repo_root=tmp_path,
+        data_root=tmp_path / "nas",
+        targets_config_path=tmp_path / "node.yml",
+        python_executable="python",
+        now=datetime(2026, 5, 5, 12, tzinfo=UTC),
+    )
+
+    assert payload["diagnostic_state"]["recommended_action"] == "launch_weak_rejection_plateau"
+    assert any(issue["kind"] == "repeated_weak_rejection_plateau" for issue in payload["issues"])
+
+
+def test_research_audit_marks_persistent_weak_plateau_after_diagnostic(tmp_path: Path, monkeypatch) -> None:
+    reason = "rank_ic<0.01 and assessment.decision != GO"
+    monkeypatch.setattr(
+        "trademl.research_audit.research_health",
+        lambda **kwargs: {
+            "program_id": "perpetual-macmini",
+            "status": "RUNNING",
+            "current_experiment_id": "exp-after-diagnostic",
+            "research_throughput": {"latest_finished_at": datetime(2026, 5, 5, 11, 58, tzinfo=UTC).isoformat()},
+            "top_rejection_reasons": [{"reason": reason, "count": 73}],
+        },
+    )
+    monkeypatch.setattr(
+        "trademl.research_audit.read_research_program_state",
+        lambda **kwargs: {
+            "status": "RUNNING",
+            "frontier": {
+                "family_history": [
+                    {
+                        "diagnostic_mode": "weak_rejection_plateau",
+                        "rejection_signature": reason,
+                    }
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr("trademl.research_audit.read_feature_family_leaderboard", lambda **kwargs: {"entries": []})
+    monkeypatch.setattr(
+        "trademl.research_audit._latest_candidate_evidence",
+        lambda **kwargs: [{"candidate_autopsy": {"classification": "weak_rejected"}}],
+    )
+
+    payload = run_research_progression_audit(
+        program_id="perpetual-macmini",
+        local_state=tmp_path / "state",
+        repo_root=tmp_path,
+        data_root=tmp_path / "nas",
+        targets_config_path=tmp_path / "node.yml",
+        python_executable="python",
+        now=datetime(2026, 5, 5, 12, tzinfo=UTC),
+    )
+
+    assert payload["diagnostic_state"]["recommended_action"] == "inspect_persistent_weak_plateau"
+    assert any(issue["kind"] == "weak_rejection_plateau_persisting" for issue in payload["issues"])
+
+
 def test_research_audit_flags_stale_paper_smoke(tmp_path: Path, monkeypatch) -> None:
     old_smoke = (datetime(2026, 5, 4, 10, tzinfo=UTC) - timedelta(hours=1)).isoformat()
     monkeypatch.setattr(

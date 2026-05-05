@@ -49,11 +49,13 @@ def run_research_progression_audit(
         evidence=evidence,
         now=current,
     )
+    diagnostic_state = _diagnostic_state(health=health_payload, state=state, evidence=evidence)
     issues = _research_audit_issues(
         health=health_payload,
         state=state,
         leaderboard=leaderboard,
         evidence=evidence,
+        diagnostic_state=diagnostic_state,
         now=current,
     )
     payload = {
@@ -77,6 +79,7 @@ def run_research_progression_audit(
             "entries": list(leaderboard.get("entries") or [])[:8],
         },
         "candidate_evidence": evidence,
+        "diagnostic_state": diagnostic_state,
         "paper": {
             "smoke": health_payload.get("latest_paper_account_smoke") or {},
             "pnl": health_payload.get("latest_paper_pnl") or {},
@@ -156,6 +159,7 @@ def _research_audit_issues(
     state: dict[str, Any],
     leaderboard: dict[str, Any],
     evidence: list[dict[str, Any]],
+    diagnostic_state: dict[str, Any],
     now: datetime,
 ) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
@@ -190,16 +194,29 @@ def _research_audit_issues(
             str((item.get("candidate_autopsy") or {}).get("classification") or "")
             for item in evidence[:10]
         }
-        if not any(value.startswith("strong_") for value in latest_classifications):
-            issues.append(
-                _issue(
-                    "research",
-                    "warning",
-                    "repeated_rejection_without_diagnostic",
-                    f"same rejection repeated {top_reasons[0].get('count')} times: {top_reasons[0].get('reason')}",
-                    "Inspect candidate evidence and whether a diagnostic family should be planned.",
+        if not latest_classifications or not any(value.startswith("strong_") for value in latest_classifications):
+            top_reason = str(top_reasons[0].get("reason") or "")
+            top_count = int(top_reasons[0].get("count") or 0)
+            if not bool(diagnostic_state.get("weak_plateau_recent")):
+                issues.append(
+                    _issue(
+                        "research",
+                        "warning",
+                        "repeated_weak_rejection_plateau",
+                        f"same weak rejection repeated {top_count} times: {top_reason}",
+                        "Let the diagnostic planner launch weak_rejection_plateau; inspect if it is not selected next.",
+                    )
                 )
-            )
+            elif not bool(diagnostic_state.get("weak_plateau_active")):
+                issues.append(
+                    _issue(
+                        "research",
+                        "warning",
+                        "weak_rejection_plateau_persisting",
+                        f"same weak rejection is still dominant after a diagnostic follow-up: {top_reason}",
+                        "Inspect weak plateau diagnostics, feature isolation results, and whether the next pivot is learning anything new.",
+                    )
+                )
     for entry in list(leaderboard.get("entries") or []):
         if not isinstance(entry, dict):
             continue
@@ -251,6 +268,49 @@ def _research_audit_issues(
             )
         )
     return issues
+
+
+def _diagnostic_state(*, health: dict[str, Any], state: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize whether rejection plateaus are being handled by diagnostics."""
+    top_reasons = list(health.get("top_rejection_reasons") or [])
+    top_reason = ""
+    top_count = 0
+    if top_reasons and isinstance(top_reasons[0], dict):
+        top_reason = str(top_reasons[0].get("reason") or "")
+        top_count = int(top_reasons[0].get("count") or 0)
+    latest_classifications = [
+        str((item.get("candidate_autopsy") or {}).get("classification") or "")
+        for item in evidence[:10]
+        if isinstance(item, dict)
+    ]
+    frontier = dict(state.get("frontier") or {})
+    history = [item for item in list(frontier.get("family_history") or []) if isinstance(item, dict)]
+    weak_mode = "weak_rejection_plateau"
+    weak_history = [
+        item
+        for item in history
+        if str(item.get("diagnostic_mode") or "") == weak_mode
+        and (not top_reason or str(item.get("rejection_signature") or "") == top_reason or str(item.get("follow_up_reason") or "").endswith(top_reason))
+    ]
+    active_mode = str(health.get("diagnostic_mode") or state.get("diagnostic_mode") or "")
+    repeated_weak = bool(top_count >= 10 and (not latest_classifications or not any(value.startswith("strong_") for value in latest_classifications)))
+    recommended_action = "none"
+    if repeated_weak and not weak_history and active_mode != weak_mode:
+        recommended_action = "launch_weak_rejection_plateau"
+    elif repeated_weak and active_mode == weak_mode:
+        recommended_action = "monitor_active_weak_plateau_diagnostic"
+    elif repeated_weak and weak_history:
+        recommended_action = "inspect_persistent_weak_plateau"
+    return {
+        "top_rejection_reason": top_reason,
+        "top_rejection_count": top_count,
+        "latest_candidate_classifications": latest_classifications,
+        "repeated_weak_plateau": repeated_weak,
+        "weak_plateau_active": active_mode == weak_mode,
+        "weak_plateau_recent": bool(weak_history) or active_mode == weak_mode,
+        "latest_weak_plateau": weak_history[-1] if weak_history else {},
+        "recommended_action": recommended_action,
+    }
 
 
 def _latest_candidate_evidence(*, data_root: Path, limit: int) -> list[dict[str, Any]]:
