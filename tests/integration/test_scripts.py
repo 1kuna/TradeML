@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -446,6 +447,8 @@ def test_pi_wizard_initializes_state(tmp_path: Path) -> None:
     fstab_path = tmp_path / "fstab"
     config_path = tmp_path / "node.yml"
     stage_symbols = [f"SYM{index:03d}" for index in range(100)]
+    child_env = os.environ.copy()
+    child_env.pop("SEC_EDGAR_USER_AGENT", None)
     result = subprocess.run(
         [
             sys.executable,
@@ -471,6 +474,7 @@ def test_pi_wizard_initializes_state(tmp_path: Path) -> None:
         check=True,
         cwd=Path.cwd(),
         capture_output=True,
+        env=child_env,
         text=True,
     )
 
@@ -490,6 +494,6 @@ def test_pi_wizard_initializes_state(tmp_path: Path) -> None:
     assert fstab_path.exists()
     assert str(tmp_path / "nas") in fstab_path.read_text(encoding="utf-8")
     node_cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    assert node_cfg["node"]["nas_share"] == "//nas/trademl"
+    assert node_cfg["node"]["nas_share"] == "//192.168.68.54/dev"
     assert node_cfg["node"]["collection_time_et"] == "17:00"
     assert node_cfg["node"]["maintenance_hour_local"] == 3

@@ -26,8 +26,8 @@ def run_wizard(
     config_path: Path,
     stage_symbols: list[str],
     stage_years: int = 5,
-    nas_mount: str = "/mnt/trademl",
-    nas_share: str = "//nas/trademl",
+    nas_mount: str = "/mnt/dev/TradeML",
+    nas_share: str = "//192.168.68.54/dev",
     collection_time_et: str = "16:30",
     maintenance_hour_local: int = 2,
     fstab_path: Path | None = None,
@@ -84,7 +84,7 @@ def main() -> int:
     parser.add_argument("--config", default="configs/node.yml")
     parser.add_argument("--stage-years", type=int, default=5)
     parser.add_argument("--nas-mount", default=None)
-    parser.add_argument("--nas-share", default="//nas/trademl")
+    parser.add_argument("--nas-share", default="//192.168.68.54/dev")
     parser.add_argument("--collection-time-et", default="16:30")
     parser.add_argument("--maintenance-hour-local", type=int, default=2)
     parser.add_argument("--env-file", default=None)
@@ -105,7 +105,7 @@ def main() -> int:
     root = Path(args.root).expanduser()
     env_values = {
         "TRADEML_ENV": "local",
-        "NAS_MOUNT": args.nas_mount or _prompt("NAS mount", "/mnt/trademl"),
+        "NAS_MOUNT": args.nas_mount or _prompt("NAS mount", "/mnt/dev/TradeML"),
         "NAS_SHARE": args.nas_share,
         "LOCAL_STATE": str((root / "control").expanduser()),
         "EDGE_NODE_ID": os.getenv("EDGE_NODE_ID", "rpi-01"),

@@ -183,7 +183,7 @@ def main() -> int:
         env_path=env_path or (workspace_root / ".env"),
         local_state=local_state,
         nas_share=os.getenv(
-            "NAS_SHARE", config["node"].get("nas_share", "//nas/trademl")
+            "NAS_SHARE", config["node"].get("nas_share", "//192.168.68.54/dev")
         ),
         worker_id=worker_id,
         lease_ttl_seconds=int(config["node"].get("lease_ttl_seconds", 90)),

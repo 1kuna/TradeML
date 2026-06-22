@@ -698,7 +698,7 @@ def _ssh_mac_health(target: dict[str, str], *, heal: bool) -> dict[str, Any]:
 
 def _ssh_mac_research_status(target: dict[str, str]) -> dict[str, Any]:
     repo = shlex.quote(target.get("repo_path") or "/Users/openclaw/TradeML")
-    data_root = shlex.quote(target.get("data_root") or "/Users/openclaw/atlas_mounts/nas")
+    data_root = shlex.quote(target.get("data_root") or "/Users/openclaw/atlas_mounts/dev/TradeML")
     local_state = shlex.quote(target.get("local_state") or "/Users/openclaw/TradeML/control")
     env_file = shlex.quote(target.get("env_file") or ".env")
     program_id = shlex.quote(target.get("program_id") or "perpetual-macmini")

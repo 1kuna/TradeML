@@ -1,6 +1,6 @@
 node:
-  nas_mount: /mnt/trademl
-  nas_share: //nas/trademl
+  nas_mount: /Volumes/dev/TradeML
+  nas_share: //192.168.68.54/dev
   local_state: ~/trademl/control
   worker_id: rpi-01
   collection_time_et: '16:30'
@@ -27,7 +27,7 @@ training_targets:
     user: openclaw
     port: 22
     repo_root: /Users/openclaw/TradeML
-    data_root: /Users/openclaw/atlas_mounts/nas
+    data_root: /Users/openclaw/atlas_mounts/dev/TradeML
     python_executable: /Users/openclaw/TradeML/.venv/bin/python
     password_env: TRADEML_WORKSTATION_REMOTE_PASSWORD
 collection:

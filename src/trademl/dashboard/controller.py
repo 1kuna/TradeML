@@ -196,8 +196,8 @@ def resolve_node_settings(
     stage = _read_yaml(resolved_workspace / "stage.yml")
     node = config.get("node", {})
     local_state = Path(env_values.get("LOCAL_STATE") or node.get("local_state") or (resolved_workspace / "control")).expanduser()
-    nas_mount = Path(env_values.get("NAS_MOUNT") or node.get("nas_mount") or "/mnt/trademl").expanduser()
-    nas_share = env_values.get("NAS_SHARE") or node.get("nas_share") or stage.get("nas", {}).get("share") or "//nas/trademl"
+    nas_mount = Path(env_values.get("NAS_MOUNT") or node.get("nas_mount") or "/mnt/dev/TradeML").expanduser()
+    nas_share = env_values.get("NAS_SHARE") or node.get("nas_share") or stage.get("nas", {}).get("share") or "//192.168.68.54/dev"
     collection_time_et = env_values.get("COLLECTION_TIME_ET") or node.get("collection_time_et") or "16:30"
     maintenance_hour_local = int(
         env_values.get("MAINTENANCE_HOUR_LOCAL") or node.get("maintenance_hour_local") or 2

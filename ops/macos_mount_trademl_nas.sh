@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mount_point="${TRADEML_NAS_MOUNT_POINT:-$HOME/atlas_mounts/trademl_nas}"
+mount_point="${TRADEML_NAS_MOUNT_POINT:-$HOME/atlas_mounts/dev}"
 server="${TRADEML_NAS_SERVER:-192.168.68.54}"
-share="${TRADEML_NAS_SHARE:-TradeML}"
+share="${TRADEML_NAS_SHARE:-dev}"
 user="${TRADEML_NAS_USER:-kuna}"
 keychain_service="${TRADEML_NAS_KEYCHAIN_SERVICE:-trademl-nas-smb}"
-required_paths="${TRADEML_NAS_REQUIRED_PATHS:-data/raw/ticker_news:data/raw/equities_minute}"
+required_paths="${TRADEML_NAS_REQUIRED_PATHS:-TradeML/data/raw/ticker_news:TradeML/data/raw/equities_minute}"
 
 log() {
   printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
