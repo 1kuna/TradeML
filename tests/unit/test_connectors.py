@@ -23,9 +23,16 @@ from trademl.connectors.fred import FredConnector
 from trademl.connectors.massive import MassiveConnector
 from trademl.connectors.sec_edgar import SecEdgarConnector
 from trademl.connectors.sec_edgar import MissingCompanyfactsError
+from trademl.connectors.sec_edgar import accession_directory_index_json_url
+from trademl.connectors.sec_edgar import accession_index_url
+from trademl.connectors.sec_edgar import complete_txt_url_from_index_filename
+from trademl.connectors.sec_edgar import complete_txt_url_from_parts
+from trademl.connectors.sec_edgar import raw_primary_xml_url
+from trademl.connectors.sec_edgar import sec_archive_dir
 from trademl.connectors.tiingo import TiingoConnector
 from trademl.connectors.twelve_data import TwelveDataConnector
 from trademl.data_node.budgets import BudgetManager
+from trademl.events.form4 import Form4ManifestRow
 
 
 class FakeResponse:
@@ -67,6 +74,7 @@ class FakeSession:
     def __init__(self, responses: list[FakeResponse]) -> None:
         self.responses = responses
         self.calls: list[tuple[str, str, dict | None, dict | None]] = []
+        self.kwargs: list[dict[str, object]] = []
 
     def request(
         self,
@@ -78,6 +86,7 @@ class FakeSession:
         **kwargs: object,
     ) -> FakeResponse:
         self.calls.append((method, url, params, headers))
+        self.kwargs.append(dict(kwargs))
         if not self.responses:
             raise AssertionError("no fake responses left")
         return self.responses.pop(0)
@@ -1293,6 +1302,329 @@ def test_sec_edgar_connector_fetches_archived_submission_segments() -> None:
         sec_session.calls[1][1]
         == "https://data.sec.gov/submissions/CIK0000320193-submissions-001.json"
     )
+
+
+def test_sec_form4_index_manifest_parses_archive_cik_and_accession() -> None:
+    sec_session = FakeSession([])
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=sec_session,
+    )
+    text = """Description:           Master Index of EDGAR Dissemination Feed
+---------------------------------------------------------------------------
+CIK|Company Name|Form Type|Date Filed|Filename
+769993|TIPTREE INC.|4|2015-04-15|edgar/data/769993/000076999315000534/0000769993-15-000534.txt
+1393726|TIPTREE INC.|8-K|2015-04-15|edgar/data/1393726/0001393726-15-000001.txt
+1971213|SINCLAIR INC.|4/A|2025-02-04|edgar/data/1971213/000125084225000026/0001250842-25-000026.txt
+"""
+
+    rows = sec.parse_form4_index_manifest(
+        text, index_year=2015, index_quarter=2, index_crawled_at="2026-05-05T00:00:00Z"
+    )
+
+    assert [row.form for row in rows] == ["4", "4/A"]
+    assert rows[0].archive_cik == "769993"
+    assert rows[0].accession == "0000769993-15-000534"
+    assert rows[0].accession_no_dashes == "000076999315000534"
+    assert (
+        rows[0].index_filename
+        == "edgar/data/769993/000076999315000534/0000769993-15-000534.txt"
+    )
+
+
+def test_sec_form4_index_manifest_parses_fixed_width_form_index() -> None:
+    sec_session = FakeSession([])
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=sec_session,
+    )
+    text = """Form Type   Company Name                                                  CIK         Date Filed  File Name
+---------------------------------------------------------------------------------------------------------------------------------------------
+1-A         AIBOTICS, INC.                                                1763329     2025-04-02  edgar/data/1763329/0001096906-25-000399.txt
+4           SINCLAIR, INC.                                                1971213     2025-04-07  edgar/data/1971213/0001250842-25-000026.txt
+4/A         SUPER MICRO COMPUTER, INC.                                    1375365     2019-03-01  edgar/data/1375365/0001758554-19-000046.txt
+"""
+
+    rows = sec.parse_form4_index_manifest(
+        text, index_year=2025, index_quarter=2, index_crawled_at="2026-05-05T00:00:00Z"
+    )
+
+    assert [row.form for row in rows] == ["4", "4/A"]
+    assert rows[0].archive_cik == "1971213"
+    assert rows[0].accession == "0001250842-25-000026"
+    assert rows[0].index_filename == (
+        "edgar/data/1971213/0001250842-25-000026.txt"
+    )
+    assert rows[1].archive_cik == "1375365"
+    assert rows[1].accession == "0001758554-19-000046"
+
+
+def test_sec_form4_url_helpers_use_archive_cik_not_issuer_cik() -> None:
+    accession = "0000769993-15-000534"
+
+    assert (
+        sec_archive_dir("769993", accession)
+        == "https://www.sec.gov/Archives/edgar/data/769993/000076999315000534/"
+    )
+    assert (
+        raw_primary_xml_url("769993", accession, "ownership doc.xml")
+        == "https://www.sec.gov/Archives/edgar/data/769993/000076999315000534/ownership%20doc.xml"
+    )
+    assert (
+        complete_txt_url_from_index_filename(
+            "edgar/data/769993/000076999315000534/0000769993-15-000534.txt"
+        )
+        == "https://www.sec.gov/Archives/edgar/data/769993/000076999315000534/0000769993-15-000534.txt"
+    )
+    assert (
+        complete_txt_url_from_index_filename(
+            "edgar/data/769993/0000769993-15-000534.txt"
+        )
+        == "https://www.sec.gov/Archives/edgar/data/769993/000076999315000534/0000769993-15-000534.txt"
+    )
+    assert (
+        complete_txt_url_from_parts("769993", accession)
+        == "https://www.sec.gov/Archives/edgar/data/769993/000076999315000534/0000769993-15-000534.txt"
+    )
+    assert accession_index_url("769993", accession).endswith(
+        "/0000769993-15-000534-index.htm"
+    )
+    assert accession_directory_index_json_url("769993", accession).endswith(
+        "/index.json"
+    )
+    assert "1393726" not in raw_primary_xml_url(
+        "769993", accession, "ownershipdoc03152015012806.xml"
+    )
+
+
+def test_sec_form4_fetch_uses_full_index_not_submissions_json() -> None:
+    sec_session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {},
+                text="""CIK|Company Name|Form Type|Date Filed|Filename
+769993|TIPTREE INC.|4|2015-04-15|edgar/data/769993/000076999315000534/0000769993-15-000534.txt
+1393726|TIPTREE INC.|8-K|2015-04-15|edgar/data/1393726/0001393726-15-000001.txt
+""",
+            )
+        ]
+    )
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=sec_session,
+    )
+
+    frame = sec.fetch("form4_ownership", [], "2015-04-01", "2015-04-30")
+
+    assert frame.iloc[0]["archive_cik"] == "769993"
+    assert frame.iloc[0]["accession"] == "0000769993-15-000534"
+    assert "/full-index/2015/QTR2/form.idx" in sec_session.calls[0][1]
+    assert sec_session.calls[0][3]["User-Agent"] == "TradeML/0.1 test@example.com"
+
+
+def test_sec_8k_fetch_uses_full_index_and_exact_form_filter() -> None:
+    sec_session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {},
+                text="""CIK|Company Name|Form Type|Date Filed|Filename
+320193|APPLE INC.|8-K|2025-04-07|edgar/data/320193/000032019325000001/0000320193-25-000001.txt
+320193|APPLE INC.|8-K/A|2025-04-08|edgar/data/320193/000032019325000002/0000320193-25-000002.txt
+320193|APPLE INC.|10-Q|2025-04-09|edgar/data/320193/000032019325000003/0000320193-25-000003.txt
+""",
+            )
+        ]
+    )
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=sec_session,
+    )
+
+    frame = sec.fetch("sec8k_index", [], "2025-04-01", "2025-04-30")
+
+    assert frame["form"].tolist() == ["8-K"]
+    assert frame.iloc[0]["archive_cik"] == "320193"
+    assert frame.iloc[0]["accession"] == "0000320193-25-000001"
+    assert "/full-index/2025/QTR2/form.idx" in sec_session.calls[0][1]
+
+
+def test_sec_retrieves_complete_submission_text_from_index_filename() -> None:
+    sec_session = FakeSession([FakeResponse(200, {}, text="<SEC-DOCUMENT />")])
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=sec_session,
+    )
+
+    status, text, url = sec.retrieve_complete_submission_text(
+        index_filename="edgar/data/320193/0000320193-25-000001.txt",
+        endpoint_key="sec8k_complete_txt",
+    )
+
+    assert status == 200
+    assert text == "<SEC-DOCUMENT />"
+    assert url.endswith("/320193/000032019325000001/0000320193-25-000001.txt")
+    assert sec_session.calls[0][3]["User-Agent"] == "TradeML/0.1 test@example.com"
+    assert sec_session.kwargs[0]["stream"] is True
+
+
+def test_sec_complete_submission_text_rejects_oversized_stream() -> None:
+    sec_session = FakeSession([FakeResponse(200, {}, text="0123456789")])
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=sec_session,
+        max_complete_text_bytes=4,
+        max_complete_text_seconds=120,
+    )
+
+    with pytest.raises(PermanentConnectorError, match="exceeded max bytes"):
+        sec.retrieve_complete_submission_text(
+            index_filename="edgar/data/320193/0000320193-25-000001.txt",
+            endpoint_key="sec8k_complete_txt",
+        )
+
+
+def test_sec_complete_submission_text_default_guard_allows_large_real_8k_headers() -> None:
+    sec_session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {},
+                text="<SEC-DOCUMENT />",
+                headers={"Content-Length": str(180 * 1024 * 1024)},
+            )
+        ]
+    )
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=sec_session,
+    )
+
+    status, text, _url = sec.retrieve_complete_submission_text(
+        index_filename="edgar/data/320193/0000320193-25-000001.txt",
+        endpoint_key="sec8k_complete_txt",
+    )
+
+    assert status == 200
+    assert text == "<SEC-DOCUMENT />"
+
+
+def test_sec_form4_retrieval_falls_back_to_complete_txt_and_records_metadata() -> None:
+    complete_txt = """<SEC-DOCUMENT>
+<SEC-HEADER>
+<ACCEPTANCE-DATETIME>20150415170104
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>4
+<FILENAME>ownershipdoc03152015012806.xml
+<XML>
+<ownershipDocument>
+  <documentType>4</documentType>
+  <issuer><issuerCik>1393726</issuerCik></issuer>
+</ownershipDocument>
+</XML>
+</DOCUMENT>
+</SEC-DOCUMENT>
+"""
+    sec_session = FakeSession(
+        [
+            FakeResponse(404, {}, text="not found"),
+            FakeResponse(200, {}, text=complete_txt),
+        ]
+    )
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=sec_session,
+    )
+    manifest = Form4ManifestRow(
+        archive_cik="769993",
+        form="4",
+        filed_date="2015-04-15",
+        index_filename="edgar/data/769993/0000769993-15-000534.txt",
+        accession="0000769993-15-000534",
+        accession_no_dashes="000076999315000534",
+        discovery_source="sec_full_index",
+        index_year=2015,
+        index_quarter=2,
+        index_file_hash="fixture",
+        index_crawled_at="2026-05-05T00:00:00Z",
+    )
+
+    result = sec.retrieve_form4_ownership_xml(
+        manifest, primary_document="missing.xml"
+    )
+
+    assert result.ownership_xml is not None
+    assert "<ownershipDocument>" in result.ownership_xml
+    assert result.metadata.primary_xml_http_status == 404
+    assert result.metadata.complete_txt_http_status == 200
+    assert result.metadata.xml_source == "complete_txt_extracted"
+    assert result.metadata.accepted_at_source == "sgml_header"
+    assert result.metadata.accepted_at_raw == "20150415170104"
+    assert "raw_primary_404" in result.metadata.quality_flags
+    assert "used_complete_txt_fallback" in result.metadata.quality_flags
+    assert "/769993/000076999315000534/missing.xml" in sec_session.calls[0][1]
+
+
+def test_sec_form4_retrieval_uses_sgml_then_index_for_accepted_time() -> None:
+    sec_session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {},
+                text="<ownershipDocument><documentType>4</documentType></ownershipDocument>",
+            ),
+            FakeResponse(404, {}, text="missing header"),
+            FakeResponse(200, {}, text="<html><body>Accepted 2025-02-04 18:01:02</body></html>"),
+        ]
+    )
+    sec = SecEdgarConnector(
+        base_url="https://data.sec.gov",
+        user_agent="TradeML/0.1 test@example.com",
+        budget_manager=_budget_manager(),
+        session=sec_session,
+    )
+    manifest = Form4ManifestRow(
+        archive_cik="1971213",
+        form="4",
+        filed_date="2025-02-04",
+        index_filename="edgar/data/1971213/0001250842-25-000026.txt",
+        accession="0001250842-25-000026",
+        accession_no_dashes="000125084225000026",
+        discovery_source="sec_full_index",
+        index_year=2025,
+        index_quarter=1,
+        index_file_hash="fixture",
+        index_crawled_at="2026-05-05T00:00:00Z",
+    )
+
+    result = sec.retrieve_form4_ownership_xml(
+        manifest, primary_document="primary_doc.xml"
+    )
+
+    assert result.metadata.xml_source == "raw_primary"
+    assert result.metadata.accepted_at_source == "accession_index"
+    assert result.metadata.accepted_at_raw == "2025-02-04 18:01:02"
+    assert "sgml_header_404" in result.metadata.quality_flags
+    assert sec_session.calls[1][1].endswith("/0001250842-25-000026.hdr.sgml")
+    assert sec_session.calls[2][1].endswith("/0001250842-25-000026-index.htm")
 
 
 def test_sec_edgar_company_tickers_uses_sec_host_without_forced_data_host() -> None:

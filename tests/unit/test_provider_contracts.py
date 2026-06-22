@@ -53,6 +53,10 @@ def test_provider_contract_exposes_canonical_contracts() -> None:
     assert dataset_contract("alpha_vantage", "news_sentiment").max_batch_symbols == 10
     assert dataset_contract("fmp", "stock_news").pagination_mode == "page"
     assert dataset_contract("finnhub", "company_news").max_batch_symbols == 1
+    assert dataset_contract("sec_edgar", "form4_ownership").pagination_mode == "quarterly_index"
+    assert dataset_contract("sec_edgar", "form4_ownership").max_batch_symbols == 0
+    assert dataset_contract("sec_edgar", "sec8k_index").pagination_mode == "quarterly_index"
+    assert dataset_contract("sec_edgar", "sec8k_index").max_batch_symbols == 0
 
 
 def test_default_vendor_limits_are_derived_from_provider_contracts() -> None:
@@ -61,4 +65,4 @@ def test_default_vendor_limits_are_derived_from_provider_contracts() -> None:
     assert limits["alpaca"] == {"rpm": 200, "daily_cap": 288000}
     assert limits["twelve_data"] == {"rpm": 8, "daily_cap": 800}
     assert limits["massive"] == {"rpm": 5, "daily_cap": 7200}
-    assert limits["sec_edgar"] == {"rpm": 600, "daily_cap": 864000}
+    assert limits["sec_edgar"] == {"rpm": 240, "daily_cap": 864000}

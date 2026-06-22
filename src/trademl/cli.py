@@ -66,6 +66,36 @@ from trademl.experiments import (
     stop_experiment_supervisor,
     supervise_experiment,
 )
+from trademl.events.form4_candidates import run_form4_candidate_curation
+from trademl.events.form4_event_study import run_form4_event_study
+from trademl.events.form4_fixture_gate import run_form4_fixture_gate_from_env
+from trademl.events.form4_ingest import run_form4_ingest_from_env
+from trademl.events.form4_labels import run_form4_label_curation
+from trademl.events.form4_market_backfill import run_form4_market_backfill_from_env
+from trademl.events.form4_rework import run_form4_rework_study
+from trademl.events.sec8k import (
+    run_sec8k_candidate_curation,
+    run_sec8k_event_study,
+    run_sec8k_research_decision,
+)
+from trademl.events.sec8k_ingest import run_sec8k_ingest_from_env
+from trademl.events.sec8k_market_backfill import run_sec8k_market_backfill_from_env
+from trademl.events.sec8k_coverage import (
+    run_sec8k_coverage_audit,
+    run_sec8k_coverage_expand,
+    run_sec_event_semantic_coverage_gate,
+)
+from trademl.events.sec8k_semantic import (
+    run_sec_event_semantic_classification,
+    run_sec_event_semantic_labelability_audit,
+    run_sec_event_semantic_scaled_gate,
+    run_sec_event_semantic_study,
+)
+from trademl.events.semantic_classifier import (
+    DEFAULT_LMSTUDIO_BASE_URL,
+    DEFAULT_SEC_EVENT_MODEL,
+    run_sec_event_semantic_fixture_gate,
+)
 from trademl.fleet.launchd import install_research_launch_agent, launch_agent_status, unload_launch_agent
 from trademl.research import (
     build_research_features,
@@ -250,6 +280,412 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="DATASET=PATH",
         help="Override one dataset source path; repeat for multiple paths/datasets.",
+    )
+    research_form4_fixture_gate = research_subparsers.add_parser(
+        "form4-fixture-gate",
+        help="Run the SEC Form 4 retrieval/parser fixture gate.",
+    )
+    research_form4_fixture_gate.add_argument("--limit", type=int, default=None)
+    research_form4_fixture_gate.add_argument("--user-agent", default=None)
+    research_form4_ingest = research_subparsers.add_parser(
+        "form4-ingest",
+        help="Fetch SEC Form 4 manifests, raw filings, parser outputs, and candidates.",
+    )
+    research_form4_ingest.add_argument("--start-date", required=True)
+    research_form4_ingest.add_argument("--end-date", required=True)
+    research_form4_ingest.add_argument("--limit", type=int, default=None)
+    research_form4_ingest.add_argument("--user-agent", default=None)
+    research_form4_ingest.add_argument("--max-retrieval-attempts", type=int, default=6)
+    research_form4_ingest.add_argument("--rate-limit-pause-seconds", type=float, default=60.0)
+    research_form4_ingest.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Refetch raw Form 4 filings instead of reusing existing raw artifacts.",
+    )
+    research_subparsers.add_parser(
+        "form4-candidates",
+        help="Build SEC Form 4 candidate events from curated parser outputs.",
+    )
+    research_form4_market_backfill = research_subparsers.add_parser(
+        "form4-market-backfill",
+        help="Fetch bounded market-data slices needed by current Form 4 labels.",
+    )
+    research_form4_market_backfill.add_argument(
+        "--horizon", action="append", type=int, default=None
+    )
+    research_form4_market_backfill.add_argument(
+        "--round-trip-cost-bps", type=float, default=50.0
+    )
+    research_form4_market_backfill.add_argument("--limit-events", type=int, default=None)
+    research_form4_market_backfill.add_argument(
+        "--no-controls",
+        action="store_true",
+        help="Do not include Form 4 negative-control candidates in market backfill.",
+    )
+    research_form4_market_backfill.add_argument("--max-fetch-attempts", type=int, default=6)
+    research_form4_market_backfill.add_argument(
+        "--rate-limit-pause-seconds",
+        type=float,
+        default=60.0,
+    )
+    research_form4_market_backfill.add_argument(
+        "--daily-symbol-batch-size",
+        type=int,
+        default=100,
+    )
+    research_form4_labels = research_subparsers.add_parser(
+        "form4-labels",
+        help="Build PIT Form 4 event labels from candidate events and market bars.",
+    )
+    research_form4_labels.add_argument("--horizon", action="append", type=int, default=None)
+    research_form4_labels.add_argument("--round-trip-cost-bps", type=float, default=50.0)
+    research_form4_labels.add_argument(
+        "--market-data-root",
+        action="append",
+        default=None,
+        help="Additional root to search for market-data partitions; repeatable.",
+    )
+    research_form4_labels.add_argument(
+        "--source-contract",
+        default=None,
+        help="Explicit feature source contract JSON path for market-data source mapping.",
+    )
+    research_form4_event_study = research_subparsers.add_parser(
+        "form4-event-study",
+        help="Write Form 4 event-study, controls, and decision packet.",
+    )
+    research_form4_event_study.add_argument("--primary-horizon", type=int, default=5)
+    research_form4_event_study.add_argument(
+        "--horizon", action="append", type=int, default=None
+    )
+    research_form4_event_study.add_argument(
+        "--round-trip-cost-bps", type=float, default=50.0
+    )
+    research_form4_event_study.add_argument(
+        "--min-historical-sample", type=int, default=300
+    )
+    research_form4_event_study.add_argument(
+        "--market-data-root",
+        action="append",
+        default=None,
+        help="Additional root to search for market-data partitions; repeatable.",
+    )
+    research_form4_event_study.add_argument(
+        "--source-contract",
+        default=None,
+        help="Explicit feature source contract JSON path for market-data source mapping.",
+    )
+    research_subparsers.add_parser(
+        "form4-rework-study",
+        help="Run the bounded Form 4 diagnostic rework gate from existing artifacts.",
+    )
+    research_sec8k_ingest = research_subparsers.add_parser(
+        "sec8k-ingest",
+        help="Fetch SEC 8-K full-index rows, complete texts, and item candidates.",
+    )
+    research_sec8k_ingest.add_argument("--start-date", required=True)
+    research_sec8k_ingest.add_argument("--end-date", required=True)
+    research_sec8k_ingest.add_argument("--limit", type=int, default=None)
+    research_sec8k_ingest.add_argument("--user-agent", default=None)
+    research_sec8k_ingest.add_argument("--max-retrieval-attempts", type=int, default=6)
+    research_sec8k_ingest.add_argument("--rate-limit-pause-seconds", type=float, default=60.0)
+    research_sec8k_ingest.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Refetch raw SEC 8-K complete text instead of reusing existing raw artifacts.",
+    )
+    research_sec8k_candidates = research_subparsers.add_parser(
+        "sec8k-candidates",
+        help="Build deterministic SEC 8-K item candidates from existing filing artifacts.",
+    )
+    research_sec8k_candidates.add_argument(
+        "--filings-path",
+        default=None,
+        help="Optional parquet path for SEC filing-index rows.",
+    )
+    research_sec8k_market_backfill = research_subparsers.add_parser(
+        "sec8k-market-backfill",
+        help="Fetch bounded market-data slices needed by current SEC 8-K labels.",
+    )
+    research_sec8k_market_backfill.add_argument(
+        "--horizon", action="append", type=int, default=None
+    )
+    research_sec8k_market_backfill.add_argument(
+        "--round-trip-cost-bps", type=float, default=50.0
+    )
+    research_sec8k_market_backfill.add_argument("--limit-events", type=int, default=None)
+    research_sec8k_market_backfill.add_argument(
+        "--no-timestamp-placebo",
+        action="store_true",
+        help="Do not include SEC 8-K timestamp-placebo candidates in market backfill.",
+    )
+    research_sec8k_market_backfill.add_argument("--max-fetch-attempts", type=int, default=6)
+    research_sec8k_market_backfill.add_argument(
+        "--rate-limit-pause-seconds",
+        type=float,
+        default=60.0,
+    )
+    research_sec8k_market_backfill.add_argument(
+        "--daily-symbol-batch-size",
+        type=int,
+        default=100,
+    )
+    research_sec8k_market_backfill.add_argument(
+        "--candidate-source",
+        choices=("sec8k_item_events", "sec_event_semantic_candidates"),
+        default="sec8k_item_events",
+    )
+    research_sec8k_market_backfill.add_argument(
+        "--target-item",
+        action="append",
+        default=None,
+        help="SEC item number to include in market backfill; repeatable.",
+    )
+    research_sec8k_market_backfill.add_argument("--accepted-from", default=None)
+    research_sec8k_market_backfill.add_argument("--accepted-to", default=None)
+    research_sec8k_event_study = research_subparsers.add_parser(
+        "sec8k-event-study",
+        help="Write SEC 8-K item-event labels, controls, and decision packet.",
+    )
+    research_sec8k_event_study.add_argument("--primary-horizon", type=int, default=5)
+    research_sec8k_event_study.add_argument("--horizon", action="append", type=int, default=None)
+    research_sec8k_event_study.add_argument("--round-trip-cost-bps", type=float, default=50.0)
+    research_sec8k_event_study.add_argument(
+        "--market-data-root",
+        action="append",
+        default=None,
+        help="Additional root to search for market-data partitions; repeatable.",
+    )
+    research_sec8k_event_study.add_argument(
+        "--source-contract",
+        default=None,
+        help="Explicit feature source contract JSON path for market-data source mapping.",
+    )
+    research_sec8k_decision = research_subparsers.add_parser(
+        "sec8k-decision",
+        help="Write the continue/kill decision for broad deterministic SEC 8-K item events.",
+    )
+    research_sec8k_decision.add_argument("--min-labeled-events", type=int, default=300)
+    research_sec8k_decision.add_argument("--min-family-events", type=int, default=100)
+    research_sec8k_decision.add_argument("--min-mean-abret", type=float, default=0.005)
+    research_sec8k_decision.add_argument(
+        "--min-control-separation",
+        type=float,
+        default=0.0075,
+    )
+    research_sec8k_decision.add_argument(
+        "--max-top5-abs-contribution",
+        type=float,
+        default=0.35,
+    )
+    research_sec8k_coverage_audit = research_subparsers.add_parser(
+        "sec8k-coverage-audit",
+        help="Audit SEC 8-K month/raw/candidate/labelability coverage before LLM spend.",
+    )
+    research_sec8k_coverage_audit.add_argument("--start-date", default="2024-01-01")
+    research_sec8k_coverage_audit.add_argument("--end-date", default="2025-12-31")
+    research_sec8k_coverage_audit.add_argument("--target-item", action="append", default=None)
+    research_sec8k_coverage_audit.add_argument(
+        "--fallback-target-item",
+        action="append",
+        default=None,
+    )
+    research_sec8k_coverage_audit.add_argument("--horizon", action="append", type=int, default=None)
+    research_sec8k_coverage_audit.add_argument("--round-trip-cost-bps", type=float, default=50.0)
+    research_sec8k_coverage_expand = research_subparsers.add_parser(
+        "sec8k-coverage-expand",
+        help="Ingest missing SEC 8-K months and rebuild global item candidates.",
+    )
+    research_sec8k_coverage_expand.add_argument("--start-date", default="2024-01-01")
+    research_sec8k_coverage_expand.add_argument("--end-date", default="2025-12-31")
+    research_sec8k_coverage_expand.add_argument("--target-item", action="append", default=None)
+    research_sec8k_coverage_expand.add_argument(
+        "--fallback-target-item",
+        action="append",
+        default=None,
+    )
+    research_sec8k_coverage_expand.add_argument("--horizon", action="append", type=int, default=None)
+    research_sec8k_coverage_expand.add_argument("--round-trip-cost-bps", type=float, default=50.0)
+    research_sec8k_coverage_expand.add_argument("--limit-per-month", type=int, default=None)
+    research_sec8k_coverage_expand.add_argument("--user-agent", default=None)
+    research_sec8k_coverage_expand.add_argument("--max-retrieval-attempts", type=int, default=6)
+    research_sec8k_coverage_expand.add_argument(
+        "--rate-limit-pause-seconds",
+        type=float,
+        default=60.0,
+    )
+    research_sec8k_coverage_expand.add_argument("--no-cache", action="store_true")
+    research_sec8k_coverage_expand.add_argument("--no-rebuild-candidates", action="store_true")
+    research_semantic_gate = research_subparsers.add_parser(
+        "sec-event-semantic-gate",
+        help="Run the LLM semantic classifier fixture gate for SEC/public-event excerpts.",
+    )
+    research_semantic_gate.add_argument("--model", default=DEFAULT_SEC_EVENT_MODEL)
+    research_semantic_gate.add_argument("--base-url", default=DEFAULT_LMSTUDIO_BASE_URL)
+    research_semantic_gate.add_argument("--timeout-seconds", type=float, default=60.0)
+    research_semantic_gate.add_argument(
+        "--response-format-mode",
+        choices=("json_schema", "prompt_json"),
+        default="json_schema",
+    )
+    research_semantic_gate.add_argument("--batch-size", type=int, default=4)
+    research_semantic_gate.add_argument("--limit", type=int, default=None)
+    research_semantic_classify = research_subparsers.add_parser(
+        "sec-event-semantic-classify",
+        help="Classify real SEC 8-K snippets with the semantic event model.",
+    )
+    research_semantic_classify.add_argument("--model", default=DEFAULT_SEC_EVENT_MODEL)
+    research_semantic_classify.add_argument("--base-url", default=DEFAULT_LMSTUDIO_BASE_URL)
+    research_semantic_classify.add_argument("--timeout-seconds", type=float, default=180.0)
+    research_semantic_classify.add_argument(
+        "--response-format-mode",
+        choices=("json_schema", "prompt_json"),
+        default="json_schema",
+    )
+    research_semantic_classify.add_argument("--batch-size", type=int, default=4)
+    research_semantic_classify.add_argument("--limit", type=int, default=None)
+    research_semantic_classify.add_argument("--max-snippet-chars", type=int, default=4000)
+    research_semantic_classify.add_argument(
+        "--routing-mode",
+        choices=("broad", "targeted"),
+        default="broad",
+        help="Use broad 8-K snippets or targeted SEC item routing before LLM classification.",
+    )
+    research_semantic_classify.add_argument(
+        "--target-item",
+        action="append",
+        default=None,
+        help="SEC item number to include in targeted routing; repeatable.",
+    )
+    research_semantic_classify.add_argument(
+        "--accepted-from",
+        default=None,
+        help="Inclusive accepted/filed date lower bound for semantic routing, YYYY-MM-DD.",
+    )
+    research_semantic_classify.add_argument(
+        "--accepted-to",
+        default=None,
+        help="Inclusive accepted/filed date upper bound for semantic routing, YYYY-MM-DD.",
+    )
+    research_semantic_classify.add_argument(
+        "--snippet-kind",
+        choices=("all", "item_section", "exhibit"),
+        default="all",
+        help="Restrict semantic snippets by source kind before LLM classification.",
+    )
+    research_semantic_classify.add_argument(
+        "--labelability-mode",
+        choices=("all", "prefer-labelable", "labelable-only"),
+        default="all",
+        help="Use market-label feasibility to order or filter SEC rows before LLM classification.",
+    )
+    research_semantic_classify.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse successful classifications from the semantic checkpoint.",
+    )
+    research_semantic_classify.add_argument(
+        "--checkpoint-path",
+        default=None,
+        help="Optional semantic classification checkpoint parquet path.",
+    )
+    research_labelability = research_subparsers.add_parser(
+        "sec-event-semantic-labelability-audit",
+        help="Audit which deterministic SEC 8-K rows can be market-labeled before LLM classification.",
+    )
+    research_labelability.add_argument(
+        "--routing-mode",
+        choices=("broad", "targeted"),
+        default="targeted",
+    )
+    research_labelability.add_argument("--target-item", action="append", default=None)
+    research_labelability.add_argument("--accepted-from", default=None)
+    research_labelability.add_argument("--accepted-to", default=None)
+    research_labelability.add_argument("--snippet-kind", default="item_section")
+    research_labelability.add_argument("--horizon", action="append", type=int, default=None)
+    research_labelability.add_argument("--round-trip-cost-bps", type=float, default=50.0)
+    research_scaled_gate = research_subparsers.add_parser(
+        "sec-event-semantic-scaled-gate",
+        help="Run the labelability-first scaled SEC 8-K semantic decision gate.",
+    )
+    research_scaled_gate.add_argument("--model", default=DEFAULT_SEC_EVENT_MODEL)
+    research_scaled_gate.add_argument("--base-url", default="http://127.0.0.1:1235/v1")
+    research_scaled_gate.add_argument("--timeout-seconds", type=float, default=300.0)
+    research_scaled_gate.add_argument(
+        "--response-format-mode",
+        choices=("json_schema", "prompt_json"),
+        default="prompt_json",
+    )
+    research_scaled_gate.add_argument("--batch-size", type=int, default=1)
+    research_scaled_gate.add_argument("--target-item", action="append", default=None)
+    research_scaled_gate.add_argument("--fallback-target-item", action="append", default=None)
+    research_scaled_gate.add_argument("--year", action="append", type=int, default=None)
+    research_scaled_gate.add_argument("--max-snippets", type=int, default=None)
+    research_scaled_gate.add_argument("--no-resume", action="store_true")
+    research_scaled_gate.add_argument("--primary-horizon", type=int, default=5)
+    research_scaled_gate.add_argument("--min-sample", type=int, default=100)
+    research_scaled_gate.add_argument("--min-mean-abret", type=float, default=0.005)
+    research_scaled_gate.add_argument("--min-control-separation", type=float, default=0.0075)
+    research_scaled_gate.add_argument("--max-top5-abs-contribution", type=float, default=0.35)
+    research_coverage_gate = research_subparsers.add_parser(
+        "sec-event-semantic-coverage-gate",
+        help="Expand SEC 8-K coverage, repair labelability, then run the semantic scaled gate.",
+    )
+    research_coverage_gate.add_argument("--start-date", default="2024-01-01")
+    research_coverage_gate.add_argument("--end-date", default="2025-12-31")
+    research_coverage_gate.add_argument("--model", default=DEFAULT_SEC_EVENT_MODEL)
+    research_coverage_gate.add_argument("--base-url", default="http://127.0.0.1:1235/v1")
+    research_coverage_gate.add_argument("--timeout-seconds", type=float, default=300.0)
+    research_coverage_gate.add_argument(
+        "--response-format-mode",
+        choices=("json_schema", "prompt_json"),
+        default="prompt_json",
+    )
+    research_coverage_gate.add_argument("--batch-size", type=int, default=1)
+    research_coverage_gate.add_argument("--target-item", action="append", default=None)
+    research_coverage_gate.add_argument("--fallback-target-item", action="append", default=None)
+    research_coverage_gate.add_argument("--max-snippets", type=int, default=None)
+    research_coverage_gate.add_argument("--no-resume", action="store_true")
+    research_coverage_gate.add_argument("--primary-horizon", type=int, default=5)
+    research_coverage_gate.add_argument("--min-sample", type=int, default=100)
+    research_coverage_gate.add_argument("--min-mean-abret", type=float, default=0.005)
+    research_coverage_gate.add_argument("--min-control-separation", type=float, default=0.0075)
+    research_coverage_gate.add_argument("--max-top5-abs-contribution", type=float, default=0.35)
+    research_coverage_gate.add_argument("--round-trip-cost-bps", type=float, default=50.0)
+    research_coverage_gate.add_argument("--no-expand", action="store_true")
+    research_coverage_gate.add_argument("--no-market-repair", action="store_true")
+    research_coverage_gate.add_argument("--limit-per-month", type=int, default=None)
+    research_coverage_gate.add_argument("--user-agent", default=None)
+    research_coverage_gate.add_argument("--max-retrieval-attempts", type=int, default=6)
+    research_coverage_gate.add_argument(
+        "--sec-rate-limit-pause-seconds",
+        type=float,
+        default=60.0,
+    )
+    research_coverage_gate.add_argument("--market-max-fetch-attempts", type=int, default=6)
+    research_coverage_gate.add_argument(
+        "--market-rate-limit-pause-seconds",
+        type=float,
+        default=60.0,
+    )
+    research_coverage_gate.add_argument("--daily-symbol-batch-size", type=int, default=100)
+    research_semantic_study = research_subparsers.add_parser(
+        "sec-event-semantic-study",
+        help="Label SEC 8-K semantic events and write a study/decision packet.",
+    )
+    research_semantic_study.add_argument("--primary-horizon", type=int, default=5)
+    research_semantic_study.add_argument("--horizon", action="append", type=int, default=None)
+    research_semantic_study.add_argument("--round-trip-cost-bps", type=float, default=50.0)
+    research_semantic_study.add_argument(
+        "--market-data-root",
+        action="append",
+        default=None,
+        help="Additional root to search for market-data partitions; repeatable.",
+    )
+    research_semantic_study.add_argument(
+        "--source-contract",
+        default=None,
+        help="Explicit feature source contract JSON path for market-data source mapping.",
     )
     research_feature_canary = research_subparsers.add_parser("feature-canary", help="Build and canary configured modeling feature versions.")
     research_feature_canary.add_argument("--program", default="configs/research/perpetual_macmini.yml")
@@ -905,6 +1341,306 @@ def _dispatch_research(args: argparse.Namespace) -> int:
             data_root=data_root,
             source_root=Path(args.source_root).expanduser() if args.source_root else None,
             dataset_paths=dataset_paths or None,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "form4-fixture-gate":
+        try:
+            payload = run_form4_fixture_gate_from_env(
+                data_root=data_root,
+                limit=args.limit,
+                user_agent=args.user_agent,
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "form4-ingest":
+        try:
+            payload = run_form4_ingest_from_env(
+                data_root=data_root,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                limit=args.limit,
+                user_agent=args.user_agent,
+                max_retrieval_attempts=args.max_retrieval_attempts,
+                rate_limit_pause_seconds=args.rate_limit_pause_seconds,
+                use_cache=not args.no_cache,
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "form4-candidates":
+        payload = run_form4_candidate_curation(data_root=data_root)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "form4-market-backfill":
+        payload = run_form4_market_backfill_from_env(
+            data_root=data_root,
+            horizons=tuple(args.horizon or [1, 5, 10, 20]),
+            round_trip_cost_bps=float(args.round_trip_cost_bps),
+            limit_events=args.limit_events,
+            include_controls=not args.no_controls,
+            max_fetch_attempts=args.max_fetch_attempts,
+            rate_limit_pause_seconds=args.rate_limit_pause_seconds,
+            daily_symbol_batch_size=args.daily_symbol_batch_size,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "form4-labels":
+        payload = run_form4_label_curation(
+            data_root=data_root,
+            horizons=args.horizon,
+            round_trip_cost_bps=float(args.round_trip_cost_bps),
+            market_data_roots=[
+                Path(item).expanduser() for item in list(args.market_data_root or [])
+            ],
+            source_contract_path=(
+                Path(args.source_contract).expanduser()
+                if args.source_contract
+                else None
+            ),
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "form4-event-study":
+        payload = run_form4_event_study(
+            data_root=data_root,
+            primary_horizon=args.primary_horizon,
+            horizons=args.horizon,
+            round_trip_cost_bps=float(args.round_trip_cost_bps),
+            min_historical_sample=args.min_historical_sample,
+            market_data_roots=[
+                Path(item).expanduser() for item in list(args.market_data_root or [])
+            ],
+            source_contract_path=(
+                Path(args.source_contract).expanduser()
+                if args.source_contract
+                else None
+            ),
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "form4-rework-study":
+        payload = run_form4_rework_study(data_root=data_root)
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec8k-ingest":
+        try:
+            payload = run_sec8k_ingest_from_env(
+                data_root=data_root,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                limit=args.limit,
+                user_agent=args.user_agent,
+                max_retrieval_attempts=args.max_retrieval_attempts,
+                rate_limit_pause_seconds=args.rate_limit_pause_seconds,
+                use_cache=not args.no_cache,
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec8k-candidates":
+        payload = run_sec8k_candidate_curation(
+            data_root=data_root,
+            filings_path=Path(args.filings_path).expanduser()
+            if args.filings_path
+            else None,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec8k-market-backfill":
+        payload = run_sec8k_market_backfill_from_env(
+            data_root=data_root,
+            horizons=tuple(args.horizon or [1, 5, 10, 20]),
+            round_trip_cost_bps=float(args.round_trip_cost_bps),
+            limit_events=args.limit_events,
+            include_timestamp_placebo=not args.no_timestamp_placebo,
+            max_fetch_attempts=args.max_fetch_attempts,
+            rate_limit_pause_seconds=args.rate_limit_pause_seconds,
+            daily_symbol_batch_size=args.daily_symbol_batch_size,
+            candidate_source=args.candidate_source,
+            target_items=tuple(args.target_item or ()),
+            accepted_from=args.accepted_from,
+            accepted_to=args.accepted_to,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec8k-event-study":
+        payload = run_sec8k_event_study(
+            data_root=data_root,
+            primary_horizon=args.primary_horizon,
+            horizons=args.horizon,
+            round_trip_cost_bps=float(args.round_trip_cost_bps),
+            market_data_roots=[
+                Path(item).expanduser() for item in list(args.market_data_root or [])
+            ],
+            source_contract_path=(
+                Path(args.source_contract).expanduser()
+                if args.source_contract
+                else None
+            ),
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec8k-decision":
+        payload = run_sec8k_research_decision(
+            data_root=data_root,
+            min_labeled_events=args.min_labeled_events,
+            min_family_events=args.min_family_events,
+            min_mean_abret=args.min_mean_abret,
+            min_control_separation=args.min_control_separation,
+            max_top5_abs_contribution=args.max_top5_abs_contribution,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec8k-coverage-audit":
+        payload = run_sec8k_coverage_audit(
+            data_root=data_root,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            target_items=args.target_item,
+            fallback_target_items=args.fallback_target_item,
+            horizons=args.horizon,
+            round_trip_cost_bps=float(args.round_trip_cost_bps),
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec8k-coverage-expand":
+        payload = run_sec8k_coverage_expand(
+            data_root=data_root,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            target_items=args.target_item,
+            fallback_target_items=args.fallback_target_item,
+            horizons=args.horizon,
+            round_trip_cost_bps=float(args.round_trip_cost_bps),
+            limit_per_month=args.limit_per_month,
+            user_agent=args.user_agent,
+            max_retrieval_attempts=args.max_retrieval_attempts,
+            rate_limit_pause_seconds=args.rate_limit_pause_seconds,
+            use_cache=not args.no_cache,
+            rebuild_candidates=not args.no_rebuild_candidates,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec-event-semantic-gate":
+        payload = run_sec_event_semantic_fixture_gate(
+            data_root=data_root,
+            model=args.model,
+            base_url=args.base_url,
+            timeout_seconds=args.timeout_seconds,
+            response_format_mode=args.response_format_mode,
+            batch_size=args.batch_size,
+            limit=args.limit,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec-event-semantic-classify":
+        payload = run_sec_event_semantic_classification(
+            data_root=data_root,
+            model=args.model,
+            base_url=args.base_url,
+            timeout_seconds=args.timeout_seconds,
+            response_format_mode=args.response_format_mode,
+            batch_size=args.batch_size,
+            limit=args.limit,
+            max_snippet_chars=args.max_snippet_chars,
+            routing_mode=args.routing_mode,
+            target_items=args.target_item,
+            accepted_from=args.accepted_from,
+            accepted_to=args.accepted_to,
+            snippet_kind=args.snippet_kind,
+            labelability_mode=args.labelability_mode,
+            resume=args.resume,
+            checkpoint_path=Path(args.checkpoint_path).expanduser()
+            if args.checkpoint_path
+            else None,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec-event-semantic-labelability-audit":
+        payload = run_sec_event_semantic_labelability_audit(
+            data_root=data_root,
+            routing_mode=args.routing_mode,
+            target_items=args.target_item,
+            accepted_from=args.accepted_from,
+            accepted_to=args.accepted_to,
+            snippet_kind=args.snippet_kind,
+            horizons=args.horizon,
+            round_trip_cost_bps=float(args.round_trip_cost_bps),
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec-event-semantic-scaled-gate":
+        payload = run_sec_event_semantic_scaled_gate(
+            data_root=data_root,
+            model=args.model,
+            base_url=args.base_url,
+            timeout_seconds=args.timeout_seconds,
+            response_format_mode=args.response_format_mode,
+            batch_size=args.batch_size,
+            target_items=args.target_item,
+            fallback_target_items=args.fallback_target_item,
+            years=args.year,
+            max_snippets=args.max_snippets,
+            resume=not args.no_resume,
+            primary_horizon=args.primary_horizon,
+            min_sample=args.min_sample,
+            min_mean_abret=args.min_mean_abret,
+            min_control_separation=args.min_control_separation,
+            max_top5_abs_contribution=args.max_top5_abs_contribution,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec-event-semantic-coverage-gate":
+        payload = run_sec_event_semantic_coverage_gate(
+            data_root=data_root,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            target_items=args.target_item,
+            fallback_target_items=args.fallback_target_item,
+            model=args.model,
+            base_url=args.base_url,
+            timeout_seconds=args.timeout_seconds,
+            response_format_mode=args.response_format_mode,
+            batch_size=args.batch_size,
+            max_snippets=args.max_snippets,
+            resume=not args.no_resume,
+            primary_horizon=args.primary_horizon,
+            min_sample=args.min_sample,
+            min_mean_abret=args.min_mean_abret,
+            min_control_separation=args.min_control_separation,
+            max_top5_abs_contribution=args.max_top5_abs_contribution,
+            round_trip_cost_bps=float(args.round_trip_cost_bps),
+            expand_missing_coverage=not args.no_expand,
+            repair_market_coverage=not args.no_market_repair,
+            limit_per_month=args.limit_per_month,
+            user_agent=args.user_agent,
+            max_retrieval_attempts=args.max_retrieval_attempts,
+            sec_rate_limit_pause_seconds=args.sec_rate_limit_pause_seconds,
+            market_max_fetch_attempts=args.market_max_fetch_attempts,
+            market_rate_limit_pause_seconds=args.market_rate_limit_pause_seconds,
+            daily_symbol_batch_size=args.daily_symbol_batch_size,
+        )
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    if args.research_command == "sec-event-semantic-study":
+        payload = run_sec_event_semantic_study(
+            data_root=data_root,
+            primary_horizon=args.primary_horizon,
+            horizons=args.horizon,
+            round_trip_cost_bps=float(args.round_trip_cost_bps),
+            market_data_roots=[
+                Path(item).expanduser() for item in list(args.market_data_root or [])
+            ],
+            source_contract_path=(
+                Path(args.source_contract).expanduser()
+                if args.source_contract
+                else None
+            ),
         )
         print(json.dumps(payload, indent=2, default=str))
         return 0

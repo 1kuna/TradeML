@@ -481,12 +481,12 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
     ),
     "sec_edgar": ProviderContract(
         vendor="sec_edgar",
-        rpm=600,
+        rpm=240,
         daily_cap=864000,
         docs_urls=(
             "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
         ),
-        notes="Respect SEC fair-access guidance at max 10 requests/sec, always send a valid user-agent, and fetch archived submission segments when present.",
+        notes="Respect SEC fair-access guidance, pace historical crawls below the 10 requests/sec ceiling, always send a valid user-agent, and fetch archived submission segments when present.",
         datasets=(
             DatasetContract(
                 dataset="filing_index",
@@ -495,6 +495,29 @@ _PROVIDER_CONTRACTS: dict[str, ProviderContract] = {
                 docs_urls=(
                     "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
                 ),
+            ),
+            DatasetContract(
+                dataset="form4_ownership",
+                endpoint_key="form4_ownership",
+                max_batch_symbols=0,
+                pagination_mode="quarterly_index",
+                max_history_years=20,
+                docs_urls=(
+                    "https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data",
+                    "https://www.sec.gov/edgar/searchedgar/ownershipformcodes.html",
+                ),
+                notes="Use SEC full-index/form.idx as the coverage backbone; raw XML retrieval must use archive CIK from the index filename, not issuer CIK.",
+            ),
+            DatasetContract(
+                dataset="sec8k_index",
+                endpoint_key="sec8k_index",
+                max_batch_symbols=0,
+                pagination_mode="quarterly_index",
+                max_history_years=20,
+                docs_urls=(
+                    "https://www.sec.gov/search-filings/edgar-search-assistance/accessing-edgar-data",
+                ),
+                notes="Use SEC full-index/form.idx for source-first 8-K discovery; retrieve complete text for accepted timestamps, item headings, and exhibit inventory.",
             ),
             DatasetContract(
                 dataset="companyfacts",

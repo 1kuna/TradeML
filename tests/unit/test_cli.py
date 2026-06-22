@@ -614,6 +614,284 @@ def test_research_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     )
     monkeypatch.setattr(cli, "run_and_persist_paper_account_smoke", lambda program_path, local_state: {"action": "paper-smoke", "api_key": os.getenv("ALPACA_API_KEY"), "program": str(program_path), "local_state": str(local_state)})
     monkeypatch.setattr(cli, "submit_paper_orders", lambda payloads_path, policy: {"action": "paper-submit", "payloads": str(payloads_path), "enabled": policy.get("enabled")})
+    monkeypatch.setattr(
+        cli,
+        "run_form4_fixture_gate_from_env",
+        lambda **kwargs: {
+            "action": "form4-fixture-gate",
+            "data_root": str(kwargs["data_root"]),
+            "limit": kwargs["limit"],
+            "user_agent": kwargs["user_agent"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_form4_candidate_curation",
+        lambda data_root: {
+            "action": "form4-candidates",
+            "data_root": str(data_root),
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_form4_ingest_from_env",
+        lambda **kwargs: {
+            "action": "form4-ingest",
+            "data_root": str(kwargs["data_root"]),
+            "start_date": kwargs["start_date"],
+            "end_date": kwargs["end_date"],
+            "limit": kwargs["limit"],
+            "max_retrieval_attempts": kwargs["max_retrieval_attempts"],
+            "rate_limit_pause_seconds": kwargs["rate_limit_pause_seconds"],
+            "use_cache": kwargs["use_cache"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_form4_market_backfill_from_env",
+        lambda **kwargs: {
+            "action": "form4-market-backfill",
+            "data_root": str(kwargs["data_root"]),
+            "horizons": list(kwargs["horizons"]),
+            "limit_events": kwargs["limit_events"],
+            "include_controls": kwargs["include_controls"],
+            "max_fetch_attempts": kwargs["max_fetch_attempts"],
+            "rate_limit_pause_seconds": kwargs["rate_limit_pause_seconds"],
+            "daily_symbol_batch_size": kwargs["daily_symbol_batch_size"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_form4_label_curation",
+        lambda **kwargs: {
+            "action": "form4-labels",
+            "data_root": str(kwargs["data_root"]),
+            "horizons": kwargs["horizons"],
+            "round_trip_cost_bps": kwargs["round_trip_cost_bps"],
+            "market_data_roots": [str(item) for item in kwargs["market_data_roots"]],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_form4_event_study",
+        lambda **kwargs: {
+            "action": "form4-event-study",
+            "data_root": str(kwargs["data_root"]),
+            "primary_horizon": kwargs["primary_horizon"],
+            "min_historical_sample": kwargs["min_historical_sample"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_form4_rework_study",
+        lambda data_root: {
+            "action": "form4-rework-study",
+            "data_root": str(data_root),
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec8k_candidate_curation",
+        lambda **kwargs: {
+            "action": "sec8k-candidates",
+            "data_root": str(kwargs["data_root"]),
+            "filings_path": str(kwargs["filings_path"]),
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec8k_ingest_from_env",
+        lambda **kwargs: {
+            "action": "sec8k-ingest",
+            "data_root": str(kwargs["data_root"]),
+            "start_date": kwargs["start_date"],
+            "end_date": kwargs["end_date"],
+            "limit": kwargs["limit"],
+            "max_retrieval_attempts": kwargs["max_retrieval_attempts"],
+            "rate_limit_pause_seconds": kwargs["rate_limit_pause_seconds"],
+            "use_cache": kwargs["use_cache"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec8k_market_backfill_from_env",
+        lambda **kwargs: {
+            "action": "sec8k-market-backfill",
+            "data_root": str(kwargs["data_root"]),
+            "horizons": list(kwargs["horizons"]),
+            "limit_events": kwargs["limit_events"],
+            "include_timestamp_placebo": kwargs["include_timestamp_placebo"],
+            "max_fetch_attempts": kwargs["max_fetch_attempts"],
+            "rate_limit_pause_seconds": kwargs["rate_limit_pause_seconds"],
+            "daily_symbol_batch_size": kwargs["daily_symbol_batch_size"],
+            "candidate_source": kwargs["candidate_source"],
+            "target_items": list(kwargs["target_items"]),
+            "accepted_from": kwargs["accepted_from"],
+            "accepted_to": kwargs["accepted_to"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec8k_event_study",
+        lambda **kwargs: {
+            "action": "sec8k-event-study",
+            "data_root": str(kwargs["data_root"]),
+            "primary_horizon": kwargs["primary_horizon"],
+            "horizons": kwargs["horizons"],
+            "round_trip_cost_bps": kwargs["round_trip_cost_bps"],
+            "market_data_roots": [str(item) for item in kwargs["market_data_roots"]],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec8k_research_decision",
+        lambda **kwargs: {
+            "action": "sec8k-decision",
+            "data_root": str(kwargs["data_root"]),
+            "min_labeled_events": kwargs["min_labeled_events"],
+            "min_family_events": kwargs["min_family_events"],
+            "min_mean_abret": kwargs["min_mean_abret"],
+            "min_control_separation": kwargs["min_control_separation"],
+            "max_top5_abs_contribution": kwargs["max_top5_abs_contribution"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec8k_coverage_audit",
+        lambda **kwargs: {
+            "action": "sec8k-coverage-audit",
+            "data_root": str(kwargs["data_root"]),
+            "start_date": kwargs["start_date"],
+            "end_date": kwargs["end_date"],
+            "target_items": kwargs["target_items"],
+            "fallback_target_items": kwargs["fallback_target_items"],
+            "horizons": kwargs["horizons"],
+            "round_trip_cost_bps": kwargs["round_trip_cost_bps"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec8k_coverage_expand",
+        lambda **kwargs: {
+            "action": "sec8k-coverage-expand",
+            "data_root": str(kwargs["data_root"]),
+            "start_date": kwargs["start_date"],
+            "end_date": kwargs["end_date"],
+            "target_items": kwargs["target_items"],
+            "fallback_target_items": kwargs["fallback_target_items"],
+            "limit_per_month": kwargs["limit_per_month"],
+            "use_cache": kwargs["use_cache"],
+            "rebuild_candidates": kwargs["rebuild_candidates"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec_event_semantic_fixture_gate",
+        lambda **kwargs: {
+            "action": "sec-event-semantic-gate",
+            "data_root": str(kwargs["data_root"]),
+            "model": kwargs["model"],
+            "base_url": kwargs["base_url"],
+            "timeout_seconds": kwargs["timeout_seconds"],
+            "response_format_mode": kwargs["response_format_mode"],
+            "batch_size": kwargs["batch_size"],
+            "limit": kwargs["limit"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec_event_semantic_classification",
+        lambda **kwargs: {
+            "action": "sec-event-semantic-classify",
+            "data_root": str(kwargs["data_root"]),
+            "model": kwargs["model"],
+            "base_url": kwargs["base_url"],
+            "timeout_seconds": kwargs["timeout_seconds"],
+            "response_format_mode": kwargs["response_format_mode"],
+            "batch_size": kwargs["batch_size"],
+            "limit": kwargs["limit"],
+            "max_snippet_chars": kwargs["max_snippet_chars"],
+            "routing_mode": kwargs["routing_mode"],
+            "target_items": kwargs["target_items"],
+            "accepted_from": kwargs["accepted_from"],
+            "accepted_to": kwargs["accepted_to"],
+            "snippet_kind": kwargs["snippet_kind"],
+            "labelability_mode": kwargs["labelability_mode"],
+            "resume": kwargs["resume"],
+            "checkpoint_path": str(kwargs["checkpoint_path"]),
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec_event_semantic_labelability_audit",
+        lambda **kwargs: {
+            "action": "sec-event-semantic-labelability-audit",
+            "data_root": str(kwargs["data_root"]),
+            "routing_mode": kwargs["routing_mode"],
+            "target_items": kwargs["target_items"],
+            "accepted_from": kwargs["accepted_from"],
+            "accepted_to": kwargs["accepted_to"],
+            "snippet_kind": kwargs["snippet_kind"],
+            "horizons": kwargs["horizons"],
+            "round_trip_cost_bps": kwargs["round_trip_cost_bps"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec_event_semantic_scaled_gate",
+        lambda **kwargs: {
+            "action": "sec-event-semantic-scaled-gate",
+            "data_root": str(kwargs["data_root"]),
+            "model": kwargs["model"],
+            "base_url": kwargs["base_url"],
+            "timeout_seconds": kwargs["timeout_seconds"],
+            "response_format_mode": kwargs["response_format_mode"],
+            "batch_size": kwargs["batch_size"],
+            "target_items": kwargs["target_items"],
+            "fallback_target_items": kwargs["fallback_target_items"],
+            "years": kwargs["years"],
+            "max_snippets": kwargs["max_snippets"],
+            "resume": kwargs["resume"],
+            "primary_horizon": kwargs["primary_horizon"],
+            "min_sample": kwargs["min_sample"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec_event_semantic_coverage_gate",
+        lambda **kwargs: {
+            "action": "sec-event-semantic-coverage-gate",
+            "data_root": str(kwargs["data_root"]),
+            "start_date": kwargs["start_date"],
+            "end_date": kwargs["end_date"],
+            "model": kwargs["model"],
+            "base_url": kwargs["base_url"],
+            "timeout_seconds": kwargs["timeout_seconds"],
+            "response_format_mode": kwargs["response_format_mode"],
+            "batch_size": kwargs["batch_size"],
+            "target_items": kwargs["target_items"],
+            "fallback_target_items": kwargs["fallback_target_items"],
+            "max_snippets": kwargs["max_snippets"],
+            "resume": kwargs["resume"],
+            "primary_horizon": kwargs["primary_horizon"],
+            "min_sample": kwargs["min_sample"],
+            "expand_missing_coverage": kwargs["expand_missing_coverage"],
+            "repair_market_coverage": kwargs["repair_market_coverage"],
+            "limit_per_month": kwargs["limit_per_month"],
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_sec_event_semantic_study",
+        lambda **kwargs: {
+            "action": "sec-event-semantic-study",
+            "data_root": str(kwargs["data_root"]),
+            "primary_horizon": kwargs["primary_horizon"],
+            "horizons": kwargs["horizons"],
+            "round_trip_cost_bps": kwargs["round_trip_cost_bps"],
+            "market_data_roots": [str(item) for item in kwargs["market_data_roots"]],
+        },
+    )
     monkeypatch.setattr(cli, "read_research_program_state", lambda local_state, program_id: {"action": "status", "program_id": program_id, "frontier": {"x": 1}})
     monkeypatch.setattr(cli, "pause_research_program", lambda local_state, program_id: {"action": "pause", "program_id": program_id})
     monkeypatch.setattr(cli, "resume_research_program", lambda program_id, **kwargs: {"action": "resume", "program_id": program_id})
@@ -645,6 +923,553 @@ def test_research_cli_dispatch(tmp_path: Path, monkeypatch, capsys) -> None:
     assert paper_smoke_payload["program"] == str(program_path)
     assert cli.main(["research", "paper-submit", "--program", str(program_path), "--payloads", str(tmp_path / "payloads.json")]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "paper-submit"
+    data_root = tmp_path / "nas"
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "form4-fixture-gate",
+                "--limit",
+                "2",
+                "--user-agent",
+                "TradeML test@example.com",
+            ]
+        )
+        == 0
+    )
+    form4_payload = json.loads(capsys.readouterr().out)
+    assert form4_payload["action"] == "form4-fixture-gate"
+    assert form4_payload["data_root"] == str(data_root)
+    assert form4_payload["limit"] == 2
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "form4-ingest",
+                "--start-date",
+                "2025-04-01",
+                "--end-date",
+                "2025-04-30",
+                "--limit",
+                "3",
+                "--max-retrieval-attempts",
+                "2",
+                "--rate-limit-pause-seconds",
+                "0.1",
+            ]
+        )
+        == 0
+    )
+    form4_ingest_payload = json.loads(capsys.readouterr().out)
+    assert form4_ingest_payload["action"] == "form4-ingest"
+    assert form4_ingest_payload["start_date"] == "2025-04-01"
+    assert form4_ingest_payload["limit"] == 3
+    assert form4_ingest_payload["max_retrieval_attempts"] == 2
+    assert form4_ingest_payload["rate_limit_pause_seconds"] == 0.1
+    assert form4_ingest_payload["use_cache"] is True
+    assert cli.main([*research_base, "--data-root", str(data_root), "form4-candidates"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "action": "form4-candidates",
+        "data_root": str(data_root),
+    }
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "form4-market-backfill",
+                "--horizon",
+                "5",
+                "--limit-events",
+                "1",
+                "--max-fetch-attempts",
+                "3",
+                "--rate-limit-pause-seconds",
+                "0.2",
+                "--daily-symbol-batch-size",
+                "2",
+            ]
+        )
+        == 0
+    )
+    form4_backfill_payload = json.loads(capsys.readouterr().out)
+    assert form4_backfill_payload["action"] == "form4-market-backfill"
+    assert form4_backfill_payload["horizons"] == [5]
+    assert form4_backfill_payload["limit_events"] == 1
+    assert form4_backfill_payload["include_controls"] is True
+    assert form4_backfill_payload["max_fetch_attempts"] == 3
+    assert form4_backfill_payload["rate_limit_pause_seconds"] == 0.2
+    assert form4_backfill_payload["daily_symbol_batch_size"] == 2
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "form4-labels",
+                "--horizon",
+                "5",
+                "--round-trip-cost-bps",
+                "75",
+                "--market-data-root",
+                str(tmp_path / "market"),
+            ]
+        )
+        == 0
+    )
+    form4_labels_payload = json.loads(capsys.readouterr().out)
+    assert form4_labels_payload["action"] == "form4-labels"
+    assert form4_labels_payload["horizons"] == [5]
+    assert form4_labels_payload["round_trip_cost_bps"] == 75.0
+    assert form4_labels_payload["market_data_roots"] == [str(tmp_path / "market")]
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "form4-event-study",
+                "--primary-horizon",
+                "5",
+                "--min-historical-sample",
+                "10",
+            ]
+        )
+        == 0
+    )
+    form4_event_study_payload = json.loads(capsys.readouterr().out)
+    assert form4_event_study_payload["action"] == "form4-event-study"
+    assert form4_event_study_payload["min_historical_sample"] == 10
+    assert (
+        cli.main([*research_base, "--data-root", str(data_root), "form4-rework-study"])
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {
+        "action": "form4-rework-study",
+        "data_root": str(data_root),
+    }
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec8k-ingest",
+                "--start-date",
+                "2025-04-01",
+                "--end-date",
+                "2025-04-30",
+                "--limit",
+                "3",
+                "--max-retrieval-attempts",
+                "2",
+                "--rate-limit-pause-seconds",
+                "0.1",
+            ]
+        )
+        == 0
+    )
+    sec8k_ingest_payload = json.loads(capsys.readouterr().out)
+    assert sec8k_ingest_payload["action"] == "sec8k-ingest"
+    assert sec8k_ingest_payload["start_date"] == "2025-04-01"
+    assert sec8k_ingest_payload["limit"] == 3
+    assert sec8k_ingest_payload["max_retrieval_attempts"] == 2
+    assert sec8k_ingest_payload["use_cache"] is True
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec8k-candidates",
+                "--filings-path",
+                str(tmp_path / "sec_filings.parquet"),
+            ]
+        )
+        == 0
+    )
+    sec8k_candidates_payload = json.loads(capsys.readouterr().out)
+    assert sec8k_candidates_payload["action"] == "sec8k-candidates"
+    assert sec8k_candidates_payload["filings_path"] == str(tmp_path / "sec_filings.parquet")
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec8k-market-backfill",
+                "--horizon",
+                "5",
+                "--limit-events",
+                "2",
+                "--no-timestamp-placebo",
+                "--max-fetch-attempts",
+                "3",
+                "--rate-limit-pause-seconds",
+                "0.2",
+                "--daily-symbol-batch-size",
+                "2",
+                "--candidate-source",
+                "sec_event_semantic_candidates",
+                "--target-item",
+                "3.02",
+                "--accepted-from",
+                "2025-04-01",
+                "--accepted-to",
+                "2025-04-30",
+            ]
+        )
+        == 0
+    )
+    sec8k_backfill_payload = json.loads(capsys.readouterr().out)
+    assert sec8k_backfill_payload["action"] == "sec8k-market-backfill"
+    assert sec8k_backfill_payload["horizons"] == [5]
+    assert sec8k_backfill_payload["limit_events"] == 2
+    assert sec8k_backfill_payload["include_timestamp_placebo"] is False
+    assert sec8k_backfill_payload["max_fetch_attempts"] == 3
+    assert sec8k_backfill_payload["rate_limit_pause_seconds"] == 0.2
+    assert sec8k_backfill_payload["daily_symbol_batch_size"] == 2
+    assert sec8k_backfill_payload["candidate_source"] == "sec_event_semantic_candidates"
+    assert sec8k_backfill_payload["target_items"] == ["3.02"]
+    assert sec8k_backfill_payload["accepted_from"] == "2025-04-01"
+    assert sec8k_backfill_payload["accepted_to"] == "2025-04-30"
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec8k-event-study",
+                "--primary-horizon",
+                "5",
+                "--horizon",
+                "5",
+                "--round-trip-cost-bps",
+                "75",
+                "--market-data-root",
+                str(tmp_path / "market"),
+            ]
+        )
+        == 0
+    )
+    sec8k_study_payload = json.loads(capsys.readouterr().out)
+    assert sec8k_study_payload["action"] == "sec8k-event-study"
+    assert sec8k_study_payload["horizons"] == [5]
+    assert sec8k_study_payload["round_trip_cost_bps"] == 75.0
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec8k-decision",
+                "--min-labeled-events",
+                "300",
+                "--min-family-events",
+                "100",
+                "--min-mean-abret",
+                "0.005",
+                "--min-control-separation",
+                "0.0075",
+                "--max-top5-abs-contribution",
+                "0.35",
+            ]
+        )
+        == 0
+    )
+    sec8k_decision_payload = json.loads(capsys.readouterr().out)
+    assert sec8k_decision_payload["action"] == "sec8k-decision"
+    assert sec8k_decision_payload["min_labeled_events"] == 300
+    assert sec8k_decision_payload["min_family_events"] == 100
+    assert sec8k_decision_payload["min_mean_abret"] == 0.005
+    assert sec8k_decision_payload["min_control_separation"] == 0.0075
+    assert sec8k_decision_payload["max_top5_abs_contribution"] == 0.35
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec8k-coverage-audit",
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2025-12-31",
+                "--target-item",
+                "3.02",
+                "--fallback-target-item",
+                "1.01",
+                "--horizon",
+                "5",
+            ]
+        )
+        == 0
+    )
+    sec8k_coverage_payload = json.loads(capsys.readouterr().out)
+    assert sec8k_coverage_payload["action"] == "sec8k-coverage-audit"
+    assert sec8k_coverage_payload["target_items"] == ["3.02"]
+    assert sec8k_coverage_payload["fallback_target_items"] == ["1.01"]
+    assert sec8k_coverage_payload["horizons"] == [5]
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec8k-coverage-expand",
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2025-12-31",
+                "--target-item",
+                "3.02",
+                "--fallback-target-item",
+                "1.01",
+                "--limit-per-month",
+                "10",
+                "--no-cache",
+                "--no-rebuild-candidates",
+            ]
+        )
+        == 0
+    )
+    sec8k_expand_payload = json.loads(capsys.readouterr().out)
+    assert sec8k_expand_payload["action"] == "sec8k-coverage-expand"
+    assert sec8k_expand_payload["limit_per_month"] == 10
+    assert sec8k_expand_payload["use_cache"] is False
+    assert sec8k_expand_payload["rebuild_candidates"] is False
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec-event-semantic-gate",
+                "--model",
+                "qwen3.5-9b-mlx",
+                "--base-url",
+                "http://127.0.0.1:1234/v1",
+                "--timeout-seconds",
+                "120",
+                "--response-format-mode",
+                "prompt_json",
+                "--batch-size",
+                "1",
+                "--limit",
+                "2",
+            ]
+        )
+        == 0
+    )
+    semantic_gate_payload = json.loads(capsys.readouterr().out)
+    assert semantic_gate_payload["action"] == "sec-event-semantic-gate"
+    assert semantic_gate_payload["model"] == "qwen3.5-9b-mlx"
+    assert semantic_gate_payload["base_url"] == "http://127.0.0.1:1234/v1"
+    assert semantic_gate_payload["timeout_seconds"] == 120.0
+    assert semantic_gate_payload["response_format_mode"] == "prompt_json"
+    assert semantic_gate_payload["batch_size"] == 1
+    assert semantic_gate_payload["limit"] == 2
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec-event-semantic-classify",
+                "--model",
+                "qwen3.5-9b-mlx",
+                "--base-url",
+                "http://127.0.0.1:1234/v1",
+                "--timeout-seconds",
+                "120",
+                "--response-format-mode",
+                "prompt_json",
+                "--batch-size",
+                "4",
+                "--limit",
+                "40",
+                "--max-snippet-chars",
+                "3000",
+                "--routing-mode",
+                "targeted",
+                "--target-item",
+                "4.01",
+                "--target-item",
+                "2.04",
+                "--accepted-from",
+                "2025-04-01",
+                "--accepted-to",
+                "2025-04-30",
+                "--snippet-kind",
+                "item_section",
+                "--labelability-mode",
+                "labelable-only",
+                "--resume",
+                "--checkpoint-path",
+                str(tmp_path / "semantic-checkpoint.parquet"),
+            ]
+        )
+        == 0
+    )
+    semantic_classify_payload = json.loads(capsys.readouterr().out)
+    assert semantic_classify_payload["action"] == "sec-event-semantic-classify"
+    assert semantic_classify_payload["response_format_mode"] == "prompt_json"
+    assert semantic_classify_payload["batch_size"] == 4
+    assert semantic_classify_payload["limit"] == 40
+    assert semantic_classify_payload["max_snippet_chars"] == 3000
+    assert semantic_classify_payload["routing_mode"] == "targeted"
+    assert semantic_classify_payload["target_items"] == ["4.01", "2.04"]
+    assert semantic_classify_payload["accepted_from"] == "2025-04-01"
+    assert semantic_classify_payload["accepted_to"] == "2025-04-30"
+    assert semantic_classify_payload["snippet_kind"] == "item_section"
+    assert semantic_classify_payload["labelability_mode"] == "labelable-only"
+    assert semantic_classify_payload["resume"] is True
+    assert semantic_classify_payload["checkpoint_path"] == str(tmp_path / "semantic-checkpoint.parquet")
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec-event-semantic-labelability-audit",
+                "--routing-mode",
+                "targeted",
+                "--target-item",
+                "3.02",
+                "--accepted-from",
+                "2025-04-01",
+                "--accepted-to",
+                "2025-04-30",
+                "--horizon",
+                "5",
+                "--round-trip-cost-bps",
+                "50",
+            ]
+        )
+        == 0
+    )
+    labelability_payload = json.loads(capsys.readouterr().out)
+    assert labelability_payload["action"] == "sec-event-semantic-labelability-audit"
+    assert labelability_payload["target_items"] == ["3.02"]
+    assert labelability_payload["horizons"] == [5]
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec-event-semantic-scaled-gate",
+                "--model",
+                "qwen3.5-9b-mlx",
+                "--base-url",
+                "http://127.0.0.1:1235/v1",
+                "--timeout-seconds",
+                "180",
+                "--response-format-mode",
+                "prompt_json",
+                "--batch-size",
+                "1",
+                "--target-item",
+                "3.02",
+                "--fallback-target-item",
+                "1.01",
+                "--year",
+                "2025",
+                "--max-snippets",
+                "10",
+                "--no-resume",
+                "--primary-horizon",
+                "5",
+                "--min-sample",
+                "20",
+            ]
+        )
+        == 0
+    )
+    scaled_payload = json.loads(capsys.readouterr().out)
+    assert scaled_payload["action"] == "sec-event-semantic-scaled-gate"
+    assert scaled_payload["base_url"] == "http://127.0.0.1:1235/v1"
+    assert scaled_payload["target_items"] == ["3.02"]
+    assert scaled_payload["fallback_target_items"] == ["1.01"]
+    assert scaled_payload["years"] == [2025]
+    assert scaled_payload["max_snippets"] == 10
+    assert scaled_payload["resume"] is False
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec-event-semantic-coverage-gate",
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2025-12-31",
+                "--model",
+                "qwen3.5-9b-mlx",
+                "--base-url",
+                "http://127.0.0.1:1235/v1",
+                "--timeout-seconds",
+                "180",
+                "--response-format-mode",
+                "prompt_json",
+                "--batch-size",
+                "1",
+                "--target-item",
+                "3.02",
+                "--fallback-target-item",
+                "1.01",
+                "--max-snippets",
+                "10",
+                "--no-resume",
+                "--primary-horizon",
+                "5",
+                "--min-sample",
+                "20",
+                "--no-expand",
+                "--no-market-repair",
+                "--limit-per-month",
+                "5",
+            ]
+        )
+        == 0
+    )
+    coverage_gate_payload = json.loads(capsys.readouterr().out)
+    assert coverage_gate_payload["action"] == "sec-event-semantic-coverage-gate"
+    assert coverage_gate_payload["base_url"] == "http://127.0.0.1:1235/v1"
+    assert coverage_gate_payload["target_items"] == ["3.02"]
+    assert coverage_gate_payload["fallback_target_items"] == ["1.01"]
+    assert coverage_gate_payload["resume"] is False
+    assert coverage_gate_payload["expand_missing_coverage"] is False
+    assert coverage_gate_payload["repair_market_coverage"] is False
+    assert (
+        cli.main(
+            [
+                *research_base,
+                "--data-root",
+                str(data_root),
+                "sec-event-semantic-study",
+                "--primary-horizon",
+                "5",
+                "--horizon",
+                "5",
+                "--round-trip-cost-bps",
+                "75",
+                "--market-data-root",
+                str(tmp_path / "market"),
+            ]
+        )
+        == 0
+    )
+    semantic_study_payload = json.loads(capsys.readouterr().out)
+    assert semantic_study_payload["action"] == "sec-event-semantic-study"
+    assert semantic_study_payload["horizons"] == [5]
+    assert semantic_study_payload["round_trip_cost_bps"] == 75.0
     assert cli.main(["research", "status", "--program-id", "perpetual"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "status"
     assert cli.main(["research", "pause", "--program-id", "perpetual"]) == 0
