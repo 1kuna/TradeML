@@ -26,7 +26,7 @@ Install or refresh the LaunchAgent from the Mac Mini repo checkout:
 
 ```bash
 .venv/bin/trademl research \
-  --data-root /Users/openclaw/atlas_mounts/nas \
+  --data-root /Users/openclaw/atlas_mounts/dev/TradeML \
   --local-state /Users/openclaw/TradeML/control \
   --env-file .env \
   install-launchd \
@@ -40,14 +40,14 @@ Check ownership and health:
 
 ```bash
 .venv/bin/trademl research --local-state /Users/openclaw/TradeML/control launchd-status --program configs/research/perpetual_macmini.yml
-.venv/bin/trademl research --data-root /Users/openclaw/atlas_mounts/nas --local-state /Users/openclaw/TradeML/control --env-file .env health --program-id perpetual-macmini
+.venv/bin/trademl research --data-root /Users/openclaw/atlas_mounts/dev/TradeML --local-state /Users/openclaw/TradeML/control --env-file .env health --program-id perpetual-macmini
 ```
 
 Graceful maintenance stop:
 
 ```bash
 .venv/bin/trademl research --local-state /Users/openclaw/TradeML/control unload-launchd --program configs/research/perpetual_macmini.yml
-.venv/bin/trademl research --data-root /Users/openclaw/atlas_mounts/nas --local-state /Users/openclaw/TradeML/control --env-file .env stop --program-id perpetual-macmini
+.venv/bin/trademl research --data-root /Users/openclaw/atlas_mounts/dev/TradeML --local-state /Users/openclaw/TradeML/control --env-file .env stop --program-id perpetual-macmini
 ```
 
 If the controller runs from another machine over SSH, do not bake a password into config. Set the configured password env var in the calling environment, or use key auth.

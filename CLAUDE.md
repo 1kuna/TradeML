@@ -24,6 +24,7 @@ Follow `DEV_GUIDE.md` phase by phase. Don't skip ahead. Each phase has a gate â€
 8. **Costs always on.** Every backtest includes 5 bps spread. No "zero cost" results ever.
 9. **SQLite is local to the Pi.** Never put SQLite on a network filesystem. Parquet files go to the NAS. SQLite stays on the machine that owns it.
 10. **Log everything.** Every API call, every training run, every design choice. This is a research system â€” reproducibility is non-negotiable.
+11. **No regex or keyword rules for semantic extraction.** Regex/deterministic parsing is allowed only for stable source structure (SEC accession metadata, SGML/XML tags, item-section boundaries, timestamps, paths, hashes). Narrative text semantics from news, filings, exhibits, press releases, contracts, and articles must be classified/extracted with an LLM or purpose-built model into a strict schema, then validated deterministically with evidence spans/source offsets. Never use regex/keyword heuristics to decide sentiment, materiality, dilution, contract awards, auditor trouble, customer loss, default/covenant issues, guidance changes, or any other economic event meaning.
 
 ## Style
 

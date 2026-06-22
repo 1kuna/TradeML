@@ -36,3 +36,11 @@ The simpler model wins when a more complex model is statistically indistinguisha
 The frontier lane stays advanced-first, but every epoch carries one tree sentinel and one linear sentinel unless budget or dependency preflight blocks them. When an epoch exhausts without a promotable candidate, the supervisor pivots to a new epoch, window, or validated data/feature lane rather than waiting or repeating stale broad cartesian searches.
 
 Raw minute/news/text archives remain excluded from training until a separate point-in-time feature curation pass makes them modeling-ready.
+
+Narrative news, filing, exhibit, IR, legal, regulatory, and contract text must
+not be semantically classified with regex or keyword heuristics. Deterministic
+parsing may segment stable source structure and preserve provenance; semantic
+event extraction must use an LLM or purpose-built model into a strict schema,
+with deterministic validation of evidence spans/source offsets, supported
+numeric fields, timestamps, categorical certainty/ambiguity, and allowed event
+classes. Numeric model confidence scores are not accepted as extraction truth.

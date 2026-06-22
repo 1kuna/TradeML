@@ -1,5 +1,14 @@
 # TradeML — Single Source of Truth (SSOT) v3
 
+Current research-direction note, 2026-05-20:
+
+- This file remains the engineering and infrastructure contract.
+- Current alpha-research direction, killed candidates, and runtime restart
+  criteria live in `docs/research/PATH_FORWARD_SSOT.md`.
+- When this file and `PATH_FORWARD_SSOT.md` disagree about what research path
+  to run next, `PATH_FORWARD_SSOT.md` wins until this repo-wide SSOT is
+  deliberately rewritten.
+
 **Purpose.** This is the canonical specification for the TradeML system. All code, configs, and design decisions must conform to this document. It supersedes all previous specs, blueprints, and architecture docs.
 
 **Philosophy.** Prove the core thesis first: can a cross-sectional daily model find meaningful signal in US equities using free-tier data? Start with the simplest credible baseline, validate honestly, and add complexity only when prior results justify it. Every layer of abstraction must earn its place.
@@ -36,7 +45,7 @@ All machines on the same LAN. NAS is the single shared filesystem for data. Pi k
 **Simple: parquet files on a NAS via SMB. State database local to each machine.**
 
 ```
-//nas/trademl/                           # SMB share root
+//z-home.local/dev/TradeML/                           # SMB share root
   data/
     raw/                                 # Immutable vendor parquet files
       equities_bars/                     # date=YYYY-MM-DD/data.parquet (multi-symbol per file)
@@ -72,7 +81,7 @@ Pi local (NOT on NAS):
 ```
 
 **Mount points:**
-- Pi: `sudo mount -t cifs //nas/trademl /mnt/trademl -o credentials=/etc/nas-creds,uid=pi,gid=pi`
+- Pi: `sudo mount -t cifs //z-home.local/dev/TradeML /mnt/trademl -o credentials=/etc/nas-creds,uid=pi,gid=pi`
 - Windows: Map `\\nas\trademl` as a network drive
 - Linux: `/etc/fstab` entry with CIFS mount
 
@@ -322,7 +331,7 @@ Every partition `(source, dataset, date)` is graded:
 - **AMBER**: exists but marginal (short session, fewer symbols than expected)
 - **RED**: missing
 
-Tracked in Pi-local SQLite (`partition_status` table) and mirrored to `//nas/trademl/data/qc/partition_status.parquet` during daily sync.
+Tracked in Pi-local SQLite (`partition_status` table) and mirrored to `//z-home.local/dev/TradeML/data/qc/partition_status.parquet` during daily sync.
 
 Non-trading days: marked GREEN with `expected_rows=0`, `qc_code='NO_SESSION'`. No gap tasks for these.
 
@@ -484,10 +493,10 @@ The training host reads from the NAS. It needs to know what data is available an
 **Mechanism:** The Pi syncs `qc/partition_status.parquet` to the NAS after each audit cycle. The training workflow reads this file to check GREEN coverage before proceeding.
 
 **Workflow:**
-1. Training script reads `//nas/trademl/data/qc/partition_status.parquet`
+1. Training script reads `//z-home.local/dev/TradeML/data/qc/partition_status.parquet`
 2. Computes GREEN fraction over the desired training window
 3. If below threshold (e.g., < 0.98), abort with a message showing which dates/symbols are missing
-4. If sufficient, proceed to load curated data from `//nas/trademl/data/curated/`
+4. If sufficient, proceed to load curated data from `//z-home.local/dev/TradeML/data/curated/`
 
 No live database connection needed. The parquet file is the contract between the Pi (data producer) and the workstation (data consumer).
 
@@ -778,7 +787,7 @@ Pi (runs 24/7):
   1. Protect canonical EOD first: fetch today's bars, repair missing frozen windows, and keep GREEN coverage moving.
   2. Saturate every independent vendor lane while canonical work runs: minute bars, ticker news, SEC/FRED/event/reference data.
   3. Spend unused daily quota before reset; only reserve forward-bar capacity until the final burn-down window.
-  4. Write raw parquet to //nas/trademl/data/raw/{dataset}/date=YYYY-MM-DD/data.parquet with source and vendor timestamp lineage.
+  4. Write raw parquet to //z-home.local/dev/TradeML/data/raw/{dataset}/date=YYYY-MM-DD/data.parquet with source and vendor timestamp lineage.
   5. Keep local SQLite on the Pi for leases, attempts, budget state, planner metadata, and watermarks.
   6. Sync partition_status.parquet and telemetry to NAS for workstation visibility.
   7. Sleep for a short poll interval, then repeat forever.
@@ -808,7 +817,7 @@ Profitability is an empirical target, not an assumption. Every claim must be bac
 ### 6.3 Training Workflow (workstation, manual in Phase 1)
 
 ```
-1. Read data from //nas/trademl/data/curated/
+1. Read data from //z-home.local/dev/TradeML/data/curated/
 2. Check GREEN coverage (≥98% of expected dates in training window)
 3. Build rank-normalized features
 4. Compute universe-relative forward returns (labels)
@@ -816,7 +825,7 @@ Profitability is an empirical target, not an assumption. Every claim must be bac
 6. Evaluate IC stability, decile spreads, placebo test, cost stress
 7. If promising: run LightGBM challenger with same walk-forward
 8. Compare Ridge vs LightGBM on OOS metrics
-9. Save model + results to //nas/trademl/models/
+9. Save model + results to //z-home.local/dev/TradeML/models/
 ```
 
 Phase 1: run manually from a script or notebook.
@@ -888,7 +897,7 @@ Any change to SSOT-governed code (features, labels, validation, portfolio, backt
 
 ### 8.2 Training Workflow Logging
 
-- Each training run logs to `//nas/trademl/logs/training/run_YYYYMMDD_HHMMSS.log`
+- Each training run logs to `//z-home.local/dev/TradeML/logs/training/run_YYYYMMDD_HHMMSS.log`
 - Captures: GREEN coverage check result, feature build summary, model hyperparameters, walk-forward fold metrics (IC, decile spreads), final summary, artifact paths
 - Model artifacts saved alongside the log so each run is fully reproducible
 

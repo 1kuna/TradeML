@@ -137,8 +137,8 @@ Earlier live evidence suggested:
   - `/mnt/trademl/data/raw/ticker_news`
   - `/mnt/trademl/data/raw/equities_minute`
 - Mac was looking under:
-  - `/Users/openclaw/atlas_mounts/nas/data/raw/ticker_news`
-  - `/Users/openclaw/atlas_mounts/nas/data/raw/equities_minute`
+  - `/Users/openclaw/atlas_mounts/dev/TradeML/data/raw/ticker_news`
+  - `/Users/openclaw/atlas_mounts/dev/TradeML/data/raw/equities_minute`
 - Those Mac paths were missing at the time of the earlier check.
 
 Likely diagnosis: the Pi and Mac do not currently see the same NAS path/layout for these datasets, or the source contract still maps to a path that is not actually visible from the Mac.
@@ -182,7 +182,7 @@ The active experiment `perpetual-macmini-p1-f547` had one running ensemble run a
 cd /Users/zach/Documents/Git/TradeML
 sshpass -e ssh openclaw@100.102.98.14 \
   'cd /Users/openclaw/TradeML && .venv/bin/python -m trademl.cli research \
-  --data-root /Users/openclaw/atlas_mounts/nas \
+  --data-root /Users/openclaw/atlas_mounts/dev/TradeML \
   --local-state /Users/openclaw/TradeML/control \
   --env-file /Users/openclaw/TradeML/.env \
   status --program-id perpetual-macmini'
@@ -231,7 +231,7 @@ Run Mac research status remotely:
 ```bash
 sshpass -e ssh openclaw@100.102.98.14 \
   'cd /Users/openclaw/TradeML && .venv/bin/python -m trademl.cli research \
-  --data-root /Users/openclaw/atlas_mounts/nas \
+  --data-root /Users/openclaw/atlas_mounts/dev/TradeML \
   --local-state /Users/openclaw/TradeML/control \
   --env-file /Users/openclaw/TradeML/.env \
   status --program-id perpetual-macmini'
