@@ -151,6 +151,45 @@ program, dashboard start/stop controls, Pi service management, and autopilot
 health checks. Their existence is not authorization to use them during the
 current freeze.
 
+## Archived Legacy Thread Addendum - 2026-06-23
+
+Several old Windows/Raspberry-Pi TradeML threads were asked to dump context
+before archival. They are historical collector context only. They do not override
+the current freeze above: do not restart the Raspberry Pi collector, Mac mini
+loop, old broad SEC loop, or any runtime unless Zach explicitly accepts a new
+gate.
+
+Useful historical facts if the collector lane is deliberately reopened:
+
+- the old Windows worktrees were `K:\Git\KUNA\TradeML` and `K:\Git\TradeML`;
+  this live handoff uses `/Users/zach/Documents/Git/TradeML` as the current local
+  authority;
+- canonical sourced equity bars were daily/EOD and 1-minute. Coarser intraday
+  bars such as `5m`, `15m`, `30m`, and `1h` should be derived from 1-minute bars
+  unless Zach intentionally changes the architecture;
+- old Pi/edge work focused on per-vendor ingestion scheduling, bounded workers,
+  request pacing, S3/MinIO writes, leases, bookmarks, and safe resume;
+- known old collector hazards included: scheduler timeouts masking slow Polygon
+  work, Alpaca SDK calls bypassing pacing, explicit-key S3 upload paths advancing
+  bookmarks without visible objects, cooldown loops exiting with zero inflight,
+  and possible `scripts/node.py` control-flow/indentation drift;
+- if that old collector work is revived, inspect live code and status first. Do
+  not trust old dirty-file lists or restart instructions from those chats;
+- historical affected bookmark families to inspect before any rerun are Alpaca
+  corporate actions/options, Finnhub options chains, and FRED treasury curves;
+- `.env`, `.env.s3`, `.minio_root.env`, logs, PID files, and MinIO/NAS data are
+  sensitive and must not be committed or pasted into public issues;
+- the old threads mention a Polygon API key in local logs/transcripts. Treat any
+  shared copy of those logs as sensitive.
+
+One old documentation-consolidation thread worked in `K:\Git\TradeML` and
+reported untracked docs such as `docs/spec/TradeML_Master_Spec.md`,
+`docs/spec/Consolidation_Map.md`, `docs/data/Data_Playbook.md`,
+`docs/data/Provider_Endpoints_Appendix.md`, `docs/Data_Sources_Detail.txt`, and
+`tmp_extract.py`. Those artifacts were not present in this current Mac checkout
+at this archival pass. Do not assume they are authoritative unless Zach
+deliberately recovers them.
+
 ## Recent Local History
 
 Latest relevant commits on `main` at handoff rewrite time:
